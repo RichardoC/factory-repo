@@ -1,0 +1,8 @@
+{
+  "models": [
+    {"slug": "zai-org/glm-5.3-flash", "role": "base", "price": 0.50},
+    {"slug": "deepseek-ai/deepseek-v4.1-flash", "role": "mid", "price": 1.20},
+    {"slug": "zai-org/glm-5.3", "role": "top", "price": 4.40}
+  ],
+  "max_output_price": 5
+}

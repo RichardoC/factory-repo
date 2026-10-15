@@ -1,0 +1,272 @@
+# CodeAF (https://github.com/Agent-Field/CodeAF) running entirely inside GitHub Actions.
+#
+# Triggers, all gated on the `codeaf` label (adding a label needs triage access):
+#   * an issue gets the `codeaf` label     -> CodeAF works the issue, opens a PR
+#   * `/codeaf <text>` comment on a labelled issue or PR, or a "changes requested"
+#     review on a labelled PR, from an OWNER/MEMBER/COLLABORATOR
+#                                            -> CodeAF continues on that PR's branch
+#
+# Models come from synthetic.new through .github/codeaf/proxy.py, which serves
+# CodeAF a catalog with synthetic.new's real prices, adds usage.cost to every
+# response, refuses models outside .github/codeaf/models.json and enforces the
+# per-run and per-day spend caps below.
+name: CodeAF
+
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+
+env:
+  CODEAF_LABEL: codeaf
+  CODEAF_REF: 6e73ac7752ae1d33c629be52a49d2b79ffcaad6d # Agent-Field/codeaf main, 2026-10-15
+  RUN_CAP: "5"   # USD per run
+  DAY_CAP: "20"  # USD per UTC day, across all runs
+
+jobs:
+  gate:
+    # Cheap pre-filter so unrelated comments don't even start a runner job.
+    if: >-
+      (github.event_name == 'issues' && github.event.label.name == 'codeaf') ||
+      (github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/codeaf')) ||
+      (github.event_name == 'pull_request_review' && (github.event.review.state == 'changes_requested' || startsWith(github.event.review.body, '/codeaf')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    outputs:
+      run: ${{ steps.gate.outputs.run }}
+      mode: ${{ steps.gate.outputs.mode }}
+      number: ${{ steps.gate.outputs.number }}
+      branch: ${{ steps.gate.outputs.branch }}
+      base: ${{ steps.gate.outputs.base }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/codeaf
+          persist-credentials: false
+      - id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -I .github/codeaf/ghctx.py gate
+
+  codeaf:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: codeaf-${{ needs.gate.outputs.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write # dispatch CI on the pushed branch (pushes by GITHUB_TOKEN don't trigger workflows)
+    env:
+      MODE: ${{ needs.gate.outputs.mode }}
+      NUMBER: ${{ needs.gate.outputs.number }}
+      BRANCH: ${{ needs.gate.outputs.branch }}
+      BASE: ${{ needs.gate.outputs.base }}
+    steps:
+      - name: Paths
+        run: |
+          {
+            echo "BRIEF_PATH=$RUNNER_TEMP/brief.md"
+            echo "RESULT_PATH=$RUNNER_TEMP/codeaf-result.json"
+            echo "LEDGER_PATH=$RUNNER_TEMP/codeaf-ledger.jsonl"
+            echo "STATE_DIR=$RUNNER_TEMP/codeaf-state"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false # CodeAF must not be able to push; we push in a later step
+
+      - name: Check out the working branch
+        run: |
+          git config user.name  "codeaf[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null; then
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+          else
+            git checkout -B "$BRANCH" "origin/$BASE"
+          fi
+
+      - name: Keep trusted copies of the harness files
+        # CodeAF edits the working tree; the steps after it must run the
+        # harness as it was before CodeAF started, not whatever it left behind.
+        run: cp -r .github/codeaf "$RUNNER_TEMP/harness"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Restore CodeAF binary
+        id: bin
+        uses: actions/cache@v4
+        with:
+          path: ~/codeaf-bin
+          key: codeaf-bin-${{ env.CODEAF_REF }}-${{ runner.os }}
+
+      - name: Build CodeAF
+        if: steps.bin.outputs.cache-hit != 'true'
+        run: |
+          git clone --filter=blob:none https://github.com/Agent-Field/codeaf "$RUNNER_TEMP/codeaf-src"
+          git -C "$RUNNER_TEMP/codeaf-src" checkout --detach "$CODEAF_REF"
+          (cd "$RUNNER_TEMP/codeaf-src" && CGO_ENABLED=0 go build -trimpath -o ~/codeaf-bin/codeaf ./cmd/codeaf)
+
+      - name: Restore today's spend
+        id: day
+        run: echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.STATE_DIR }}
+          key: codeaf-spend-${{ steps.day.outputs.date }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: codeaf-spend-${{ steps.day.outputs.date }}-
+      - name: Read today's spend
+        id: spent
+        run: |
+          mkdir -p "$STATE_DIR"
+          spent=$(cat "$STATE_DIR/day-total" 2>/dev/null || echo 0)
+          echo "usd=$spent" >> "$GITHUB_OUTPUT"
+          echo "Spent so far today: \$$spent of \$$DAY_CAP"
+
+      - name: Start pricing proxy
+        env:
+          SYNTHETIC_API_KEY: ${{ secrets.SYNTHETIC_API_KEY }}
+          PROXY_DAY_SPENT_USD: ${{ steps.spent.outputs.usd }}
+          PROXY_RUN_CAP_USD: ${{ env.RUN_CAP }}
+          PROXY_DAY_CAP_USD: ${{ env.DAY_CAP }}
+          PROXY_MODELS: ${{ runner.temp }}/harness/models.json
+          PROXY_LEDGER: ${{ env.LEDGER_PATH }}
+        run: |
+          # The key goes in on stdin so it is not in the proxy's environment,
+          # where the CodeAF job (same user) could read it.
+          key="$SYNTHETIC_API_KEY"; unset SYNTHETIC_API_KEY
+          printf '%s\n' "$key" | nohup python3 -I "$RUNNER_TEMP/harness/proxy.py" > "$RUNNER_TEMP/proxy.log" 2>&1 &
+          for _ in $(seq 30); do curl -fsS http://127.0.0.1:8787/healthz && exit 0; sleep 1; done
+          cat "$RUNNER_TEMP/proxy.log"; exit 1
+
+      - name: Write the brief
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -I "$RUNNER_TEMP/harness/ghctx.py" brief
+
+      - name: Run CodeAF
+        id: run
+        env:
+          CODEAF_HOME: ${{ runner.temp }}/codeaf-home
+          CODEAF_BASE_URL: http://127.0.0.1:8787/v1
+          OPENAI_API_KEY: via-local-proxy # the proxy holds the real key
+          CODEAF_TELEMETRY: "off"
+          DO_NOT_TRACK: "1"
+          CODEAF_MODEL_POOL: "off"
+          # Every seat opens on the cheap model; the panel escalates a call to the
+          # next model only when a verifier catches a failure.
+          CODEAF_MODEL: zai-org/glm-5.3-flash
+          CODEAF_PLAN_MODEL: zai-org/glm-5.3-flash
+          CODEAF_CHECK_MODEL: zai-org/glm-5.3-flash
+          CODEAF_MODELS: ${{ runner.temp }}/harness/panel.json
+          CODEAF_DAILY_BUDGET: ${{ env.DAY_CAP }}
+        run: |
+          set +e
+          ~/codeaf-bin/codeaf do "$(cat "$BRIEF_PATH")" --dir . --json --yes-spend --timeout 100m \
+            > "$RESULT_PATH" 2> "$RUNNER_TEMP/codeaf.stderr"
+          code=$?
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          tail -n 80 "$RUNNER_TEMP/codeaf.stderr"
+          python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); d.pop("answer",None); print(json.dumps(d,indent=1)[:4000])' "$RESULT_PATH" || cat "$RESULT_PATH"
+          exit 0
+
+      - name: Commit
+        id: commit
+        run: |
+          # Harness/workflow files are never taken from CodeAF.
+          git checkout HEAD -- .github 2>/dev/null || true
+          git clean -fdq -- .github
+          git add -A
+          changed=$(git diff --cached --name-only | wc -l)
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          if [ "$changed" -gt 0 ]; then
+            title=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("stop","?"))' "$RESULT_PATH" 2>/dev/null || echo "?")
+            git commit -q -m "codeaf: work for #$NUMBER (stop: $title)" -m "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          fi
+          git log --oneline -3
+
+      - name: Push and open/update PR
+        id: pr
+        if: steps.commit.outputs.changed != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/$BRANCH"
+          pr=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')
+          if [ -z "$pr" ]; then
+            title=$(gh issue view "$NUMBER" --json title --jq .title)
+            pr_url=$(gh pr create --base "$BASE" --head "$BRANCH" --title "$title" \
+              --body "Closes #$NUMBER
+
+          Opened by the [CodeAF workflow]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID). Comment \`/codeaf <instructions>\` (or request changes in a review) to have CodeAF continue on this branch.")
+            pr=${pr_url##*/}
+            gh pr edit "$pr" --add-label "$CODEAF_LABEL"
+          fi
+          echo "number=$pr" >> "$GITHUB_OUTPUT"
+          gh workflow run ci.yml --ref "$BRANCH" || echo "::warning::could not dispatch CI"
+
+      - name: Save today's spend
+        if: always()
+        run: |
+          run=$(python3 -I -c 'import json,sys
+          t=0
+          try:
+              for l in open(sys.argv[1]): t+=json.loads(l).get("cost_usd",0)
+          except OSError: pass
+          print(t)' "$LEDGER_PATH")
+          python3 -I -c 'import sys; print(float(sys.argv[1])+float(sys.argv[2]))' "${{ steps.spent.outputs.usd }}" "$run" > "$STATE_DIR/day-total"
+          echo "Run: \$$run, today: \$$(cat "$STATE_DIR/day-total")"
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ${{ env.STATE_DIR }}
+          key: codeaf-spend-${{ steps.day.outputs.date }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Report
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          DAY_SPENT_BEFORE: ${{ steps.spent.outputs.usd }}
+          CHANGED: ${{ steps.commit.outputs.changed }}
+          OUTCOME: ${{ job.status == 'success' && (steps.commit.outputs.changed != '0' && 'changes pushed' || 'no changes') || 'job failed' }}
+        run: |
+          python3 -I "$RUNNER_TEMP/harness/ghctx.py" report > "$RUNNER_TEMP/report.md"
+          cat "$RUNNER_TEMP/report.md" >> "$GITHUB_STEP_SUMMARY"
+          target="${{ steps.pr.outputs.number }}"
+          [ -n "$target" ] || target="$NUMBER"
+          gh issue comment "$target" --body-file "$RUNNER_TEMP/report.md"
+          if [ "$target" != "$NUMBER" ] && [ "$MODE" = issue ]; then
+            gh issue comment "$NUMBER" --body "CodeAF opened #$target for this issue."
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: codeaf-run-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/brief.md
+            ${{ runner.temp }}/codeaf-result.json
+            ${{ runner.temp }}/codeaf-ledger.jsonl
+            ${{ runner.temp }}/codeaf.stderr
+            ${{ runner.temp }}/proxy.log
+            ${{ runner.temp }}/codeaf-home/runs
+          if-no-files-found: ignore
+          retention-days: 14

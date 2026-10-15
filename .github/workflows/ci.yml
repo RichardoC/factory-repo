@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # The CodeAF workflow dispatches this on its branches, because pushes made
+  # with GITHUB_TOKEN do not trigger pull_request/push workflows.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Detect Go module
+        id: detect
+        run: |
+          if [ -f go.mod ]; then echo "go=true" >> "$GITHUB_OUTPUT"; else echo "No go.mod yet; nothing to check."; fi
+      - uses: actions/setup-go@v6
+        if: steps.detect.outputs.go == 'true'
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        if: steps.detect.outputs.go == 'true'
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then echo "Not gofmt'd:"; echo "$unformatted"; exit 1; fi
+      - name: go vet
+        if: steps.detect.outputs.go == 'true'
+        run: go vet ./...
+      - name: go build
+        if: steps.detect.outputs.go == 'true'
+        run: go build ./...
+      - name: go test
+        if: steps.detect.outputs.go == 'true'
+        run: go test -race -count=1 ./...
