@@ -84,7 +84,9 @@ jobs:
             echo "BRIEF_PATH=$RUNNER_TEMP/brief.md"
             echo "RESULT_PATH=$RUNNER_TEMP/codeaf-result.json"
             echo "LEDGER_PATH=$RUNNER_TEMP/codeaf-ledger.jsonl"
+            echo "SPEND_DIR=$RUNNER_TEMP/codeaf-spend"
             echo "STATE_DIR=$RUNNER_TEMP/codeaf-state"
+            echo "CODEAF_HOME=$RUNNER_TEMP/codeaf-home"
             echo "HARNESS=$RUNNER_TEMP/harness/harness"
           } >> "$GITHUB_ENV"
 
@@ -117,35 +119,53 @@ jobs:
           cp -r .github/codeaf "$RUNNER_TEMP/harness"
           (cd "$RUNNER_TEMP/harness" && go build -trimpath -o harness .)
 
-      - name: Restore CodeAF binary
-        id: bin
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/codeaf-bin
-          key: codeaf-bin-${{ env.CODEAF_REF }}-${{ runner.os }}
-
       - name: Build CodeAF
-        if: steps.bin.outputs.cache-hit != 'true'
+        # Always from the pinned source, never from a cache: a cached binary was
+        # written by an earlier job the agent ran in (see AGENTS.md, "Caches").
         run: |
           git clone --filter=blob:none https://github.com/Agent-Field/codeaf "$RUNNER_TEMP/codeaf-src"
           git -C "$RUNNER_TEMP/codeaf-src" checkout --detach "$CODEAF_REF"
           (cd "$RUNNER_TEMP/codeaf-src" && CGO_ENABLED=0 go build -trimpath -o ~/codeaf-bin/codeaf ./cmd/codeaf)
 
+      # Everything restored from the Actions cache below was written by an
+      # earlier job in which the agent had a shell: it is untrusted input and is
+      # validated before use (AGENTS.md, "Caches and carried state").
       - name: Restore today's spend
         id: day
         run: echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ env.STATE_DIR }}
+          path: ${{ env.SPEND_DIR }}
           key: codeaf-spend-${{ steps.day.outputs.date }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: codeaf-spend-${{ steps.day.outputs.date }}-
       - name: Read today's spend
         id: spent
         run: |
-          mkdir -p "$STATE_DIR"
-          spent=$(cat "$STATE_DIR/day-total" 2>/dev/null || echo 0)
+          mkdir -p "$SPEND_DIR"
+          spent=$(head -c 64 "$SPEND_DIR/day-total" 2>/dev/null || true)
+          spent=${spent:-0}
+          # A plain non-negative number or nothing: anything else stops the run
+          # rather than reaching $GITHUB_OUTPUT or loosening the daily cap.
+          if ! [[ "$spent" =~ ^[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+            echo "::error::cached day total is not a valid number; refusing to run"; exit 1
+          fi
           echo "usd=$spent" >> "$GITHUB_OUTPUT"
           echo "Spent so far today: \$$spent (caps are in .github/codeaf/models.json)"
+
+      - name: Restore CodeAF state
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.STATE_DIR }}
+          key: codeaf-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: codeaf-state-v1-
+      - name: Load CodeAF state
+        # Only the model-rating ledger is carried, rebuilt from validated
+        # numbers about models in models.json. CodeAF's memory db and event log
+        # are deliberately not carried: they hold text that would reach future
+        # prompts, and `codeaf do` never writes memory anyway.
+        run: |
+          mkdir -p "$CODEAF_HOME"
+          "$HARNESS" ledger "$STATE_DIR/router-ledger.json" "$CODEAF_HOME/router-ledger.json"
 
       - name: Start pricing proxy
         env:
@@ -172,11 +192,9 @@ jobs:
         # Only the endpoint and the escalation panel stay in the environment:
         # CodeAF reads those two from nowhere else.
         env:
-          CODEAF_HOME: ${{ runner.temp }}/codeaf-home
           CODEAF_BASE_URL: http://127.0.0.1:8787/v1
           CODEAF_MODELS: ${{ runner.temp }}/harness/panel.json
         run: |
-          mkdir -p "$CODEAF_HOME"
           cp "$RUNNER_TEMP/harness/codeaf-config.json" "$CODEAF_HOME/config.json"
           set +e
           ~/codeaf-bin/codeaf do "$(cat "$BRIEF_PATH")" --dir . --json --yes-spend --timeout 100m \
@@ -227,13 +245,28 @@ jobs:
         env:
           DAY_SPENT_BEFORE: ${{ steps.spent.outputs.usd }}
         run: |
-          "$HARNESS" spend > "$STATE_DIR/day-total"
-          echo "Spent today, including this run: \$$(cat "$STATE_DIR/day-total")"
+          # From the proxy's in-memory total, not a file the agent could edit.
+          # The directory is recreated so nothing the agent left in it (extra
+          # files, symlinks) is written through or cached.
+          total=$("$HARNESS" spend)
+          rm -rf "$SPEND_DIR" && mkdir -p "$SPEND_DIR"
+          printf '%s\n' "$total" > "$SPEND_DIR/day-total"
+          echo "Spent today, including this run: \$$(cat "$SPEND_DIR/day-total")"
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: always()
+        with:
+          path: ${{ env.SPEND_DIR }}
+          key: codeaf-spend-${{ steps.day.outputs.date }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Keep CodeAF state
+        if: always()
+        run: |
+          rm -rf "$STATE_DIR" && mkdir -p "$STATE_DIR"
+          "$HARNESS" ledger "$CODEAF_HOME/router-ledger.json" "$STATE_DIR/router-ledger.json"
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: always()
         with:
           path: ${{ env.STATE_DIR }}
-          key: codeaf-spend-${{ steps.day.outputs.date }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: codeaf-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Report
         if: always()

@@ -55,6 +55,11 @@ workflow artifact.
 - The agent has a shell on the runner, so treat it as having the same access as any
   CI job. It gets no GitHub token: the checkout does not keep credentials, and the
   workflow pushes after CodeAF exits. Edits it makes under `.github/` are discarded.
+- Caches are treated as untrusted, because the agent can write to them. Only
+  CodeAF's model-rating ledger is carried between runs, rebuilt from validated
+  numbers each time. CodeAF itself is rebuilt from source on every run, and the
+  daily spend total is validated before use. The rules for future changes are
+  in [`AGENTS.md`](AGENTS.md#security-rules-for-changing-the-harness).
 - Protecting `main`: [`CODEOWNERS`](.github/CODEOWNERS) makes @RichardoC the owner of
   everything. Pair it with a ruleset on `main` that requires a PR, a Code Owner review,
   approval of the most recent push, and the `CI / go` check. A `github-actions[bot]`

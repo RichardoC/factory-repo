@@ -8,7 +8,11 @@
 //	                 outputs (run, reason, mode, number, branch, base)
 //	harness brief    write the task brief for `codeaf do` to $BRIEF_PATH
 //	harness summary  print CodeAF's JSON result without its long answer
-//	harness spend    print today's spend after this run: $DAY_SPENT_BEFORE + ledger
+//	harness spend    print today's spend after this run: $DAY_SPENT_BEFORE + what
+//	                 the proxy metered (its in-memory total, not a file the agent
+//	                 could edit)
+//	harness ledger   copy CodeAF's model-rating ledger (router-ledger.json) from
+//	                 IN to OUT, rebuilt from validated fields only
 //	harness report   print the Markdown run report posted on the issue/PR
 //
 // Trust model: the `codeaf` label can only be added by people with triage access
@@ -24,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -47,6 +52,7 @@ func main() {
 		"brief":   runBrief,
 		"summary": runSummary,
 		"spend":   runSpend,
+		"ledger":  runLedger,
 		"report":  runReport,
 	}
 	command, ok := commands[os.Args[1]]
@@ -197,7 +203,7 @@ func runProxy() error {
 		return err
 	}
 	p.models, p.runCap, p.dayCap = cfg.Models, cfg.Limits.RunUSD, cfg.Limits.DayUSD
-	if p.daySpent, err = envFloat("PROXY_DAY_SPENT_USD", 0); err != nil {
+	if p.daySpent, err = spentToday("PROXY_DAY_SPENT_USD"); err != nil {
 		return err
 	}
 	// Preferred: the key arrives on stdin, so it is not in /proc/<pid>/environ
@@ -979,17 +985,177 @@ func ledgerTotal(lines []LedgerLine) float64 {
 	return total
 }
 
+// spentToday reads the day's earlier spend, which comes from the Actions cache.
+// The cache is written by jobs the agent ran in, so the value is untrusted: a
+// negative, infinite or unparseable total would loosen the daily cap, and is
+// refused rather than repaired.
+func spentToday(name string) (float64, error) {
+	value, err := envFloat(name, 0)
+	if err != nil {
+		return 0, err
+	}
+	if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+		return 0, fmt.Errorf("%s: %v is not a valid spend total", name, value)
+	}
+	return value, nil
+}
+
+// meteredRunSpend asks the running proxy what this run cost. The proxy keeps
+// the total in memory, out of reach of the agent's file writes.
+func meteredRunSpend() (float64, error) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	response, err := client.Get("http://127.0.0.1:" + envOr("PROXY_PORT", "8787") + "/healthz")
+	if err != nil {
+		return 0, err
+	}
+	defer response.Body.Close()
+	var health struct {
+		RunSpentUSD *float64 `json:"run_spent_usd"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&health); err != nil {
+		return 0, err
+	}
+	if health.RunSpentUSD == nil {
+		return 0, errors.New("proxy health has no run_spent_usd")
+	}
+	return *health.RunSpentUSD, nil
+}
+
 func runSpend() error {
-	lines, err := readLedger(os.Getenv("LEDGER_PATH"))
+	before, err := spentToday("DAY_SPENT_BEFORE")
 	if err != nil {
 		return err
 	}
-	before, err := envFloat("DAY_SPENT_BEFORE", 0)
+	run, err := meteredRunSpend()
 	if err != nil {
-		return err
+		// The proxy is gone (crashed, or killed during the run). The ledger
+		// file is the next best record, though the agent could have edited it.
+		log.Printf("warning: proxy unreachable (%v); using the ledger file", err)
+		lines, err := readLedger(os.Getenv("LEDGER_PATH"))
+		if err != nil {
+			return err
+		}
+		run = ledgerTotal(lines)
 	}
-	fmt.Println(strconv.FormatFloat(before+ledgerTotal(lines), 'f', -1, 64))
+	fmt.Println(strconv.FormatFloat(before+run, 'f', -1, 64))
 	return nil
+}
+
+// ---------------------------------------------------------------- router ledger
+
+// RouterEntry is one rating in CodeAF's router-ledger.json (internal/router).
+type RouterEntry struct {
+	Model   string    `json:"model"`
+	Class   string    `json:"class"`
+	Rating  float64   `json:"rating"`
+	Count   int       `json:"count"`
+	Updated time.Time `json:"updated"`
+}
+
+// RouterLedger is CodeAF's router-ledger.json.
+type RouterLedger struct {
+	Entries []RouterEntry     `json:"entries"`
+	Aliases map[string]string `json:"aliases,omitempty"`
+}
+
+const (
+	maxLedgerBytes   = 1 << 20
+	maxLedgerEntries = 256
+	maxRating        = 20.0
+	maxCount         = 1_000_000
+)
+
+func validClass(class string) bool {
+	if len(class) > 32 {
+		return false
+	}
+	for _, r := range class {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+// SanitizeLedger rebuilds a router ledger from fields that can only carry
+// numbers about allowed models. The file is carried between runs in the
+// Actions cache and the agent can write to it, so nothing else survives: no
+// unknown model ids, no free text, no out-of-range numbers.
+func SanitizeLedger(data []byte, models []Model) (RouterLedger, int) {
+	allowed := map[string]bool{}
+	for _, m := range models {
+		allowed[m.ID] = true
+	}
+	var in RouterLedger
+	clean := RouterLedger{Entries: []RouterEntry{}}
+	if len(data) > maxLedgerBytes || json.Unmarshal(data, &in) != nil {
+		return clean, len(in.Entries) + len(in.Aliases) + 1
+	}
+	dropped := 0
+	seen := map[string]bool{}
+	for _, e := range in.Entries {
+		key := e.Model + "\x00" + e.Class
+		if !allowed[e.Model] || !validClass(e.Class) || seen[key] || len(clean.Entries) >= maxLedgerEntries ||
+			math.IsNaN(e.Rating) || math.IsInf(e.Rating, 0) || math.Abs(e.Rating) > maxRating ||
+			e.Count < 0 || e.Count > maxCount {
+			dropped++
+			continue
+		}
+		seen[key] = true
+		clean.Entries = append(clean.Entries, RouterEntry{Model: e.Model, Class: e.Class, Rating: e.Rating, Count: e.Count, Updated: e.Updated.UTC()})
+	}
+	for from, to := range in.Aliases {
+		if !allowed[from] || !allowed[to] {
+			dropped++
+			continue
+		}
+		if clean.Aliases == nil {
+			clean.Aliases = map[string]string{}
+		}
+		clean.Aliases[from] = to
+	}
+	return clean, dropped
+}
+
+func runLedger() error {
+	if len(os.Args) != 4 {
+		return errors.New("usage: harness ledger IN OUT")
+	}
+	in, out := os.Args[2], os.Args[3]
+	info, err := os.Lstat(in)
+	if errors.Is(err, os.ErrNotExist) {
+		log.Printf("no router ledger at %s; nothing to carry", in)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file; refusing it", in)
+	}
+	data, err := os.ReadFile(in)
+	if err != nil {
+		return err
+	}
+	cfg, err := loadConfig(configPath())
+	if err != nil {
+		return err
+	}
+	clean, dropped := SanitizeLedger(data, cfg.Models)
+	if dropped > 0 {
+		log.Printf("warning: dropped %d invalid router-ledger rows from %s", dropped, in)
+	}
+	encoded, err := json.MarshalIndent(clean, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+		return err
+	}
+	// Replace rather than write through: OUT may be a symlink planted by the agent.
+	_ = os.Remove(out)
+	log.Printf("carried %d router ratings to %s", len(clean.Entries), out)
+	return os.WriteFile(out, append(encoded, '\n'), 0o644)
 }
 
 func money(x float64) string { return fmt.Sprintf("$%.4f", x) }

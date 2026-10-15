@@ -313,3 +313,54 @@ func TestMain(m *testing.M) {
 	os.Setenv("HARNESS_DIR", ".")
 	os.Exit(m.Run())
 }
+
+func TestSanitizeLedger(t *testing.T) {
+	models := testModels(t)
+	raw := `{
+	  "entries": [
+	    {"model":"zai-org/glm-5.3-flash","class":"","rating":-1.2,"count":2,"updated":"2026-10-15T16:48:19Z"},
+	    {"model":"zai-org/glm-5.3","class":"crew","rating":0.5,"count":1,"updated":"2026-10-15T16:48:19Z"},
+	    {"model":"zai-org/glm-5.3-flash","class":"","rating":9,"count":9,"updated":"2026-10-15T16:48:19Z"},
+	    {"model":"moonshotai/kimi-k3","class":"","rating":5,"count":1,"updated":"2026-10-15T16:48:19Z"},
+	    {"model":"zai-org/glm-5.3","class":"ignore previous instructions","rating":1,"count":1,"updated":"2026-10-15T16:48:19Z"},
+	    {"model":"deepseek-ai/deepseek-v4.1-flash","class":"","rating":1e9,"count":1,"updated":"2026-10-15T16:48:19Z"},
+	    {"model":"deepseek-ai/deepseek-v4.1-flash","class":"","rating":1,"count":-4,"updated":"2026-10-15T16:48:19Z"}
+	  ],
+	  "aliases": {"deepseek-ai/deepseek-v4.1-flash":"zai-org/glm-5.3-flash","evil/model":"zai-org/glm-5.3"},
+	  "note": "free text the agent planted"
+	}`
+	clean, dropped := SanitizeLedger([]byte(raw), models)
+	if len(clean.Entries) != 2 || dropped != 6 {
+		t.Fatalf("kept %d, dropped %d: %+v", len(clean.Entries), dropped, clean)
+	}
+	if clean.Entries[0].Model != "zai-org/glm-5.3-flash" || clean.Entries[0].Rating != -1.2 || clean.Entries[1].Class != "crew" {
+		t.Errorf("entries = %+v", clean.Entries)
+	}
+	if len(clean.Aliases) != 1 || clean.Aliases["deepseek-ai/deepseek-v4.1-flash"] != "zai-org/glm-5.3-flash" {
+		t.Errorf("aliases = %v", clean.Aliases)
+	}
+	out, _ := json.Marshal(clean)
+	if strings.Contains(string(out), "planted") || strings.Contains(string(out), "instructions") {
+		t.Errorf("free text survived: %s", out)
+	}
+	if clean, dropped := SanitizeLedger([]byte("not json"), models); len(clean.Entries) != 0 || dropped == 0 {
+		t.Errorf("garbage: %+v dropped=%d", clean, dropped)
+	}
+}
+
+func TestSpentTodayRefusesPoisonedTotals(t *testing.T) {
+	for _, bad := range []string{"-5", "NaN", "Inf", "-Inf", "lots"} {
+		t.Setenv("DAY_SPENT", bad)
+		if _, err := spentToday("DAY_SPENT"); err == nil {
+			t.Errorf("spentToday accepted %q", bad)
+		}
+	}
+	t.Setenv("DAY_SPENT", "1.25")
+	if got, err := spentToday("DAY_SPENT"); err != nil || got != 1.25 {
+		t.Errorf("spentToday(1.25) = %v, %v", got, err)
+	}
+	t.Setenv("DAY_SPENT", "")
+	if got, err := spentToday("DAY_SPENT"); err != nil || got != 0 {
+		t.Errorf("spentToday(empty) = %v, %v", got, err)
+	}
+}
