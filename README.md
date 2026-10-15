@@ -55,13 +55,23 @@ workflow artifact.
 - The agent has a shell on the runner, so treat it as having the same access as any
   CI job. It gets no GitHub token: the checkout does not keep credentials, and the
   workflow pushes after CodeAF exits. Edits it makes under `.github/` are discarded.
+- CodeAF runs in a job with no write access (`run`). A separate job on a fresh
+  runner (`publish`) checks and applies the resulting patch, then commits,
+  pushes, opens the PR and posts the report. Nothing CodeAF could have tampered
+  with is executed with a write token.
 - Caches are treated as untrusted, because the agent can write to them. Only
   CodeAF's model-rating ledger is carried between runs, rebuilt from validated
-  numbers each time. CodeAF's memory db, event log and raw ledger are still
-  saved, as a `codeaf-state-untrusted-*` workflow artifact kept for 90 days, but
-  nothing loads them back. CodeAF itself is rebuilt from source on every run, and the
-  daily spend total is validated before use. The rules for future changes are
-  in [`AGENTS.md`](AGENTS.md#security-rules-for-changing-the-harness).
+  numbers each time. CodeAF itself is rebuilt from source on every run, and the
+  daily spend total is validated before use.
+- Artifacts on a public repo can be downloaded by any signed-in GitHub user. The
+  diagnostics (brief, transcripts, logs, and CodeAF's memory db, event log and
+  raw ledger, which are kept for audit and never restored) are therefore encrypted
+  with [age](https://age-encryption.org) to the keys in
+  [`artifact-recipients.txt`](.github/codeaf/artifact-recipients.txt), and not
+  uploaded at all until a key is there. Decrypt with
+  `age -d -i ~/.ssh/id_ed25519 diagnostics.tar.gz.age | tar xz`.
+- The rules for future changes are in
+  [`AGENTS.md`](AGENTS.md#security-rules-for-changing-the-harness).
 - Protecting `main`: [`CODEOWNERS`](.github/CODEOWNERS) makes @RichardoC the owner of
   everything. Pair it with a ruleset on `main` that requires a PR, a Code Owner review,
   approval of the most recent push, and the `CI / go` check. A `github-actions[bot]`

@@ -47,10 +47,10 @@ hostile, whether through prompt injection or a compromised model.
   or build caches, scripts, CodeAF's memory database (`graph.db`), event logs,
   transcripts, briefs and notes. Build tools from pinned sources each run.
 - Untrusted state may be *stored* for audit or later review, as long as no
-  run restores it automatically. The `codeaf-state-untrusted-*` artifact
-  (CodeAF's `graph.db`, event log and raw ledger, kept 90 days) is an example.
-  To start using such state, a person reviews a snapshot first and then adds
-  the restore step deliberately, with validation, in a reviewed PR.
+  run restores it automatically. For example, the encrypted diagnostics
+  bundle holds CodeAF's `graph.db`, event log and raw ledger for 90 days. To
+  start using such state, a person reviews a snapshot first and then adds the
+  restore step deliberately, with validation, in a reviewed PR.
 - Carry only data that can be fully validated, and validate it on every
   restore and save. Rebuild it from typed fields with bounds and an allowlist,
   as `harness ledger` does for the model-rating ledger. Never copy a file
@@ -64,6 +64,31 @@ hostile, whether through prompt injection or a compromised model.
 - Runs triggered by issues and issue comments write caches in the default
   branch's scope, which every branch and PR can read. Treat those caches as
   shared.
+
+### Privilege separation
+
+- The job that runs CodeAF (`run`) gets no write token and no secret other
+  than the proxy's key on stdin. Anything that needs write access (commit,
+  push, PR, comments, CI dispatch) happens in `publish`, on a fresh runner.
+- After CodeAF has run, nothing on that runner can be trusted: binaries,
+  `.git` (hooks, config), `$GITHUB_ENV`, `$GITHUB_OUTPUT`, files. Never give a
+  later step in that job a secret or a write token.
+- `publish` treats the run job's outputs and artifacts as untrusted data. It
+  builds its own harness from the checkout. It applies the patch with
+  `git apply`, which runs nothing, and only after checking the size, that the
+  base commit matches, and that no path is under `.github/` or `.git`. Keep it
+  that way: never run, `source` or `eval` anything that came from `run`.
+
+### Artifacts
+
+- On a public repository, any signed-in GitHub user can download workflow
+  artifacts, and GitHub does not mask secrets inside them. Treat every
+  artifact as public.
+- Anything that might hold transcripts, prompts, logs or CodeAF state must be
+  encrypted to `.github/codeaf/artifact-recipients.txt` before upload. If no
+  key is configured, don't upload it; never fall back to plaintext. Only the
+  patch, CodeAF's result and the cost ledger, which are published on the PR
+  anyway, go up unencrypted.
 
 ### Secrets, tokens and triggers
 
