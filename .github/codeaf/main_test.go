@@ -15,11 +15,11 @@ import (
 
 func testModels(t *testing.T) []Model {
 	t.Helper()
-	models, err := loadModels("models.json")
+	cfg, err := loadConfig("models.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return models
+	return cfg.Models
 }
 
 func mustResolve(t *testing.T, models []Model, id string) Model {
@@ -285,9 +285,10 @@ func TestReport(t *testing.T) {
 		{Model: "zai-org/glm-5.3", PromptTokens: 1000, CompletionTokens: 200, CostUSD: 0.00228, UsageSeen: true},
 		{Model: "zai-org/glm-5.3", Stream: true},
 	}
-	env := map[string]string{"DAY_SPENT_BEFORE": "1.2", "RUN_CAP": "5", "DAY_CAP": "20", "CHANGED": "3",
+	env := map[string]string{"DAY_SPENT_BEFORE": "1.2", "CHANGED": "3",
 		"GITHUB_REPOSITORY": "RichardoC/factory-repo", "GITHUB_RUN_ID": "42"}
-	report := Report(result, true, lines, testModels(t), func(k string) string { return env[k] })
+	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
+	report := Report(result, true, lines, cfg, func(k string) string { return env[k] })
 	for _, want := range []string{
 		reportMarker,
 		"| stop / ok | `done` / `true` |",

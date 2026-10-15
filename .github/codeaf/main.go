@@ -74,25 +74,43 @@ type Model struct {
 	Efforts         []string `json:"efforts"`
 }
 
-type modelFile struct {
+// Limits are the spend caps the proxy enforces, in USD.
+type Limits struct {
+	RunUSD float64 `json:"run_usd"` // per workflow run
+	DayUSD float64 `json:"day_usd"` // per UTC day, across runs
+}
+
+// Config is models.json: the spend caps and the models CodeAF may use.
+type Config struct {
+	Limits Limits  `json:"limits"`
 	Models []Model `json:"models"`
 }
 
-func loadModels(path string) ([]Model, error) {
+func loadConfig(path string) (Config, error) {
+	var cfg Config
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return cfg, err
 	}
-	var file modelFile
-	if err := json.Unmarshal(data, &file); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return cfg, fmt.Errorf("%s: %w", path, err)
 	}
-	for _, m := range file.Models {
+	if cfg.Limits.RunUSD <= 0 || cfg.Limits.DayUSD <= 0 {
+		return cfg, fmt.Errorf("%s: limits.run_usd and limits.day_usd must be positive", path)
+	}
+	if len(cfg.Models) == 0 {
+		return cfg, fmt.Errorf("%s: no models", path)
+	}
+	for _, m := range cfg.Models {
 		if m.ID == "" || m.Upstream == "" || len(m.Efforts) == 0 {
-			return nil, fmt.Errorf("%s: model %q needs id, upstream and efforts", path, m.ID)
+			return cfg, fmt.Errorf("%s: model %q needs id, upstream and efforts", path, m.ID)
 		}
 	}
-	return file.Models, nil
+	return cfg, nil
+}
+
+func configPath() string {
+	return envOr("PROXY_MODELS", filepath.Join(harnessDir(), "models.json"))
 }
 
 func harnessDir() string {
@@ -174,17 +192,12 @@ func runProxy() error {
 		ledger:   envOr("PROXY_LEDGER", "codeaf-ledger.jsonl"),
 		client:   &http.Client{Timeout: 15 * time.Minute},
 	}
-	var err error
-	if p.runCap, err = envFloat("PROXY_RUN_CAP_USD", 5); err != nil {
+	cfg, err := loadConfig(configPath())
+	if err != nil {
 		return err
 	}
-	if p.dayCap, err = envFloat("PROXY_DAY_CAP_USD", 20); err != nil {
-		return err
-	}
+	p.models, p.runCap, p.dayCap = cfg.Models, cfg.Limits.RunUSD, cfg.Limits.DayUSD
 	if p.daySpent, err = envFloat("PROXY_DAY_SPENT_USD", 0); err != nil {
-		return err
-	}
-	if p.models, err = loadModels(envOr("PROXY_MODELS", filepath.Join(harnessDir(), "models.json"))); err != nil {
 		return err
 	}
 	// Preferred: the key arrives on stdin, so it is not in /proc/<pid>/environ
@@ -990,7 +1003,8 @@ type modelTotals struct {
 
 // Report renders the run report. It is a pure function of its inputs so it can
 // be tested; runReport gathers them.
-func Report(result Result, haveResult bool, lines []LedgerLine, models []Model, env func(string) string) string {
+func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, env func(string) string) string {
+	models := cfg.Models
 	totals := map[string]*modelTotals{}
 	for _, l := range lines {
 		t := totals[l.Model]
@@ -1046,7 +1060,7 @@ func Report(result Result, haveResult bool, lines []LedgerLine, models []Model, 
 		orUnknown(result.Model), orUnknown(result.PlanModel), orUnknown(result.CheckModel), strings.Join(panel, " → "))
 	fmt.Fprintf(&b, "| CodeAF's own spend figure | %s (plan estimate %s) |\n", money(result.SpendUSD), money(result.EstUSD))
 	fmt.Fprintf(&b, "| metered by proxy | **%s** this run · %s today (cap $%s/run, $%s/day) |\n",
-		money(total), money(dayBefore+total), orUnknown(env("RUN_CAP")), orUnknown(env("DAY_CAP")))
+		money(total), money(dayBefore+total), trimNumber(cfg.Limits.RunUSD), trimNumber(cfg.Limits.DayUSD))
 	fmt.Fprintf(&b, "| files changed | %s |\n\n", orUnknown(env("CHANGED")))
 
 	if len(totals) > 0 {
@@ -1102,10 +1116,10 @@ func runReport() error {
 	if err != nil {
 		return err
 	}
-	models, err := loadModels(filepath.Join(harnessDir(), "models.json"))
+	cfg, err := loadConfig(configPath())
 	if err != nil {
 		return err
 	}
-	fmt.Print(Report(result, haveResult, lines, models, os.Getenv))
+	fmt.Print(Report(result, haveResult, lines, cfg, os.Getenv))
 	return nil
 }

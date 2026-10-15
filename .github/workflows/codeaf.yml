@@ -9,7 +9,7 @@
 # Models come from synthetic.new through `harness proxy` (.github/codeaf/main.go), which serves
 # CodeAF a catalog with synthetic.new's real prices, adds usage.cost to every
 # response, refuses models outside .github/codeaf/models.json and enforces the
-# per-run and per-day spend caps below.
+# per-run and per-day spend caps set in that file.
 name: CodeAF
 
 on:
@@ -26,8 +26,6 @@ permissions:
 env:
   CODEAF_LABEL: codeaf
   CODEAF_REF: 6e73ac7752ae1d33c629be52a49d2b79ffcaad6d # Agent-Field/codeaf main, 2026-10-15
-  RUN_CAP: "5"   # USD per run
-  DAY_CAP: "20"  # USD per UTC day, across all runs
 
 jobs:
   gate:
@@ -48,11 +46,11 @@ jobs:
       branch: ${{ steps.gate.outputs.branch }}
       base: ${{ steps.gate.outputs.base }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: .github/codeaf
           persist-credentials: false
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: .github/codeaf/go.mod
           cache: false
@@ -90,22 +88,23 @@ jobs:
             echo "HARNESS=$RUNNER_TEMP/harness/harness"
           } >> "$GITHUB_ENV"
 
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false # CodeAF must not be able to push; we push in a later step
 
       - name: Check out the working branch
         run: |
           git config user.name  "codeaf[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null; then
-            git checkout -B "$BRANCH" "origin/$BRANCH"
+          # The default checkout is a shallow clone of the triggering ref (the
+          # default branch). Continue an existing branch if there is one.
+          if git fetch --depth=1 origin "refs/heads/$BRANCH" 2>/dev/null; then
+            git checkout -B "$BRANCH" FETCH_HEAD
           else
-            git checkout -B "$BRANCH" "origin/$BASE"
+            git checkout -B "$BRANCH"
           fi
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
           cache: false
@@ -120,7 +119,7 @@ jobs:
 
       - name: Restore CodeAF binary
         id: bin
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/codeaf-bin
           key: codeaf-bin-${{ env.CODEAF_REF }}-${{ runner.os }}
@@ -135,7 +134,7 @@ jobs:
       - name: Restore today's spend
         id: day
         run: echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.STATE_DIR }}
           key: codeaf-spend-${{ steps.day.outputs.date }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -146,14 +145,12 @@ jobs:
           mkdir -p "$STATE_DIR"
           spent=$(cat "$STATE_DIR/day-total" 2>/dev/null || echo 0)
           echo "usd=$spent" >> "$GITHUB_OUTPUT"
-          echo "Spent so far today: \$$spent of \$$DAY_CAP"
+          echo "Spent so far today: \$$spent (caps are in .github/codeaf/models.json)"
 
       - name: Start pricing proxy
         env:
           SYNTHETIC_API_KEY: ${{ secrets.SYNTHETIC_API_KEY }}
           PROXY_DAY_SPENT_USD: ${{ steps.spent.outputs.usd }}
-          PROXY_RUN_CAP_USD: ${{ env.RUN_CAP }}
-          PROXY_DAY_CAP_USD: ${{ env.DAY_CAP }}
           PROXY_LEDGER: ${{ env.LEDGER_PATH }}
         run: |
           # The key goes in on stdin so it is not in the proxy's environment,
@@ -170,21 +167,17 @@ jobs:
 
       - name: Run CodeAF
         id: run
+        # CodeAF's settings (seat models, budgets, telemetry off) are in
+        # .github/codeaf/codeaf-config.json, installed as its profile config.
+        # Only the endpoint and the escalation panel stay in the environment:
+        # CodeAF reads those two from nowhere else.
         env:
           CODEAF_HOME: ${{ runner.temp }}/codeaf-home
           CODEAF_BASE_URL: http://127.0.0.1:8787/v1
-          OPENAI_API_KEY: via-local-proxy # the proxy holds the real key
-          CODEAF_TELEMETRY: "off"
-          DO_NOT_TRACK: "1"
-          CODEAF_MODEL_POOL: "off"
-          # Every seat opens on the cheap model; the panel escalates a call to the
-          # next model only when a verifier catches a failure.
-          CODEAF_MODEL: zai-org/glm-5.3-flash
-          CODEAF_PLAN_MODEL: zai-org/glm-5.3-flash
-          CODEAF_CHECK_MODEL: zai-org/glm-5.3-flash
           CODEAF_MODELS: ${{ runner.temp }}/harness/panel.json
-          CODEAF_DAILY_BUDGET: ${{ env.DAY_CAP }}
         run: |
+          mkdir -p "$CODEAF_HOME"
+          cp "$RUNNER_TEMP/harness/codeaf-config.json" "$CODEAF_HOME/config.json"
           set +e
           ~/codeaf-bin/codeaf do "$(cat "$BRIEF_PATH")" --dir . --json --yes-spend --timeout 100m \
             > "$RESULT_PATH" 2> "$RUNNER_TEMP/codeaf.stderr"
@@ -236,7 +229,7 @@ jobs:
         run: |
           "$HARNESS" spend > "$STATE_DIR/day-total"
           echo "Spent today, including this run: \$$(cat "$STATE_DIR/day-total")"
-      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: always()
         with:
           path: ${{ env.STATE_DIR }}
@@ -260,7 +253,7 @@ jobs:
             gh issue comment "$NUMBER" --body "CodeAF opened #$target for this issue."
           fi
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: codeaf-run-${{ github.run_id }}-${{ github.run_attempt }}

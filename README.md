@@ -62,5 +62,14 @@ workflow artifact.
   never approves or merges anything.
 - Repository setting needed: *Settings → Actions → General → Allow GitHub Actions to
   create and approve pull requests* (for `gh pr create` with `GITHUB_TOKEN`).
-- To change prices or models, edit `models.json` and `panel.json` together. Prices
-  are USD per million tokens.
+- Configuration lives in files, not workflow variables:
+  - [`models.json`](.github/codeaf/models.json): the spend caps (`limits`) and the
+    allowed models with their prices (USD per million tokens);
+  - [`panel.json`](.github/codeaf/panel.json): the escalation order;
+  - [`codeaf-config.json`](.github/codeaf/codeaf-config.json): CodeAF's own settings
+    (seat models, budgets, telemetry and Model Pool off), installed as its profile
+    config.
+
+  Keep the three consistent when changing models. The only CodeAF settings left in
+  the environment are the endpoint (`CODEAF_BASE_URL`) and the panel path
+  (`CODEAF_MODELS`), because CodeAF reads those from nowhere else.

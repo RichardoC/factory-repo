@@ -1,5 +1,9 @@
 {
-  "_comment": "Models CodeAF may use, served to it by proxy.py as an OpenRouter-shaped catalog. Prices are USD per million tokens, from https://synthetic.new/pricing (usage-based) / GET https://api.synthetic.new/openai/v1/models, checked 2026-10-15. 'id' is what CodeAF sees; 'upstream' is the synthetic.new model id.",
+  "_comment": "Harness config. limits: spend caps (USD) the proxy enforces per workflow run and per UTC day. models: what CodeAF may use, served to it by `harness proxy` as an OpenRouter-shaped catalog; prices are USD per million tokens, from https://synthetic.new/pricing (usage-based) / GET https://api.synthetic.new/openai/v1/models, checked 2026-10-15. 'id' is what CodeAF sees; 'upstream' is the synthetic.new model id.",
+  "limits": {
+    "run_usd": 5,
+    "day_usd": 20
+  },
   "models": [
     {
       "id": "zai-org/glm-5.3-flash",
