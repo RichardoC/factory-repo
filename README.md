@@ -52,6 +52,11 @@ workflow artifact.
 - The agent has a shell on the runner, so treat it as having the same access as any
   CI job. It gets no GitHub token: the checkout does not keep credentials, and the
   workflow pushes after CodeAF exits. Edits it makes under `.github/` are discarded.
+- Protecting `main`: [`CODEOWNERS`](.github/CODEOWNERS) makes @RichardoC the owner of
+  everything. Pair it with a ruleset on `main` that requires a PR, a Code Owner review,
+  approval of the most recent push, and the `CI / go` check. A `github-actions[bot]`
+  approval then never counts, even with the setting below enabled. The workflow itself
+  never approves or merges anything.
 - Repository setting needed: *Settings → Actions → General → Allow GitHub Actions to
   create and approve pull requests* (for `gh pr create` with `GITHUB_TOKEN`).
 - To change prices or models, edit `models.json` and `panel.json` together. Prices
