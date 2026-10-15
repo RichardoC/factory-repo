@@ -69,8 +69,9 @@ func TestEffortFor(t *testing.T) {
 	}{
 		{flash, reasoningRequest{Effort: "high"}, "high"},
 		{flash, reasoningRequest{Effort: "medium"}, "high"},
-		{flash, reasoningRequest{Effort: "minimal"}, "low"},
-		{flash, reasoningRequest{Enabled: &off}, "low"},
+		{flash, reasoningRequest{Effort: "low"}, "high"},
+		{flash, reasoningRequest{Effort: "minimal"}, "high"},
+		{flash, reasoningRequest{Enabled: &off}, "high"},
 		{deepseek, reasoningRequest{Enabled: &off}, "none"},
 		{flash, reasoningRequest{}, ""},
 		{flash, reasoningRequest{Effort: "weird"}, "high"},

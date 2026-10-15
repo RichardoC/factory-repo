@@ -11,7 +11,8 @@
       "cache_read": 0.04,
       "context_length": 524288,
       "input_modalities": ["text", "image"],
-      "efforts": ["low", "high", "max"]
+      "efforts": ["high", "max"],
+      "efforts_note": "synthetic.new also lists 'low', but GLM at low returns an empty answer (all reasoning, no content; tested 2026-10-15), so low requests are sent as high"
     },
     {
       "id": "deepseek-ai/deepseek-v4.1-flash",
@@ -35,7 +36,8 @@
       "cache_read": 0.26,
       "context_length": 524288,
       "input_modalities": ["text"],
-      "efforts": ["low", "high", "max"]
+      "efforts": ["high", "max"],
+      "efforts_note": "as for GLM-5.3-Flash: 'low' returns empty answers, so it is not offered"
     }
   ]
 }
