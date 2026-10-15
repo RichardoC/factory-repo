@@ -46,6 +46,11 @@ hostile, whether through prompt injection or a compromised model.
   front of the model. That rules out caching binaries, toolchains, Go module
   or build caches, scripts, CodeAF's memory database (`graph.db`), event logs,
   transcripts, briefs and notes. Build tools from pinned sources each run.
+- Untrusted state may be *stored* for audit or later review, as long as no
+  run restores it automatically. The `codeaf-state-untrusted-*` artifact
+  (CodeAF's `graph.db`, event log and raw ledger, kept 90 days) is an example.
+  To start using such state, a person reviews a snapshot first and then adds
+  the restore step deliberately, with validation, in a reviewed PR.
 - Carry only data that can be fully validated, and validate it on every
   restore and save. Rebuild it from typed fields with bounds and an allowlist,
   as `harness ledger` does for the model-rating ledger. Never copy a file

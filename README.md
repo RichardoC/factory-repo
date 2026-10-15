@@ -57,7 +57,9 @@ workflow artifact.
   workflow pushes after CodeAF exits. Edits it makes under `.github/` are discarded.
 - Caches are treated as untrusted, because the agent can write to them. Only
   CodeAF's model-rating ledger is carried between runs, rebuilt from validated
-  numbers each time. CodeAF itself is rebuilt from source on every run, and the
+  numbers each time. CodeAF's memory db, event log and raw ledger are still
+  saved, as a `codeaf-state-untrusted-*` workflow artifact kept for 90 days, but
+  nothing loads them back. CodeAF itself is rebuilt from source on every run, and the
   daily spend total is validated before use. The rules for future changes are
   in [`AGENTS.md`](AGENTS.md#security-rules-for-changing-the-harness).
 - Protecting `main`: [`CODEOWNERS`](.github/CODEOWNERS) makes @RichardoC the owner of

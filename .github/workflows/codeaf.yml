@@ -299,3 +299,28 @@ jobs:
             ${{ runner.temp }}/codeaf-home/runs
           if-no-files-found: ignore
           retention-days: 14
+
+      - name: Snapshot CodeAF state (untrusted, not restored)
+        # CodeAF's memory db, routing event log and raw rating ledger are kept
+        # for audit, or to adopt later after review, but nothing restores them
+        # into a run (AGENTS.md, "Caches and carried state"). Only regular
+        # files are copied, so a symlink the agent planted can't pull other
+        # files into this public artifact.
+        if: always()
+        run: |
+          snap="$RUNNER_TEMP/codeaf-state-snapshot"
+          rm -rf "$snap" && mkdir -p "$snap"
+          for f in graph.db router-events.jsonl router-ledger.json; do
+            src="$CODEAF_HOME/$f"
+            if [ -f "$src" ] && [ ! -L "$src" ] && [ "$(stat -c %s "$src")" -le 104857600 ]; then
+              cp "$src" "$snap/$f"
+            fi
+          done
+          ls -la "$snap"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: codeaf-state-untrusted-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/codeaf-state-snapshot
+          if-no-files-found: ignore
+          retention-days: 90
