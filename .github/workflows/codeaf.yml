@@ -256,15 +256,26 @@ jobs:
         # Artifacts on a public repository can be downloaded by any signed-in
         # GitHub user, so the brief, transcripts, logs and CodeAF's state
         # (memory db, event log, raw ledger; kept for audit, never restored)
-        # are encrypted to the maintainers' keys in artifact-recipients.txt.
-        # Without a key there, nothing is uploaded rather than anything in
-        # the clear. Only regular files are copied, so a planted symlink can't
+        # are encrypted to the maintainers' public keys: those in
+        # artifact-recipients.txt plus the CODEAF_ARTIFACT_PUBLIC_KEY secret.
+        # That secret is a public key, so exposing it to this untrusted step
+        # costs nothing; the private key is never given to any workflow.
+        # Without any key, nothing is uploaded rather than anything in the
+        # clear. Only regular files are copied, so a planted symlink can't
         # pull in other files.
         if: always()
+        env:
+          ARTIFACT_PUBLIC_KEY: ${{ secrets.CODEAF_ARTIFACT_PUBLIC_KEY }}
         run: |
-          recipients="$RUNNER_TEMP/harness/artifact-recipients.txt"
+          recipients="$RUNNER_TEMP/recipients.txt"
+          cp "$RUNNER_TEMP/harness/artifact-recipients.txt" "$recipients"
+          if [[ "$ARTIFACT_PUBLIC_KEY" =~ ^(age1[0-9a-z]+|ssh-(ed25519|rsa)\ [A-Za-z0-9+/=]+)$ ]]; then
+            printf '%s\n' "$ARTIFACT_PUBLIC_KEY" >> "$recipients"
+          elif [ -n "$ARTIFACT_PUBLIC_KEY" ]; then
+            echo "::warning::CODEAF_ARTIFACT_PUBLIC_KEY is not an age or SSH public key; ignoring it"
+          fi
           if ! grep -qvE '^[[:space:]]*(#|$)' "$recipients"; then
-            echo "::warning::no recipients in .github/codeaf/artifact-recipients.txt; diagnostics not uploaded"
+            echo "::warning::no artifact recipient configured; diagnostics not uploaded"
             exit 0
           fi
           bundle="$RUNNER_TEMP/diagnostics"

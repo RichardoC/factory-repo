@@ -85,7 +85,12 @@ hostile, whether through prompt injection or a compromised model.
   artifacts, and GitHub does not mask secrets inside them. Treat every
   artifact as public.
 - Anything that might hold transcripts, prompts, logs or CodeAF state must be
-  encrypted to `.github/codeaf/artifact-recipients.txt` before upload. If no
+  encrypted before upload, to the public keys in
+  `.github/codeaf/artifact-recipients.txt` and the `CODEAF_ARTIFACT_PUBLIC_KEY`
+  secret. That secret is the one exception to "no secrets after CodeAF runs",
+  because it is a public key. The matching `CODEAF_ARTIFACT_PRIVATE_KEY` is a
+  write-only backup: no workflow may ever read it, since any job that
+  decrypts would have nowhere private to put the result. If no
   key is configured, don't upload it; never fall back to plaintext. Only the
   patch, CodeAF's result and the cost ledger, which are published on the PR
   anyway, go up unencrypted.

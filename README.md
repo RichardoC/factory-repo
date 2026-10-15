@@ -66,10 +66,13 @@ workflow artifact.
 - Artifacts on a public repo can be downloaded by any signed-in GitHub user. The
   diagnostics (brief, transcripts, logs, and CodeAF's memory db, event log and
   raw ledger, which are kept for audit and never restored) are therefore encrypted
-  with [age](https://age-encryption.org) to the keys in
-  [`artifact-recipients.txt`](.github/codeaf/artifact-recipients.txt), and not
-  uploaded at all until a key is there. Decrypt with
-  `age -d -i ~/.ssh/id_ed25519 diagnostics.tar.gz.age | tar xz`.
+  with [age](https://age-encryption.org) to the `CODEAF_ARTIFACT_PUBLIC_KEY`
+  secret and any keys in
+  [`artifact-recipients.txt`](.github/codeaf/artifact-recipients.txt). They are
+  not uploaded at all until a key is configured. Decrypt with
+  `age -d -i private-key.txt diagnostics.tar.gz.age | tar xz`. The private key's
+  `CODEAF_ARTIFACT_PRIVATE_KEY` secret is a backup only: GitHub secrets can't be
+  read back, and no workflow uses it, so keep your own copy to decrypt.
 - The rules for future changes are in
   [`AGENTS.md`](AGENTS.md#security-rules-for-changing-the-harness).
 - Protecting `main`: [`CODEOWNERS`](.github/CODEOWNERS) makes @RichardoC the owner of
