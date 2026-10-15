@@ -6,7 +6,7 @@
 #     review on a labelled PR, from an OWNER/MEMBER/COLLABORATOR
 #                                            -> CodeAF continues on that PR's branch
 #
-# Models come from synthetic.new through .github/codeaf/proxy.py, which serves
+# Models come from synthetic.new through `harness proxy` (.github/codeaf/main.go), which serves
 # CodeAF a catalog with synthetic.new's real prices, adds usage.cost to every
 # response, refuses models outside .github/codeaf/models.json and enforces the
 # per-run and per-day spend caps below.
@@ -52,10 +52,14 @@ jobs:
         with:
           sparse-checkout: .github/codeaf
           persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: .github/codeaf/go.mod
+          cache: false
       - id: gate
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 -I .github/codeaf/ghctx.py gate
+        run: cd .github/codeaf && go run . gate
 
   codeaf:
     needs: gate
@@ -83,6 +87,7 @@ jobs:
             echo "RESULT_PATH=$RUNNER_TEMP/codeaf-result.json"
             echo "LEDGER_PATH=$RUNNER_TEMP/codeaf-ledger.jsonl"
             echo "STATE_DIR=$RUNNER_TEMP/codeaf-state"
+            echo "HARNESS=$RUNNER_TEMP/harness/harness"
           } >> "$GITHUB_ENV"
 
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -100,15 +105,18 @@ jobs:
             git checkout -B "$BRANCH" "origin/$BASE"
           fi
 
-      - name: Keep trusted copies of the harness files
-        # CodeAF edits the working tree; the steps after it must run the
-        # harness as it was before CodeAF started, not whatever it left behind.
-        run: cp -r .github/codeaf "$RUNNER_TEMP/harness"
-
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: stable
           cache: false
+
+      - name: Build the harness
+        # CodeAF edits the working tree; the steps after it must run the harness
+        # as it was before CodeAF started, not whatever it left behind. The
+        # binary reads models.json and instructions.md from its own directory.
+        run: |
+          cp -r .github/codeaf "$RUNNER_TEMP/harness"
+          (cd "$RUNNER_TEMP/harness" && go build -trimpath -o harness .)
 
       - name: Restore CodeAF binary
         id: bin
@@ -146,20 +154,19 @@ jobs:
           PROXY_DAY_SPENT_USD: ${{ steps.spent.outputs.usd }}
           PROXY_RUN_CAP_USD: ${{ env.RUN_CAP }}
           PROXY_DAY_CAP_USD: ${{ env.DAY_CAP }}
-          PROXY_MODELS: ${{ runner.temp }}/harness/models.json
           PROXY_LEDGER: ${{ env.LEDGER_PATH }}
         run: |
           # The key goes in on stdin so it is not in the proxy's environment,
           # where the CodeAF job (same user) could read it.
           key="$SYNTHETIC_API_KEY"; unset SYNTHETIC_API_KEY
-          printf '%s\n' "$key" | nohup python3 -I "$RUNNER_TEMP/harness/proxy.py" > "$RUNNER_TEMP/proxy.log" 2>&1 &
+          printf '%s\n' "$key" | nohup "$HARNESS" proxy > "$RUNNER_TEMP/proxy.log" 2>&1 &
           for _ in $(seq 30); do curl -fsS http://127.0.0.1:8787/healthz && exit 0; sleep 1; done
           cat "$RUNNER_TEMP/proxy.log"; exit 1
 
       - name: Write the brief
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 -I "$RUNNER_TEMP/harness/ghctx.py" brief
+        run: '"$HARNESS" brief'
 
       - name: Run CodeAF
         id: run
@@ -184,7 +191,7 @@ jobs:
           code=$?
           echo "exit=$code" >> "$GITHUB_OUTPUT"
           tail -n 80 "$RUNNER_TEMP/codeaf.stderr"
-          python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); d.pop("answer",None); print(json.dumps(d,indent=1)[:4000])' "$RESULT_PATH" || cat "$RESULT_PATH"
+          "$HARNESS" summary
           exit 0
 
       - name: Commit
@@ -197,8 +204,8 @@ jobs:
           changed=$(git diff --cached --name-only | wc -l)
           echo "changed=$changed" >> "$GITHUB_OUTPUT"
           if [ "$changed" -gt 0 ]; then
-            title=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("stop","?"))' "$RESULT_PATH" 2>/dev/null || echo "?")
-            git commit -q -m "codeaf: work for #$NUMBER (stop: $title)" -m "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            stop=$(jq -r '.stop // "?"' "$RESULT_PATH" 2>/dev/null || echo "?")
+            git commit -q -m "codeaf: work for #$NUMBER (stop: $stop)" -m "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           fi
           git log --oneline -3
 
@@ -224,15 +231,11 @@ jobs:
 
       - name: Save today's spend
         if: always()
+        env:
+          DAY_SPENT_BEFORE: ${{ steps.spent.outputs.usd }}
         run: |
-          run=$(python3 -I -c 'import json,sys
-          t=0
-          try:
-              for l in open(sys.argv[1]): t+=json.loads(l).get("cost_usd",0)
-          except OSError: pass
-          print(t)' "$LEDGER_PATH")
-          python3 -I -c 'import sys; print(float(sys.argv[1])+float(sys.argv[2]))' "${{ steps.spent.outputs.usd }}" "$run" > "$STATE_DIR/day-total"
-          echo "Run: \$$run, today: \$$(cat "$STATE_DIR/day-total")"
+          "$HARNESS" spend > "$STATE_DIR/day-total"
+          echo "Spent today, including this run: \$$(cat "$STATE_DIR/day-total")"
       - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         if: always()
         with:
@@ -248,7 +251,7 @@ jobs:
           CHANGED: ${{ steps.commit.outputs.changed }}
           OUTCOME: ${{ job.status == 'success' && (steps.commit.outputs.changed != '0' && 'changes pushed' || 'no changes') || 'job failed' }}
         run: |
-          python3 -I "$RUNNER_TEMP/harness/ghctx.py" report > "$RUNNER_TEMP/report.md"
+          "$HARNESS" report > "$RUNNER_TEMP/report.md"
           cat "$RUNNER_TEMP/report.md" >> "$GITHUB_STEP_SUMMARY"
           target="${{ steps.pr.outputs.number }}"
           [ -n "$target" ] || target="$NUMBER"

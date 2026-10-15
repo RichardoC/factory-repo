@@ -23,11 +23,14 @@ workflow artifact.
 ## How it is wired
 
 - [`.github/workflows/codeaf.yml`](.github/workflows/codeaf.yml) checks the event
-  against the rules above (via `.github/codeaf/ghctx.py`), builds CodeAF at a pinned
+  against the rules above (`harness gate`), builds CodeAF at a pinned
   commit, writes a brief from the issue/PR, runs `codeaf do` headless, then commits,
   pushes, opens or updates the PR, and dispatches [CI](.github/workflows/ci.yml).
   Pushes made with `GITHUB_TOKEN` do not trigger CI on their own.
-- [`.github/codeaf/proxy.py`](.github/codeaf/proxy.py) runs on `127.0.0.1` for the
+- [`.github/codeaf/main.go`](.github/codeaf/main.go) is the harness: a standalone,
+  standard-library-only Go program, with tests, that the workflow builds on every run.
+  It decides whether an event may run (`gate`), writes the brief (`brief`), and renders
+  the cost report (`report`). As `harness proxy` it runs on `127.0.0.1` for the
   length of the job and sits between CodeAF and [synthetic.new](https://synthetic.new).
   It:
   - serves CodeAF an OpenRouter-style `/models` catalog containing only the models in
