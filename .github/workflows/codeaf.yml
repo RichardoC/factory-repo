@@ -48,7 +48,7 @@ jobs:
       branch: ${{ steps.gate.outputs.branch }}
       base: ${{ steps.gate.outputs.base }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           sparse-checkout: .github/codeaf
           persist-credentials: false
@@ -85,7 +85,7 @@ jobs:
             echo "STATE_DIR=$RUNNER_TEMP/codeaf-state"
           } >> "$GITHUB_ENV"
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
           persist-credentials: false # CodeAF must not be able to push; we push in a later step
@@ -105,14 +105,14 @@ jobs:
         # harness as it was before CodeAF started, not whatever it left behind.
         run: cp -r .github/codeaf "$RUNNER_TEMP/harness"
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: stable
           cache: false
 
       - name: Restore CodeAF binary
         id: bin
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/codeaf-bin
           key: codeaf-bin-${{ env.CODEAF_REF }}-${{ runner.os }}
@@ -127,7 +127,7 @@ jobs:
       - name: Restore today's spend
         id: day
         run: echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ env.STATE_DIR }}
           key: codeaf-spend-${{ steps.day.outputs.date }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -233,7 +233,7 @@ jobs:
           print(t)' "$LEDGER_PATH")
           python3 -I -c 'import sys; print(float(sys.argv[1])+float(sys.argv[2]))' "${{ steps.spent.outputs.usd }}" "$run" > "$STATE_DIR/day-total"
           echo "Run: \$$run, today: \$$(cat "$STATE_DIR/day-total")"
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         if: always()
         with:
           path: ${{ env.STATE_DIR }}
@@ -257,7 +257,7 @@ jobs:
             gh issue comment "$NUMBER" --body "CodeAF opened #$target for this issue."
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: codeaf-run-${{ github.run_id }}-${{ github.run_attempt }}
