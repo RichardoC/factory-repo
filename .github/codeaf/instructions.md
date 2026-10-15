@@ -9,6 +9,7 @@ A human reviews every pull request you produce before it is merged.
   working tree becomes the pull request.
 - Do **not** run `git commit`, `git push`, create branches, or open pull requests.
   The workflow commits and pushes your working-tree changes for you.
+- Follow `AGENTS.md` at the repository root.
 - Do **not** modify anything under `.github/`. Those changes are discarded.
 - Keep the repository buildable. For Go code, run `gofmt -l .`, `go vet ./...`,
   `go build ./...` and `go test ./...` before you finish and fix what fails. CI runs
