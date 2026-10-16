@@ -19,17 +19,16 @@ package vfs
 
 import (
 	"bytes"
-	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sync/atomic"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/psanford/sqlite3vfs"
-	"go.uber.org/zap"
 	v1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -52,7 +51,7 @@ var (
 func newTestVFS(tb testing.TB) (*vfs, *fake.Clientset) {
 	tb.Helper()
 	fcs := fake.NewSimpleClientset()
-	return NewVFS(fcs, testNamespace, zap.NewNop().Sugar(), 3), fcs
+	return NewVFS(tb.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3), fcs
 }
 
 // openTestFile opens name through the VFS itself, as sqlite would.
@@ -127,12 +126,12 @@ func seedSector(tb testing.TB, fcs *fake.Clientset, f *file, index int64, data [
 		BinaryData: map[string][]byte{"sector": data},
 		Data:       map[string]string{"filename": f.RawName},
 	}
-	if _, err := fcs.CoreV1().ConfigMaps(testNamespace).Create(context.TODO(), cm, metav1.CreateOptions{}); err != nil {
+	if _, err := fcs.CoreV1().ConfigMaps(testNamespace).Create(tb.Context(), cm, metav1.CreateOptions{}); err != nil {
 		if !kerrors.IsAlreadyExists(err) {
 			tb.Fatalf("seed sector %d: %v", index, err)
 		}
 		// Open() pre-creates an empty sector 0; overwrite it.
-		if _, err := fcs.CoreV1().ConfigMaps(testNamespace).Update(context.TODO(), cm, metav1.UpdateOptions{}); err != nil {
+		if _, err := fcs.CoreV1().ConfigMaps(testNamespace).Update(tb.Context(), cm, metav1.UpdateOptions{}); err != nil {
 			tb.Fatalf("seed (update) sector %d: %v", index, err)
 		}
 	}
@@ -153,7 +152,7 @@ func seedMultiSectorFile(tb testing.TB, fcs *fake.Clientset, f *file, n int) []b
 
 func listSectorConfigMaps(tb testing.TB, fcs *fake.Clientset, f *file) []v1.ConfigMap {
 	tb.Helper()
-	cms, err := fcs.CoreV1().ConfigMaps(testNamespace).List(context.TODO(), metav1.ListOptions{
+	cms, err := fcs.CoreV1().ConfigMaps(testNamespace).List(tb.Context(), metav1.ListOptions{
 		LabelSelector: labels.SelectorFromSet(f.SectorLabels).String(),
 	})
 	if err != nil {
@@ -164,7 +163,7 @@ func listSectorConfigMaps(tb testing.TB, fcs *fake.Clientset, f *file) []v1.Conf
 
 func getLockfileConfigMap(tb testing.TB, fcs *fake.Clientset, f *file) *v1.ConfigMap {
 	tb.Helper()
-	cm, err := fcs.CoreV1().ConfigMaps(testNamespace).Get(context.TODO(), f.LockFileName(), metav1.GetOptions{})
+	cm, err := fcs.CoreV1().ConfigMaps(testNamespace).Get(tb.Context(), f.LockFileName(), metav1.GetOptions{})
 	if err != nil {
 		tb.Fatalf("get lockfile %q: %v", f.LockFileName(), err)
 	}
@@ -191,7 +190,7 @@ func mustWriteAt(tb testing.TB, f *file, p []byte, off int64) int {
 func mustReadAt(tb testing.TB, f *file, p []byte, off int64) int {
 	tb.Helper()
 	n, err := f.ReadAt(p, off)
-	if err != nil && err != io.EOF {
+	if err != nil && !errors.Is(err, io.EOF) {
 		tb.Fatalf("ReadAt(len=%d, off=%d) failed: %v", len(p), off, err)
 	}
 	return n
@@ -434,7 +433,7 @@ func TestReadAtShortReadReturnsEOF(t *testing.T) {
 	if n != len(data) {
 		t.Errorf("short read got %d bytes, want %d", n, len(data))
 	}
-	if err != io.EOF {
+	if !errors.Is(err, io.EOF) {
 		t.Errorf("short read err = %v, want io.EOF", err)
 	}
 	if !bytes.Equal(got[:n], data) {
@@ -456,14 +455,14 @@ func TestReadAtPastEndReturnsEOF(t *testing.T) {
 		if n != 0 {
 			t.Errorf("ReadAt(off=%d) got %d bytes, want 0", off, n)
 		}
-		if err != io.EOF {
+		if !errors.Is(err, io.EOF) {
 			t.Errorf("ReadAt(off=%d) err = %v, want io.EOF", off, err)
 		}
 	}
 
 	// Same for a never-written (empty) file.
 	empty := openTestFile(t, v, "pastend-empty.db")
-	if n, err := empty.ReadAt(got, 0); n != 0 || err != io.EOF {
+	if n, err := empty.ReadAt(got, 0); n != 0 || !errors.Is(err, io.EOF) {
 		t.Errorf("ReadAt on empty file got (%d, %v), want (0, io.EOF)", n, err)
 	}
 }
@@ -563,7 +562,7 @@ func TestTruncateShrinkAlignedToSectorEnd(t *testing.T) {
 	if n := mustReadAt(t, f, got, 0); n != 100 || !bytes.Equal(got, data[:100]) {
 		t.Error("truncate damaged the kept prefix")
 	}
-	if n, err := f.ReadAt(got, sectorSize); n != 0 || err != io.EOF {
+	if n, err := f.ReadAt(got, sectorSize); n != 0 || !errors.Is(err, io.EOF) {
 		t.Errorf("read past the new EOF got (%d, %v), want (0, io.EOF)", n, err)
 	}
 }
@@ -601,7 +600,7 @@ func TestTruncateShrinkMidSectorKeepsPrefix(t *testing.T) {
 	if !bytes.Equal(got, data[:700]) {
 		t.Error("truncate damaged the kept prefix")
 	}
-	if n, err := f.ReadAt(got, 700); n != 0 || err != io.EOF {
+	if n, err := f.ReadAt(got, 700); n != 0 || !errors.Is(err, io.EOF) {
 		t.Errorf("read past the new EOF got (%d, %v), want (0, io.EOF)", n, err)
 	}
 }
@@ -653,7 +652,7 @@ func TestReadAtDoesNotCreateSectors(t *testing.T) {
 	if n != 10 {
 		t.Errorf("read reaching the missing sector got %d bytes, want 10 (short read)", n)
 	}
-	if err != io.EOF {
+	if !errors.Is(err, io.EOF) {
 		t.Errorf("read reaching the missing sector err = %v, want io.EOF", err)
 	}
 	if sectors := listSectorConfigMaps(t, fcs, f); len(sectors) != 1 {
@@ -675,7 +674,7 @@ func TestDeleteRemovesSectorsAndLockfile(t *testing.T) {
 		t.Fatalf("Delete: %v", err)
 	}
 
-	all, err := fcs.CoreV1().ConfigMaps(testNamespace).List(context.TODO(), metav1.ListOptions{})
+	all, err := fcs.CoreV1().ConfigMaps(testNamespace).List(t.Context(), metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("list all configmaps: %v", err)
 	}
@@ -689,7 +688,7 @@ func TestDeleteRemovesSectorsAndLockfile(t *testing.T) {
 	}
 
 	// The lockfile is really gone.
-	if _, err := fcs.CoreV1().ConfigMaps(testNamespace).Get(context.TODO(), f.LockFileName(), metav1.GetOptions{}); !kerrors.IsNotFound(err) {
+	if _, err := fcs.CoreV1().ConfigMaps(testNamespace).Get(t.Context(), f.LockFileName(), metav1.GetOptions{}); !kerrors.IsNotFound(err) {
 		t.Errorf("lockfile get after delete: err = %v, want NotFound", err)
 	}
 }
@@ -784,6 +783,29 @@ func TestUnlockTransitions(t *testing.T) {
 	}
 	if err := f.Unlock(sqlite3vfs.LockNone); err != nil {
 		t.Errorf("Unlock(None) = %v, want nil", err)
+	}
+}
+
+// TestUnlockRejectsInvalidRequests pins the panic-to-error change: Unlock
+// used to log.Panic on an unlock above SHARED or above the current lock
+// level; through the sqlite3vfs shim a panic crashes the whole process, so
+// both cases must now be returned as errors, leaving the stored lock level
+// untouched.
+func TestUnlockRejectsInvalidRequests(t *testing.T) {
+	v, fcs := newTestVFS(t)
+	f := openTestFile(t, v, "badunlock.db")
+
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("Lock(Shared): %v", err)
+	}
+	if err := f.Unlock(sqlite3vfs.LockExclusive); err == nil {
+		t.Error("Unlock(Exclusive) while holding Shared = nil, want an error (was a panic)")
+	}
+	if err := f.Unlock(sqlite3vfs.LockReserved); err == nil {
+		t.Error("Unlock(Reserved) above the current lock level = nil, want an error (was a panic)")
+	}
+	if got := lockState(t, fcs, f); got != sqlite3vfs.LockShared.String() {
+		t.Errorf("failed unlock requests changed the stored lock to %q, want %q", got, sqlite3vfs.LockShared.String())
 	}
 }
 
@@ -978,8 +1000,8 @@ func TestOpenDoesNotAdoptAnotherProcessLock(t *testing.T) {
 // data and size visibility this test pins.)
 func TestTwoVFSInstancesSeeEachOthersWritesAndTruncate(t *testing.T) {
 	_, fcs := newTestVFS(t)
-	va := NewVFS(fcs, testNamespace, zap.NewNop().Sugar(), 3)
-	vb := NewVFS(fcs, testNamespace, zap.NewNop().Sugar(), 3)
+	va := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3)
+	vb := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3)
 
 	fa := openTestFile(t, va, "shared-file.db")
 	first := make([]byte, 3000)
