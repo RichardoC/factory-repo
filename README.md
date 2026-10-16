@@ -3,6 +3,8 @@
 An experiment in running [CodeAF](https://github.com/Agent-Field/CodeAF) entirely inside
 GitHub: issues go in, CodeAF does the work in GitHub Actions, and pull requests come out.
 
+The repository root also hosts [kube-sqlite3-vfs](docs/kube-sqlite3-vfs.md), a SQLite VFS that stores database files in Kubernetes ConfigMaps (MIT, see `LICENSE-kube-sqlite3-vfs`).
+
 ## Using it
 
 | You do | CodeAF does |

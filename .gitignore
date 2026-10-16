@@ -35,3 +35,20 @@ go.work.sum
 # Python bytecode caches
 __pycache__/
 *.py[cod]
+
+# kube-sqlite3-vfs import: entries from the upstream .gitignore not already present above
+
+# Binary
+kube-sqlite3-vfs
+
+# vscode directories
+.vscode
+
+# Vim temp files
+*.swp
+
+# temp db files
+file2*
+
+# Debug files
+__debug_bin
