@@ -9,8 +9,8 @@
 //	harness brief    write the task brief for `codeaf do` to $BRIEF_PATH
 //	harness summary  print CodeAF's JSON result without its long answer
 //	harness spend    print today's spend after this run: $DAY_SPENT_BEFORE + what
-//	                 the proxy metered (its in-memory total, not a file the agent
-//	                 could edit)
+//	                 the proxy metered (its in-memory total; if the proxy is gone,
+//	                 the ledger file, which the agent could have edited)
 //	harness ledger   copy CodeAF's model-rating ledger (router-ledger.json) from
 //	                 IN to OUT, rebuilt from validated fields only
 //	harness report   print the Markdown run report posted on the issue/PR
@@ -44,7 +44,7 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("harness: ")
 	if len(os.Args) < 2 {
-		log.Fatal("usage: harness proxy|gate|brief|summary|spend|report")
+		log.Fatal("usage: harness proxy|gate|brief|summary|spend|ledger|report")
 	}
 	commands := map[string]func() error{
 		"proxy":   runProxy,
@@ -1225,7 +1225,7 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, env 
 	fmt.Fprintf(&b, "| seats | worker `%s`, planner `%s`, checker `%s` (escalation panel: %s) |\n",
 		orUnknown(result.Model), orUnknown(result.PlanModel), orUnknown(result.CheckModel), strings.Join(panel, " → "))
 	fmt.Fprintf(&b, "| CodeAF's own spend figure | %s (plan estimate %s) |\n", money(result.SpendUSD), money(result.EstUSD))
-	fmt.Fprintf(&b, "| metered by proxy | **%s** this run · %s today (cap $%s/run, $%s/day) |\n",
+	fmt.Fprintf(&b, "| metered by proxy (from its ledger) | **%s** this run · %s today (cap $%s/run, $%s/day) |\n",
 		money(total), money(dayBefore+total), trimNumber(cfg.Limits.RunUSD), trimNumber(cfg.Limits.DayUSD))
 	fmt.Fprintf(&b, "| files changed | %s |\n\n", orUnknown(env("CHANGED")))
 

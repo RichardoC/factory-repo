@@ -59,8 +59,10 @@ hostile, whether through prompt injection or a compromised model.
   `$GITHUB_OUTPUT` or `$GITHUB_ENV` raw. A spend total that is negative or not
   a number fails the run.
 - Record spend from the proxy's in-memory total, not from files the agent can
-  edit. Cached totals can be reset by an attacker, so for a hard budget also
-  set a spending limit on the synthetic.new account itself.
+  edit. The harness falls back to the ledger file only if the proxy is gone,
+  and the agent (same user) could even replace the proxy. Cached totals can
+  also be reset by an attacker. So for a hard budget, also set a spending limit
+  on the synthetic.new account itself.
 - Runs triggered by issues and issue comments write caches in the default
   branch's scope, which every branch and PR can read. Treat those caches as
   shared.
@@ -73,11 +75,15 @@ hostile, whether through prompt injection or a compromised model.
 - After CodeAF has run, nothing on that runner can be trusted: binaries,
   `.git` (hooks, config), `$GITHUB_ENV`, `$GITHUB_OUTPUT`, files. Never give a
   later step in that job a secret or a write token.
+- Every job checks out the default branch explicitly
+  (`ref: ${{ github.event.repository.default_branch }}`) and builds the harness
+  from it. On `pull_request_review` events the default ref is the PR's merge
+  commit, which is PR code.
 - `publish` treats the run job's outputs and artifacts as untrusted data. It
-  builds its own harness from the checkout. It applies the patch with
-  `git apply`, which runs nothing, and only after checking the size, that the
-  base commit matches, and that no path is under `.github/` or `.git`. Keep it
-  that way: never run, `source` or `eval` anything that came from `run`.
+  checks the patch's size and that its base commit matches, applies it with
+  `git apply`, which runs nothing and refuses `.git` paths, then refuses the
+  result if any staged path is under `.github/`. Keep it that way: never run,
+  `source` or `eval` anything that came from `run`.
 
 ### Artifacts
 
@@ -87,12 +93,13 @@ hostile, whether through prompt injection or a compromised model.
 - Anything that might hold transcripts, prompts, logs or CodeAF state must be
   encrypted before upload, with `gpg --recipient-file`, to the OpenPGP public
   key in the `CODEAF_ARTIFACT_PUBLIC_KEY` secret. That secret is the one
-  exception to "no secrets after CodeAF runs", because it is a public key. The matching `CODEAF_ARTIFACT_PRIVATE_KEY` is a
-  write-only backup: no workflow may ever read it, since any job that
-  decrypts would have nowhere private to put the result. If no
-  key is configured, don't upload it; never fall back to plaintext. Only the
-  patch, CodeAF's result and the cost ledger, which are published on the PR
-  anyway, go up unencrypted.
+  exception to "no secrets after CodeAF runs", because it is a public key.
+  The private key stays with the maintainer. If it is also kept as a
+  `CODEAF_ARTIFACT_PRIVATE_KEY` secret for backup, no workflow may ever read
+  it, since any job that decrypts would have nowhere private to put the
+  result. If no key is configured, don't upload it; never fall back to
+  plaintext. Only the patch, its base commit, CodeAF's result and the cost
+  ledger, which are published on the PR anyway, go up unencrypted.
 
 ### Secrets, tokens and triggers
 

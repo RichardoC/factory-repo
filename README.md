@@ -17,16 +17,23 @@ commands are obeyed only from repository owners, members and collaborators, so
 outside contributors cannot spend the API budget. PRs from forks are ignored.
 
 Every run posts a report comment with CodeAF's outcome and a per-model cost table.
-The full brief, CodeAF's JSON result, the call ledger and logs are uploaded as a
-workflow artifact.
+Two workflow artifacts are uploaded:
+- `codeaf-output-*` (14 days), not encrypted: the patch, its base commit, CodeAF's
+  JSON result and the call ledger;
+- `codeaf-diagnostics-*` (90 days), GnuPG-encrypted: the brief, logs,
+  transcripts and CodeAF state. It is only uploaded once
+  `CODEAF_ARTIFACT_PUBLIC_KEY` is set (see below).
 
 ## How it is wired
 
-- [`.github/workflows/codeaf.yml`](.github/workflows/codeaf.yml) checks the event
-  against the rules above (`harness gate`), builds CodeAF at a pinned
-  commit, writes a brief from the issue/PR, runs `codeaf do` headless, then commits,
-  pushes, opens or updates the PR, and dispatches [CI](.github/workflows/ci.yml).
-  Pushes made with `GITHUB_TOKEN` do not trigger CI on their own.
+- [`.github/workflows/codeaf.yml`](.github/workflows/codeaf.yml) runs three jobs,
+  each checked out at the default branch:
+  - `gate` checks the event against the rules above (`harness gate`).
+  - `run`, which has no write token, builds CodeAF at a pinned commit, writes a
+    brief from the issue/PR, runs `codeaf do` headless and hands over a patch.
+  - `publish`, on a fresh runner, checks and applies the patch, then commits,
+    pushes, opens or updates the PR and dispatches [CI](.github/workflows/ci.yml).
+    Pushes made with `GITHUB_TOKEN` do not trigger CI on their own.
 - [`.github/codeaf/main.go`](.github/codeaf/main.go) is the harness: a standalone,
   standard-library-only Go program, with tests, that the workflow builds on every run.
   It decides whether an event may run (`gate`), writes the brief (`brief`), and renders
@@ -79,7 +86,9 @@ workflow artifact.
   Decrypt a downloaded artifact with
   `gpg --decrypt diagnostics.tar.gz.gpg | tar xz`. The private key stays in your
   own GnuPG keyring; no workflow uses it. Back it up with
-  `gpg --armor --export-secret-keys codeaf-artifacts`.
+  `gpg --armor --export-secret-keys codeaf-artifacts`. If you also keep that
+  backup as a `CODEAF_ARTIFACT_PRIVATE_KEY` secret, no workflow reads it, and
+  GitHub can't show it back to you, so keep another copy.
 - The rules for future changes are in
   [`AGENTS.md`](AGENTS.md#security-rules-for-changing-the-harness).
 - Protecting `main`: [`CODEOWNERS`](.github/CODEOWNERS) makes @RichardoC the owner of

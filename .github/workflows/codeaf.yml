@@ -56,6 +56,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # Always the default branch. On pull_request_review events the
+          # default ref is the PR's merge commit, i.e. PR code.
+          ref: ${{ github.event.repository.default_branch }}
           sparse-checkout: .github/codeaf
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -102,12 +105,29 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # Always the default branch, so the harness (including the proxy that
+          # receives the API key) is built from reviewed code, never from a PR.
+          ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Build the harness
+        # Built from the default branch before the working branch is checked
+        # out, and before CodeAF starts. The agent could still swap the binary
+        # (same user), which is why nothing after CodeAF in this job holds a
+        # secret or a write token.
+        run: |
+          cp -r .github/codeaf "$RUNNER_TEMP/harness"
+          (cd "$RUNNER_TEMP/harness" && go build -trimpath -o harness .)
 
       - name: Check out the working branch
         run: |
-          # The default checkout is a shallow clone of the triggering ref (the
-          # default branch). Continue an existing branch if there is one.
+          # Continue an existing CodeAF branch if there is one, else branch
+          # from the default branch checked out above.
           if git fetch --depth=1 origin "refs/heads/$BRANCH" 2>/dev/null; then
             git checkout -B "$BRANCH" FETCH_HEAD
           else
@@ -115,19 +135,6 @@ jobs:
           fi
           mkdir -p "$RUNNER_TEMP/out"
           git rev-parse HEAD > "$RUNNER_TEMP/out/base-commit"
-
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: stable
-          cache: false
-
-      - name: Build the harness and tools
-        # Everything this job runs after CodeAF is built before CodeAF starts.
-        # The agent could still swap these binaries (same user), which is why
-        # nothing after CodeAF in this job holds a secret or a write token.
-        run: |
-          cp -r .github/codeaf "$RUNNER_TEMP/harness"
-          (cd "$RUNNER_TEMP/harness" && go build -trimpath -o harness .)
 
       - name: Build CodeAF
         # Always from the pinned source, never from a cache: a cached binary was
@@ -228,7 +235,8 @@ jobs:
         env:
           DAY_SPENT_BEFORE: ${{ steps.spent.outputs.usd }}
         run: |
-          # From the proxy's in-memory total, not a file the agent could edit.
+          # From the proxy's in-memory total when it answers; if the proxy is
+          # gone, from the ledger file, which the agent could have edited.
           # The directory is recreated so nothing the agent left in it (extra
           # files, symlinks) is written through or cached.
           total=$("$HARNESS" spend)
@@ -304,8 +312,8 @@ jobs:
           retention-days: 90
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        # The patch, CodeAF's result and the cost ledger: all of it is published
-        # on the PR anyway. `publish` reads it as untrusted data.
+        # The patch, its base commit, CodeAF's result and the cost ledger: all of
+        # it is published on the PR anyway. `publish` reads it as untrusted data.
         if: always()
         with:
           name: codeaf-output-${{ github.run_id }}-${{ github.run_attempt }}
@@ -344,6 +352,9 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # Always the default branch: this job holds a write token, so it must
+          # never build or run PR code (the default ref on review events).
+          ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -353,7 +364,7 @@ jobs:
 
       - name: Build the harness
         # From the default branch's checkout on this fresh runner, never from
-        # anything the run job produced.
+        # a PR or anything the run job produced.
         run: |
           cp -r .github/codeaf "$RUNNER_TEMP/harness"
           (cd "$RUNNER_TEMP/harness" && go build -trimpath -o harness .)

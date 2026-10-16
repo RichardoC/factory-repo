@@ -59,7 +59,7 @@ func TestResolve(t *testing.T) {
 
 func TestEffortFor(t *testing.T) {
 	models := testModels(t)
-	flash := mustResolve(t, models, "zai-org/glm-5.3-flash")              // low, high, max
+	flash := mustResolve(t, models, "zai-org/glm-5.3-flash")              // high, max
 	deepseek := mustResolve(t, models, "deepseek-ai/deepseek-v4.1-flash") // none … max
 	off := false
 	cases := []struct {
@@ -212,6 +212,8 @@ func TestDecide(t *testing.T) {
 		FullName string `json:"full_name"`
 	}{FullName: "RichardoC/factory-repo"}
 	openPR.Base.Ref = "main"
+	closedPR := openPR
+	closedPR.State = "closed"
 	forkPR := openPR
 	forkPR.Head.Repo = &struct {
 		FullName string `json:"full_name"`
@@ -263,6 +265,22 @@ func TestDecide(t *testing.T) {
 			e.PullRequest = &openPR
 			e.Review = &comment{Body: "nice", State: "approved", AuthorAssociation: "OWNER", User: user{Type: "User"}}
 		}), noLookup, false, "", ""},
+		{"approval carrying a command", "pull_request_review", with(func(e *event) {
+			e.PullRequest = &openPR
+			e.Review = &comment{Body: "/codeaf tidy the docs", State: "approved", AuthorAssociation: "OWNER", User: user{Type: "User"}}
+		}), lookup(openPR), true, "pr", "codeaf/issue-3"},
+		{"untrusted reviewer", "pull_request_review", with(func(e *event) {
+			e.PullRequest = &openPR
+			e.Review = &comment{Body: "do this", State: "changes_requested", AuthorAssociation: "CONTRIBUTOR", User: user{Login: "x", Type: "User"}}
+		}), noLookup, false, "", ""},
+		{"bot comment", "issue_comment", with(func(e *event) {
+			e.Issue = &item{Number: 3, Labels: labelled}
+			e.Comment = &comment{Body: "/codeaf go", AuthorAssociation: "MEMBER", User: user{Login: "some-bot[bot]", Type: "Bot"}}
+		}), noLookup, false, "", ""},
+		{"command on closed PR", "issue_comment", with(func(e *event) {
+			e.Issue = &item{Number: 7, Labels: labelled, PullRequest: prMarker}
+			e.Comment = owner
+		}), lookup(closedPR), false, "", ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
