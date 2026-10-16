@@ -49,34 +49,42 @@ hostile, whether through prompt injection or a compromised model.
 ### Caches and carried state
 
 - Anything written during a job in which the agent ran is untrusted. That
-  includes Actions caches, artifacts, files under `$RUNNER_TEMP`, and
-  `$CODEAF_HOME`. The agent may also be able to reach the cache service from inside the
-  job, so it can overwrite cache entries, not just the files the workflow
-  saves.
-- Never carry anything between runs that a later run will execute or put in
-  front of the model. That rules out caching binaries, toolchains, Go module
-  or build caches, scripts, CodeAF's memory database (`graph.db`), event logs,
-  transcripts, briefs and notes. Build tools from pinned sources each run.
-- Untrusted state may be *stored* for audit or later review, as long as no
-  run restores it automatically. For example, the encrypted diagnostics
-  bundle holds CodeAF's `graph.db`, event log and raw ledger for 90 days. To
-  start using such state, a person reviews a snapshot first and then adds the
-  restore step deliberately, with validation, in a reviewed PR.
-- Carry only data that can be fully validated, and validate it on every
-  restore and save. Rebuild it from typed fields with bounds and an allowlist,
-  as `harness ledger` does for the model-rating ledger. Never copy a file
-  through as-is.
-- Validate numbers from a cache before using them; never paste them into
-  `$GITHUB_OUTPUT` or `$GITHUB_ENV` raw. A spend total that is negative or not
-  a number fails the run.
+  includes artifacts, files under `$RUNNER_TEMP`, and `$CODEAF_HOME`.
+- The `run` job can't write the Actions cache: it has no writable token scope.
+  Keep it that way. Only workflows that never run the agent write caches.
+- Never carry binaries, toolchains, Go module or build caches, or scripts
+  between runs. Build tools from pinned sources each run.
+- CodeAF's state is carried between runs in one shared bundle
+  (`.github/codeaf/state.go`, `codeaf-state.yml`): the memory db
+  (`graph.db`), `router-events.jsonl`, the model ratings and the day's spend.
+  This was a deliberate decision. CodeAF puts saved memories from `graph.db`
+  into every worker's prompt, so a poisoned memory would reach later runs.
+  Hence the rules below:
+  - Only the CodeAF state workflow writes the bundle, one merge at a time.
+    Runs only hand over their state as an artifact.
+  - Every packed run is checked before it is merged. The ledger is rebuilt
+    from typed, bounded fields about allowed models. Events are kept only as
+    bounded JSON objects. The db is accepted as an opaque SQLite file by its
+    header, and is never opened by the harness. Runs from forks are ignored.
+  - `state load` checks the bundle again before CodeAF starts, and fails the
+    run if it isn't valid.
+  - Overlapping runs don't overwrite each other. Spend is added. Ratings and
+    events are merged. The db is taken only from a run that started from the
+    current generation.
+  - To roll back, delete the newest `codeaf-shared-v1-*` cache entries; the
+    last five generations are kept.
+- Never copy anything else between runs as-is. Carry only data that can be
+  validated, and validate it on every load and merge.
+- Validate numbers from the bundle and from run artifacts before using them;
+  never paste them into `$GITHUB_OUTPUT` or `$GITHUB_ENV` raw. A spend total in
+  the bundle that is negative or not a number fails the run. A run's own spend
+  that can't be right counts as the whole per-run cap.
 - Record spend from the proxy's in-memory total, not from files the agent can
   edit. The harness falls back to the ledger file only if the proxy is gone,
-  and the agent (same user) could even replace the proxy. Cached totals can
-  also be reset by an attacker. So for a hard budget, also set a spending limit
-  on the synthetic.new account itself.
-- Runs triggered by issues and issue comments write caches in the default
-  branch's scope, which every branch and PR can read. Treat those caches as
-  shared.
+  and the agent (same user) could even replace the proxy. Runs that overlap
+  each start from the day total as it was, so together they can pass the daily
+  cap. So for a hard budget, also set a spending limit on the synthetic.new
+  account itself.
 
 ### Privilege separation
 
@@ -103,6 +111,9 @@ hostile, whether through prompt injection or a compromised model.
   creates a missing environment with no reviewers. Only then is it applied and
   pushed. The `run` job's `touches_harness` output only routes the job; never
   treat its absence as proof that a patch leaves `.github/` alone.
+- `codeaf-state.yml` runs no agent and handles no secret. It reads other runs'
+  artifacts as untrusted data and holds only `actions: write`, for the
+  artifacts and the cache.
 - `CODEAF_HARNESS_TOKEN` (needed because `GITHUB_TOKEN` can't push workflow
   changes) lives only as a secret of the `codeaf-harness` environment, and is
   read only after that approval check.
@@ -110,18 +121,14 @@ hostile, whether through prompt injection or a compromised model.
 ### Artifacts
 
 - On a public repository, any signed-in GitHub user can download workflow
-  artifacts, and GitHub does not mask secrets inside them. Treat every
-  artifact as public.
-- Anything that might hold transcripts, prompts, logs or CodeAF state must be
-  encrypted before upload, with `gpg --recipient-file`, to the OpenPGP public
-  key in the `CODEAF_ARTIFACT_PUBLIC_KEY` secret. That secret is the one
-  exception to "no secrets after CodeAF runs", because it is a public key.
-  The private key stays with the maintainer. If it is also kept as a
-  `CODEAF_ARTIFACT_PRIVATE_KEY` secret for backup, no workflow may ever read
-  it, since any job that decrypts would have nowhere private to put the
-  result. If no key is configured, don't upload it; never fall back to
-  plaintext. Only the patch, its base commit, CodeAF's result and the cost
-  ledger, which are published on the PR anyway, go up unencrypted.
+  artifacts, and GitHub does not mask secrets inside them. Every artifact is
+  public.
+- Diagnostics are uploaded in plaintext, by choice: being able to see why a
+  run failed matters more here than hiding its prompts. They hold the brief,
+  transcripts, tool output and logs, so nothing secret may ever reach the
+  `run` job's files or environment once the proxy has started. The
+  token-shaped redaction in "Collect diagnostics" is a backstop, not a
+  licence.
 
 ### Secrets, tokens and triggers
 

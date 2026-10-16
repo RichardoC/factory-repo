@@ -23,12 +23,13 @@ commands are obeyed only from repository owners, members and collaborators, so
 outside contributors cannot spend the API budget. PRs from forks are ignored.
 
 Every run posts a report comment with CodeAF's outcome and a per-model cost table.
-Two workflow artifacts are uploaded:
-- `codeaf-output-*` (14 days), not encrypted: the patch, its base commit, CodeAF's
-  JSON result and the call ledger;
-- `codeaf-diagnostics-*` (90 days), GnuPG-encrypted: the brief, logs,
-  transcripts and CodeAF state. It is only uploaded once
-  `CODEAF_ARTIFACT_PUBLIC_KEY` is set (see below).
+Three workflow artifacts are uploaded, none of them encrypted:
+- `codeaf-output-*` (14 days): the patch, its base commit, CodeAF's JSON result
+  and the call ledger;
+- `codeaf-diagnostics-*` (30 days): the brief, CodeAF's stderr, its run records
+  (prompts, replies, tool output), call log and usage, and the proxy log;
+- `codeaf-state-*` (14 days): what the run left in CodeAF's home, and what it
+  cost, for the shared state below.
 
 ## How it is wired
 
@@ -52,8 +53,7 @@ Two workflow artifacts are uploaded:
   - adds `usage.cost` to every response, which is where CodeAF's spend accounting
     reads cost from;
   - refuses any other model, and returns HTTP 402 once the run reaches **$5** or the
-    UTC day reaches **$20**. The day's total is carried between runs in the Actions
-    cache.
+    UTC day reaches **$20**. The day's total comes from the shared state.
 
   The synthetic.new key (`SYNTHETIC_API_KEY` secret) is held only by the proxy. It is
   passed in on stdin, not through the environment.
@@ -86,29 +86,32 @@ Two workflow artifacts are uploaded:
   runner (`publish`) checks and applies the resulting patch, then commits,
   pushes, opens the PR and posts the report. Nothing CodeAF could have tampered
   with is executed with a write token.
-- Caches are treated as untrusted, because the agent can write to them. Only
-  CodeAF's model-rating ledger is carried between runs, rebuilt from validated
-  numbers each time. CodeAF itself is rebuilt from source on every run, and the
-  daily spend total is validated before use.
-- Artifacts on a public repo can be downloaded by any signed-in GitHub user. The
-  diagnostics (brief, transcripts, logs, and CodeAF's memory db, event log and
-  raw ledger, which are kept for audit and never restored) are therefore encrypted
-  with GnuPG to the OpenPGP public key in the `CODEAF_ARTIFACT_PUBLIC_KEY` secret.
-  Until that secret holds a usable key, they are not uploaded at all. To create
-  the key (Ed25519, with a Curve25519 encryption subkey) and set the secret:
+- **Shared state.** Every run starts from one shared bundle:
+  - CodeAF's memory db, router events and model ratings;
+  - the day's spend.
 
-  ```sh
-  gpg --quick-generate-key "codeaf-artifacts" default default never
-  gpg --armor --export codeaf-artifacts \
-    | gh secret set CODEAF_ARTIFACT_PUBLIC_KEY --repo RichardoC/factory-repo
-  ```
+  [`codeaf-state.yml`](.github/workflows/codeaf-state.yml) is the only writer:
+  - It merges each run's `codeaf-state-*` artifact into a new generation of
+    the bundle, saved in the Actions cache as `codeaf-shared-v1-g<N>-…`. The
+    last five generations are kept.
+  - The CodeAF workflow's `handoff` job starts it as soon as CodeAF has
+    finished. It runs one merge at a time, and each merge picks up every run
+    not merged yet.
+  - When runs overlap, spend is added and ratings and events are merged. The
+    memory db comes only from a run that started from the latest generation.
 
-  Decrypt a downloaded artifact with
-  `gpg --decrypt diagnostics.tar.gz.gpg | tar xz`. The private key stays in your
-  own GnuPG keyring; no workflow uses it. Back it up with
-  `gpg --armor --export-secret-keys codeaf-artifacts`. If you also keep that
-  backup as a `CODEAF_ARTIFACT_PRIVATE_KEY` secret, no workflow reads it, and
-  GitHub can't show it back to you, so keep another copy.
+  Everything is checked before it is merged, and again before CodeAF sees it
+  (see [`AGENTS.md`](AGENTS.md#caches-and-carried-state)). Saved memories reach
+  CodeAF's prompts. So to reset the state, delete the `codeaf-shared-v1-*`
+  caches (*Actions → Caches*); to roll back, delete only the newest ones.
+- CodeAF itself is rebuilt from source on every run; nothing executable is
+  carried between runs.
+- **Diagnostics are public.** Artifacts on a public repo can be downloaded by
+  any signed-in GitHub user, and the diagnostics are not encrypted. They hold
+  the brief, prompts, model replies and tool output, so never put anything
+  secret in an issue or in the `run` job. Token-shaped strings are redacted
+  before upload, as a backstop. The `CODEAF_ARTIFACT_PUBLIC_KEY` and
+  `CODEAF_ARTIFACT_PRIVATE_KEY` secrets are no longer used and can be deleted.
 - The rules for future changes are in
   [`AGENTS.md`](AGENTS.md#security-rules-for-changing-the-harness).
 - Protecting `main`: [`CODEOWNERS`](.github/CODEOWNERS) makes @RichardoC the owner of

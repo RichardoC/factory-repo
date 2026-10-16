@@ -1,0 +1,121 @@
+# Merges CodeAF runs' state into the one bundle all runs share
+# (.github/codeaf/state.go): CodeAF's memory db, router events and model
+# ratings, and the day's spend. It is the only thing that writes the bundle.
+#
+# Several CodeAF runs can be going at once (one per issue or PR). Each loads
+# the bundle as it is when it starts, and leaves its own state in a
+# codeaf-state-<run>-<attempt> artifact. This workflow decides what to do with
+# overlapping runs:
+#   * one merge at a time (the concurrency group below), so no update is lost;
+#   * each merge folds in every packed run it hasn't merged yet, not just the
+#     one that started it. GitHub keeps only the newest pending run of a
+#     concurrency group, so a merge that was dropped from the queue is picked
+#     up by the next one;
+#   * per run: spend is added; ratings and events are merged; the memory db is
+#     taken from a run that started from the current bundle, and otherwise
+#     left as it is (the overlapping run's copy stays in its artifact).
+#
+# Started by the CodeAF workflow's handoff job, and again when a CodeAF run
+# completes, in case a handoff was missed.
+name: CodeAF state
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: [CodeAF]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeaf-state
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    # Most CodeAF runs are comments that the gate skips; those leave nothing.
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: write # read other runs' artifacts; save and prune the bundle's caches
+    steps:
+      - name: Paths
+        run: |
+          {
+            echo "SHARED_DIR=$RUNNER_TEMP/shared"
+            echo "RUNS_DIR=$RUNNER_TEMP/runs"
+            echo "OUT_DIR=$RUNNER_TEMP/next"
+            echo "HARNESS=$RUNNER_TEMP/harness/harness"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The harness is always built from the default branch.
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/codeaf
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: .github/codeaf/go.mod
+          cache: false
+      - name: Build the harness
+        run: |
+          cp -r .github/codeaf "$RUNNER_TEMP/harness"
+          (cd "$RUNNER_TEMP/harness" && go build -trimpath -o harness .)
+
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.SHARED_DIR }}
+          key: codeaf-shared-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: codeaf-shared-v1-
+
+      - name: Download runs not merged yet
+        # The 50 latest CodeAF runs, finished or not (a run waiting for a
+        # publish approval has already uploaded its state). Only runs from
+        # this repository count: a fork's run could upload any artifact it
+        # liked. Artifacts are untrusted and checked by `state merge`.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNS_DIR"
+          merged=$("$HARNESS" state merged "$SHARED_DIR")
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/codeaf.yml/runs?per_page=50" \
+            | jq -r --arg repo "$GITHUB_REPOSITORY" '.workflow_runs[] | select(.head_repository.full_name == $repo) | .id' \
+            | while read -r id; do
+                gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/artifacts" \
+                  | jq -r '.artifacts[] | select(.expired | not) | .name | select(test("^codeaf-state-[0-9]+-[0-9]+$"))' \
+                  | while read -r name; do
+                      key=${name#codeaf-state-}
+                      if [ "${key%-*}" != "$id" ] || grep -qxF "$key" <<< "$merged"; then continue; fi
+                      echo "Downloading $name"
+                      gh run download "$id" --repo "$GITHUB_REPOSITORY" -n "$name" -D "$RUNS_DIR/$name" \
+                        || echo "::warning::could not download $name"
+                    done
+              done
+
+      - name: Merge
+        id: merge
+        run: |
+          shopt -s nullglob
+          "$HARNESS" state merge "$SHARED_DIR" "$OUT_DIR" "$RUNS_DIR"/*
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.merge.outputs.changed == 'true'
+        with:
+          path: ${{ env.OUT_DIR }}
+          # Cache entries can't be overwritten; each generation is a new one,
+          # and runs restore the newest by the prefix.
+          key: codeaf-shared-v1-g${{ steps.merge.outputs.generation }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Prune old generations
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Keep the five newest, so a bad generation can be rolled back by
+          # deleting the newer ones.
+          gh cache list --repo "$GITHUB_REPOSITORY" --key codeaf-shared-v1- --sort created_at --order desc --limit 100 --json id --jq '.[5:][].id' \
+            | while read -r id; do gh cache delete "$id" --repo "$GITHUB_REPOSITORY" || true; done

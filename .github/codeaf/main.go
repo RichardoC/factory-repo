@@ -8,11 +8,9 @@
 //	                 outputs (run, reason, mode, number, branch, base)
 //	harness brief    write the task brief for `codeaf do` to $BRIEF_PATH
 //	harness summary  print CodeAF's JSON result without its long answer
-//	harness spend    print today's spend after this run: $DAY_SPENT_BEFORE + what
-//	                 the proxy metered (its in-memory total; if the proxy is gone,
-//	                 the ledger file, which the agent could have edited)
-//	harness ledger   copy CodeAF's model-rating ledger (router-ledger.json) from
-//	                 IN to OUT, rebuilt from validated fields only
+//	harness state    the state shared between runs (state.go): load the shared
+//	                 bundle into $CODEAF_HOME, pack what a run left, merge packed
+//	                 runs into a new bundle
 //	harness report   print the Markdown run report posted on the issue/PR
 //
 // Trust model: the `codeaf` label can only be added by people with triage access
@@ -44,15 +42,14 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("harness: ")
 	if len(os.Args) < 2 {
-		log.Fatal("usage: harness proxy|gate|brief|summary|spend|ledger|report")
+		log.Fatal("usage: harness proxy|gate|brief|summary|state|report")
 	}
 	commands := map[string]func() error{
 		"proxy":   runProxy,
 		"gate":    runGate,
 		"brief":   runBrief,
 		"summary": runSummary,
-		"spend":   runSpend,
-		"ledger":  runLedger,
+		"state":   runState,
 		"report":  runReport,
 	}
 	command, ok := commands[os.Args[1]]
@@ -985,10 +982,10 @@ func ledgerTotal(lines []LedgerLine) float64 {
 	return total
 }
 
-// spentToday reads the day's earlier spend, which comes from the Actions cache.
-// The cache is written by jobs the agent ran in, so the value is untrusted: a
-// negative, infinite or unparseable total would loosen the daily cap, and is
-// refused rather than repaired.
+// spentToday reads the day's earlier spend, which comes from the shared state
+// bundle. That total is built from numbers run jobs reported, so it is treated
+// as untrusted: a negative, infinite or unparseable total would loosen the
+// daily cap, and is refused rather than repaired.
 func spentToday(name string) (float64, error) {
 	value, err := envFloat(name, 0)
 	if err != nil {
@@ -1019,26 +1016,6 @@ func meteredRunSpend() (float64, error) {
 		return 0, errors.New("proxy health has no run_spent_usd")
 	}
 	return *health.RunSpentUSD, nil
-}
-
-func runSpend() error {
-	before, err := spentToday("DAY_SPENT_BEFORE")
-	if err != nil {
-		return err
-	}
-	run, err := meteredRunSpend()
-	if err != nil {
-		// The proxy is gone (crashed, or killed during the run). The ledger
-		// file is the next best record, though the agent could have edited it.
-		log.Printf("warning: proxy unreachable (%v); using the ledger file", err)
-		lines, err := readLedger(os.Getenv("LEDGER_PATH"))
-		if err != nil {
-			return err
-		}
-		run = ledgerTotal(lines)
-	}
-	fmt.Println(strconv.FormatFloat(before+run, 'f', -1, 64))
-	return nil
 }
 
 // ---------------------------------------------------------------- router ledger
@@ -1078,8 +1055,8 @@ func validClass(class string) bool {
 }
 
 // SanitizeLedger rebuilds a router ledger from fields that can only carry
-// numbers about allowed models. The file is carried between runs in the
-// Actions cache and the agent can write to it, so nothing else survives: no
+// numbers about allowed models. The file is carried between runs in the shared
+// state bundle and the agent can write to it, so nothing else survives: no
 // unknown model ids, no free text, no out-of-range numbers.
 func SanitizeLedger(data []byte, models []Model) (RouterLedger, int) {
 	allowed := map[string]bool{}
@@ -1115,47 +1092,6 @@ func SanitizeLedger(data []byte, models []Model) (RouterLedger, int) {
 		clean.Aliases[from] = to
 	}
 	return clean, dropped
-}
-
-func runLedger() error {
-	if len(os.Args) != 4 {
-		return errors.New("usage: harness ledger IN OUT")
-	}
-	in, out := os.Args[2], os.Args[3]
-	info, err := os.Lstat(in)
-	if errors.Is(err, os.ErrNotExist) {
-		log.Printf("no router ledger at %s; nothing to carry", in)
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("%s is not a regular file; refusing it", in)
-	}
-	data, err := os.ReadFile(in)
-	if err != nil {
-		return err
-	}
-	cfg, err := loadConfig(configPath())
-	if err != nil {
-		return err
-	}
-	clean, dropped := SanitizeLedger(data, cfg.Models)
-	if dropped > 0 {
-		log.Printf("warning: dropped %d invalid router-ledger rows from %s", dropped, in)
-	}
-	encoded, err := json.MarshalIndent(clean, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
-		return err
-	}
-	// Replace rather than write through: OUT may be a symlink planted by the agent.
-	_ = os.Remove(out)
-	log.Printf("carried %d router ratings to %s", len(clean.Entries), out)
-	return os.WriteFile(out, append(encoded, '\n'), 0o644)
 }
 
 func money(x float64) string { return fmt.Sprintf("$%.4f", x) }
