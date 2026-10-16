@@ -83,10 +83,26 @@ Three workflow artifacts are uploaded, none of them encrypted:
     - **Required reviewers**: yourself. Leave *Prevent self-review* off, since
       the run is started by you.
     - **Deployment branches**: `main` only.
-  - Add an environment secret `CODEAF_HARNESS_TOKEN`: a fine-grained personal
-    access token for this repository only, with *Contents* and *Workflows*
-    read/write. `GITHUB_TOKEN` can't push changes to `.github/workflows/`, so
-    without it only changes elsewhere under `.github/` can be published.
+  - Create a GitHub App to push approved harness patches, so they don't
+    go out as you. `GITHUB_TOKEN` can't push changes to
+    `.github/workflows/`, so without the app only changes elsewhere under
+    `.github/` can be published.
+    1. *Settings → Developer settings → GitHub Apps → New GitHub App*, for
+       example "factory-repo CodeAF harness".
+       - Untick *Webhook → Active*.
+       - Repository permissions: *Contents* read and write, *Workflows* read
+         and write. Nothing else.
+       - *Only on this account*.
+    2. Install it on `RichardoC/factory-repo` only.
+    3. Generate a private key, then add two secrets to the `codeaf-harness`
+       environment:
+       - `CODEAF_APP_ID`: the app's ID;
+       - `CODEAF_APP_PRIVATE_KEY`: the whole `.pem` file.
+    4. Delete the downloaded key file.
+
+    After approval, `publish` uses the key to mint a token that lasts an hour,
+    for this repository only, with just those two permissions. It pushes with
+    that token, so the push shows as `<app name>[bot]`.
 - CodeAF runs in a job with no write access (`run`). A separate job on a fresh
   runner (`publish`) checks and applies the resulting patch, then commits,
   pushes, opens the PR and posts the report. Nothing CodeAF could have tampered
