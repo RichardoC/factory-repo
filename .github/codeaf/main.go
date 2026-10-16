@@ -1154,12 +1154,12 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, env 
 	} else {
 		b.WriteString("| result | CodeAF produced no JSON result; see the workflow logs |\n")
 	}
-	panel := make([]string, len(models))
+	allowed := make([]string, len(models))
 	for i, m := range models {
-		panel[i] = "`" + m.ID + "`"
+		allowed[i] = "`" + m.ID + "`"
 	}
-	fmt.Fprintf(&b, "| seats | worker `%s`, planner `%s`, checker `%s` (escalation panel: %s) |\n",
-		orUnknown(result.Model), orUnknown(result.PlanModel), orUnknown(result.CheckModel), strings.Join(panel, " → "))
+	fmt.Fprintf(&b, "| seats | worker `%s`, planner `%s`, checker `%s` (allowed: %s; no escalation) |\n",
+		orUnknown(result.Model), orUnknown(result.PlanModel), orUnknown(result.CheckModel), strings.Join(allowed, ", "))
 	fmt.Fprintf(&b, "| CodeAF's own spend figure | %s (plan estimate %s) |\n", money(result.SpendUSD), money(result.EstUSD))
 	fmt.Fprintf(&b, "| metered by proxy (from its ledger) | **%s** this run · %s today (cap $%s/run, $%s/day) |\n",
 		money(total), money(dayBefore+total), trimNumber(cfg.Limits.RunUSD), trimNumber(cfg.Limits.DayUSD))

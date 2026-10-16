@@ -57,11 +57,16 @@ Three workflow artifacts are uploaded, none of them encrypted:
 
   The synthetic.new key (`SYNTHETIC_API_KEY` secret) is held only by the proxy. It is
   passed in on stdin, not through the environment.
-- Model choice: every seat (worker, planner, checker) starts on
-  **GLM-5.3-Flash** ($0.15 in / $0.50 out per M tokens). CodeAF's cascade
-  ([`panel.json`](.github/codeaf/panel.json)) escalates a call to
-  **DeepSeek-V4.1-Flash** ($0.60 / $1.20) and then **GLM-5.3** ($1.40 / $4.40) only
-  when a verifier catches a failure.
+- Model choice: every seat (worker, planner, checker) runs on
+  **GLM-5.3-Flash** ($0.15 in / $0.50 out per M tokens).
+  - Escalation is switched off for now. CodeAF's cascade
+    ([`panel.json`](.github/codeaf/panel.json)) would escalate to
+    **DeepSeek-V4.1-Flash** ($0.60 / $1.20) and then **GLM-5.3** ($1.40 / $4.40),
+    but it has two bugs:
+    - it treats a reply made only of tool calls as empty, and fails every run;
+    - its pinned rungs all call the seat model, so it never escalates.
+  - [`codeaf.yml`](.github/workflows/codeaf.yml) explains how to turn it back on
+    once CodeAF is fixed.
 
 ## Limits worth knowing
 
@@ -124,11 +129,12 @@ Three workflow artifacts are uploaded, none of them encrypted:
 - Configuration lives in files, not workflow variables:
   - [`models.json`](.github/codeaf/models.json): the spend caps (`limits`) and the
     allowed models with their prices (USD per million tokens);
-  - [`panel.json`](.github/codeaf/panel.json): the escalation order;
+  - [`panel.json`](.github/codeaf/panel.json): the escalation order (not used for
+    now, see above);
   - [`codeaf-config.json`](.github/codeaf/codeaf-config.json): CodeAF's own settings
     (seat models, budgets, telemetry and Model Pool off), installed as its profile
     config.
 
-  Keep the three consistent when changing models. The only CodeAF settings left in
-  the environment are the endpoint (`CODEAF_BASE_URL`) and the panel path
-  (`CODEAF_MODELS`), because CodeAF reads those from nowhere else.
+  Keep the three consistent when changing models. The only CodeAF setting left in
+  the environment is the endpoint (`CODEAF_BASE_URL`), because CodeAF reads it from
+  nowhere else. The panel path (`CODEAF_MODELS`) would be the second one.
