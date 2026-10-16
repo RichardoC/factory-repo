@@ -101,6 +101,7 @@ jobs:
             echo "BRIEF_PATH=$RUNNER_TEMP/brief.md"
             echo "RESULT_PATH=$RUNNER_TEMP/out/codeaf-result.json"
             echo "LEDGER_PATH=$RUNNER_TEMP/out/codeaf-ledger.jsonl"
+            # Same path as in codeaf-state.yml, or the cache never matches.
             echo "SHARED_DIR=$RUNNER_TEMP/codeaf-shared"
             echo "CODEAF_HOME=$RUNNER_TEMP/codeaf-home"
             echo "HARNESS=$RUNNER_TEMP/harness/harness"

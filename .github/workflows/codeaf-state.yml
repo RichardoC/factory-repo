@@ -45,7 +45,9 @@ jobs:
       - name: Paths
         run: |
           {
-            echo "SHARED_DIR=$RUNNER_TEMP/shared"
+            # Must be the same path as the run job's SHARED_DIR: actions/cache
+            # versions an entry by its path, so a different path never matches.
+            echo "SHARED_DIR=$RUNNER_TEMP/codeaf-shared"
             echo "RUNS_DIR=$RUNNER_TEMP/runs"
             echo "OUT_DIR=$RUNNER_TEMP/next"
             echo "HARNESS=$RUNNER_TEMP/harness/harness"
@@ -101,11 +103,16 @@ jobs:
         run: |
           shopt -s nullglob
           "$HARNESS" state merge "$SHARED_DIR" "$OUT_DIR" "$RUNS_DIR"/*
+          # Saved from the path every job restores to (see Paths).
+          if [ -d "$OUT_DIR" ]; then
+            rm -rf "$SHARED_DIR"
+            mv "$OUT_DIR" "$SHARED_DIR"
+          fi
 
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.merge.outputs.changed == 'true'
         with:
-          path: ${{ env.OUT_DIR }}
+          path: ${{ env.SHARED_DIR }}
           # Cache entries can't be overwritten; each generation is a new one,
           # and runs restore the newest by the prefix.
           key: codeaf-shared-v1-g${{ steps.merge.outputs.generation }}-${{ github.run_id }}-${{ github.run_attempt }}
