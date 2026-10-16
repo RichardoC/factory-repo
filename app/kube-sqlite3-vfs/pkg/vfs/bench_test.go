@@ -11,16 +11,17 @@ package vfs
 // (both recorded with -benchtime=10x, before and after the optimisation) are
 // tabulated in the module README.
 //
-// Every benchmark seeds its sectors up front, and the SQLite insert
-// benchmark keeps the default 4 KiB page size with its workload inside one
-// 64 KiB sector, so its numbers stay directly comparable with the
-// pre-optimisation baseline.
+// Every benchmark seeds its sectors up front. The SQLite insert benchmark
+// runs at 64 KiB pages — the configuration main.go and the cmd tools use —
+// and its transaction spans several 64 KiB sectors.
 
 import (
 	"fmt"
 	"k8s.io/client-go/kubernetes/fake"
 	"math/rand"
 	"testing"
+
+	"github.com/psanford/sqlite3vfs"
 )
 
 // seedSectors fills a file of the given sector count with fillPattern data.
@@ -43,6 +44,42 @@ func BenchmarkSequentialRead(b *testing.B) {
 	seedSectors(b, fcs, f, sectors)
 
 	buf := make([]byte, SectorSize)
+	var calls int64
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		off := int64(i%sectors) * SectorSize
+		fcs.ClearActions()
+		if _, err := f.ReadAt(buf, off); err != nil {
+			b.Fatal(err)
+		}
+		calls += int64(len(fcs.Actions()))
+	}
+	b.ReportMetric(float64(calls)/float64(b.N), "api-calls/op")
+}
+
+// BenchmarkSequentialReadLocked reads one 64 KiB sector at a time while a
+// SHARED lock is held: the sector cache is warm and FileSize is served from
+// memory, so a read costs no Kubernetes API call at all. This is the steady
+// state of a sqlite reader between write transactions, and it is exactly
+// what the sector cache and the O(1) FileSize buy; the unlocked benchmark
+// above pays the revalidating LIST plus the sector GET on every read.
+func BenchmarkSequentialReadLocked(b *testing.B) {
+	v, fcs := newTestVFS(b)
+	f := openTestFile(b, v, "bench-seq-read-locked.db")
+	const sectors = 4
+	seedSectors(b, fcs, f, sectors)
+
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		b.Fatal(err)
+	}
+	// One warm-up read outside the timed loop: it pays the revalidating
+	// LIST that fills the cache once SHARED is held; every read after it
+	// is served entirely from memory.
+	buf := make([]byte, SectorSize)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		b.Fatal(err)
+	}
+
 	var calls int64
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
@@ -111,10 +148,14 @@ func BenchmarkSequentialWrite(b *testing.B) {
 // benchmark iteration is one full transaction; api-calls/op is the number of
 // Kubernetes API calls that transaction costs.
 //
-// The default 4 KiB page size keeps the whole database inside one 64 KiB
-// sector (asserted below), so this benchmark's api-calls/op stays directly
-// comparable with the pre-optimisation baseline; a 64 KiB-page workload like
-// main.go's is covered by TestSQLiteMultiSector64KiBPages.
+// It runs at 64 KiB pages — SQLite's largest page size, exactly one VFS
+// sector per page, and the configuration main.go and the cmd tools use — and
+// its ~200-byte rows push the transaction across several 64 KiB sectors
+// (asserted below), so the multi-sector write path is what gets measured.
+// The pre-optimisation code panicked the moment a database outgrew its
+// first sector, so this workload has no pre-optimisation baseline; the
+// one-sector numbers the previous 4 KiB-page version of this benchmark
+// produced are preserved in the module README.
 func BenchmarkSQLiteInsert1000Rows(b *testing.B) {
 	const rows = 1000
 	var calls int64
@@ -124,6 +165,12 @@ func BenchmarkSQLiteInsert1000Rows(b *testing.B) {
 		vfsName := registerUniqueVFS(b, v)
 		fileName := newSQLFileName()
 		db := openSQLDB(b, vfsName, fileName)
+		// 64 KiB pages, as main.go and the cmd tools use. page_size is only
+		// honoured while the database is still empty, so it must come
+		// before the first CREATE TABLE.
+		if _, err := db.Exec("PRAGMA page_size=65536"); err != nil {
+			b.Fatalf("PRAGMA page_size=65536: %v", err)
+		}
 		if _, err := db.Exec(`CREATE TABLE books (
 			id text NOT NULL PRIMARY KEY,
 			title text
@@ -142,7 +189,7 @@ func BenchmarkSQLiteInsert1000Rows(b *testing.B) {
 			b.Fatalf("Prepare: %v", err)
 		}
 		for r := 0; r < rows; r++ {
-			if _, err := stmt.Exec(fmt.Sprintf("r-%06d", r), "t"); err != nil {
+			if _, err := stmt.Exec(fmt.Sprintf("r-%06d", r), fmt.Sprintf("title %06d %0180d", r, r)); err != nil {
 				b.Fatalf("insert %d: %v", r, err)
 			}
 		}
@@ -159,8 +206,8 @@ func BenchmarkSQLiteInsert1000Rows(b *testing.B) {
 		if err != nil {
 			b.Fatalf("FileSize: %v", err)
 		}
-		if size > SectorSize {
-			b.Fatalf("database grew to %d bytes, past the one-sector cap (%d) this benchmark pins to stay comparable with the pre-optimisation baseline", size, SectorSize)
+		if size <= SectorSize {
+			b.Fatalf("database stayed at %d bytes: the transaction never left the first 64 KiB sector, so this benchmark would not span several sectors", size)
 		}
 		if err := db.Close(); err != nil {
 			b.Fatalf("db.Close: %v", err)

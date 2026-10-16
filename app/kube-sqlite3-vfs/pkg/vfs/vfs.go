@@ -181,11 +181,14 @@ type file struct {
 	// drops below SHARED (adoptLockState) and revalidated with one LIST by
 	// the first FileSize after SHARED is re-acquired.
 	//
-	// lockLevel/lockKnown: the lock level this process believes it holds.
+	// lockLevel/lockKnown: the lock level this process believes IT holds.
 	// sqlite asks Lock, Unlock and CheckReservedLock around every
 	// operation; the imported code GET the lock ConfigMap before each one.
-	// Until lockKnown is set (a file object created by NewFile rather than
-	// opened through the VFS) the ConfigMap is consulted as before.
+	// A file opened through the VFS starts at NONE and only ever records
+	// levels it wrote itself — the ConfigMap's stored level is never
+	// adopted as this file's own, because it may be another process's
+	// lock. A file object created with NewFile (the cmd tools) has no known
+	// local state and consults the ConfigMap per transition, as before.
 	//
 	// size/valid/sectors: the file size and sector contents last observed
 	// from the cluster, or written by this process, while the lock is held.
@@ -376,25 +379,25 @@ func (f *file) getCurrentLock() (sqlite3vfs.LockType, error) {
 	return lockToReturn, nil
 }
 
-// currentLockLevel returns this file's local view of the lock level,
-// consulting (and adopting) the lock ConfigMap only when nothing is known
-// locally yet — a file object created with NewFile rather than opened
-// through the VFS. Once the state is known it is trusted: this process
-// performed the transitions itself, and re-GETting the ConfigMap before
-// every Lock/Unlock — as the imported code did — is one of the
-// per-operation API calls this optimisation removes.
+// currentLockLevel returns the lock level to judge a transition against.
+// While this file's state is known locally — every file opened through the
+// VFS starts at NONE and records its own transitions — no API call is made:
+// re-GETting the ConfigMap before every Lock/Unlock, as the imported code
+// did, is one of the per-operation API calls this optimisation removes. A
+// file object created with NewFile (the cmd tools) has no local state and
+// consults the ConfigMap here, as before.
+//
+// The fetched level is deliberately NOT recorded as this file's own: it may
+// be another process's lock, and believing it ours is what let a newly
+// opened file skip its own transitions and clobber the cluster's level
+// under them. Local state is only ever written by adoptLockState, after
+// this process's own setLock succeeded.
 func (f *file) currentLockLevel() (sqlite3vfs.LockType, error) {
 	f.vfs.logger.Debugw("currentLockLevel")
 	if f.lockKnown {
 		return f.lockLevel, nil
 	}
-	level, err := f.getCurrentLock()
-	if err != nil {
-		return sqlite3vfs.LockNone, err
-	}
-	f.lockLevel = level
-	f.lockKnown = true
-	return level, nil
+	return f.getCurrentLock()
 }
 
 func (f *file) LockFileName() string {
@@ -416,6 +419,21 @@ func (f *file) generateSectorsLabels() {
 // possibly add the validation?
 func (f *file) setLock(lock sqlite3vfs.LockType) error {
 	f.vfs.logger.Debugw("setLock", "lock", lock)
+
+	// Any downgrade — Unlock and Close land here — invalidates the local
+	// view BEFORE the write is attempted, whatever the write returns. If
+	// the ConfigMap write fails transiently, sqlite largely ignores the
+	// unlock error and carries on, so the caches must already be gone by
+	// then: with the lock state unknown, the next Lock/Unlock/
+	// CheckReservedLock re-GETs the ConfigMap and the next FileSize pays
+	// its revalidating LIST, so writes another process made between our
+	// locks can never be masked by stale cached sectors. On success,
+	// adoptLockState below records the new level (dropping the caches
+	// again for sub-SHARED levels, a no-op by then).
+	if f.lockKnown && lock < f.lockLevel {
+		f.dropCaches()
+		f.lockKnown = false
+	}
 
 	LockfileLabels := make(map[string]string)
 	for k, v := range LockfileLabel {
@@ -446,17 +464,26 @@ func (f *file) setLock(lock sqlite3vfs.LockType) error {
 
 }
 
-// adoptLockState records a lock transition this process just made and drops
-// the sector/size caches when the lock falls below SHARED: from that moment
-// another process may modify the database, so everything cached under the
-// lock is stale until the next FileSize revalidates it after SHARED is
-// re-acquired.
+// dropCaches discards the cached file size and sector contents. Everything
+// cached is trusted only while this process holds a lock of SHARED or
+// better; from the moment that stops being true the cache may not match the
+// cluster, and the next FileSize revalidates it with one LIST after SHARED
+// is re-acquired.
+func (f *file) dropCaches() {
+	f.valid = false
+	f.sectors = nil
+}
+
+// adoptLockState records a lock transition this process just made, and
+// drops the sector/size caches when the lock falls below SHARED: from that
+// moment another process may modify the database, so everything cached
+// under the lock is stale until the next FileSize revalidates it after
+// SHARED is re-acquired.
 func (f *file) adoptLockState(lock sqlite3vfs.LockType) {
 	f.lockLevel = lock
 	f.lockKnown = true
 	if lock < sqlite3vfs.LockShared {
-		f.valid = false
-		f.sectors = nil
+		f.dropCaches()
 	}
 }
 
@@ -560,7 +587,7 @@ func (v *vfs) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sql
 		f := NewFile(name, v)
 
 		// Now check for lock file
-		lf, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Get(context.TODO(), f.LockFileName(), metav1.GetOptions{})
+		_, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Get(context.TODO(), f.LockFileName(), metav1.GetOptions{})
 		if kerrors.IsNotFound(err) {
 			err = f.setLock(sqlite3vfs.LockNone)
 			if err != nil {
@@ -569,11 +596,14 @@ func (v *vfs) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sql
 			}
 		} else if err != nil {
 			return f, flags, err
-		} else if level, ok := lockLevelFromString(lf.Data["lock"]); ok {
-			// Adopt the stored lock level as this file object's local view:
-			// it is exactly what the imported code's first getCurrentLock
-			// GET would have reported.
-			f.lockLevel = level
+		} else {
+			// Every opened file starts at NONE locally. The ConfigMap's
+			// stored level may be another process's lock, and adopting it
+			// made this file believe it held that lock: its Lock calls
+			// became no-ops and its Unlock wrote the level down under the
+			// other process. This object records only the transitions it
+			// performs itself, each one through the ConfigMap.
+			f.lockLevel = sqlite3vfs.LockNone
 			f.lockKnown = true
 		}
 

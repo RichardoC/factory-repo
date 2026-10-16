@@ -823,6 +823,216 @@ func TestCheckReservedLockSecondProcess(t *testing.T) {
 	}
 }
 
+// TestFailedUnlockInvalidatesCaches pins the failed-unlock fix: a transient
+// failure of the lock ConfigMap write on Unlock(NONE) must leave no valid
+// cache and no trusted lock level, because sqlite largely ignores unlock
+// errors and keeps going. The bug this replaces updated the lock state and
+// the caches only on write success, so after one failed unlock the next
+// Lock(SHARED) made no API call and served cached sectors and size while
+// another process had rewritten the database — wrong reads, and lost writes
+// once a partial-sector write built on the cached data.
+func TestFailedUnlockInvalidatesCaches(t *testing.T) {
+	v, fcs := newTestVFS(t)
+	fa := openTestFile(t, v, "stale.db")
+
+	old := make([]byte, 1000)
+	fillPattern(old)
+	mustWriteAt(t, fa, old, 0)
+	if err := fa.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("A Lock(Shared): %v", err)
+	}
+	got := make([]byte, 1000)
+	if n := mustReadAt(t, fa, got, 0); n != 1000 {
+		t.Fatalf("A warm-up read got %d bytes, want 1000", n)
+	}
+	if !fa.valid || len(fa.sectors) == 0 {
+		t.Fatal("setup: A caches are not warm after a read under SHARED")
+	}
+
+	// A's next unlock fails once, at the API layer, on the lock ConfigMap
+	// only (sector writes must still go through).
+	var failed int32
+	boom := errors.New("boom: transient API error")
+	fcs.PrependReactor("update", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		ua, isUpdate := action.(k8stesting.UpdateAction)
+		if !isUpdate {
+			return false, nil, nil
+		}
+		cm, ok := ua.GetObject().(*v1.ConfigMap)
+		if !ok || cm.Name != fa.LockFileName() {
+			return false, nil, nil
+		}
+		if atomic.AddInt32(&failed, 1) > 1 {
+			return false, nil, nil
+		}
+		return true, nil, boom
+	})
+	if err := fa.Unlock(sqlite3vfs.LockNone); err == nil {
+		t.Fatal("Unlock(None) with a failing ConfigMap write = nil, want the error")
+	}
+	if fa.valid || fa.sectors != nil || fa.lockKnown {
+		t.Errorf("failed unlock left state known/caches valid: valid=%v, sectors=%v, lockKnown=%v; caches must be dropped and the lock state unknown whatever the write returns", fa.valid, fa.sectors, fa.lockKnown)
+	}
+
+	// B rewrites the database while A no longer trusts anything of its own:
+	// new bytes, bigger file.
+	fb := openTestFile(t, v, "stale.db")
+	latest := make([]byte, 2000)
+	fillPatternAlt(latest)
+	mustWriteAt(t, fb, latest, 0)
+
+	// A re-locks and reads: it must see B's data and size, and re-locking
+	// must cost API calls — the bug served all of it from the stale cache
+	// with zero calls.
+	fcs.ClearActions()
+	if err := fa.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("A re-Lock(Shared): %v", err)
+	}
+	size, err := fa.FileSize()
+	if err != nil {
+		t.Fatalf("A FileSize after re-lock: %v", err)
+	}
+	if size != int64(len(latest)) {
+		t.Errorf("A FileSize after re-lock = %d, want %d (B size)", size, len(latest))
+	}
+	got = make([]byte, len(latest))
+	if n := mustReadAt(t, fa, got, 0); n != len(latest) {
+		t.Fatalf("A read %d bytes after re-lock, want %d", n, len(latest))
+	}
+	if !bytes.Equal(got, latest) {
+		t.Error("A served stale bytes after a failed unlock: the cache survived an unlock whose write failed")
+	}
+	if calls := len(fcs.Actions()); calls == 0 {
+		t.Error("A re-lock and read made 0 API calls: the failed unlock left the cache valid")
+	}
+}
+
+// TestOpenDoesNotAdoptAnotherProcessLock pins the no-adoption fix: the lock
+// level stored in the ConfigMap may be another process's, so a file opened
+// through the VFS must start at NONE locally and take every one of its own
+// transitions through the ConfigMap. The bug this replaces copied the
+// stored level into the new file object's lockLevel, so a newly opened A
+// believed it held B's EXCLUSIVE: its CheckReservedLock answered from that
+// belief, its Lock(SHARED) made no call, its Unlock(NONE) wrote NONE while
+// B still held EXCLUSIVE, and its later Lock(RESERVED)/Lock(EXCLUSIVE) were
+// silent no-ops that let it write while the cluster showed NONE.
+func TestOpenDoesNotAdoptAnotherProcessLock(t *testing.T) {
+	v, fcs := newTestVFS(t)
+	fb := openTestFile(t, v, "held.db")
+	if err := fb.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("B Lock(Shared): %v", err)
+	}
+	if err := fb.Lock(sqlite3vfs.LockExclusive); err != nil {
+		t.Fatalf("B Lock(Exclusive): %v", err)
+	}
+	if got := lockState(t, fcs, fb); got != sqlite3vfs.LockExclusive.String() {
+		t.Fatalf("setup: stored lock = %q, want exclusive", got)
+	}
+
+	// A opens while B holds EXCLUSIVE.
+	fa := openTestFile(t, v, "held.db")
+	if !fa.lockKnown || fa.lockLevel != sqlite3vfs.LockNone {
+		t.Errorf("opened file lock state = (known=%v, level=%v), want (true, NONE): the stored level must never be adopted", fa.lockKnown, fa.lockLevel)
+	}
+
+	// A must still learn, from the cluster, that a lock is held.
+	if reserved, err := fa.CheckReservedLock(); err != nil || !reserved {
+		t.Errorf("A CheckReservedLock while B holds Exclusive = (%v, %v), want (true, nil)", reserved, err)
+	}
+
+	// A holds nothing, so unlocking to NONE is a no-op that must not write:
+	// the stored level stays B's EXCLUSIVE.
+	fcs.ClearActions()
+	if err := fa.Unlock(sqlite3vfs.LockNone); err != nil {
+		t.Fatalf("A Unlock(None): %v", err)
+	}
+	if calls := len(fcs.Actions()); calls != 0 {
+		t.Errorf("A no-op Unlock(None) made %d API calls, want 0", calls)
+	}
+	if got := lockState(t, fcs, fa); got != sqlite3vfs.LockExclusive.String() {
+		t.Errorf("A Unlock(None) changed the stored lock to %q; B still holds Exclusive", got)
+	}
+
+	// From the un-adopted NONE, climbing straight to RESERVED or EXCLUSIVE
+	// is an error, not a silent no-op: A cannot believe it already holds a
+	// higher lock than it ever asked for.
+	if err := fa.Lock(sqlite3vfs.LockReserved); err == nil {
+		t.Error("A Lock(Reserved) from the un-adopted None = nil, want an error")
+	}
+	if err := fa.Lock(sqlite3vfs.LockExclusive); err == nil {
+		t.Error("A Lock(Exclusive) from the un-adopted None = nil, want an error")
+	}
+	if got := lockState(t, fcs, fa); got != sqlite3vfs.LockExclusive.String() {
+		t.Errorf("rejected lock requests changed the stored lock to %q, want exclusive", got)
+	}
+}
+
+// TestTwoVFSInstancesSeeEachOthersWritesAndTruncate covers the cross-
+// instance handoff the sector cache exists to serve: two VFS instances over
+// one fake clientset — two processes. A reads under SHARED and lets the
+// lock go; B, seeing none of the state A warmed, rewrites the file larger
+// and then truncates it; A re-locks and must see B's bytes and B's size,
+// revalidated by FileSize's LIST rather than anything cached under A's
+// previous lock. (The lock ConfigMap provides no real mutual exclusion —
+// see the README — so B takes no lock here; that does not matter for the
+// data and size visibility this test pins.)
+func TestTwoVFSInstancesSeeEachOthersWritesAndTruncate(t *testing.T) {
+	_, fcs := newTestVFS(t)
+	va := NewVFS(fcs, testNamespace, zap.NewNop().Sugar(), 3)
+	vb := NewVFS(fcs, testNamespace, zap.NewNop().Sugar(), 3)
+
+	fa := openTestFile(t, va, "shared-file.db")
+	first := make([]byte, 3000)
+	fillPattern(first)
+	mustWriteAt(t, fa, first, 0)
+
+	// A reads under a held SHARED lock — warming every cache it has — then
+	// lets the lock go.
+	if err := fa.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("A Lock(Shared): %v", err)
+	}
+	got := make([]byte, len(first))
+	if n := mustReadAt(t, fa, got, 0); n != len(first) {
+		t.Fatalf("A read %d bytes, want %d", n, len(first))
+	}
+	if err := fa.Unlock(sqlite3vfs.LockNone); err != nil {
+		t.Fatalf("A Unlock(None): %v", err)
+	}
+
+	// B writes new bytes — the file grows across two sectors — and then
+	// truncates the file back down.
+	fb := openTestFile(t, vb, "shared-file.db")
+	second := make([]byte, 2*int(sectorSize)+100)
+	fillPatternAlt(second)
+	mustWriteAt(t, fb, second, 0)
+	if err := fb.Truncate(45000); err != nil {
+		t.Fatalf("B Truncate(45000): %v", err)
+	}
+
+	// A re-locks: its caches were dropped at Unlock, so it must revalidate
+	// and see exactly the file B left behind.
+	if err := fa.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("A re-Lock(Shared): %v", err)
+	}
+	size, err := fa.FileSize()
+	if err != nil {
+		t.Fatalf("A FileSize after B rewrite: %v", err)
+	}
+	if size != 45000 {
+		t.Errorf("A FileSize = %d, want 45000 (B truncated size)", size)
+	}
+	got = make([]byte, 45000)
+	if n := mustReadAt(t, fa, got, 0); n != 45000 {
+		t.Fatalf("A read %d bytes, want 45000", n)
+	}
+	if !bytes.Equal(got, second[:45000]) {
+		t.Error("A sees bytes other than B truncated data")
+	}
+	if sectors := listSectorConfigMaps(t, fcs, fa); len(sectors) != 1 {
+		t.Errorf("%d sector configmaps remain after B write+truncate, want 1", len(sectors))
+	}
+}
+
 // --- Through database/sql ---
 //
 // TestSQLiteThroughDatabaseSQL keeps the default 4 KiB page size and a small
