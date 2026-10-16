@@ -46,9 +46,12 @@ more will be added.
   directory as its boundary: a change for one app shouldn't touch another
   app's files unless the task says so.
 - `.github/` holds the CodeAF harness and CI. CodeAF may change it when a task asks
-  for that, but such a patch is only published after a maintainer approves the
-  `codeaf-harness` environment deployment, and the harness changes take effect
-  only once merged.
+  for that.
+  - A change only under `.github/codeaf/` (the harness program and its
+    config) is published like app code. It takes effect only once merged.
+  - Any other change under `.github/` (workflows, `CODEOWNERS`) is published
+    only after a maintainer approves the `codeaf-harness` environment
+    deployment.
 
 ## Security rules for changing the harness
 
@@ -114,11 +117,18 @@ hostile, whether through prompt injection or a compromised model.
   starts from that commit only after the API confirms the default branch
   contains it), applies it with
   `git apply`, which runs nothing and refuses `.git` paths, then refuses the
-  result if any staged path is under `.github/` unless a maintainer approved
-  it. Keep it that way: never run, `source` or `eval` anything that came from
-  `run`.
-- A patch that touches `.github/` is a patch that can change what CI runs with
-  secrets. `publish` runs it in the `codeaf-harness` environment, which must
+  result if any staged path (rename detection off) is under `.github/` but
+  outside `.github/codeaf/`, unless a maintainer approved it. Keep it that
+  way: never run, `source` or `eval` anything that came from `run`.
+- `.github/codeaf/` may be published without approval only because every job
+  that holds a secret or a write token builds the harness from the default
+  branch. On a branch it is only tested by CI, read-only and without secrets.
+  Keep both true. Never make a workflow build, run or read config from
+  `.github/codeaf/` on a non-default ref in a job with secrets or write
+  access.
+- A patch that touches `.github/` outside `.github/codeaf/` is a patch that
+  can change what CI runs with secrets. `publish` runs it in the
+  `codeaf-harness` environment, which must
   require a maintainer's review, and then checks through the API that someone
   with admin or maintain access approved this run, since GitHub silently
   creates a missing environment with no reviewers. Only then is it applied and
@@ -161,6 +171,6 @@ hostile, whether through prompt injection or a compromised model.
   `/codeaf` commands from OWNER/MEMBER/COLLABORATOR only. Pass issue and PR
   text to tools as data (files, environment variables), never into `${{ }}`
   expressions inside `run:` scripts.
-- Pin every action to a full commit SHA. CodeAF's `.github/` changes are
-  published only after a maintainer's approval; never add a path that
-  publishes them without one.
+- Pin every action to a full commit SHA. CodeAF's changes to `.github/`
+  outside `.github/codeaf/` are published only after a maintainer's approval;
+  never add a path that publishes them without one.
