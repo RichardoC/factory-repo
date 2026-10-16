@@ -34,8 +34,10 @@ more will be added.
   `go.mod` (and its own Go version), README and licence. Treat an app's
   directory as its boundary: a change for one app shouldn't touch another
   app's files unless the task says so.
-- `.github/` holds the CodeAF harness and CI. Agents running under the CodeAF workflow
-  can't change it: edits there are discarded.
+- `.github/` holds the CodeAF harness and CI. CodeAF may change it when a task asks
+  for that, but such a patch is only published after a maintainer approves the
+  `codeaf-harness` environment deployment, and the harness changes take effect
+  only once merged.
 
 ## Security rules for changing the harness
 
@@ -91,8 +93,19 @@ hostile, whether through prompt injection or a compromised model.
 - `publish` treats the run job's outputs and artifacts as untrusted data. It
   checks the patch's size and that its base commit matches, applies it with
   `git apply`, which runs nothing and refuses `.git` paths, then refuses the
-  result if any staged path is under `.github/`. Keep it that way: never run,
-  `source` or `eval` anything that came from `run`.
+  result if any staged path is under `.github/` unless a maintainer approved
+  it. Keep it that way: never run, `source` or `eval` anything that came from
+  `run`.
+- A patch that touches `.github/` is a patch that can change what CI runs with
+  secrets. `publish` runs it in the `codeaf-harness` environment, which must
+  require a maintainer's review, and then checks through the API that someone
+  with admin or maintain access approved this run, since GitHub silently
+  creates a missing environment with no reviewers. Only then is it applied and
+  pushed. The `run` job's `touches_harness` output only routes the job; never
+  treat its absence as proof that a patch leaves `.github/` alone.
+- `CODEAF_HARNESS_TOKEN` (needed because `GITHUB_TOKEN` can't push workflow
+  changes) lives only as a secret of the `codeaf-harness` environment, and is
+  read only after that approval check.
 
 ### Artifacts
 
@@ -122,5 +135,6 @@ hostile, whether through prompt injection or a compromised model.
   `/codeaf` commands from OWNER/MEMBER/COLLABORATOR only. Pass issue and PR
   text to tools as data (files, environment variables), never into `${{ }}`
   expressions inside `run:` scripts.
-- Pin every action to a full commit SHA. Keep `.github/` changes out of
-  CodeAF's commits; the workflow discards them.
+- Pin every action to a full commit SHA. CodeAF's `.github/` changes are
+  published only after a maintainer's approval; never add a path that
+  publishes them without one.

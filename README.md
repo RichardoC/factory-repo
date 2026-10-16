@@ -67,7 +67,21 @@ Two workflow artifacts are uploaded:
 
 - The agent has a shell on the runner, so treat it as having the same access as any
   CI job. It gets no GitHub token: the checkout does not keep credentials, and the
-  workflow pushes after CodeAF exits. Edits it makes under `.github/` are discarded.
+  workflow pushes after CodeAF exits.
+- CodeAF may change `.github/` (the harness, CI and workflows) when a task asks
+  for it. Because such a change controls what CI runs with secrets, `publish`
+  then runs in the **`codeaf-harness`** environment and waits for a maintainer
+  to approve it in the run's page (GitHub emails the reviewers) before anything
+  is pushed. It also checks the approval through the API, so a misconfigured
+  environment refuses the patch rather than publishing it. One-off setup:
+  - *Settings → Environments → New environment* `codeaf-harness`:
+    - **Required reviewers**: yourself. Leave *Prevent self-review* off, since
+      the run is started by you.
+    - **Deployment branches**: `main` only.
+  - Add an environment secret `CODEAF_HARNESS_TOKEN`: a fine-grained personal
+    access token for this repository only, with *Contents* and *Workflows*
+    read/write. `GITHUB_TOKEN` can't push changes to `.github/workflows/`, so
+    without it only changes elsewhere under `.github/` can be published.
 - CodeAF runs in a job with no write access (`run`). A separate job on a fresh
   runner (`publish`) checks and applies the resulting patch, then commits,
   pushes, opens the PR and posts the report. Nothing CodeAF could have tampered
