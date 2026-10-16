@@ -54,7 +54,7 @@ Three workflow artifacts are uploaded, none of them encrypted:
   - adds `usage.cost` to every response, which is where CodeAF's spend accounting
     reads cost from;
   - refuses any other model, and returns HTTP 402 once the run reaches **$5** or the
-    UTC day reaches **$20**. The day's total comes from the shared state.
+    UTC day reaches **$40**. The day's total comes from the shared state.
 
   The synthetic.new key (`SYNTHETIC_API_KEY` secret) is held only by the proxy. It is
   passed in on stdin, not through the environment.
