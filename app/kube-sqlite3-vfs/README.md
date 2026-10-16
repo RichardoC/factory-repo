@@ -3,8 +3,11 @@ sqlite3 using kubernetes as the backing storage
 
 ## Requirements and building
 
-The module targets **Go 1.27** (`go 1.27` in `go.mod`; CI uses the version from
-`go.mod`, so no explicit toolchain line is needed). Building `main` and the
+The module requires **Go 1.27.2 or later** (`go 1.27.2` in `go.mod`; CI uses
+the version from `go.mod`, so no explicit toolchain line is needed. Toolchains
+older than 1.27.2 are refused: their standard library carries
+vulnerabilities govulncheck reports as called, all fixed in 1.27.2).
+Building `main` and the
 `cmd/` tools needs a **cgo toolchain** and a **C compiler**: `mattn/go-sqlite3`
 is imported for the `sqlite3_*` symbols the `sqlite3vfs` C shim links against.
 
@@ -99,19 +102,22 @@ The insert benchmark now runs at 64 KiB pages (the `main.go`/cmd-tools configura
 
 The module moved from `go 1.19` to `go 1.27` and its dependencies from their
 2023 versions, among them several `golang.org/x/*` releases with published
-vulnerabilities. `govulncheck ./...` now reports no vulnerabilities in this
-module.
+vulnerabilities. On go1.27.0 govulncheck still reported eight called
+standard-library vulnerabilities (net/http, http2, crypto/tls,
+mime/multipart), all fixed in go1.27.2, so the issue #28 follow-up raised
+the module's floor to `go 1.27.2`. `govulncheck ./...` now reports no
+vulnerabilities in this module.
 
 | Module | Old | New |
 | ------ | --- | --- |
-| Go (language/module version) | 1.19 | 1.27 |
-| `k8s.io/api` | v0.26.0 | v0.37.1 |
-| `k8s.io/apimachinery` | v0.26.0 | v0.37.1 |
-| `k8s.io/client-go` | v0.26.0 | v0.37.1 |
+| Go (language/module version) | 1.19 | 1.27.2 |
+| `k8s.io/api` | v0.26.3 | v0.37.1 |
+| `k8s.io/apimachinery` | v0.26.3 | v0.37.1 |
+| `k8s.io/client-go` | v0.26.3 | v0.37.1 |
 | `github.com/mattn/go-sqlite3` | v1.14.16 | v1.14.52 |
 | `github.com/google/uuid` | v1.3.0 | v1.6.0 |
-| `github.com/thought-machine/go-flags` | v1.5.0 | v1.7.0 |
-| `github.com/psanford/sqlite3vfs` | v0.0.0-20260428… | v0.0.0-20260519004904-f9180fa2acc9 |
+| `github.com/thought-machine/go-flags` | v1.6.2 | v1.7.0 |
+| `github.com/psanford/sqlite3vfs` | v0.0.0-20230408… | v0.0.0-20260519004904-f9180fa2acc9 |
 | `go.uber.org/zap` | v1.24.0 | **removed** — replaced by `log/slog` |
 | `golang.org/x/net`, `.../sys`, `.../text`, `.../time`, `.../term`, `.../oauth2` and the rest of the indirect set | 2023 releases | current releases (`golang.org/x/net` v0.61.0, `golang.org/x/sys` v0.49.0, …) |
 
@@ -119,6 +125,27 @@ module.
 they must. Everything else is at `latest`; `go mod tidy` is clean. Nothing
 in the direct set had to be held back — the only dependency that went away is
 zap.
+
+### Follow-up (issue #28)
+
+* **Go 1.27.2 floor.** `go.mod` requires `go 1.27.2` (see above:
+  eight called standard-library vulnerabilities on 1.27.0, all fixed in
+  1.27.2). `govulncheck ./...` reports nothing reachable.
+* **The tools exit non-zero on failure.** `db-download` used to log failed
+  reads, writes, size checks and byte comparisons and still exit 0 on a
+  half-failed transfer (and ignored the `Seek` error between them), and
+  `main` logged a failed insert and committed the rest of the transaction
+  anyway. Every failure now returns up to `main`, which prints it to stderr
+  and exits 1 — and because nothing calls `os.Exit` mid-run any more, the
+  deferred `db.Close`/`f.Close` calls actually run on the error paths.
+* **`file-create` opened the wrong file.** It opened the literal path `fn`
+  instead of the variable `fn` holding the file's name, so the local half of
+  its differential comparison always went to a stray file called `fn`.
+* **Tests.** `main`, `db-upload` and `db-download` are covered by tests
+  driven with the fake clientset (`go test -race ./...`): db-upload's stored
+  sector bytes, db-download's transfer and its size/byte verification, and
+  the failure paths — missing file, failed sector write, failed insert,
+  failed commit, size mismatch, byte mismatch.
 
 ### Modernisation (behaviour unchanged except where noted)
 

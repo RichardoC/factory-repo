@@ -33,14 +33,6 @@ type Options struct {
 	Retries    int    `long:"retries" description:"Number of retries for API calls" default:"1"`
 }
 
-// fatal prints err to stderr and exits non-zero. The command line tools
-// never panic on ordinary errors: a panic unwinds through the cgo sqlite
-// boundary and kills the process without a usable message.
-func fatal(err error) {
-	fmt.Fprintln(os.Stderr, err)
-	os.Exit(1)
-}
-
 // newLogger returns the process logger: debug-level text logging with -v,
 // info-level JSON logging without.
 func newLogger(verbose bool) *slog.Logger {
@@ -54,7 +46,8 @@ func main() {
 	var opts Options
 	parser := flags.NewParser(&opts, flags.Default)
 	if _, err := parser.Parse(); err != nil {
-		fatal(err)
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 
 	logger := newLogger(opts.Verbose)
@@ -62,9 +55,34 @@ func main() {
 
 	logger.Info("Got config", "opts", opts)
 
+	// The only two os.Exit calls in the process are the flag-parse failure
+	// above and this one, both before or after run has returned: the old
+	// fatal() exited from the middle of the work, skipping the deferred
+	// f.Close. A failure now unwinds through run's defers and leaves the
+	// exit code to main.
+	if err := run(opts, logger); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+// run does the command's work and returns the first failure instead of
+// exiting, so main can print it and exit non-zero and the deferred closes
+// in run and runWithClient run on every path out.
+func run(opts Options, logger *slog.Logger) error {
+	clientset, err := newClientset(opts.KubeConfig)
+	if err != nil {
+		return err
+	}
+	return runWithClient(clientset, opts, logger)
+}
+
+// newClientset builds a clientset from --kubeconfig, or from the current
+// context in the kubeconfig under the user's home directory.
+func newClientset(kubeconfigFlag string) (kubernetes.Interface, error) {
 	var kubeconfig string
-	if opts.KubeConfig != "" {
-		kubeconfig = opts.KubeConfig
+	if kubeconfigFlag != "" {
+		kubeconfig = kubeconfigFlag
 	} else if home := homedir.HomeDir(); home != "" {
 		kubeconfig = filepath.Join(home, ".kube", "config")
 	}
@@ -72,26 +90,28 @@ func main() {
 	// use the current context in kubeconfig
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
-		fatal(err)
+		return nil, err
 	}
 
 	// create the clientset
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		fatal(err)
-	}
+	return kubernetes.NewForConfig(config)
+}
 
+// runWithClient holds the command's body. It takes a kubernetes.Interface
+// so the tests can drive it — the error paths included — with the fake
+// clientset, and it returns the first failure to its caller.
+func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Logger) error {
 	vfsN := vfs.NewVFS(context.Background(), clientset, "test", logger, opts.Retries)
 
 	fn := "file2.db"
 
 	if _, _, err := vfsN.Open(fn, sqlite3vfs.OpenFlag(0)); err != nil {
-		fatal(err)
+		return fmt.Errorf("open %q in the cluster: %w", fn, err)
 	}
 
 	f, err := os.Open(fn)
 	if err != nil {
-		fatal(err)
+		return fmt.Errorf("open local file: %w", err)
 	}
 	defer f.Close()
 
@@ -106,13 +126,14 @@ func main() {
 			break
 		}
 		if err != nil && !errors.Is(err, io.EOF) {
-			fatal(err)
+			return fmt.Errorf("read %s: %w", fn, err)
 		}
 		logger.Info("Writing sector", "sector", index)
 		sect := &vfs.Sector{Index: index, Data: buf[:n]}
 		if err := fileA.WriteSector(sect); err != nil {
-			fatal(err)
+			return fmt.Errorf("write sector %d: %w", index, err)
 		}
 		index++
 	}
+	return nil
 }
