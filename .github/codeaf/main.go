@@ -698,13 +698,33 @@ type Decision struct {
 
 func skip(reason string) Decision { return Decision{Reason: reason} }
 
+// runID reads GITHUB_RUN_ID, which names this workflow run: issue runs use it
+// as a branch suffix so every run gets its own branch, and the report links to
+// it. A missing or non-numeric run id fails the gate.
+func runID() (string, error) {
+	id := os.Getenv("GITHUB_RUN_ID")
+	if id == "" {
+		return "", errors.New("GITHUB_RUN_ID is empty")
+	}
+	for _, r := range id {
+		if r < '0' || r > '9' {
+			return "", fmt.Errorf("GITHUB_RUN_ID %q is not a run id of digits", id)
+		}
+	}
+	return id, nil
+}
+
 // Decide applies the trust rules to one event. lookupPR fetches a PR when the
 // event only carries its issue form; it is only called once the event has
 // passed every check that needs no network.
 func Decide(name string, ev event, labelName string, lookupPR func(int) (item, error)) (Decision, error) {
-	issueRun := func(i item, reason string) Decision {
+	issueRun := func(i item, reason string) (Decision, error) {
+		id, err := runID()
+		if err != nil {
+			return Decision{}, err
+		}
 		return Decision{Run: true, Reason: reason, Mode: "issue", Number: i.Number,
-			Branch: fmt.Sprintf("codeaf/issue-%d", i.Number), Base: ev.Repository.DefaultBranch}
+			Branch: fmt.Sprintf("codeaf/issue-%d-%s", i.Number, id), Base: ev.Repository.DefaultBranch}, nil
 	}
 	var target *item
 	var trigger *comment
@@ -717,7 +737,7 @@ func Decide(name string, ev event, labelName string, lookupPR func(int) (item, e
 		if len(ev.Issue.PullRequest) > 0 {
 			return skip("labelled a PR; PRs act on " + command + " commands"), nil
 		}
-		return issueRun(*ev.Issue, "issue labelled"), nil
+		return issueRun(*ev.Issue, "issue labelled")
 	case "issue_comment":
 		target, trigger = ev.Issue, ev.Comment
 		if trigger != nil {
@@ -747,7 +767,7 @@ func Decide(name string, ev event, labelName string, lookupPR func(int) (item, e
 		return skip("bot comment"), nil
 	}
 	if name == "issue_comment" && len(target.PullRequest) == 0 {
-		return issueRun(*target, "command on issue"), nil
+		return issueRun(*target, "command on issue")
 	}
 	pr, err := lookupPR(target.Number)
 	if err != nil {
@@ -766,6 +786,10 @@ func Decide(name string, ev event, labelName string, lookupPR func(int) (item, e
 func runGate() error {
 	ev, err := readEvent()
 	if err != nil {
+		return err
+	}
+	// GITHUB_RUN_ID names this run; refuse to go on without a valid one.
+	if _, err := runID(); err != nil {
 		return err
 	}
 	gh := newGitHub()

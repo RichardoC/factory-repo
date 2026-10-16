@@ -13,10 +13,10 @@ It is set up as a monorepo:
 
 | You do | CodeAF does |
 |---|---|
-| Add the **`codeaf`** label to an issue | Works the issue on branch `codeaf/issue-N` and opens a PR (labelled `codeaf`) |
+| Add the **`codeaf`** label to an issue | Works the issue on a new branch `codeaf/issue-N-<run id>` cut from the default branch and opens its own PR (labelled `codeaf`), so re-running never collides with an earlier run |
 | Comment `/codeaf <instructions>` on a `codeaf`-labelled PR | Continues on the PR's branch with your instructions, the review comments and the conversation |
 | Submit a **Request changes** review on a `codeaf`-labelled PR | Same as above, using the review as the instructions |
-| Comment `/codeaf <instructions>` on a `codeaf`-labelled issue | Re-runs the issue (on its existing branch if there is one) |
+| Comment `/codeaf <instructions>` on a `codeaf`-labelled issue | Re-runs the issue on a new branch and opens a new PR; earlier runs' branches and PRs are left alone |
 
 Nothing else triggers it. Only people with triage access can add labels, and `/codeaf`
 commands are obeyed only from repository owners, members and collaborators, so

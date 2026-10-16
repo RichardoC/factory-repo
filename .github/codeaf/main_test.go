@@ -203,6 +203,7 @@ func TestProxyEndToEnd(t *testing.T) {
 
 func TestDecide(t *testing.T) {
 	t.Setenv("GITHUB_REPOSITORY", "RichardoC/factory-repo")
+	t.Setenv("GITHUB_RUN_ID", "42")
 	labelled := []label{{Name: "codeaf"}}
 	owner := &comment{Body: "/codeaf go", AuthorAssociation: "OWNER", User: user{Login: "RichardoC", Type: "User"}}
 	prMarker := json.RawMessage(`{"url":"x"}`)
@@ -233,7 +234,7 @@ func TestDecide(t *testing.T) {
 		mode   string
 		branch string
 	}{
-		{"issue labelled", "issues", with(func(e *event) { e.Label = &label{Name: "codeaf"}; e.Issue = &item{Number: 3, Labels: labelled} }), noLookup, true, "issue", "codeaf/issue-3"},
+		{"issue labelled", "issues", with(func(e *event) { e.Label = &label{Name: "codeaf"}; e.Issue = &item{Number: 3, Labels: labelled} }), noLookup, true, "issue", "codeaf/issue-3-42"},
 		{"other label", "issues", with(func(e *event) { e.Label = &label{Name: "bug"}; e.Issue = &item{Number: 3} }), noLookup, false, "", ""},
 		{"label on a PR", "issues", with(func(e *event) {
 			e.Label = &label{Name: "codeaf"}
@@ -248,7 +249,7 @@ func TestDecide(t *testing.T) {
 			e.Issue = &item{Number: 3, Labels: labelled}
 			e.Comment = &comment{Body: "looks good", AuthorAssociation: "OWNER", User: user{Type: "User"}}
 		}), noLookup, false, "", ""},
-		{"command on issue", "issue_comment", with(func(e *event) { e.Issue = &item{Number: 3, Labels: labelled}; e.Comment = owner }), noLookup, true, "issue", "codeaf/issue-3"},
+		{"command on issue", "issue_comment", with(func(e *event) { e.Issue = &item{Number: 3, Labels: labelled}; e.Comment = owner }), noLookup, true, "issue", "codeaf/issue-3-42"},
 		{"command on PR", "issue_comment", with(func(e *event) {
 			e.Issue = &item{Number: 7, Labels: labelled, PullRequest: prMarker}
 			e.Comment = owner
@@ -292,6 +293,36 @@ func TestDecide(t *testing.T) {
 				t.Fatalf("Decide = %+v", got)
 			}
 		})
+	}
+}
+
+// TestRunID pins the run-id validation behind the issue branch name.
+func TestRunID(t *testing.T) {
+	for _, bad := range []string{"", "abc", "12a", " 42", "-1"} {
+		t.Setenv("GITHUB_RUN_ID", bad)
+		if _, err := runID(); err == nil {
+			t.Errorf("runID accepted %q", bad)
+		}
+	}
+	t.Setenv("GITHUB_RUN_ID", "42")
+	if id, err := runID(); err != nil || id != "42" {
+		t.Errorf("runID(42) = %q, %v", id, err)
+	}
+}
+
+func TestDecideRefusesABadRunID(t *testing.T) {
+	t.Setenv("GITHUB_REPOSITORY", "RichardoC/factory-repo")
+	t.Setenv("GITHUB_RUN_ID", "nope")
+	base := event{}
+	base.Repository.DefaultBranch = "main"
+	ev := base
+	ev.Label = &label{Name: "codeaf"}
+	ev.Issue = &item{Number: 3, Labels: []label{{Name: "codeaf"}}}
+	if _, err := Decide("issues", ev, "codeaf", func(int) (item, error) {
+		t.Fatal("unexpected PR lookup")
+		return item{}, nil
+	}); err == nil {
+		t.Fatal("Decide accepted a non-numeric GITHUB_RUN_ID")
 	}
 }
 
