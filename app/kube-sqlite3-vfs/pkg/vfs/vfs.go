@@ -29,13 +29,13 @@ var (
 )
 
 type vfs struct {
-	kc        *kubernetes.Clientset
+	kc        kubernetes.Interface
 	logger    *zap.SugaredLogger
 	retries   int
 	namespace string
 }
 
-func NewVFS(kc *kubernetes.Clientset, namespace string, logger *zap.SugaredLogger, retries int) *vfs {
+func NewVFS(kc kubernetes.Interface, namespace string, logger *zap.SugaredLogger, retries int) *vfs {
 	return &vfs{kc: kc, logger: logger, retries: retries, namespace: namespace}
 }
 
@@ -64,50 +64,137 @@ func (f *file) Truncate(size int64) error {
 		return nil
 	}
 
-	lastRemainingSector := f.sectorForPos(size)
-
-	sect, err := f.getSector(lastRemainingSector)
-	if err != nil {
-		return err
+	// The last surviving byte is at size-1; the sector holding it may need
+	// shortening. (The imported code used sectorForPos(size), which for a
+	// sector-aligned size points one sector PAST the surviving data.)
+	// Truncating to 0 leaves no surviving byte at all: every sector goes.
+	lastRemainingSector := int64(-1)
+	if size > 0 {
+		lastRemainingSector = f.sectorForPos(size - 1)
 	}
 
-	sect.Data = sect.Data[:size%SectorSize]
-
-	f.WriteSector(sect)
+	if lastRemainingSector >= 0 && size%SectorSize != 0 {
+		sect, err := f.getSector(lastRemainingSector)
+		if err != nil && err != errSectorNotFound {
+			return err
+		}
+		if err == nil {
+			keep := size % SectorSize
+			if int64(len(sect.Data)) > keep {
+				sect.Data = sect.Data[:keep]
+			} else if int64(len(sect.Data)) < keep {
+				// Inconsistent state (the sector holds less than the file
+				// size claimed): zero-pad so the kept prefix has room.
+				padded := make([]byte, keep)
+				copy(padded, sect.Data)
+				sect.Data = padded
+			}
+			// BUG FIX (issue #8): the imported code ignored this error and
+			// carried on deleting sectors, silently losing the shortened
+			// sector's data.
+			if err := f.writeSectorOnce(sect.Index, sect.Data, true); err != nil {
+				return err
+			}
+			if f.valid {
+				f.cacheSector(sect.Index, sect.Data)
+			}
+		}
+		// errSectorNotFound: the sector holding the new last byte does not
+		// exist (a hole in a sparse file), so there is nothing to shorten.
+	}
 
 	lastSector := f.sectorForPos(fileSize)
 
-	for sectToDelete := lastRemainingSector; sectToDelete <= lastSector; sectToDelete += 1 {
+	// BUG FIX (issue #8): the delete loop used to START at
+	// lastRemainingSector, deleting the sector that holds the kept prefix
+	// (and, when fileSize was sector-aligned, running past the last
+	// existing sector). It must start after it.
+	for sectToDelete := lastRemainingSector + 1; sectToDelete <= lastSector; sectToDelete += 1 {
 		err := f.deleteSector(sectToDelete)
-		if err != nil {
+		if err != nil && !kerrors.IsNotFound(err) {
 			return err
 		}
+		if f.valid {
+			delete(f.sectors, sectToDelete)
+		}
+	}
+
+	if f.valid {
+		f.size = size
 	}
 
 	return nil
 }
 
+// FileSize returns the size of the file. While the cache is valid (a lock
+// of SHARED or better is held) this is O(1): the size is served from memory,
+// having been observed from the cluster — or written by this process — since
+// the lock was acquired. Otherwise it costs one LIST of the file's sector
+// ConfigMaps; the imported version LISTed and then GET the last sector on
+// EVERY call, including once per read.
+//
+// When the lock is held, that same LIST response warms the sector cache:
+// this is the revalidation required after (re)acquiring SHARED, because
+// another process may have modified the database between our locks.
 func (f *file) FileSize() (int64, error) {
 	f.vfs.logger.Debugw("FileSize", "f", f)
-	lastcm, err := f.getLastSector()
+	if f.valid {
+		return f.size, nil
+	}
+	cms, err := f.listSectorConfigMaps()
 	if err != nil {
 		f.vfs.logger.Error(err)
 
 		return 0, err
 	}
-	// Could have an off by one error
-	size := lastcm.Index*f.SectorSize() + int64(len(lastcm.Data))
+	size := f.sizeFromSectorList(cms)
+	if f.lockKnown && f.lockLevel >= sqlite3vfs.LockShared {
+		f.size = size
+		f.valid = true
+		f.sectors = make(map[int64][]byte, len(cms))
+		for i := range cms {
+			if idx, ok := f.sectorIndexFromConfigMapName(cms[i].Name); ok {
+				data := make([]byte, len(cms[i].BinaryData["sector"]))
+				copy(data, cms[i].BinaryData["sector"])
+				f.cacheSector(idx, data)
+			}
+		}
+	}
 	f.vfs.logger.Debugw("FileSize", "f", f, "size", size)
 
 	return size, nil
-
 }
 
+// A file object backs one sqlite connection; sqlite serialises the calls
+// made per connection, so (as before this change) no extra synchronisation
+// is added around the fields below.
 type file struct {
 	RawName      string
 	vfs          *vfs
 	encoding     *base32.Encoding
 	SectorLabels map[string]string
+
+	// Local view of the shared state, kept to cut Kubernetes API round
+	// trips. Everything cached here is trusted only while a lock of SHARED
+	// or better is held: another process may hold and modify the database
+	// between our locks, so the caches are dropped the moment the lock
+	// drops below SHARED (adoptLockState) and revalidated with one LIST by
+	// the first FileSize after SHARED is re-acquired.
+	//
+	// lockLevel/lockKnown: the lock level this process believes it holds.
+	// sqlite asks Lock, Unlock and CheckReservedLock around every
+	// operation; the imported code GET the lock ConfigMap before each one.
+	// Until lockKnown is set (a file object created by NewFile rather than
+	// opened through the VFS) the ConfigMap is consulted as before.
+	//
+	// size/valid/sectors: the file size and sector contents last observed
+	// from the cluster, or written by this process, while the lock is held.
+	// valid is only ever true while lockLevel >= LockShared.
+	lockLevel sqlite3vfs.LockType
+	lockKnown bool
+	size      int64
+	valid     bool
+	sectors   map[int64][]byte
 }
 
 // this needs to return Eof if a read is attempted off the end of the file...
@@ -149,7 +236,13 @@ func (f *file) ReadAt(p []byte, off int64) (int, error) {
 	for _, sect := range sectors {
 		if first {
 			startIndex := off % SectorSize
-			n = copy(p, sect.Data[startIndex:])
+			// A sector that does not exist (a hole) contributes no bytes:
+			// guard the slice so this reports a short read instead of
+			// panicking. The imported code created the missing sector on
+			// read (a write to the cluster!) and then panicked anyway.
+			if int(startIndex) < len(sect.Data) {
+				n = copy(p, sect.Data[startIndex:])
+			}
 			first = false
 			continue
 		}
@@ -181,20 +274,27 @@ func (f *file) WriteAt(p []byte, off int64) (int, error) {
 
 	lastSector := f.sectorForPos(lastByte)
 
+	if len(p) == 0 {
+		return 0, nil
+	}
+
 	var (
 		nW int
 	)
-	sectors, err := f.getSectorRange(firstSector, lastSector) // do we care if we're writing over the top?
-	if err != nil {
-		return 0, sqlite3vfs.IOErrorRead
-	}
-	// replace all this logic with calculating how many bytes should be in this sector
-	// then if the sector size is smaller than than
-	// allocate a new one, copy of the old data
-	// then overwrite with the new data?
-	for _, sect := range sectors {
-		lastPossibleByteForThisSector := ((sect.Index + 1) * SectorSize) - 1
-		startByteForThisSector := ((sect.Index) * SectorSize)
+	for sectorIndex := firstSector; sectorIndex <= lastSector; sectorIndex++ {
+		// Fetch each sector's current bytes at most once (a cache hit while
+		// the lock is held, otherwise one GET); a sector that does not exist
+		// yet is created by the write below rather than by the fetch. The
+		// imported code fetched every sector up front via getSector, which
+		// created missing sectors on the cluster and then panicked on the
+		// nil response it got back — so no write could ever grow a file.
+		data, exists, err := f.sectorDataForWrite(sectorIndex)
+		if err != nil {
+			return nW, sqlite3vfs.IOErrorRead
+		}
+
+		lastPossibleByteForThisSector := ((sectorIndex + 1) * SectorSize) - 1
+		startByteForThisSector := ((sectorIndex) * SectorSize)
 
 		currentOffset := off + int64(nW)
 		var sectorData []byte
@@ -203,21 +303,28 @@ func (f *file) WriteAt(p []byte, off int64) (int, error) {
 		} else {
 			// If there's existing data, ensure the buffer is large enough to hold it
 			newlyRequiredSize := (1 + lastByte) - startByteForThisSector
-			if l := int64(len(sect.Data)); l > newlyRequiredSize {
+			if l := int64(len(data)); l > newlyRequiredSize {
 				newlyRequiredSize = l
 			}
 			sectorData = make([]byte, newlyRequiredSize)
 		}
 		startOffset := currentOffset - startByteForThisSector
 		// copy in existing data
-		_ = copy(sectorData, sect.Data)
+		_ = copy(sectorData, data)
 		// copy new data
 		nn := copy(sectorData[startOffset:], p[nW:])
-		sect.Data = sectorData
-		err := f.WriteSector(sect)
-		if err != nil {
+		// Write the sector exactly once: UPDATE when it is known to exist,
+		// CREATE when it is known to be new; an unexpected conflict falls
+		// back to the other verb (see writeSectorOnce).
+		if err := f.writeSectorOnce(sectorIndex, sectorData, exists); err != nil {
 			f.vfs.logger.Error(err)
 			return nW, err
+		}
+		if f.valid {
+			f.cacheSector(sectorIndex, sectorData)
+			if end := sectorIndex*f.SectorSize() + int64(len(sectorData)); end > f.size {
+				f.size = end
+			}
 		}
 		nW += nn
 	}
@@ -232,6 +339,24 @@ func (f *file) Sync(flag sqlite3vfs.SyncType) error {
 	return nil
 }
 
+// lockLevelFromString maps the lock ConfigMap's "lock" value to a
+// sqlite3vfs.LockType, reporting false for an unknown value.
+func lockLevelFromString(currentLockString string) (sqlite3vfs.LockType, bool) {
+	switch currentLockString {
+	case sqlite3vfs.LockNone.String():
+		return sqlite3vfs.LockNone, true
+	case sqlite3vfs.LockShared.String():
+		return sqlite3vfs.LockShared, true
+	case sqlite3vfs.LockPending.String():
+		return sqlite3vfs.LockPending, true
+	case sqlite3vfs.LockExclusive.String():
+		return sqlite3vfs.LockExclusive, true
+	case sqlite3vfs.LockReserved.String():
+		return sqlite3vfs.LockReserved, true
+	}
+	return sqlite3vfs.LockNone, false
+}
+
 func (f *file) getCurrentLock() (sqlite3vfs.LockType, error) {
 	f.vfs.logger.Debugw("getCurrentLock")
 
@@ -240,27 +365,36 @@ func (f *file) getCurrentLock() (sqlite3vfs.LockType, error) {
 		f.vfs.logger.Error(err)
 		return sqlite3vfs.LockNone, err
 	}
-	currentLockString := cm.Data["lock"]
-	lockToReturn := sqlite3vfs.LockNone
-	switch currentLockString {
-	case sqlite3vfs.LockNone.String():
-		lockToReturn = sqlite3vfs.LockNone
-	case sqlite3vfs.LockShared.String():
-		lockToReturn = sqlite3vfs.LockShared
-	case sqlite3vfs.LockPending.String():
-		lockToReturn = sqlite3vfs.LockPending
-	case sqlite3vfs.LockExclusive.String():
-		lockToReturn = sqlite3vfs.LockExclusive
-	case sqlite3vfs.LockReserved.String():
-		lockToReturn = sqlite3vfs.LockReserved
-	default:
-		errStr := fmt.Sprintf("lock type unknown: %v, %v", f, currentLockString)
+	lockToReturn, ok := lockLevelFromString(cm.Data["lock"])
+	if !ok {
+		errStr := fmt.Sprintf("lock type unknown: %v, %v", f, cm.Data["lock"])
 		f.vfs.logger.Error(errStr)
 		return sqlite3vfs.LockNone, errors.New(errStr)
 	}
 	f.vfs.logger.Debugw("getCurrentLock", "found current lock", lockToReturn)
 
 	return lockToReturn, nil
+}
+
+// currentLockLevel returns this file's local view of the lock level,
+// consulting (and adopting) the lock ConfigMap only when nothing is known
+// locally yet — a file object created with NewFile rather than opened
+// through the VFS. Once the state is known it is trusted: this process
+// performed the transitions itself, and re-GETting the ConfigMap before
+// every Lock/Unlock — as the imported code did — is one of the
+// per-operation API calls this optimisation removes.
+func (f *file) currentLockLevel() (sqlite3vfs.LockType, error) {
+	f.vfs.logger.Debugw("currentLockLevel")
+	if f.lockKnown {
+		return f.lockLevel, nil
+	}
+	level, err := f.getCurrentLock()
+	if err != nil {
+		return sqlite3vfs.LockNone, err
+	}
+	f.lockLevel = level
+	f.lockKnown = true
+	return level, nil
 }
 
 func (f *file) LockFileName() string {
@@ -299,16 +433,36 @@ func (f *file) setLock(lock sqlite3vfs.LockType) error {
 		lf := &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: f.LockFileName(), Labels: LockfileLabels}, Data: map[string]string{"lock": lock.String(), "relevant-file": string(f.b32ByteFromString(f.RawName))}}
 		_, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Create(context.TODO(), lf, metav1.CreateOptions{})
 		f.vfs.logger.Debugw("setLock has been created", "lock", lock, "err", err)
+		if err == nil {
+			f.adoptLockState(lock)
+		}
 		return err
+	}
+	if err == nil {
+		f.adoptLockState(lock)
 	}
 
 	return err
 
 }
 
+// adoptLockState records a lock transition this process just made and drops
+// the sector/size caches when the lock falls below SHARED: from that moment
+// another process may modify the database, so everything cached under the
+// lock is stale until the next FileSize revalidates it after SHARED is
+// re-acquired.
+func (f *file) adoptLockState(lock sqlite3vfs.LockType) {
+	f.lockLevel = lock
+	f.lockKnown = true
+	if lock < sqlite3vfs.LockShared {
+		f.valid = false
+		f.sectors = nil
+	}
+}
+
 func (f *file) Lock(elock sqlite3vfs.LockType) error {
 	f.vfs.logger.Debugw("Lock", "elock", elock)
-	currentLock, err := f.getCurrentLock()
+	currentLock, err := f.currentLockLevel()
 	if err != nil {
 		f.vfs.logger.Error(err)
 		return err
@@ -344,7 +498,7 @@ func (f *file) Lock(elock sqlite3vfs.LockType) error {
 func (f *file) Unlock(elock sqlite3vfs.LockType) error {
 	f.vfs.logger.Debugw("Unlock", "elock", elock)
 
-	currentLock, err := f.getCurrentLock()
+	currentLock, err := f.currentLockLevel()
 	if err != nil {
 		f.vfs.logger.Error(err)
 		return err
@@ -392,7 +546,7 @@ func NewFile(name string, v *vfs) *file {
 func (v *vfs) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
 	v.logger.Debugw("Open", "name", name, "flags", flags)
 
-	_, err := v.kc.ServerVersion()
+	_, err := v.kc.Discovery().ServerVersion()
 	if err != nil {
 		v.logger.Error(err)
 		return nil, flags, sqlite3vfs.IOError
@@ -406,7 +560,7 @@ func (v *vfs) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sql
 		f := NewFile(name, v)
 
 		// Now check for lock file
-		_, err = f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Get(context.TODO(), f.LockFileName(), metav1.GetOptions{})
+		lf, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Get(context.TODO(), f.LockFileName(), metav1.GetOptions{})
 		if kerrors.IsNotFound(err) {
 			err = f.setLock(sqlite3vfs.LockNone)
 			if err != nil {
@@ -415,6 +569,12 @@ func (v *vfs) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sql
 			}
 		} else if err != nil {
 			return f, flags, err
+		} else if level, ok := lockLevelFromString(lf.Data["lock"]); ok {
+			// Adopt the stored lock level as this file object's local view:
+			// it is exactly what the imported code's first getCurrentLock
+			// GET would have reported.
+			f.lockLevel = level
+			f.lockKnown = true
 		}
 
 		cms, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).List(context.TODO(), metav1.ListOptions{LabelSelector: labels.SelectorFromSet(f.SectorLabels).String()})
@@ -428,7 +588,10 @@ func (v *vfs) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sql
 			v.logger.Debugw("err response for data configmaps", "error", err)
 		}
 		if len(cms.Items) == 0 {
-			err := f.WriteSector(&Sector{Index: 0, Labels: f.SectorLabels})
+			// Fresh (or externally emptied) file: create the empty sector 0
+			// that the size computation and reads expect. Known to be new,
+			// so this is one CREATE, with the usual conflict fallback.
+			err := f.writeSectorOnce(0, nil, false)
 			v.logger.Debugw("wrote an empty sector", "error", err)
 
 			if err != nil {
@@ -505,9 +668,16 @@ func (v *vfs) FullPathname(name string) string {
 	return name
 }
 
-// CheckReservedLock
-// TODO actually fulfil this
+// CheckReservedLock reports whether a lock is held. When this process
+// itself holds one the answer is known locally and costs no API call;
+// otherwise another process may hold one, so the lock ConfigMap is
+// consulted as before.
 func (f *file) CheckReservedLock() (bool, error) {
+
+	if f.lockKnown && f.lockLevel > sqlite3vfs.LockNone {
+		// we hold a lock
+		return true, nil
+	}
 
 	currentLock, err := f.getCurrentLock()
 	if err != nil {
