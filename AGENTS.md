@@ -14,8 +14,10 @@ Instructions for any coding agent working in this repository, including CodeAF
 
 ## Go
 
-- Run `gofmt -l .`, `go vet ./...`, `go build ./...` and `go test -race ./...` before
-  you finish, and leave all four clean. CI runs the same checks.
+- Applications live under `app/<name>/`, each its own Go module. Run
+  `gofmt -l .`, `go vet ./...`, `go build ./...` and `go test -race ./...` from
+  inside each module you change, and leave all four clean. CI runs the same
+  checks for every module, using the Go version in that module's `go.mod`.
 - Use the Go version in `go.mod`. Run `go mod tidy` after changing dependencies and
   commit `go.sum` along with `go.mod`.
 - Tests must not need a live Kubernetes cluster. Use client-go's fake clientset, or
@@ -25,6 +27,13 @@ Instructions for any coding agent working in this repository, including CodeAF
 
 ## Repository layout
 
+This is a monorepo: several independent applications live side by side, and
+more will be added.
+
+- `app/<name>/` holds one application each. Each is its own Go module with its own
+  `go.mod` (and its own Go version), README and licence. Treat an app's
+  directory as its boundary: a change for one app shouldn't touch another
+  app's files unless the task says so.
 - `.github/` holds the CodeAF harness and CI. Agents running under the CodeAF workflow
   can't change it: edits there are discarded.
 

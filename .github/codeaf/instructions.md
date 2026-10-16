@@ -11,9 +11,11 @@ A human reviews every pull request you produce before it is merged.
   The workflow commits and pushes your working-tree changes for you.
 - Follow `AGENTS.md` at the repository root.
 - Do **not** modify anything under `.github/`. Those changes are discarded.
-- Keep the repository buildable. For Go code, run `gofmt -l .`, `go vet ./...`,
-  `go build ./...` and `go test ./...` before you finish and fix what fails. CI runs
-  the same checks (plus `go test -race`) on the pull request.
+- Keep the repository buildable. Go code lives in modules under `app/` (each
+  directory with a `go.mod`). In every module you touch, run `gofmt -l .`,
+  `go vet ./...`, `go build ./...` and `go test -race ./...` from that module's
+  directory before you finish, and fix what fails. CI runs the same checks for
+  every module.
 - Prefer small, reviewable changes that do exactly what was asked. Explain
   non-obvious decisions in code comments or in a short note at the end of your answer;
   your final answer is posted on the pull request.
