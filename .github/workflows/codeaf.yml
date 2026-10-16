@@ -221,15 +221,21 @@ jobs:
         # (Its state below is still packed, so a cancelled run's cost counts.)
         if: ${{ !cancelled() }}
         run: |
-          # Changes under .github/ are included, but publish only applies them
-          # after a maintainer approves (the codeaf-harness environment).
+          # Changes under .github/ are included. Those outside .github/codeaf/
+          # (workflows, CODEOWNERS) are applied only after a maintainer
+          # approves (the codeaf-harness environment). .github/codeaf/ is the
+          # harness program and its config. Every job holding a secret or a
+          # write token builds it from the default branch only, so a change
+          # there takes effect only once it is merged; until then CI just
+          # tests it, read-only and without secrets, like app code.
           git -c core.hooksPath=/dev/null add -A -- .
           git -c core.hooksPath=/dev/null diff --cached --binary --no-ext-diff --no-textconv HEAD \
             > "$RUNNER_TEMP/out/changes.patch"
           echo "Patch: $(wc -c < "$RUNNER_TEMP/out/changes.patch") bytes"
-          if git -c core.hooksPath=/dev/null diff --cached --name-only HEAD | grep -q '^\.github/'; then
+          outside=$(git -c core.hooksPath=/dev/null diff --cached --no-renames --name-only HEAD | grep '^\.github/' | grep -v '^\.github/codeaf/' || true)
+          if [ -n "$outside" ]; then
             echo "touches_harness=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::the patch changes .github/; publishing waits for a maintainer's approval"
+            echo "::notice::the patch changes .github/ outside .github/codeaf/; publishing waits for a maintainer's approval"
           fi
 
       - name: Pack CodeAF's state
@@ -387,7 +393,7 @@ jobs:
               exit 0
             fi
           done
-          echo "::error::the patch changes .github/ but no maintainer approved the codeaf-harness deployment; set required reviewers on that environment"
+          echo "::error::the patch changes .github/ outside .github/codeaf/ but no maintainer approved the codeaf-harness deployment; set required reviewers on that environment"
           exit 1
 
       - name: Apply the patch
@@ -421,8 +427,10 @@ jobs:
           changed=0
           if [ -f "$patch" ] && [ ! -L "$patch" ] && [ -s "$patch" ]; then
             # Untrusted input: size-capped, must apply to the commit it was made
-            # from, may not touch any .git path, and may touch .github/ only
-            # with a maintainer's approval (checked above, in this job).
+            # from, may not touch any .git path, and may touch .github/
+            # outside .github/codeaf/ only with a maintainer's approval
+            # (checked above, in this job). --no-renames, so a file moved out
+            # of .github/workflows/ shows up under its old path too.
             if [ "$(stat -c %s "$patch")" -gt 52428800 ]; then
               echo "::error::patch is over 50 MB; refusing it"; exit 1
             fi
@@ -433,8 +441,12 @@ jobs:
             if git diff --cached --name-only | grep -qE '(^|/)\.git(/|$)'; then
               echo "::error::patch touches a .git path; refusing it"; exit 1
             fi
-            if git diff --cached --name-only | grep -q '^\.github/' && [ "$HARNESS_APPROVED" != true ]; then
-              echo "::error::patch touches .github/ without a maintainer's approval; refusing it"; exit 1
+            # Collected first, not piped to `grep -q`: an early exit there could
+            # kill git with SIGPIPE, and under pipefail the test would read false.
+            outside=$(git diff --cached --no-renames --name-only | grep '^\.github/' | grep -v '^\.github/codeaf/' || true)
+            if [ -n "$outside" ] && [ "$HARNESS_APPROVED" != true ]; then
+              printf '%s\n' "$outside" # every line starts with .github/, so none is a workflow command
+              echo "::error::patch touches .github/ outside .github/codeaf/ without a maintainer's approval; refusing it"; exit 1
             fi
             changed=$(git diff --cached --name-only | wc -l)
           fi

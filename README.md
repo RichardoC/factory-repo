@@ -83,8 +83,14 @@ Three workflow artifacts are uploaded, none of them encrypted:
   CI job. It gets no GitHub token: the checkout does not keep credentials, and the
   workflow pushes after CodeAF exits.
 - CodeAF may change `.github/` (the harness, CI and workflows) when a task asks
-  for it. Because such a change controls what CI runs with secrets, `publish`
-  then runs in the **`codeaf-harness`** environment and waits for a maintainer
+  for it.
+  - A change only to `.github/codeaf/` (the harness program, `models.json`,
+    `codeaf-config.json`) is published like app code. Every job that holds a
+    secret or a write token builds the harness from `main`, so the change
+    takes effect only once merged.
+  - Any other change under `.github/` (workflows, `CODEOWNERS`) controls what
+    CI runs with secrets. For those, `publish` runs in the
+    **`codeaf-harness`** environment and waits for a maintainer
   to approve it in the run's page (GitHub emails the reviewers) before anything
   is pushed. It also checks the approval through the API, so a misconfigured
   environment refuses the patch rather than publishing it. One-off setup:
