@@ -1,7 +1,6 @@
 package vfs
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -14,6 +13,9 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 )
 
+// errSectorNotFound reports that a sector's ConfigMap does not exist on the
+// cluster: a hole in a sparse file. Callers decide what that means — reads
+// treat it as empty bytes, writes as a sector to CREATE.
 var errSectorNotFound = errors.New("sector not found")
 
 // maxCachedSectors bounds the per-file sector cache: 256 * 64 KiB = 16 MiB
@@ -22,24 +24,27 @@ var errSectorNotFound = errors.New("sector not found")
 // depends on the cache — only the API-call count does.
 const maxCachedSectors = 256
 
+// Sector is one stored sector of a database file: its index within the file
+// and its bytes. WriteSector stores it as the sector ConfigMap of Index.
 type Sector struct {
-	Index  int64
-	Data   []byte
-	Labels map[string]string
+	// Index is the sector's position in the file: byte offset
+	// Index*SectorSize.
+	Index int64
+	// Data holds the sector's bytes, at most SectorSize long.
+	Data []byte
 }
 
 func (f *file) sectorForPos(pos int64) int64 {
-
-	s := (pos / SectorSize)
-	f.vfs.logger.Debugw("sectorForPos", "pos", pos, "sector", s)
+	s := pos / SectorSize
+	f.vfs.logger.Debug("sectorForPos", "pos", pos, "sector", s)
 
 	return s
 }
 
 func (f *file) deleteSector(sectorIndex int64) error {
 	n := f.sectorNameFromSectorIndex(sectorIndex)
-	err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Delete(context.TODO(), n, metav1.DeleteOptions{})
-	f.vfs.logger.Debugw("deleteSector", "sectorIndex", sectorIndex, "err", err)
+	err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Delete(f.vfs.ctx, n, metav1.DeleteOptions{})
+	f.vfs.logger.Debug("deleteSector", "sectorIndex", sectorIndex, "err", err)
 
 	return err
 }
@@ -57,7 +62,7 @@ func (f *file) deleteSector(sectorIndex int64) error {
 // so overwriting an existing sector — the common case for SQLite, which
 // rewrites pages in place — cost two API calls every time.
 func (f *file) writeSectorOnce(index int64, data []byte, exists bool) error {
-	f.vfs.logger.Debugw("writeSectorOnce", "sectorIndex", index, "exists", exists)
+	f.vfs.logger.Debug("writeSectorOnce", "sectorIndex", index, "exists", exists)
 	sectorName := f.sectorNameFromSectorIndex(index)
 	cm := &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
@@ -74,22 +79,22 @@ func (f *file) writeSectorOnce(index int64, data []byte, exists bool) error {
 	}
 	var err error
 	if exists {
-		_, err = f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Update(context.TODO(), cm, metav1.UpdateOptions{})
+		_, err = f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Update(f.vfs.ctx, cm, metav1.UpdateOptions{})
 		if kerrors.IsNotFound(err) {
 			// The sector vanished under us (another client deleted it);
 			// recreate it rather than silently dropping the write.
-			_, err = f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Create(context.TODO(), cm, metav1.CreateOptions{})
+			_, err = f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Create(f.vfs.ctx, cm, metav1.CreateOptions{})
 		}
 	} else {
-		_, err = f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Create(context.TODO(), cm, metav1.CreateOptions{})
+		_, err = f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Create(f.vfs.ctx, cm, metav1.CreateOptions{})
 		if kerrors.IsAlreadyExists(err) {
 			// The sector appeared under us (a concurrent writer created
 			// it first); overwrite it rather than failing the write.
-			_, err = f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Update(context.TODO(), cm, metav1.UpdateOptions{})
+			_, err = f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Update(f.vfs.ctx, cm, metav1.UpdateOptions{})
 		}
 	}
 	if err != nil {
-		f.vfs.logger.Error(err)
+		f.vfs.logger.Error("writeSectorOnce", "sectorIndex", index, "err", err)
 	}
 	return err
 }
@@ -102,9 +107,8 @@ func (f *file) WriteSector(s *Sector) error {
 }
 
 func (f *file) sectorNameFromSectorIndex(sectorIndex int64) string {
-
 	sectorName := fmt.Sprintf("%s-%d", f.b32ByteFromString(f.RawName), sectorIndex)
-	f.vfs.logger.Debugw("sectorNameFromSectorIndex", "sectorIndex", sectorIndex, "sectorName", sectorName)
+	f.vfs.logger.Debug("sectorNameFromSectorIndex", "sectorIndex", sectorIndex, "sectorName", sectorName)
 
 	return sectorName
 }
@@ -135,7 +139,7 @@ func (f *file) sectorIndexFromConfigMapName(name string) (int64, bool) {
 // that means: reads treat it as empty bytes, writes treat it as a sector to
 // CREATE.
 func (f *file) getSector(sectorIndex int64) (*Sector, error) {
-	f.vfs.logger.Debugw("getSector", "sectorIndex", sectorIndex)
+	f.vfs.logger.Debug("getSector", "sectorIndex", sectorIndex)
 	data, err := f.sectorData(sectorIndex)
 	if err != nil {
 		return nil, err
@@ -153,13 +157,13 @@ func (f *file) sectorData(sectorIndex int64) ([]byte, error) {
 		}
 	}
 	sectorName := f.sectorNameFromSectorIndex(sectorIndex)
-	cm, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Get(context.TODO(), sectorName, metav1.GetOptions{})
-	f.vfs.logger.Debugw("sectorData", "sectorIndex", sectorIndex, "err", err)
+	cm, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Get(f.vfs.ctx, sectorName, metav1.GetOptions{})
+	f.vfs.logger.Debug("sectorData", "sectorIndex", sectorIndex, "err", err)
 
 	if kerrors.IsNotFound(err) {
 		return nil, errSectorNotFound
 	} else if err != nil {
-		f.vfs.logger.Error(err)
+		f.vfs.logger.Error("sectorData", "sectorIndex", sectorIndex, "err", err)
 		return nil, sqlite3vfs.IOErrorShortRead
 	}
 
@@ -176,14 +180,14 @@ func (f *file) sectorData(sectorIndex int64) ([]byte, error) {
 // answers with no API call at all; otherwise it is one GET. A missing
 // sector is reported as (nil, false, nil) so the write can CREATE it.
 func (f *file) sectorDataForWrite(sectorIndex int64) (data []byte, exists bool, err error) {
-	f.vfs.logger.Debugw("sectorDataForWrite", "sectorIndex", sectorIndex)
+	f.vfs.logger.Debug("sectorDataForWrite", "sectorIndex", sectorIndex)
 	if f.valid {
 		if data, ok := f.sectors[sectorIndex]; ok {
 			return data, true, nil
 		}
 	}
 	sectorName := f.sectorNameFromSectorIndex(sectorIndex)
-	cm, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Get(context.TODO(), sectorName, metav1.GetOptions{})
+	cm, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Get(f.vfs.ctx, sectorName, metav1.GetOptions{})
 	if err == nil {
 		data = make([]byte, len(cm.BinaryData["sector"]))
 		copy(data, cm.BinaryData["sector"])
@@ -195,7 +199,7 @@ func (f *file) sectorDataForWrite(sectorIndex int64) (data []byte, exists bool, 
 	if kerrors.IsNotFound(err) {
 		return nil, false, nil
 	}
-	f.vfs.logger.Error(err)
+	f.vfs.logger.Error("sectorDataForWrite", "sectorIndex", sectorIndex, "err", err)
 	return nil, false, err
 }
 
@@ -216,8 +220,8 @@ func (f *file) cacheSector(index int64, data []byte) {
 // computable from it alone, without the follow-up GET of the last sector
 // the imported FileSize made.
 func (f *file) listSectorConfigMaps() ([]corev1.ConfigMap, error) {
-	cms, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).List(context.TODO(), metav1.ListOptions{LabelSelector: labels.SelectorFromSet(f.SectorLabels).String()})
-	f.vfs.logger.Debugw("listSectorConfigMaps", "f.RawName", f.RawName, "len(configmaps)", len(cms.Items), "err", err)
+	cms, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).List(f.vfs.ctx, metav1.ListOptions{LabelSelector: labels.SelectorFromSet(f.SectorLabels).String()})
+	f.vfs.logger.Debug("listSectorConfigMaps", "f.RawName", f.RawName, "len(configmaps)", len(cms.Items), "err", err)
 	return cms.Items, err
 }
 
@@ -231,12 +235,10 @@ func (f *file) sizeFromSectorList(cms []corev1.ConfigMap) int64 {
 	for i := range cms {
 		idx, ok := f.sectorIndexFromConfigMapName(cms[i].Name)
 		if !ok {
-			f.vfs.logger.Errorw("sector configmap with unparsable name", "name", cms[i].Name)
+			f.vfs.logger.Error("sector configmap with unparsable name", "name", cms[i].Name)
 			continue
 		}
-		if s := idx*f.SectorSize() + int64(len(cms[i].BinaryData["sector"])); s > size {
-			size = s
-		}
+		size = max(size, idx*SectorSize+int64(len(cms[i].BinaryData["sector"])))
 	}
 	return size
 }
@@ -245,14 +247,14 @@ func (f *file) sizeFromSectorList(cms []corev1.ConfigMap) int64 {
 // does not exist contributes no bytes (a read into a hole yields short data
 // and io.EOF at the ReadAt layer) — nothing is created on a read.
 func (f *file) getSectorRange(firstSector, lastSector int64) ([]*Sector, error) {
-	f.vfs.logger.Debugw("getSectorRange", "firstSector", firstSector, "lastSector", lastSector)
+	f.vfs.logger.Debug("getSectorRange", "firstSector", firstSector, "lastSector", lastSector)
 
-	sectors := make([]*Sector, ((lastSector - firstSector) + 1)) // +1 because 0 indexes
+	sectors := make([]*Sector, (lastSector-firstSector)+1) // +1 because 0 indexes
 
 	for i := firstSector; i <= lastSector; i++ {
 		data, err := f.sectorData(i)
-		if err != nil && err != errSectorNotFound {
-			f.vfs.logger.Error(err)
+		if err != nil && !errors.Is(err, errSectorNotFound) {
+			f.vfs.logger.Error("getSectorRange", "sector", i, "err", err)
 			return nil, sqlite3vfs.IOErrorRead
 		}
 		sectors[i-firstSector] = &Sector{Index: i, Data: data}

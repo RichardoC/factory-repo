@@ -17,9 +17,10 @@ package vfs
 
 import (
 	"fmt"
-	"k8s.io/client-go/kubernetes/fake"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
+
+	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/psanford/sqlite3vfs"
 )
@@ -29,7 +30,7 @@ func seedSectors(tb testing.TB, fcs *fake.Clientset, f *file, sectors int) []byt
 	tb.Helper()
 	data := make([]byte, int64(sectors)*SectorSize)
 	fillPattern(data)
-	for i := 0; i < sectors; i++ {
+	for i := range sectors {
 		seedSector(tb, fcs, f, int64(i), data[int64(i)*SectorSize:(int64(i)+1)*SectorSize])
 	}
 	return data
@@ -46,7 +47,7 @@ func BenchmarkSequentialRead(b *testing.B) {
 	buf := make([]byte, SectorSize)
 	var calls int64
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for i := range b.N {
 		off := int64(i%sectors) * SectorSize
 		fcs.ClearActions()
 		if _, err := f.ReadAt(buf, off); err != nil {
@@ -82,7 +83,7 @@ func BenchmarkSequentialReadLocked(b *testing.B) {
 
 	var calls int64
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for i := range b.N {
 		off := int64(i%sectors) * SectorSize
 		fcs.ClearActions()
 		if _, err := f.ReadAt(buf, off); err != nil {
@@ -105,12 +106,12 @@ func BenchmarkRandomPageRead(b *testing.B) {
 	seedSectors(b, fcs, f, sectors)
 
 	pages := sectors * int(SectorSize) / pageSize
-	rng := rand.New(rand.NewSource(1))
+	rng := rand.New(rand.NewPCG(1, 1))
 	buf := make([]byte, pageSize)
 	var calls int64
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		off := int64(rng.Intn(pages)) * pageSize
+	for range b.N {
+		off := int64(rng.IntN(pages)) * pageSize
 		fcs.ClearActions()
 		if _, err := f.ReadAt(buf, off); err != nil {
 			b.Fatal(err)
@@ -132,7 +133,7 @@ func BenchmarkSequentialWrite(b *testing.B) {
 	fillPatternAlt(buf)
 	var calls int64
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for i := range b.N {
 		off := int64(i%sectors) * SectorSize
 		fcs.ClearActions()
 		if _, err := f.WriteAt(buf, off); err != nil {
@@ -159,7 +160,7 @@ func BenchmarkSequentialWrite(b *testing.B) {
 func BenchmarkSQLiteInsert1000Rows(b *testing.B) {
 	const rows = 1000
 	var calls int64
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		b.StopTimer()
 		v, fcs := newTestVFS(b)
 		vfsName := registerUniqueVFS(b, v)

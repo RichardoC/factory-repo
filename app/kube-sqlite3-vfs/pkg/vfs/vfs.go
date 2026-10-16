@@ -1,3 +1,19 @@
+// Package vfs implements a sqlite3vfs virtual file system that stores
+// database files in Kubernetes as ConfigMaps: one ConfigMap per 64 KiB
+// sector plus a "lockfile" ConfigMap holding the SQLite lock level.
+//
+// A database file is split into fixed-size sectors (SectorSize — 64 KiB, the
+// largest SQLite page size). Each sector is the BinaryData of a ConfigMap
+// named "<base32 filename>-<sector index>", labelled with the file's base32
+// name; the lock ConfigMap is named "<base32 filename>-lockfile" and holds
+// the lock level as a string. Reads and writes map onto Get/Update/Create
+// calls, and the file size is computed from a single LIST of the file's
+// sector ConfigMaps.
+//
+// The VFS talks to any kubernetes.Interface: pass a real clientset in
+// production and client-go's fake clientset in tests. The context given to
+// NewVFS is used for every Kubernetes call the VFS makes; SQLite calls into
+// the VFS through cgo, so there is no per-call context to accept.
 package vfs
 
 import (
@@ -6,23 +22,30 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"maps"
 	"strings"
 
 	"github.com/psanford/sqlite3vfs"
-	"go.uber.org/zap"
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 )
 
 const (
+	// LockFileNameSuffix is appended to the base32-encoded file name to form
+	// the name of the ConfigMap holding the file's SQLite lock level.
 	LockFileNameSuffix = "lockfile"
-	SectorSize         = 64 * 1024 // Max pagesize supported by SQLITE3
+
+	// SectorSize is the size of one stored sector: 64 KiB, the largest page
+	// size SQLite supports. Each sector is stored as one ConfigMap.
+	SectorSize = 64 * 1024 // Max pagesize supported by SQLITE3
 )
 
-// Only var because this can't be a const
+// CommonSectorLabel and LockfileLabel are the base labels every sector and
+// lockfile ConfigMap, respectively, carries. They are vars only because Go
+// cannot express a map as a const.
 var (
 	CommonSectorLabel = map[string]string{"data": "sector"}
 	LockfileLabel     = map[string]string{"data": "lockfile"}
@@ -30,13 +53,21 @@ var (
 
 type vfs struct {
 	kc        kubernetes.Interface
-	logger    *zap.SugaredLogger
+	logger    *slog.Logger
 	retries   int
 	namespace string
+
+	// ctx backs every Kubernetes call this VFS makes. It is fixed at
+	// construction because SQLite enters the VFS through cgo, where there
+	// is no caller context to propagate.
+	ctx context.Context
 }
 
-func NewVFS(kc kubernetes.Interface, namespace string, logger *zap.SugaredLogger, retries int) *vfs {
-	return &vfs{kc: kc, logger: logger, retries: retries, namespace: namespace}
+// NewVFS returns a VFS that stores database files as ConfigMaps in
+// namespace. Every Kubernetes call the VFS makes uses ctx. retries is the
+// number of attempts Open makes against races between concurrent clients.
+func NewVFS(ctx context.Context, kc kubernetes.Interface, namespace string, logger *slog.Logger, retries int) *vfs {
+	return &vfs{kc: kc, logger: logger, retries: retries, namespace: namespace, ctx: ctx}
 }
 
 func (f *file) b32ByteFromString(s string) []byte {
@@ -46,15 +77,16 @@ func (f *file) b32ByteFromString(s string) []byte {
 	return dst
 }
 
+// Close implements sqlite3vfs.File: it releases the file's lock by writing
+// LockNone to the lock ConfigMap.
 func (f *file) Close() error {
-
-	err := f.setLock(sqlite3vfs.LockNone)
-
-	return err
+	return f.setLock(sqlite3vfs.LockNone)
 }
 
+// Truncate implements sqlite3vfs.File: it shortens the file to size bytes,
+// deleting the sectors past the new end and shortening the one holding the
+// kept prefix. Growing (or no-op) truncates do nothing.
 func (f *file) Truncate(size int64) error {
-
 	fileSize, err := f.FileSize()
 	if err != nil {
 		return err
@@ -75,7 +107,7 @@ func (f *file) Truncate(size int64) error {
 
 	if lastRemainingSector >= 0 && size%SectorSize != 0 {
 		sect, err := f.getSector(lastRemainingSector)
-		if err != nil && err != errSectorNotFound {
+		if err != nil && !errors.Is(err, errSectorNotFound) {
 			return err
 		}
 		if err == nil {
@@ -109,7 +141,7 @@ func (f *file) Truncate(size int64) error {
 	// lastRemainingSector, deleting the sector that holds the kept prefix
 	// (and, when fileSize was sector-aligned, running past the last
 	// existing sector). It must start after it.
-	for sectToDelete := lastRemainingSector + 1; sectToDelete <= lastSector; sectToDelete += 1 {
+	for sectToDelete := lastRemainingSector + 1; sectToDelete <= lastSector; sectToDelete++ {
 		err := f.deleteSector(sectToDelete)
 		if err != nil && !kerrors.IsNotFound(err) {
 			return err
@@ -137,13 +169,13 @@ func (f *file) Truncate(size int64) error {
 // this is the revalidation required after (re)acquiring SHARED, because
 // another process may have modified the database between our locks.
 func (f *file) FileSize() (int64, error) {
-	f.vfs.logger.Debugw("FileSize", "f", f)
+	f.vfs.logger.Debug("FileSize", "f", f)
 	if f.valid {
 		return f.size, nil
 	}
 	cms, err := f.listSectorConfigMaps()
 	if err != nil {
-		f.vfs.logger.Error(err)
+		f.vfs.logger.Error("FileSize: list sector configmaps", "err", err)
 
 		return 0, err
 	}
@@ -160,7 +192,7 @@ func (f *file) FileSize() (int64, error) {
 			}
 		}
 	}
-	f.vfs.logger.Debugw("FileSize", "f", f, "size", size)
+	f.vfs.logger.Debug("FileSize", "f", f, "size", size)
 
 	return size, nil
 }
@@ -169,9 +201,14 @@ func (f *file) FileSize() (int64, error) {
 // made per connection, so (as before this change) no extra synchronisation
 // is added around the fields below.
 type file struct {
-	RawName      string
-	vfs          *vfs
-	encoding     *base32.Encoding
+	// RawName is the unencoded name the file was opened under.
+	RawName string
+
+	vfs      *vfs
+	encoding *base32.Encoding
+
+	// SectorLabels are the labels every sector ConfigMap of this file
+	// carries: CommonSectorLabel plus the file's base32 "relevant-file".
 	SectorLabels map[string]string
 
 	// Local view of the shared state, kept to cut Kubernetes API round
@@ -200,15 +237,18 @@ type file struct {
 	sectors   map[int64][]byte
 }
 
-// this needs to return Eof if a read is attempted off the end of the file...
+// ReadAt implements sqlite3vfs.File. A read that starts at or past the end
+// of the file returns (0, io.EOF); one that reaches past the end returns
+// the bytes read so far with io.EOF, which the sqlite3vfs layer turns into
+// SQLITE_IOERR_SHORT_READ.
 func (f *file) ReadAt(p []byte, off int64) (int, error) {
-	f.vfs.logger.Debugw("ReadAt", "f", f, "off", off, "len(buffer)", len(p))
+	f.vfs.logger.Debug("ReadAt", "f", f, "off", off, "len(buffer)", len(p))
 
 	firstSector := f.sectorForPos(off)
 
 	fileSize, err := f.FileSize()
 	if err != nil {
-		f.vfs.logger.Debugw("ReadAt", "off", off, "len(buffer)", len(p), "fileSize", fileSize, "err", err)
+		f.vfs.logger.Debug("ReadAt", "off", off, "len(buffer)", len(p), "fileSize", fileSize, "err", err)
 
 		return 0, err
 	}
@@ -222,9 +262,8 @@ func (f *file) ReadAt(p []byte, off int64) (int, error) {
 	}
 	if off >= fileSize {
 		// Maybe this will stop it being unhappy about the journal file not existing?
-		// err = sqlite3vfs.IOErrorShortRead
 		err = io.EOF
-		f.vfs.logger.Debugw("ReadAt", "off", off, "len(buffer)", len(p), "fileSize", fileSize, "err", err)
+		f.vfs.logger.Debug("ReadAt", "off", off, "len(buffer)", len(p), "fileSize", fileSize, "err", err)
 		return 0, err
 	}
 
@@ -256,20 +295,28 @@ func (f *file) ReadAt(p []byte, off int64) (int, error) {
 	if lastByte >= fileSize {
 		return n, io.EOF
 	}
-	f.vfs.logger.Debugw("ReadAt", "off", off, "len(buffer)", len(p), "n", n)
+	f.vfs.logger.Debug("ReadAt", "off", off, "len(buffer)", len(p), "n", n)
 
 	if n < len(p) {
 		f.vfs.logger.Error("Read too little")
 		return n, io.EOF
 	}
 
-	f.vfs.logger.Debugw("ReadAt read all expected bytes")
+	f.vfs.logger.Debug("ReadAt read all expected bytes")
 
 	return n, nil
 }
 
+// WriteAt implements sqlite3vfs.File: it writes p at off, fetching each
+// touched sector at most once and writing each changed sector exactly once
+// (see writeSectorOnce). Sectors past the current end are created, so a
+// write grows the file across as many 64 KiB sectors as it needs.
 func (f *file) WriteAt(p []byte, off int64) (int, error) {
-	f.vfs.logger.Debugw("WriteAt", "len(p)", len(p), "off", off)
+	f.vfs.logger.Debug("WriteAt", "len(p)", len(p), "off", off)
+
+	if len(p) == 0 {
+		return 0, nil
+	}
 
 	firstSector := f.sectorForPos(off)
 
@@ -277,13 +324,7 @@ func (f *file) WriteAt(p []byte, off int64) (int, error) {
 
 	lastSector := f.sectorForPos(lastByte)
 
-	if len(p) == 0 {
-		return 0, nil
-	}
-
-	var (
-		nW int
-	)
+	var nW int
 	for sectorIndex := firstSector; sectorIndex <= lastSector; sectorIndex++ {
 		// Fetch each sector's current bytes at most once (a cache hit while
 		// the lock is held, otherwise one GET); a sector that does not exist
@@ -297,7 +338,7 @@ func (f *file) WriteAt(p []byte, off int64) (int, error) {
 		}
 
 		lastPossibleByteForThisSector := ((sectorIndex + 1) * SectorSize) - 1
-		startByteForThisSector := ((sectorIndex) * SectorSize)
+		startByteForThisSector := sectorIndex * SectorSize
 
 		currentOffset := off + int64(nW)
 		var sectorData []byte
@@ -306,9 +347,7 @@ func (f *file) WriteAt(p []byte, off int64) (int, error) {
 		} else {
 			// If there's existing data, ensure the buffer is large enough to hold it
 			newlyRequiredSize := (1 + lastByte) - startByteForThisSector
-			if l := int64(len(data)); l > newlyRequiredSize {
-				newlyRequiredSize = l
-			}
+			newlyRequiredSize = max(newlyRequiredSize, int64(len(data)))
 			sectorData = make([]byte, newlyRequiredSize)
 		}
 		startOffset := currentOffset - startByteForThisSector
@@ -320,12 +359,12 @@ func (f *file) WriteAt(p []byte, off int64) (int, error) {
 		// CREATE when it is known to be new; an unexpected conflict falls
 		// back to the other verb (see writeSectorOnce).
 		if err := f.writeSectorOnce(sectorIndex, sectorData, exists); err != nil {
-			f.vfs.logger.Error(err)
+			f.vfs.logger.Error("WriteAt: write sector", "sector", sectorIndex, "err", err)
 			return nW, err
 		}
 		if f.valid {
 			f.cacheSector(sectorIndex, sectorData)
-			if end := sectorIndex*f.SectorSize() + int64(len(sectorData)); end > f.size {
+			if end := sectorIndex*SectorSize + int64(len(sectorData)); end > f.size {
 				f.size = end
 			}
 		}
@@ -335,9 +374,10 @@ func (f *file) WriteAt(p []byte, off int64) (int, error) {
 	return nW, nil
 }
 
-// Sync noops as we're doing the writes directly
+// Sync implements sqlite3vfs.File: it no-ops, because sector writes reach
+// the cluster directly.
 func (f *file) Sync(flag sqlite3vfs.SyncType) error {
-	f.vfs.logger.Debugw("Sync", "flag", flag)
+	f.vfs.logger.Debug("Sync", "flag", flag)
 
 	return nil
 }
@@ -361,20 +401,17 @@ func lockLevelFromString(currentLockString string) (sqlite3vfs.LockType, bool) {
 }
 
 func (f *file) getCurrentLock() (sqlite3vfs.LockType, error) {
-	f.vfs.logger.Debugw("getCurrentLock")
+	f.vfs.logger.Debug("getCurrentLock")
 
-	cm, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Get(context.TODO(), f.LockFileName(), metav1.GetOptions{})
+	cm, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Get(f.vfs.ctx, f.LockFileName(), metav1.GetOptions{})
 	if err != nil {
-		f.vfs.logger.Error(err)
-		return sqlite3vfs.LockNone, err
+		return sqlite3vfs.LockNone, fmt.Errorf("get lock configmap: %w", err)
 	}
 	lockToReturn, ok := lockLevelFromString(cm.Data["lock"])
 	if !ok {
-		errStr := fmt.Sprintf("lock type unknown: %v, %v", f, cm.Data["lock"])
-		f.vfs.logger.Error(errStr)
-		return sqlite3vfs.LockNone, errors.New(errStr)
+		return sqlite3vfs.LockNone, fmt.Errorf("lock type unknown: file %v, configmap lock value %q", f, cm.Data["lock"])
 	}
-	f.vfs.logger.Debugw("getCurrentLock", "found current lock", lockToReturn)
+	f.vfs.logger.Debug("getCurrentLock", "found current lock", lockToReturn)
 
 	return lockToReturn, nil
 }
@@ -393,13 +430,15 @@ func (f *file) getCurrentLock() (sqlite3vfs.LockType, error) {
 // under them. Local state is only ever written by adoptLockState, after
 // this process's own setLock succeeded.
 func (f *file) currentLockLevel() (sqlite3vfs.LockType, error) {
-	f.vfs.logger.Debugw("currentLockLevel")
+	f.vfs.logger.Debug("currentLockLevel")
 	if f.lockKnown {
 		return f.lockLevel, nil
 	}
 	return f.getCurrentLock()
 }
 
+// LockFileName returns the name of the ConfigMap holding this file's SQLite
+// lock level: the base32-encoded file name plus LockFileNameSuffix.
 func (f *file) LockFileName() string {
 	localLockFileName := fmt.Sprintf("%s-%s", f.b32ByteFromString(f.RawName), LockFileNameSuffix)
 	return localLockFileName
@@ -408,17 +447,16 @@ func (f *file) LockFileName() string {
 func (f *file) generateSectorsLabels() {
 	fileNameLabel := string(f.b32ByteFromString(f.RawName))
 
-	f.SectorLabels = make(map[string]string)
-	for k, v := range CommonSectorLabel {
-		f.SectorLabels[k] = v
-	}
-
+	f.SectorLabels = make(map[string]string, len(CommonSectorLabel)+1)
+	maps.Copy(f.SectorLabels, CommonSectorLabel)
 	f.SectorLabels["relevant-file"] = fileNameLabel
 }
 
-// possibly add the validation?
+// setLock writes the requested lock level to the lock ConfigMap, creating
+// the ConfigMap if it does not exist yet, and records the transition
+// locally (adoptLockState) only once the write succeeded.
 func (f *file) setLock(lock sqlite3vfs.LockType) error {
-	f.vfs.logger.Debugw("setLock", "lock", lock)
+	f.vfs.logger.Debug("setLock", "lock", lock)
 
 	// Any downgrade — Unlock and Close land here — invalidates the local
 	// view BEFORE the write is attempted, whatever the write returns. If
@@ -435,33 +473,24 @@ func (f *file) setLock(lock sqlite3vfs.LockType) error {
 		f.lockKnown = false
 	}
 
-	LockfileLabels := make(map[string]string)
-	for k, v := range LockfileLabel {
-		LockfileLabels[k] = v
-	}
 	fileNameLabel := string(f.b32ByteFromString(f.RawName))
+	lockfileLabels := make(map[string]string, len(LockfileLabel)+1)
+	maps.Copy(lockfileLabels, LockfileLabel)
+	lockfileLabels["relevant-file"] = fileNameLabel
 
-	LockfileLabels["relevant-file"] = fileNameLabel
+	lf := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: f.LockFileName(), Labels: lockfileLabels}, Data: map[string]string{"lock": lock.String(), "relevant-file": fileNameLabel}}
 
-	lf := &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: f.LockFileName(), Labels: LockfileLabels}, Data: map[string]string{"lock": lock.String(), "relevant-file": string(f.b32ByteFromString(f.RawName))}}
-
-	_, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Update(context.TODO(), lf, metav1.UpdateOptions{})
-	f.vfs.logger.Debugw("setLock", "lock", lock, "err", err)
+	_, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Update(f.vfs.ctx, lf, metav1.UpdateOptions{})
+	f.vfs.logger.Debug("setLock", "lock", lock, "err", err)
 	if kerrors.IsNotFound(err) {
-		lf := &v1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: f.LockFileName(), Labels: LockfileLabels}, Data: map[string]string{"lock": lock.String(), "relevant-file": string(f.b32ByteFromString(f.RawName))}}
-		_, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Create(context.TODO(), lf, metav1.CreateOptions{})
-		f.vfs.logger.Debugw("setLock has been created", "lock", lock, "err", err)
-		if err == nil {
-			f.adoptLockState(lock)
-		}
-		return err
+		_, err = f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Create(f.vfs.ctx, lf, metav1.CreateOptions{})
+		f.vfs.logger.Debug("setLock has been created", "lock", lock, "err", err)
 	}
 	if err == nil {
 		f.adoptLockState(lock)
 	}
 
 	return err
-
 }
 
 // dropCaches discards the cached file size and sector contents. Everything
@@ -487,11 +516,15 @@ func (f *file) adoptLockState(lock sqlite3vfs.LockType) {
 	}
 }
 
+// Lock implements sqlite3vfs.File: it acquires or upgrades the file's lock
+// through the lock ConfigMap. Only the transitions of the sqlite locking
+// chart below are legal; sqlite never requests PENDING explicitly, and a
+// file holding no lock cannot climb past SHARED in one step.
 func (f *file) Lock(elock sqlite3vfs.LockType) error {
-	f.vfs.logger.Debugw("Lock", "elock", elock)
+	f.vfs.logger.Debug("Lock", "elock", elock)
 	currentLock, err := f.currentLockLevel()
 	if err != nil {
-		f.vfs.logger.Error(err)
+		f.vfs.logger.Error("Lock", "err", err)
 		return err
 	}
 
@@ -509,7 +542,7 @@ func (f *file) Lock(elock sqlite3vfs.LockType) error {
 	if currentLock == sqlite3vfs.LockNone && elock > sqlite3vfs.LockShared {
 		return errors.New("invalid lock transition requested")
 	}
-	//  (2) SQLite never explicitly requests a pendig lock.
+	//  (2) SQLite never explicitly requests a pending lock.
 	if elock == sqlite3vfs.LockPending {
 		return errors.New("invalid Lock() request for state pending")
 	}
@@ -519,24 +552,28 @@ func (f *file) Lock(elock sqlite3vfs.LockType) error {
 	}
 
 	return f.setLock(elock)
-
 }
 
+// Unlock implements sqlite3vfs.File: it drops or downgrades the file's lock
+// through the lock ConfigMap. An unlock above SHARED (sqlite never unlocks
+// upward) or to a level above the one currently held is an error, not a
+// panic: the sqlite3vfs interface lets Unlock report an error, and a panic
+// here crashed the whole process through cgo.
 func (f *file) Unlock(elock sqlite3vfs.LockType) error {
-	f.vfs.logger.Debugw("Unlock", "elock", elock)
+	f.vfs.logger.Debug("Unlock", "elock", elock)
 
 	currentLock, err := f.currentLockLevel()
 	if err != nil {
-		f.vfs.logger.Error(err)
+		f.vfs.logger.Error("Unlock", "err", err)
 		return err
 	}
 
 	if elock > sqlite3vfs.LockShared {
-		f.vfs.logger.Panicf("Invalid unlock request to level %s", elock)
+		return fmt.Errorf("invalid unlock request to level %s", elock)
 	}
 
 	if currentLock < elock {
-		f.vfs.logger.Panic("Cannot unlock to a level > current lock level")
+		return fmt.Errorf("cannot unlock to a level %s above the current lock level %s", elock, currentLock)
 	}
 
 	if elock == currentLock {
@@ -550,17 +587,21 @@ func (f *file) Unlock(elock sqlite3vfs.LockType) error {
 	return f.setLock(sqlite3vfs.LockNone)
 }
 
+// SectorSize implements sqlite3vfs.File: it reports the size of one stored
+// sector, SectorSize (64 KiB).
 func (f *file) SectorSize() int64 {
-	// 64k as we're considering each sector
 	return SectorSize
 }
 
-// DeviceCharacteristics
-// We'll target 64K per configmap
+// DeviceCharacteristics implements sqlite3vfs.File: it advertises atomic
+// 64 KiB writes, since one sector is one ConfigMap write.
 func (f *file) DeviceCharacteristics() sqlite3vfs.DeviceCharacteristic {
 	return sqlite3vfs.IocapAtomic64K
 }
 
+// NewFile returns a file object for name backed by v. The cmd tools use it
+// to read and write a database stored in the cluster without going through
+// a sqlite connection.
 func NewFile(name string, v *vfs) *file {
 	o := base32.NewEncoding("abcdefghijklmnopqrstuv0123456789")
 	e := o.WithPadding('x')
@@ -569,17 +610,22 @@ func NewFile(name string, v *vfs) *file {
 	return f
 }
 
-// TODO, locking so other connections refused?
+// Open implements sqlite3vfs.VFS: it backs name with the cluster, creating
+// the file's lock ConfigMap at LockNone and an empty sector 0 if the file
+// has no sectors yet. The lock level stored in the ConfigMap may belong to
+// another process, so a file opened here starts at NONE locally and records
+// only the transitions it performs itself (see file.lockLevel). Transient
+// races between clients are retried up to the VFS's retry budget.
 func (v *vfs) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
-	v.logger.Debugw("Open", "name", name, "flags", flags)
+	v.logger.Debug("Open", "name", name, "flags", flags)
 
-	_, err := v.kc.Discovery().ServerVersion()
-	if err != nil {
-		v.logger.Error(err)
+	if _, err := v.kc.Discovery().ServerVersionWithContext(v.ctx); err != nil {
+		v.logger.Error("Open: server version", "err", err)
 		return nil, flags, sqlite3vfs.IOError
 	}
 
-	for i := 0; i < v.retries; i++ {
+	var lastErr error
+	for range v.retries {
 		// Check if namespace and lockfile already exist.
 		// If they don't, create them
 		// if this fails, return readonlyfs
@@ -587,16 +633,17 @@ func (v *vfs) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sql
 		f := NewFile(name, v)
 
 		// Now check for lock file
-		_, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Get(context.TODO(), f.LockFileName(), metav1.GetOptions{})
-		if kerrors.IsNotFound(err) {
-			err = f.setLock(sqlite3vfs.LockNone)
-			if err != nil {
-				f.vfs.logger.Error(err)
+		_, err := v.kc.CoreV1().ConfigMaps(v.namespace).Get(v.ctx, f.LockFileName(), metav1.GetOptions{})
+		switch {
+		case kerrors.IsNotFound(err):
+			if err := f.setLock(sqlite3vfs.LockNone); err != nil {
+				v.logger.Error("Open: set initial lock state", "err", err)
+				lastErr = err
 				continue
 			}
-		} else if err != nil {
+		case err != nil:
 			return f, flags, err
-		} else {
+		default:
 			// Every opened file starts at NONE locally. The ConfigMap's
 			// stored level may be another process's lock, and adopting it
 			// made this file believe it held that lock: its Lock calls
@@ -607,103 +654,113 @@ func (v *vfs) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sql
 			f.lockKnown = true
 		}
 
-		cms, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).List(context.TODO(), metav1.ListOptions{LabelSelector: labels.SelectorFromSet(f.SectorLabels).String()})
-		names := []string{}
-		for _, n := range cms.Items {
-			names = append(names, n.Name)
+		cms, err := f.listSectorConfigMaps()
+		if err != nil {
+			// Without the LIST we cannot tell a fresh file from an existing
+			// one: treating it as fresh would write an empty sector 0 over
+			// the first sector of an existing database. Retry, and fail if
+			// the attempts run out.
+			v.logger.Error("Open: list sector configmaps", "err", err)
+			lastErr = err
+			continue
+		}
+		names := make([]string, 0, len(cms))
+		for _, cm := range cms {
+			names = append(names, cm.Name)
 		}
 
-		v.logger.Debugw("Checked for existing sectors", "sectors", names, "len(cms.Items)", len(cms.Items), "err", err)
-		if err != nil {
-			v.logger.Debugw("err response for data configmaps", "error", err)
-		}
-		if len(cms.Items) == 0 {
+		v.logger.Debug("Checked for existing sectors", "sectors", names, "len(cms)", len(cms))
+
+		if len(cms) == 0 {
 			// Fresh (or externally emptied) file: create the empty sector 0
 			// that the size computation and reads expect. Known to be new,
 			// so this is one CREATE, with the usual conflict fallback.
-			err := f.writeSectorOnce(0, nil, false)
-			v.logger.Debugw("wrote an empty sector", "error", err)
-
-			if err != nil {
-				v.logger.Error(err)
-				return f, flags, err
-
+			if err := f.writeSectorOnce(0, nil, false); err != nil {
+				v.logger.Error("Open: create initial empty sector", "err", err)
+				lastErr = err
+				continue
 			}
-
 		}
-		v.logger.Debugw("Opened file successfully", "name", name, "flags", flags)
+		v.logger.Debug("Opened file successfully", "name", name, "flags", flags)
 
 		return f, flags, nil
-
 	}
-	v.logger.Debugw("Failed to open file")
-	return nil, flags, errors.New("failed to get/create file metadata too many times due to races")
+	if lastErr == nil {
+		lastErr = errors.New("no open attempt was made (retries must be positive)")
+	}
+	v.logger.Debug("Failed to open file")
 
+	return nil, flags, fmt.Errorf("open %q: file metadata did not settle after %d attempts: %w", name, v.retries, lastErr)
 }
 
+// Delete implements sqlite3vfs.VFS: it removes every sector ConfigMap of
+// the named file and then its lock ConfigMap, retrying transient races up
+// to the VFS's retry budget.
 func (v *vfs) Delete(name string, dirSync bool) error {
-	v.logger.Debugw("Delete", "name", name, "dirSync", dirSync)
+	v.logger.Debug("Delete", "name", name, "dirSync", dirSync)
 	// in case we're racing another client
 	f := NewFile(name, v)
-	for i := 0; i <= f.vfs.retries; i++ {
-
-		v.logger.Debugw("Deleting configmaps representing this filename", "name", name)
-		cms, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).List(context.TODO(), metav1.ListOptions{LabelSelector: labels.SelectorFromSet(f.SectorLabels).String()})
+	var lastErr error
+	for range f.vfs.retries + 1 {
+		v.logger.Debug("Deleting configmaps representing this filename", "name", name)
+		cms, err := f.listSectorConfigMaps()
 		if err != nil {
-			v.logger.Errorw("Delete's get cms failed", "err", err)
+			// Without the LIST the sectors cannot be found; deleting only
+			// the lockfile would leave them orphaned on the cluster.
+			v.logger.Error("Delete: list sector configmaps", "err", err)
+			lastErr = err
+			continue
 		}
-		v.logger.Debugw("Delete get cms", "cms", cms, "err", err)
-		aDeleteFailed := false
 
-		for _, c := range cms.Items {
-			err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Delete(context.TODO(), c.Name, metav1.DeleteOptions{})
-			if err != nil {
-				v.logger.Errorw("Delete failed to delete cm", "cm", c, "err", err)
+		aDeleteFailed := false
+		for _, c := range cms {
+			if err := v.kc.CoreV1().ConfigMaps(v.namespace).Delete(v.ctx, c.Name, metav1.DeleteOptions{}); err != nil {
+				v.logger.Error("Delete: delete sector configmap", "configmap", c.Name, "err", err)
 				aDeleteFailed = true
 				continue
 			}
-			v.logger.Debugw("Deleted configmap", "configmap", c)
-
+			v.logger.Debug("Deleted configmap", "configmap", c.Name)
 		}
 		if aDeleteFailed {
 			continue
 		}
 
-		v.logger.Debugw("Deleting lockfile for this filename", "name", name)
-		err = f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Delete(context.TODO(), f.LockFileName(), metav1.DeleteOptions{})
-		if kerrors.IsNotFound(err) || err == nil {
+		v.logger.Debug("Deleting lockfile for this filename", "name", name)
+		err = v.kc.CoreV1().ConfigMaps(v.namespace).Delete(v.ctx, f.LockFileName(), metav1.DeleteOptions{})
+		if err == nil || kerrors.IsNotFound(err) {
 			return nil
-		} else {
-			f.vfs.logger.Error(err)
-			continue
 		}
+		v.logger.Error("Delete: delete lockfile", "err", err)
+		lastErr = err
 	}
-	f.vfs.logger.Errorw("Failed to delete file", "filename", name, "dirSync", dirSync)
+	v.logger.Error("Failed to delete file", "filename", name, "dirSync", dirSync, "err", lastErr)
 	return sqlite3vfs.IOError
 }
 
-// Access tests for access permission. Returns true if the requested permission is available.
+// Access implements sqlite3vfs.VFS. It reports every file as accessible,
+// except sqlite's side files, which never exist in the cluster: sqlite
+// fails with "unable to open database file: invalid argument" when it tries
+// to read them while they are empty.
 func (v *vfs) Access(name string, flags sqlite3vfs.AccessFlag) (bool, error) {
-	v.logger.Debugw("Access", "name", name, "flags", flags)
-	// Required because SQLITE3 fails with "unable to open database file: invalid argument" when it tries to read this when they're empty, and we return io.EOF
+	v.logger.Debug("Access", "name", name, "flags", flags)
 	if strings.HasSuffix(name, "-wal") || strings.HasSuffix(name, "-journal") {
 		return false, nil
 	}
 	return true, nil
 }
 
-// FullPathname returns the canonicalized version of name.
-// TODO actually fulfil this
+// FullPathname implements sqlite3vfs.VFS: it returns name unchanged, as
+// file names are already cluster-wide (the TODO of fulfilling
+// canonicalisation properly stands).
 func (v *vfs) FullPathname(name string) string {
 	return name
 }
 
-// CheckReservedLock reports whether a lock is held. When this process
-// itself holds one the answer is known locally and costs no API call;
-// otherwise another process may hold one, so the lock ConfigMap is
-// consulted as before.
+// CheckReservedLock implements sqlite3vfs.File. When this process itself
+// holds a lock the answer is known locally and costs no API call; otherwise
+// another process may hold one, so the lock ConfigMap is consulted as
+// before.
 func (f *file) CheckReservedLock() (bool, error) {
-
 	if f.lockKnown && f.lockLevel > sqlite3vfs.LockNone {
 		// we hold a lock
 		return true, nil
@@ -711,7 +768,7 @@ func (f *file) CheckReservedLock() (bool, error) {
 
 	currentLock, err := f.getCurrentLock()
 	if err != nil {
-		f.vfs.logger.Error(err)
+		f.vfs.logger.Error("CheckReservedLock", "err", err)
 		return false, err
 	}
 	if currentLock > sqlite3vfs.LockNone {
