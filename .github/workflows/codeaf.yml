@@ -90,6 +90,9 @@ jobs:
       # Only routes publish to the approval-gated environment. publish checks
       # the patch itself and never trusts this to mean "no .github/ changes".
       touches_harness: ${{ steps.package.outputs.touches_harness }}
+      # The attempt that uploaded codeaf-output-*. Re-running only a failed
+      # publish starts a new attempt, but its patch is still this one's.
+      attempt: ${{ github.run_attempt }}
     env:
       MODE: ${{ needs.gate.outputs.mode }}
       NUMBER: ${{ needs.gate.outputs.number }}
@@ -359,7 +362,7 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         continue-on-error: true
         with:
-          name: codeaf-output-${{ github.run_id }}-${{ github.run_attempt }}
+          name: codeaf-output-${{ github.run_id }}-${{ needs.run.outputs.attempt }}
           path: ${{ runner.temp }}/in
 
       - name: Check the maintainer's approval
@@ -447,12 +450,27 @@ jobs:
             unsigned="$(printf '{"alg":"RS256","typ":"JWT"}' | b64url).$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((now - 60)) $((now + 540)) "$APP_ID" | b64url)"
             jwt="$unsigned.$(printf '%s' "$unsigned" | openssl dgst -sha256 -sign <(printf '%s\n' "$APP_KEY") | b64url)"
             echo "::add-mask::$jwt"
-            installation=$(curl -fsS -H "Authorization: Bearer $jwt" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$GITHUB_REPOSITORY/installation" | jq -r .id)
-            push_token=$(curl -fsS -X POST -H "Authorization: Bearer $jwt" -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/app/installations/$installation/access_tokens" \
-              -d "$(jq -n --arg repo "${GITHUB_REPOSITORY#*/}" '{repositories: [$repo], permissions: {contents: "write", workflows: "write"}}')" \
-              | jq -r .token)
+            # Each call is checked on its own, so a failure stops here with
+            # GitHub's answer rather than going on with an empty token.
+            api() { curl -sS -o "$RUNNER_TEMP/app-api.json" -w '%{http_code}' -H "Authorization: Bearer $jwt" -H "Accept: application/vnd.github+json" "$@"; }
+            status=$(api "https://api.github.com/repos/$GITHUB_REPOSITORY/installation")
+            if [ "$status" != 200 ]; then
+              case "$status" in
+                404) echo "::error::the CodeAF harness app is not installed on $GITHUB_REPOSITORY (GET /repos/…/installation: 404). Install it on this repository (app settings → Install App)." ;;
+                401) echo "::error::GitHub refused the app's JWT (401): check CODEAF_APP_ID and CODEAF_APP_PRIVATE_KEY on the codeaf-harness environment." ;;
+                *) echo "::error::looking up the app's installation failed: HTTP $status $(jq -r '.message // empty' "$RUNNER_TEMP/app-api.json")" ;;
+              esac
+              exit 1
+            fi
+            installation=$(jq -r '.id // empty' "$RUNNER_TEMP/app-api.json")
+            status=$(api -X POST "https://api.github.com/app/installations/$installation/access_tokens" \
+              -d "$(jq -n --arg repo "${GITHUB_REPOSITORY#*/}" '{repositories: [$repo], permissions: {contents: "write", workflows: "write"}}')")
+            push_token=$(jq -r '.token // empty' "$RUNNER_TEMP/app-api.json")
+            rm -f "$RUNNER_TEMP/app-api.json"
+            if [ "$status" != 201 ] || [ -z "$push_token" ]; then
+              echo "::error::the app could not get an installation token (HTTP $status): it needs Contents and Workflows read and write on $GITHUB_REPOSITORY"
+              exit 1
+            fi
             echo "::add-mask::$push_token"
             unset APP_KEY jwt
           elif [ "$APPROVED" = true ]; then
