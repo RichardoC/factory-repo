@@ -85,6 +85,9 @@ jobs:
       pull-requests: read
     outputs:
       day_before: ${{ steps.spent.outputs.usd }}
+      # Only routes publish to the approval-gated environment. publish checks
+      # the patch itself and never trusts this to mean "no .github/ changes".
+      touches_harness: ${{ steps.package.outputs.touches_harness }}
     env:
       MODE: ${{ needs.gate.outputs.mode }}
       NUMBER: ${{ needs.gate.outputs.number }}
@@ -222,15 +225,21 @@ jobs:
       # From here on, this job only packages results. Nothing it produces is
       # trusted by `publish`.
       - name: Package the changes as a patch
+        id: package
         # Not on cancel: partial work from a cancelled run is never handed on.
         # (Spend and state below are still saved, so a cancelled run's cost counts.)
         if: ${{ !cancelled() }}
         run: |
-          # .github/ is never taken from CodeAF; publish refuses it too.
-          git -c core.hooksPath=/dev/null add -A -- . ':!.github'
+          # Changes under .github/ are included, but publish only applies them
+          # after a maintainer approves (the codeaf-harness environment).
+          git -c core.hooksPath=/dev/null add -A -- .
           git -c core.hooksPath=/dev/null diff --cached --binary --no-ext-diff --no-textconv HEAD \
             > "$RUNNER_TEMP/out/changes.patch"
           echo "Patch: $(wc -c < "$RUNNER_TEMP/out/changes.patch") bytes"
+          if git -c core.hooksPath=/dev/null diff --cached --name-only HEAD | grep -q '^\.github/'; then
+            echo "touches_harness=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::the patch changes .github/; publishing waits for a maintainer's approval"
+          fi
 
       - name: Save today's spend
         if: always()
@@ -329,6 +338,13 @@ jobs:
     # partial work. (A failed run still reports.)
     if: ${{ !cancelled() && needs.gate.outputs.run == 'true' }}
     runs-on: ubuntu-latest
+    # A patch that changes .github/ (the harness, CI, workflows) runs this job
+    # in the codeaf-harness environment, which needs a maintainer's approval
+    # before the job starts. Pushing it would otherwise let a prompt-injected
+    # run put its own workflows on a branch, where CI would run them with
+    # secrets. "Check the maintainer's approval" below verifies the approval
+    # through the API, so an environment without reviewers can't skip it.
+    environment: ${{ needs.run.outputs.touches_harness == 'true' && 'codeaf-harness' || '' }}
     timeout-minutes: 15
     concurrency:
       group: codeaf-publish-${{ needs.gate.outputs.number }}
@@ -379,8 +395,33 @@ jobs:
           name: codeaf-output-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/in
 
+      - name: Check the maintainer's approval
+        id: approval
+        if: needs.run.outputs.touches_harness == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The environment's protection is set in the repository settings,
+          # and GitHub creates a missing environment with no reviewers, so the
+          # approval itself is checked: an approved review of this run, for
+          # codeaf-harness, by someone with admin or maintain access.
+          approvers=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/approvals" \
+            --jq '.[] | select(.state == "approved") | select(any(.environments[]; .name == "codeaf-harness")) | .user.login')
+          for u in $approvers; do
+            perm=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$u/permission" --jq .permission)
+            if [ "$perm" = admin ] || [ "$perm" = maintain ]; then
+              echo "Approved by $u ($perm)"
+              echo "approved=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "::error::the patch changes .github/ but no maintainer approved the codeaf-harness deployment; set required reviewers on that environment"
+          exit 1
+
       - name: Apply the patch
         id: apply
+        env:
+          HARNESS_APPROVED: ${{ steps.approval.outputs.approved }}
         run: |
           git config user.name  "codeaf[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -393,7 +434,8 @@ jobs:
           changed=0
           if [ -f "$patch" ] && [ ! -L "$patch" ] && [ -s "$patch" ]; then
             # Untrusted input: size-capped, must apply to the commit it was made
-            # from, and may not touch .github/ or any .git path.
+            # from, may not touch any .git path, and may touch .github/ only
+            # with a maintainer's approval (checked above, in this job).
             if [ "$(stat -c %s "$patch")" -gt 52428800 ]; then
               echo "::error::patch is over 50 MB; refusing it"; exit 1
             fi
@@ -401,8 +443,11 @@ jobs:
               echo "::error::the branch moved while CodeAF ran; refusing to apply a stale patch"; exit 1
             fi
             git apply --index --binary "$patch"
-            if git diff --cached --name-only | grep -qE '^\.github/|(^|/)\.git(/|$)'; then
-              echo "::error::patch touches .github/ or a .git path; refusing it"; exit 1
+            if git diff --cached --name-only | grep -qE '(^|/)\.git(/|$)'; then
+              echo "::error::patch touches a .git path; refusing it"; exit 1
+            fi
+            if git diff --cached --name-only | grep -q '^\.github/' && [ "$HARNESS_APPROVED" != true ]; then
+              echo "::error::patch touches .github/ without a maintainer's approval; refusing it"; exit 1
             fi
             changed=$(git diff --cached --name-only | wc -l)
           fi
@@ -417,8 +462,15 @@ jobs:
         if: steps.apply.outputs.changed != '0'
         env:
           GH_TOKEN: ${{ github.token }}
+          # GITHUB_TOKEN may not push changes to .github/workflows/, so an
+          # approved harness patch is pushed with this token instead: a
+          # fine-grained token (contents and workflows: write on this repo
+          # only), kept as a secret of the codeaf-harness environment so no
+          # unapproved job can read it. The PR is still opened as the bot.
+          HARNESS_TOKEN: ${{ steps.approval.outputs.approved == 'true' && secrets.CODEAF_HARNESS_TOKEN || '' }}
         run: |
-          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/$BRANCH"
+          push_token=${HARNESS_TOKEN:-$GH_TOKEN}
+          git push "https://x-access-token:${push_token}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/$BRANCH"
           pr=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')
           if [ -z "$pr" ]; then
             title=$(gh issue view "$NUMBER" --json title --jq .title)

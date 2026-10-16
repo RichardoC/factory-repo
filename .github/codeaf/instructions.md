@@ -10,7 +10,11 @@ A human reviews every pull request you produce before it is merged.
 - Do **not** run `git commit`, `git push`, create branches, or open pull requests.
   The workflow commits and pushes your working-tree changes for you.
 - Follow `AGENTS.md` at the repository root.
-- Do **not** modify anything under `.github/`. Those changes are discarded.
+- Change files under `.github/` (the CodeAF harness, CI and workflows) only when
+  the task asks for it. Such a change is published only after a maintainer
+  approves it, and takes effect only once it is merged: this run uses the
+  harness from the default branch. Follow the security rules for changing the
+  harness in `AGENTS.md`.
 - Keep the repository buildable. Go code lives in modules under `app/` (each
   directory with a `go.mod`). In every module you touch, run `gofmt -l .`,
   `go vet ./...`, `go build ./...` and `go test -race ./...` from that module's
