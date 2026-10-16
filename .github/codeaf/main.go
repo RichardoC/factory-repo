@@ -154,6 +154,22 @@ func (u Usage) cached() int {
 	return min(u.PromptTokensDetails.CachedTokens, u.PromptTokens)
 }
 
+// reasoningTokens reads completion_tokens_details.reasoning_tokens out of the
+// raw usage block, if upstream sent it. The details stay raw on the response,
+// so CodeAF sees exactly what upstream sent.
+func (u Usage) reasoningTokens() (int, bool) {
+	if len(u.CompletionTokensDetails) == 0 {
+		return 0, false
+	}
+	var details struct {
+		ReasoningTokens *int `json:"reasoning_tokens"`
+	}
+	if err := json.Unmarshal(u.CompletionTokensDetails, &details); err != nil || details.ReasoningTokens == nil {
+		return 0, false
+	}
+	return *details.ReasoningTokens, true
+}
+
 // CostOf prices one call: uncached input, cached input and output (which
 // includes reasoning tokens) at the model's per-million rates.
 func CostOf(m Model, u Usage) float64 {
@@ -224,6 +240,9 @@ func runProxy() error {
 	}
 	addr := "127.0.0.1:" + envOr("PROXY_PORT", "8787")
 	log.Printf("proxy on %s -> %s (run cap $%.2f, day cap $%.2f, day spent $%.4f)", addr, p.upstream, p.runCap, p.dayCap, p.daySpent)
+	// One marker line at the top of the ledger; the report times the CodeAF
+	// session from it to the last call's end.
+	p.recordMarker("proxy_start")
 	return http.ListenAndServe(addr, p)
 }
 
@@ -401,6 +420,8 @@ func RewriteRequest(body map[string]json.RawMessage, m Model) (stream bool, err 
 }
 
 // LedgerLine is one call, as appended to the ledger and read by report.
+// Kind marks lines that are not calls: the proxy writes one "proxy_start"
+// marker when it starts, which the report times the session from.
 type LedgerLine struct {
 	Time             time.Time `json:"ts"`
 	Model            string    `json:"model"`
@@ -408,24 +429,59 @@ type LedgerLine struct {
 	PromptTokens     int       `json:"prompt_tokens"`
 	CachedTokens     int       `json:"cached_tokens"`
 	CompletionTokens int       `json:"completion_tokens"`
-	CostUSD          float64   `json:"cost_usd"`
-	Stream           bool      `json:"stream"`
-	UsageSeen        bool      `json:"usage_seen"`
+	// ReasoningTokens is completion_tokens_details.reasoning_tokens. A nil
+	// means upstream did not report it; a known zero records 0.
+	ReasoningTokens *int    `json:"reasoning_tokens,omitempty"`
+	CostUSD         float64 `json:"cost_usd"`
+	Stream          bool    `json:"stream"`
+	UsageSeen       bool    `json:"usage_seen"`
+	// Start is when the upstream request was issued, after any wait for a
+	// slot; ts is when the call ended. SlotWaitS is how long the call queued
+	// for a model slot. Old ledgers carry neither.
+	Start     time.Time `json:"start,omitzero"`
+	SlotWaitS float64   `json:"slot_wait_s,omitempty"`
+	Kind      string    `json:"kind,omitempty"`
 }
 
-func (p *proxy) record(m Model, usage *Usage, stream bool) {
-	line := LedgerLine{Time: time.Now().UTC(), Model: m.ID, Upstream: m.Upstream, Stream: stream}
+func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slotWait time.Duration) {
+	line := LedgerLine{Time: time.Now().UTC(), Model: m.ID, Upstream: m.Upstream, Stream: stream,
+		Start: start.UTC(), SlotWaitS: slotWait.Seconds()}
 	if usage != nil {
 		line.UsageSeen = true
 		line.PromptTokens, line.CachedTokens, line.CompletionTokens = usage.PromptTokens, usage.cached(), usage.CompletionTokens
 		line.CostUSD = usage.Cost
+		if n, ok := usage.reasoningTokens(); ok {
+			line.ReasoningTokens = &n
+		}
 	} else {
 		log.Printf("warning: %s returned no usage; this call is unpriced", m.Upstream)
 	}
-	data, _ := json.Marshal(line)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.runSpent += line.CostUSD
+	p.appendLedger(line)
+}
+
+// recordMarker appends one non-call line, such as the proxy_start marker the
+// report times the session from. Markers carry only their kind and ts.
+func (p *proxy) recordMarker(kind string) {
+	marker := struct {
+		Kind string    `json:"kind"`
+		Time time.Time `json:"ts"`
+	}{Kind: kind, Time: time.Now().UTC()}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.appendLedger(marker)
+}
+
+// appendLedger writes one JSON line. Callers hold p.mu, which keeps the
+// run-spend total and the file in step.
+func (p *proxy) appendLedger(line any) {
+	data, err := json.Marshal(line)
+	if err != nil {
+		log.Printf("ledger: %v", err)
+		return
+	}
 	f, err := os.OpenFile(p.ledger, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		log.Printf("ledger: %v", err)
@@ -464,7 +520,7 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("model %q is not allowed; allowed: %s", requested, strings.Join(allowed, ", ")))
 		return
 	}
-	release, err := p.acquire(r.Context(), m)
+	release, slotWait, err := p.acquire(r.Context(), m)
 	if err != nil {
 		return // CodeAF gave up on the call while it waited
 	}
@@ -490,6 +546,9 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 	if stream {
 		request.Header.Set("Accept", "text/event-stream")
 	}
+	// The call starts here, after any wait for a slot; the ledger reads the
+	// duration from this moment to when the call is recorded.
+	started := time.Now()
 	response, err := p.client.Do(request)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream unreachable: "+err.Error())
@@ -506,10 +565,10 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !stream {
-		p.relayJSON(w, response.Body, m)
+		p.relayJSON(w, response.Body, m, started, slotWait)
 		return
 	}
-	p.relayStream(w, response.Body, m)
+	p.relayStream(w, response.Body, m, started, slotWait)
 }
 
 // newSlots makes one semaphore per upstream model that has a max_concurrent.
@@ -525,30 +584,33 @@ func newSlots(models []Model) map[string]chan struct{} {
 
 // acquire waits for one of the model's call slots, so that no more than
 // max_concurrent calls to it are in flight upstream. Waiting is logged, so the
-// proxy log shows how much a run was held up by the limit.
-func (p *proxy) acquire(ctx context.Context, m Model) (func(), error) {
+// proxy log shows how much a run was held up by the limit; the wait is also
+// returned, and the ledger records it per call.
+func (p *proxy) acquire(ctx context.Context, m Model) (func(), time.Duration, error) {
 	slot, ok := p.slots[m.Upstream]
 	if !ok {
-		return func() {}, nil
+		return func() {}, 0, nil
 	}
 	release := func() { <-slot }
 	select {
 	case slot <- struct{}{}:
-		return release, nil
+		return release, 0, nil
 	default:
 	}
 	start := time.Now()
 	select {
 	case slot <- struct{}{}:
-		log.Printf("waited %.1fs for a slot on %s (max %d at once)", time.Since(start).Seconds(), m.Upstream, cap(slot))
-		return release, nil
+		wait := time.Since(start)
+		log.Printf("waited %.1fs for a slot on %s (max %d at once)", wait.Seconds(), m.Upstream, cap(slot))
+		return release, wait, nil
 	case <-ctx.Done():
-		log.Printf("call to %s abandoned after waiting %.1fs for a slot (max %d at once)", m.Upstream, time.Since(start).Seconds(), cap(slot))
-		return nil, ctx.Err()
+		wait := time.Since(start)
+		log.Printf("call to %s abandoned after waiting %.1fs for a slot (max %d at once)", m.Upstream, wait.Seconds(), cap(slot))
+		return nil, wait, ctx.Err()
 	}
 }
 
-func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model) {
+func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, started time.Time, slotWait time.Duration) {
 	var payload map[string]json.RawMessage
 	if err := json.NewDecoder(upstream).Decode(&payload); err != nil {
 		writeError(w, http.StatusBadGateway, "upstream body: "+err.Error())
@@ -565,7 +627,7 @@ func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model) {
 		}
 	}
 	payload["model"], _ = json.Marshal(m.ID)
-	p.record(m, usage, false)
+	p.record(m, usage, false, started, slotWait)
 	writeJSON(w, http.StatusOK, payload)
 }
 
@@ -595,7 +657,7 @@ func RewriteChunk(data []byte, m Model) ([]byte, *Usage) {
 	return out, usage
 }
 
-func (p *proxy) relayStream(w http.ResponseWriter, upstream io.Reader, m Model) {
+func (p *proxy) relayStream(w http.ResponseWriter, upstream io.Reader, m Model, started time.Time, slotWait time.Duration) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
@@ -628,7 +690,7 @@ func (p *proxy) relayStream(w http.ResponseWriter, upstream io.Reader, m Model) 
 			break
 		}
 	}
-	p.record(m, usage, true)
+	p.record(m, usage, true, started, slotWait)
 }
 
 // ---------------------------------------------------------------- GitHub
@@ -1053,6 +1115,9 @@ func readLedger(path string) ([]LedgerLine, error) {
 func ledgerTotal(lines []LedgerLine) float64 {
 	total := 0.0
 	for _, l := range lines {
+		if l.Kind != "" {
+			continue // marker lines are not calls
+		}
 		total += l.CostUSD
 	}
 	return total
@@ -1174,17 +1239,64 @@ func money(x float64) string { return fmt.Sprintf("$%.4f", x) }
 
 func trimNumber(x float64) string { return strconv.FormatFloat(x, 'f', -1, 64) }
 
+// fmtDuration renders a duration for the report, rounded to the second.
+func fmtDuration(d time.Duration) string { return d.Round(time.Second).String() }
+
+// callSpan is one call's time in flight, for the timing figures.
+type callSpan struct {
+	start, end time.Time
+	out        int
+	model      string
+}
+
+// inFlight merges the spans: the total time with at least one call in flight,
+// and how long exactly 1, 2 and 3+ calls overlapped.
+func inFlight(spans []callSpan) (union, at1, at2, at3 float64) {
+	type edge struct {
+		t time.Time
+		d int
+	}
+	edges := make([]edge, 0, 2*len(spans))
+	for _, s := range spans {
+		edges = append(edges, edge{s.start, 1}, edge{s.end, -1})
+	}
+	sort.Slice(edges, func(i, j int) bool { return edges[i].t.Before(edges[j].t) })
+	level, prev := 0, time.Time{}
+	for _, e := range edges {
+		if level > 0 && e.t.After(prev) {
+			d := e.t.Sub(prev).Seconds()
+			union += d
+			switch {
+			case level == 1:
+				at1 += d
+			case level == 2:
+				at2 += d
+			default:
+				at3 += d
+			}
+		}
+		level += e.d
+		prev = e.t
+	}
+	return union, at1, at2, at3
+}
+
 type modelTotals struct {
 	calls, in, cached, out, unpriced int
 	cost                             float64
+	reasoning                        int
+	reasoningKnown                   bool // whether any call reported reasoning tokens
 }
 
 // Report renders the run report. It is a pure function of its inputs so it can
-// be tested; runReport gathers them.
-func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, env func(string) string) string {
+// be tested; runReport gathers them, including the run job's wall time.
+func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall *time.Duration, env func(string) string) string {
 	models := cfg.Models
 	totals := map[string]*modelTotals{}
 	for _, l := range lines {
+		if l.Kind != "" {
+			continue // marker lines are not calls
+		}
 		t := totals[l.Model]
 		if t == nil {
 			t = &modelTotals{}
@@ -1195,8 +1307,44 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, env 
 		t.cached += l.CachedTokens
 		t.out += l.CompletionTokens
 		t.cost += l.CostUSD
+		if l.ReasoningTokens != nil {
+			t.reasoning += *l.ReasoningTokens
+			t.reasoningKnown = true
+		}
 		if !l.UsageSeen {
 			t.unpriced++
+		}
+	}
+	// Timing figures. The proxy_start marker and each call's start..ts span
+	// carry them; anything the ledger does not have renders as an em-dash, as
+	// it does for ledgers written before timing was recorded.
+	var (
+		marker, lastEnd time.Time // proxy start, and the last call's end
+		spans           []callSpan
+		totalOut        int
+		slotWait        float64
+		haveStarts      bool // the ledger carries per-call timing at all
+	)
+	for _, l := range lines {
+		if l.Kind == "proxy_start" {
+			if marker.IsZero() || l.Time.Before(marker) {
+				marker = l.Time
+			}
+			continue
+		}
+		if l.Kind != "" {
+			continue
+		}
+		totalOut += l.CompletionTokens
+		slotWait += l.SlotWaitS
+		if l.Time.After(lastEnd) {
+			lastEnd = l.Time
+		}
+		if !l.Start.IsZero() {
+			haveStarts = true
+			if l.Time.After(l.Start) {
+				spans = append(spans, callSpan{start: l.Start, end: l.Time, out: l.CompletionTokens, model: l.Model})
+			}
 		}
 	}
 	total := ledgerTotal(lines)
@@ -1251,19 +1399,66 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, env 
 			ids = append(ids, id)
 		}
 		sort.Slice(ids, func(i, j int) bool { return totals[ids[i]].cost > totals[ids[j]].cost })
-		b.WriteString("| model | $/M in · cached · out | calls | input tok | cached tok | output tok | cost |\n")
-		b.WriteString("|---|---|---:|---:|---:|---:|---:|\n")
+		b.WriteString("| model | $/M in · cached · out | calls | input tok | cached tok | output tok | reasoning tok | cost |\n")
+		b.WriteString("|---|---|---:|---:|---:|---:|---:|---:|\n")
 		for _, id := range ids {
 			t, p := totals[id], prices[id]
 			cost := money(t.cost)
 			if t.unpriced > 0 {
 				cost += fmt.Sprintf(" (+%d unpriced)", t.unpriced)
 			}
-			fmt.Fprintf(&b, "| `%s` | %s · %s · %s | %d | %d | %d | %d | %s |\n", id,
-				trimNumber(p.Input), trimNumber(p.CacheRead), trimNumber(p.Output), t.calls, t.in, t.cached, t.out, cost)
+			reasoning := "—"
+			if t.reasoningKnown {
+				reasoning = strconv.Itoa(t.reasoning)
+			}
+			fmt.Fprintf(&b, "| `%s` | %s · %s · %s | %d | %d | %d | %d | %s | %s |\n", id,
+				trimNumber(p.Input), trimNumber(p.CacheRead), trimNumber(p.Output), t.calls, t.in, t.cached, t.out, reasoning, cost)
 		}
 		b.WriteString("\n")
 	}
+	// The timing table: one row per figure, an em-dash where the ledger or
+	// the workflow environment lacks the data.
+	wallRow := "—"
+	if wall != nil {
+		wallRow = fmtDuration(*wall)
+	}
+	session := "—"
+	if !marker.IsZero() && lastEnd.After(marker) {
+		session = fmtDuration(lastEnd.Sub(marker))
+	}
+	inFlightRow, splitRow, rateRow := "—", "—", "—"
+	if union, at1, at2, at3 := inFlight(spans); union > 0 {
+		inFlightRow = fmtDuration(time.Duration(union * float64(time.Second)))
+		splitRow = fmtDuration(time.Duration(at1*float64(time.Second))) + " · " +
+			fmtDuration(time.Duration(at2*float64(time.Second))) + " · " +
+			fmtDuration(time.Duration(at3*float64(time.Second)))
+		if totalOut > 0 {
+			rateRow = fmt.Sprintf("%.1f tok/s", float64(totalOut)/union)
+		}
+	}
+	longestRow := "—"
+	if len(spans) > 0 {
+		longest := spans[0]
+		for _, s := range spans[1:] {
+			if s.end.Sub(s.start) > longest.end.Sub(longest.start) {
+				longest = s
+			}
+		}
+		longestRow = fmt.Sprintf("%s · %d tok · `%s`", fmtDuration(longest.end.Sub(longest.start)), longest.out, longest.model)
+	}
+	queuedRow := "—"
+	if haveStarts {
+		queuedRow = fmtDuration(time.Duration(slotWait * float64(time.Second)))
+	}
+	b.WriteString("| timing | |\n|---|---|\n")
+	fmt.Fprintf(&b, "| run job wall time | %s |\n", wallRow)
+	fmt.Fprintf(&b, "| CodeAF session (proxy start → last call end) | %s |\n", session)
+	fmt.Fprintf(&b, "| time with a call in flight | %s |\n", inFlightRow)
+	fmt.Fprintf(&b, "| in-flight split (1 / 2 / 3+ concurrent) | %s |\n", splitRow)
+	fmt.Fprintf(&b, "| output tok/s while in flight | %s |\n", rateRow)
+	fmt.Fprintf(&b, "| longest single call | %s |\n", longestRow)
+	fmt.Fprintf(&b, "| queued at the model limit | %s |\n", queuedRow)
+	b.WriteString("\n")
 	if result.Answer != "" {
 		answer := result.Answer
 		if len(answer) > 6000 {
@@ -1284,6 +1479,45 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, env 
 	return b.String()
 }
 
+// runWallTime asks the GitHub API how long this run's `run` job took, latest
+// attempt first. Any problem — a missing env, a failed call, a job that has
+// not finished — means no figure, and the report still renders without it.
+// The token only goes to the API; nothing here is logged or printed.
+func runWallTime() *time.Duration {
+	gh := newGitHub()
+	run := os.Getenv("GITHUB_RUN_ID")
+	if gh.repo == "" || run == "" || gh.token == "" {
+		return nil
+	}
+	var listing struct {
+		Jobs []struct {
+			Name        string    `json:"name"`
+			RunAttempt  int       `json:"run_attempt"`
+			StartedAt   time.Time `json:"started_at"`
+			CompletedAt time.Time `json:"completed_at"`
+		} `json:"jobs"`
+	}
+	if err := gh.get(fmt.Sprintf("/actions/runs/%s/jobs?per_page=100", run), &listing); err != nil {
+		return nil
+	}
+	found, attempt := false, -1
+	var started, completed time.Time
+	for _, job := range listing.Jobs {
+		if job.Name != "run" || job.StartedAt.IsZero() || job.CompletedAt.IsZero() {
+			continue
+		}
+		if !found || job.RunAttempt > attempt {
+			found, attempt = true, job.RunAttempt
+			started, completed = job.StartedAt, job.CompletedAt
+		}
+	}
+	if !found || !completed.After(started) {
+		return nil
+	}
+	spent := completed.Sub(started)
+	return &spent
+}
+
 func runReport() error {
 	result, err := readResult()
 	haveResult := err == nil
@@ -1298,6 +1532,6 @@ func runReport() error {
 	if err != nil {
 		return err
 	}
-	fmt.Print(Report(result, haveResult, lines, cfg, os.Getenv))
+	fmt.Print(Report(result, haveResult, lines, cfg, runWallTime(), os.Getenv))
 	return nil
 }
