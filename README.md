@@ -7,6 +7,7 @@ It is set up as a monorepo:
 - applications live under `app/<name>/`, each its own Go module with its own README
   and licence;
 - CI checks every module separately;
+- the first application here is [kube-sqlite3-vfs](app/kube-sqlite3-vfs/README.md), a SQLite VFS that stores database files in Kubernetes ConfigMaps;
 - the CodeAF harness and CI live in `.github/`.
 
 ## Using it
