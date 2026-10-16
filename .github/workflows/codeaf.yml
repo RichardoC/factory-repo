@@ -1,7 +1,9 @@
 # CodeAF (https://github.com/Agent-Field/CodeAF) running entirely inside GitHub Actions.
 #
 # Triggers, all gated on the `codeaf` label (adding a label needs triage access):
-#   * an issue gets the `codeaf` label     -> CodeAF works the issue, opens a PR
+#   * an issue gets the `codeaf` label     -> CodeAF works the issue on a fresh
+#     branch `codeaf/issue-N-<run id>` cut from the default branch and opens its
+#     own PR, so an issue can be re-run without colliding with an earlier run
 #   * `/codeaf <text>` comment on a labelled issue or PR, or a "changes requested"
 #     review on a labelled PR, from an OWNER/MEMBER/COLLABORATOR
 #                                            -> CodeAF continues on that PR's branch
