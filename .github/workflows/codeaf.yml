@@ -185,11 +185,18 @@ jobs:
       - name: Run CodeAF
         # CodeAF's settings (seat models, budgets, telemetry off) are in
         # .github/codeaf/codeaf-config.json, installed as its profile config.
-        # Only the endpoint and the escalation panel stay in the environment:
-        # CodeAF reads those two from nowhere else.
+        # Only the endpoint stays in the environment: CodeAF reads it from
+        # nowhere else.
+        #
+        # CODEAF_MODELS (the escalation panel, .github/codeaf/panel.json) is
+        # deliberately not set. With a panel, CodeAF's router checks every reply
+        # with verify(), which counts a reply holding only tool calls as
+        # "empty_response". Nearly every agent step is such a reply, so runs
+        # ended at once with "the request did not get through". The pinned
+        # router also sent every rung to the seat model, so it never escalated.
+        # Put it back once CodeAF fixes both (internal/router/router.go).
         env:
           CODEAF_BASE_URL: http://127.0.0.1:8787/v1
-          CODEAF_MODELS: ${{ runner.temp }}/harness/panel.json
         run: |
           cp "$RUNNER_TEMP/harness/codeaf-config.json" "$CODEAF_HOME/config.json"
           set +e
