@@ -222,7 +222,9 @@ jobs:
       # From here on, this job only packages results. Nothing it produces is
       # trusted by `publish`.
       - name: Package the changes as a patch
-        if: always()
+        # Not on cancel: partial work from a cancelled run is never handed on.
+        # (Spend and state below are still saved, so a cancelled run's cost counts.)
+        if: ${{ !cancelled() }}
         run: |
           # .github/ is never taken from CodeAF; publish refuses it too.
           git -c core.hooksPath=/dev/null add -A -- . ':!.github'
@@ -314,7 +316,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         # The patch, its base commit, CodeAF's result and the cost ledger: all of
         # it is published on the PR anyway. `publish` reads it as untrusted data.
-        if: always()
+        if: ${{ !cancelled() }}
         with:
           name: codeaf-output-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/out
@@ -323,7 +325,9 @@ jobs:
 
   publish:
     needs: [gate, run]
-    if: always() && needs.gate.outputs.run == 'true'
+    # !cancelled(), not always(): a cancelled run must not publish its
+    # partial work. (A failed run still reports.)
+    if: ${{ !cancelled() && needs.gate.outputs.run == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     concurrency:

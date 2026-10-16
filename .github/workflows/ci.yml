@@ -31,32 +31,66 @@ jobs:
       - run: go vet ./...
       - run: go test -race -count=1 ./...
 
-  go:
+  modules:
+    # Every Go module outside .github/ (the harness has its own job above).
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 5
+    outputs:
+      dirs: ${{ steps.find.outputs.dirs }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Detect Go module
-        id: detect
+      - id: find
         run: |
-          if [ -f go.mod ]; then echo "go=true" >> "$GITHUB_OUTPUT"; else echo "No go.mod yet; nothing to check."; fi
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        if: steps.detect.outputs.go == 'true'
+          dirs=$(find . -name go.mod -not -path './.github/*' -not -path '*/vendor/*' -printf '%h\n' \
+            | sed 's|^\./||; s|^\.$|.|' | sort | jq -Rsc 'split("\n") | map(select(length > 0))')
+          echo "dirs=$dirs" >> "$GITHUB_OUTPUT"
+          echo "Go modules: $dirs"
+
+  go-module:
+    needs: modules
+    if: needs.modules.outputs.dirs != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJSON(needs.modules.outputs.dirs) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          go-version-file: go.mod
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ matrix.dir }}/go.mod
+          cache: false
       - name: gofmt
-        if: steps.detect.outputs.go == 'true'
         run: |
           unformatted=$(gofmt -l .)
           if [ -n "$unformatted" ]; then echo "Not gofmt'd:"; echo "$unformatted"; exit 1; fi
       - name: go vet
-        if: steps.detect.outputs.go == 'true'
         run: go vet ./...
       - name: go build
-        if: steps.detect.outputs.go == 'true'
         run: go build ./...
       - name: go test
-        if: steps.detect.outputs.go == 'true'
         run: go test -race -count=1 ./...
+
+  go:
+    # The required status check: passes when every module passed, or when
+    # there are no modules yet. Kept under this name for branch protection.
+    needs: [modules, go-module]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          MODULES: ${{ needs.modules.result }}
+          CHECKS: ${{ needs.go-module.result }}
+        run: |
+          echo "modules: $MODULES, per-module checks: $CHECKS"
+          [ "$MODULES" = success ] || exit 1
+          [ "$CHECKS" = success ] || [ "$CHECKS" = skipped ]
