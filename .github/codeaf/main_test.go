@@ -207,7 +207,7 @@ func TestDecide(t *testing.T) {
 	owner := &comment{Body: "/codeaf go", AuthorAssociation: "OWNER", User: user{Login: "RichardoC", Type: "User"}}
 	prMarker := json.RawMessage(`{"url":"x"}`)
 	openPR := item{Number: 7, State: "open", Labels: labelled}
-	openPR.Head.Ref = "codeaf/issue-3"
+	openPR.Head.Ref = "codeaf/issue-3-41"
 	openPR.Head.Repo = &struct {
 		FullName string `json:"full_name"`
 	}{FullName: "RichardoC/factory-repo"}
@@ -233,7 +233,7 @@ func TestDecide(t *testing.T) {
 		mode   string
 		branch string
 	}{
-		{"issue labelled", "issues", with(func(e *event) { e.Label = &label{Name: "codeaf"}; e.Issue = &item{Number: 3, Labels: labelled} }), noLookup, true, "issue", "codeaf/issue-3"},
+		{"issue labelled", "issues", with(func(e *event) { e.Label = &label{Name: "codeaf"}; e.Issue = &item{Number: 3, Labels: labelled} }), noLookup, true, "issue", "codeaf/issue-3-42"},
 		{"other label", "issues", with(func(e *event) { e.Label = &label{Name: "bug"}; e.Issue = &item{Number: 3} }), noLookup, false, "", ""},
 		{"label on a PR", "issues", with(func(e *event) {
 			e.Label = &label{Name: "codeaf"}
@@ -248,11 +248,11 @@ func TestDecide(t *testing.T) {
 			e.Issue = &item{Number: 3, Labels: labelled}
 			e.Comment = &comment{Body: "looks good", AuthorAssociation: "OWNER", User: user{Type: "User"}}
 		}), noLookup, false, "", ""},
-		{"command on issue", "issue_comment", with(func(e *event) { e.Issue = &item{Number: 3, Labels: labelled}; e.Comment = owner }), noLookup, true, "issue", "codeaf/issue-3"},
+		{"command on issue", "issue_comment", with(func(e *event) { e.Issue = &item{Number: 3, Labels: labelled}; e.Comment = owner }), noLookup, true, "issue", "codeaf/issue-3-42"},
 		{"command on PR", "issue_comment", with(func(e *event) {
 			e.Issue = &item{Number: 7, Labels: labelled, PullRequest: prMarker}
 			e.Comment = owner
-		}), lookup(openPR), true, "pr", "codeaf/issue-3"},
+		}), lookup(openPR), true, "pr", "codeaf/issue-3-41"},
 		{"command on fork PR", "issue_comment", with(func(e *event) {
 			e.Issue = &item{Number: 7, Labels: labelled, PullRequest: prMarker}
 			e.Comment = owner
@@ -260,7 +260,7 @@ func TestDecide(t *testing.T) {
 		{"changes requested", "pull_request_review", with(func(e *event) {
 			e.PullRequest = &openPR
 			e.Review = &comment{Body: "fix the test", State: "changes_requested", AuthorAssociation: "OWNER", User: user{Type: "User"}}
-		}), lookup(openPR), true, "pr", "codeaf/issue-3"},
+		}), lookup(openPR), true, "pr", "codeaf/issue-3-41"},
 		{"plain approval", "pull_request_review", with(func(e *event) {
 			e.PullRequest = &openPR
 			e.Review = &comment{Body: "nice", State: "approved", AuthorAssociation: "OWNER", User: user{Type: "User"}}
@@ -268,7 +268,7 @@ func TestDecide(t *testing.T) {
 		{"approval carrying a command", "pull_request_review", with(func(e *event) {
 			e.PullRequest = &openPR
 			e.Review = &comment{Body: "/codeaf tidy the docs", State: "approved", AuthorAssociation: "OWNER", User: user{Type: "User"}}
-		}), lookup(openPR), true, "pr", "codeaf/issue-3"},
+		}), lookup(openPR), true, "pr", "codeaf/issue-3-41"},
 		{"untrusted reviewer", "pull_request_review", with(func(e *event) {
 			e.PullRequest = &openPR
 			e.Review = &comment{Body: "do this", State: "changes_requested", AuthorAssociation: "CONTRIBUTOR", User: user{Login: "x", Type: "User"}}
@@ -284,7 +284,7 @@ func TestDecide(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := Decide(c.event, c.ev, "codeaf", c.lookup)
+			got, err := Decide(c.event, c.ev, "codeaf", "42", c.lookup)
 			if err != nil {
 				t.Fatal(err)
 			}

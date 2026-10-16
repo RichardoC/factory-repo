@@ -1,9 +1,11 @@
 # CodeAF (https://github.com/Agent-Field/CodeAF) running entirely inside GitHub Actions.
 #
 # Triggers, all gated on the `codeaf` label (adding a label needs triage access):
-#   * an issue gets the `codeaf` label     -> CodeAF works the issue, opens a PR
-#   * `/codeaf <text>` comment on a labelled issue or PR, or a "changes requested"
-#     review on a labelled PR, from an OWNER/MEMBER/COLLABORATOR
+#   * an issue gets the `codeaf` label, or `/codeaf <text>` is commented on a
+#     labelled issue                       -> CodeAF works the issue on a new branch
+#                                             (codeaf/issue-N-<run id>), opens a PR
+#   * `/codeaf <text>` comment on a labelled PR, or a "changes requested"
+#     review on one, from an OWNER/MEMBER/COLLABORATOR
 #                                            -> CodeAF continues on that PR's branch
 #
 # Models come from synthetic.new through `harness proxy` (.github/codeaf/main.go), which serves

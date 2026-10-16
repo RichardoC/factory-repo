@@ -704,10 +704,14 @@ func skip(reason string) Decision { return Decision{Reason: reason} }
 // Decide applies the trust rules to one event. lookupPR fetches a PR when the
 // event only carries its issue form; it is only called once the event has
 // passed every check that needs no network.
-func Decide(name string, ev event, labelName string, lookupPR func(int) (item, error)) (Decision, error) {
+//
+// Every issue run gets its own branch, codeaf/issue-N-<runID>, cut from the
+// default branch, so re-running an issue never collides with an earlier run's
+// branch or PR. Continuing earlier work is done from that run's PR instead.
+func Decide(name string, ev event, labelName, runID string, lookupPR func(int) (item, error)) (Decision, error) {
 	issueRun := func(i item, reason string) Decision {
 		return Decision{Run: true, Reason: reason, Mode: "issue", Number: i.Number,
-			Branch: fmt.Sprintf("codeaf/issue-%d", i.Number), Base: ev.Repository.DefaultBranch}
+			Branch: fmt.Sprintf("codeaf/issue-%d-%s", i.Number, runID), Base: ev.Repository.DefaultBranch}
 	}
 	var target *item
 	var trigger *comment
@@ -771,8 +775,12 @@ func runGate() error {
 	if err != nil {
 		return err
 	}
+	runID := os.Getenv("GITHUB_RUN_ID")
+	if runID == "" || strings.Trim(runID, "0123456789") != "" {
+		return fmt.Errorf("GITHUB_RUN_ID %q is not a run number", runID)
+	}
 	gh := newGitHub()
-	decision, err := Decide(os.Getenv("GITHUB_EVENT_NAME"), ev, envOr("CODEAF_LABEL", "codeaf"), func(n int) (item, error) {
+	decision, err := Decide(os.Getenv("GITHUB_EVENT_NAME"), ev, envOr("CODEAF_LABEL", "codeaf"), runID, func(n int) (item, error) {
 		var pr item
 		return pr, gh.get(fmt.Sprintf("/pulls/%d", n), &pr)
 	})
