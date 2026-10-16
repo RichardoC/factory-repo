@@ -90,6 +90,9 @@ jobs:
       # Only routes publish to the approval-gated environment. publish checks
       # the patch itself and never trusts this to mean "no .github/ changes".
       touches_harness: ${{ steps.package.outputs.touches_harness }}
+      # The attempt that uploaded codeaf-output-*. Re-running only a failed
+      # publish starts a new attempt, but its patch is still this one's.
+      attempt: ${{ github.run_attempt }}
     env:
       MODE: ${{ needs.gate.outputs.mode }}
       NUMBER: ${{ needs.gate.outputs.number }}
@@ -359,7 +362,7 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         continue-on-error: true
         with:
-          name: codeaf-output-${{ github.run_id }}-${{ github.run_attempt }}
+          name: codeaf-output-${{ github.run_id }}-${{ needs.run.outputs.attempt }}
           path: ${{ runner.temp }}/in
 
       - name: Check the maintainer's approval
