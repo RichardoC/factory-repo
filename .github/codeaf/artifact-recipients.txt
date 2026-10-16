@@ -1,6 +1,0 @@
-# Public keys that CodeAF's diagnostics artifacts are encrypted to, one per line.
-# These are age recipients (age1...) or SSH public keys (ssh-ed25519 ..., ssh-rsa ...).
-# Decrypt a downloaded artifact with:
-#   age -d -i ~/.ssh/id_ed25519 diagnostics.tar.gz.age | tar xz
-# (or -i your-age-identity.txt). If this file has no keys, diagnostics are not
-# uploaded at all.

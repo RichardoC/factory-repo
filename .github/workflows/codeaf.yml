@@ -128,7 +128,6 @@ jobs:
         run: |
           cp -r .github/codeaf "$RUNNER_TEMP/harness"
           (cd "$RUNNER_TEMP/harness" && go build -trimpath -o harness .)
-          GOBIN="$TOOLS" go install filippo.io/age/cmd/age@v1.3.2
 
       - name: Build CodeAF
         # Always from the pinned source, never from a cache: a cached binary was
@@ -256,26 +255,21 @@ jobs:
         # Artifacts on a public repository can be downloaded by any signed-in
         # GitHub user, so the brief, transcripts, logs and CodeAF's state
         # (memory db, event log, raw ledger; kept for audit, never restored)
-        # are encrypted to the maintainers' public keys: those in
-        # artifact-recipients.txt plus the CODEAF_ARTIFACT_PUBLIC_KEY secret.
-        # That secret is a public key, so exposing it to this untrusted step
-        # costs nothing; the private key is never given to any workflow.
-        # Without any key, nothing is uploaded rather than anything in the
-        # clear. Only regular files are copied, so a planted symlink can't
-        # pull in other files.
+        # are encrypted with OpenSSL CMS (AES-256-GCM, authenticated) to the
+        # RSA certificate in the CODEAF_ARTIFACT_PUBLIC_KEY secret. That secret
+        # holds only a public certificate, so exposing it to this untrusted
+        # step costs nothing; the private key is never given to any workflow.
+        # Without a valid certificate nothing is uploaded, rather than anything
+        # in the clear. Only regular files are copied, so a planted symlink
+        # can't pull in other files.
         if: always()
         env:
           ARTIFACT_PUBLIC_KEY: ${{ secrets.CODEAF_ARTIFACT_PUBLIC_KEY }}
         run: |
-          recipients="$RUNNER_TEMP/recipients.txt"
-          cp "$RUNNER_TEMP/harness/artifact-recipients.txt" "$recipients"
-          if [[ "$ARTIFACT_PUBLIC_KEY" =~ ^(age1[0-9a-z]+|ssh-(ed25519|rsa)\ [A-Za-z0-9+/=]+)$ ]]; then
-            printf '%s\n' "$ARTIFACT_PUBLIC_KEY" >> "$recipients"
-          elif [ -n "$ARTIFACT_PUBLIC_KEY" ]; then
-            echo "::warning::CODEAF_ARTIFACT_PUBLIC_KEY is not an age or SSH public key; ignoring it"
-          fi
-          if ! grep -qvE '^[[:space:]]*(#|$)' "$recipients"; then
-            echo "::warning::no artifact recipient configured; diagnostics not uploaded"
+          cert="$RUNNER_TEMP/artifact-cert.pem"
+          printf '%s\n' "$ARTIFACT_PUBLIC_KEY" > "$cert"
+          if ! openssl x509 -in "$cert" -noout -text 2>/dev/null | grep -qE 'Public Key Algorithm: rsaEncryption'; then
+            echo "::warning::CODEAF_ARTIFACT_PUBLIC_KEY is not set to an RSA certificate; diagnostics not uploaded"
             exit 0
           fi
           bundle="$RUNNER_TEMP/diagnostics"
@@ -291,13 +285,16 @@ jobs:
           done
           [ -d "$CODEAF_HOME/runs" ] && cp -r --no-dereference "$CODEAF_HOME/runs" "$bundle/runs"
           mkdir -p "$RUNNER_TEMP/out-enc"
-          tar -C "$bundle" -czf - . | "$TOOLS/age" -R "$recipients" -o "$RUNNER_TEMP/out-enc/diagnostics.tar.gz.age"
+          tar -C "$bundle" -czf "$RUNNER_TEMP/diagnostics.tar.gz" .
           rm -rf "$bundle"
+          openssl cms -encrypt -binary -aes-256-gcm -outform DER \
+            -in "$RUNNER_TEMP/diagnostics.tar.gz" -out "$RUNNER_TEMP/out-enc/diagnostics.tar.gz.cms" "$cert"
+          rm -f "$RUNNER_TEMP/diagnostics.tar.gz"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: codeaf-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/out-enc/diagnostics.tar.gz.age
+          path: ${{ runner.temp }}/out-enc/diagnostics.tar.gz.cms
           if-no-files-found: ignore
           retention-days: 90
 

@@ -66,13 +66,28 @@ workflow artifact.
 - Artifacts on a public repo can be downloaded by any signed-in GitHub user. The
   diagnostics (brief, transcripts, logs, and CodeAF's memory db, event log and
   raw ledger, which are kept for audit and never restored) are therefore encrypted
-  with [age](https://age-encryption.org) to the `CODEAF_ARTIFACT_PUBLIC_KEY`
-  secret and any keys in
-  [`artifact-recipients.txt`](.github/codeaf/artifact-recipients.txt). They are
-  not uploaded at all until a key is configured. Decrypt with
-  `age -d -i private-key.txt diagnostics.tar.gz.age | tar xz`. The private key's
-  `CODEAF_ARTIFACT_PRIVATE_KEY` secret is a backup only: GitHub secrets can't be
-  read back, and no workflow uses it, so keep your own copy to decrypt.
+  with OpenSSL CMS (AES-256-GCM) to the RSA certificate in the
+  `CODEAF_ARTIFACT_PUBLIC_KEY` secret. Until that secret holds a valid
+  certificate, they are not uploaded at all. To create the key pair and set the
+  secret:
+
+  ```sh
+  mkdir -p ~/.config/codeaf && chmod 700 ~/.config/codeaf && cd ~/.config/codeaf
+  openssl req -x509 -newkey rsa:4096 -nodes -keyout artifact-key.pem \
+    -out artifact-cert.pem -subj "/CN=codeaf-artifacts" -days 3650
+  chmod 600 artifact-key.pem
+  gh secret set CODEAF_ARTIFACT_PUBLIC_KEY --repo RichardoC/factory-repo < artifact-cert.pem
+  ```
+
+  Decrypt a downloaded artifact with:
+
+  ```sh
+  openssl cms -decrypt -binary -inform DER -in diagnostics.tar.gz.cms \
+    -inkey ~/.config/codeaf/artifact-key.pem | tar xz
+  ```
+
+  Keep `artifact-key.pem` yourself. No workflow uses the private key, and a
+  GitHub secret can't be read back, so it is only useful as a secret for backup.
 - The rules for future changes are in
   [`AGENTS.md`](AGENTS.md#security-rules-for-changing-the-harness).
 - Protecting `main`: [`CODEOWNERS`](.github/CODEOWNERS) makes @RichardoC the owner of
