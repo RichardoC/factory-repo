@@ -2,7 +2,7 @@
   "_comment": "Harness config. limits: spend caps (USD) the proxy enforces per workflow run and per UTC day. models: what CodeAF may use, served to it by `harness proxy` as an OpenRouter-shaped catalog; prices are USD per million tokens, from https://synthetic.new/pricing (usage-based) / GET https://api.synthetic.new/openai/v1/models, checked 2026-10-16. 'id' is what CodeAF sees; 'upstream' is the synthetic.new model id. 'max_concurrent': the synthetic.new subscription allows 2 calls to each model at once; the proxy queues calls past that.",
   "limits": {
     "run_usd": 5,
-    "day_usd": 20
+    "day_usd": 40
   },
   "models": [
     {
