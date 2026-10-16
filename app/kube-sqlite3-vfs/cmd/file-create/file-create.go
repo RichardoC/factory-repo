@@ -33,14 +33,6 @@ type Options struct {
 	Retries    int    `long:"retries" description:"Number of retries for API calls" default:"1"`
 }
 
-// fatal prints err to stderr and exits non-zero. The command line tools
-// never panic on ordinary errors: a panic unwinds through the cgo sqlite
-// boundary and kills the process without a usable message.
-func fatal(err error) {
-	fmt.Fprintln(os.Stderr, err)
-	os.Exit(1)
-}
-
 // newLogger returns the process logger: debug-level text logging with -v,
 // info-level JSON logging without.
 func newLogger(verbose bool) *slog.Logger {
@@ -54,7 +46,8 @@ func main() {
 	var opts Options
 	parser := flags.NewParser(&opts, flags.Default)
 	if _, err := parser.Parse(); err != nil {
-		fatal(err)
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 
 	logger := newLogger(opts.Verbose)
@@ -66,9 +59,34 @@ func main() {
 		logger.Info("working directory", "dir", wd)
 	}
 
+	// The only two os.Exit calls in the process are the flag-parse failure
+	// above and this one, both before or after run has returned: the old
+	// fatal() exited from the middle of the work, skipping the deferred
+	// f.Close. A failure now unwinds through run's defers and leaves the
+	// exit code to main.
+	if err := run(opts, logger); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+// run does the command's work and returns the first failure instead of
+// exiting, so main can print it and exit non-zero and the deferred closes
+// in run and runWithClient run on every path out.
+func run(opts Options, logger *slog.Logger) error {
+	clientset, err := newClientset(opts.KubeConfig)
+	if err != nil {
+		return err
+	}
+	return runWithClient(clientset, opts, logger)
+}
+
+// newClientset builds a clientset from --kubeconfig, or from the current
+// context in the kubeconfig under the user's home directory.
+func newClientset(kubeconfigFlag string) (kubernetes.Interface, error) {
 	var kubeconfig string
-	if opts.KubeConfig != "" {
-		kubeconfig = opts.KubeConfig
+	if kubeconfigFlag != "" {
+		kubeconfig = kubeconfigFlag
 	} else if home := homedir.HomeDir(); home != "" {
 		kubeconfig = filepath.Join(home, ".kube", "config")
 	}
@@ -76,22 +94,26 @@ func main() {
 	// use the current context in kubeconfig
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
-		fatal(err)
+		return nil, err
 	}
 
 	// create the clientset
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		fatal(err)
-	}
+	return kubernetes.NewForConfig(config)
+}
 
+// runWithClient holds the command's body. It takes a kubernetes.Interface
+// so the tests can drive it with the fake clientset, and it returns the
+// first hard failure (the local file cannot be opened or stat'ed) to its
+// caller; the per-write comparison failures stay logged, as this is a
+// differential test harness.
+func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Logger) error {
 	vfsN := vfs.NewVFS(context.Background(), clientset, "test", logger, opts.Retries)
 
 	fn := "fakefile.txt"
 
-	f, err := os.OpenFile("fn", os.O_CREATE|os.O_RDWR, 0o644)
+	f, err := os.OpenFile(fn, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
-		fatal(err)
+		return fmt.Errorf("open local file: %w", err)
 	}
 	defer f.Close()
 
@@ -142,7 +164,7 @@ func main() {
 
 	fi, err := f.Stat()
 	if err != nil {
-		fatal(err)
+		return fmt.Errorf("stat local file: %w", err)
 	}
 
 	fSize := fi.Size()
@@ -162,7 +184,7 @@ func main() {
 
 	fi, err = f.Stat()
 	if err != nil {
-		fatal(err)
+		return fmt.Errorf("stat local file: %w", err)
 	}
 
 	fSize = fi.Size()
@@ -179,15 +201,17 @@ func main() {
 	rand.Read(randomToWrite)
 
 	// testWriting updates the outer fi/fSize: the offsets of the calls
-	// after it are computed from the size the previous write left.
-	testWriting := func(p []byte, off int64) {
+	// after it are computed from the size the previous write left. A
+	// failed stat of the local file fails the run — every offset after it
+	// would be computed from a stale size.
+	testWriting := func(p []byte, off int64) error {
 		if err := dualWrite(p, off); err != nil {
 			logger.Error("dualWrite", "err", err)
 		}
 
 		fi, err = f.Stat()
 		if err != nil {
-			fatal(err)
+			return fmt.Errorf("stat local file: %w", err)
 		}
 
 		fSize = fi.Size()
@@ -204,16 +228,25 @@ func main() {
 		if fi.Size() != virtualFileSize {
 			logger.Error("Mismatched file sizes", "realFile", fi.Size(), "virtualFile", virtualFileSize)
 		}
+		return nil
 	}
 
-	testWriting(randomToWrite, 0)
+	if err := testWriting(randomToWrite, 0); err != nil {
+		return err
+	}
 	randomToWrite = make([]byte, vfs.SectorSize+2)
 	rand.Read(randomToWrite)
-	testWriting(randomToWrite, fSize-46)
+	if err := testWriting(randomToWrite, fSize-46); err != nil {
+		return err
+	}
 	randomToWrite = make([]byte, vfs.SectorSize+2)
-	testWriting(randomToWrite, fSize-46)
+	if err := testWriting(randomToWrite, fSize-46); err != nil {
+		return err
+	}
 	randomToWrite = make([]byte, 2*vfs.SectorSize-1)
-	testWriting(randomToWrite, fSize-46-vfs.SectorSize)
+	if err := testWriting(randomToWrite, fSize-46-vfs.SectorSize); err != nil {
+		return err
+	}
 
 	p1 = make([]byte, fSize)
 	p2 = make([]byte, fSize)
@@ -230,7 +263,9 @@ func main() {
 
 		randomToWrite = make([]byte, length.Int64())
 		rand.Read(randomToWrite)
-		testWriting(randomToWrite, offset.Int64())
+		if err := testWriting(randomToWrite, offset.Int64()); err != nil {
+			return err
+		}
 
 		length, _ = rand.Int(rand.Reader, new(big.Int).SetInt64(fi.Size()))
 		off := fi.Size() - length.Int64()
@@ -246,4 +281,5 @@ func main() {
 			logger.Error("Mismatched file sizes", "realFile", fi.Size(), "virtualFile", virtualFileSize)
 		}
 	}
+	return nil
 }
