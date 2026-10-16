@@ -35,3 +35,4 @@ go.work.sum
 # Python bytecode caches
 __pycache__/
 *.py[cod]
+.github/codeaf/codeaf-harness

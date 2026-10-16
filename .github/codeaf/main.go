@@ -21,6 +21,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -75,6 +76,10 @@ type Model struct {
 	ContextLength   int      `json:"context_length"`
 	InputModalities []string `json:"input_modalities"`
 	Efforts         []string `json:"efforts"`
+	// MaxConcurrent is how many calls to this model may be in flight at
+	// once; 0 is no limit. The synthetic.new subscription allows 2 per
+	// model, and the proxy queues calls past that rather than sending them.
+	MaxConcurrent int `json:"max_concurrent"`
 }
 
 // Limits are the spend caps the proxy enforces, in USD.
@@ -107,6 +112,9 @@ func loadConfig(path string) (Config, error) {
 	for _, m := range cfg.Models {
 		if m.ID == "" || m.Upstream == "" || len(m.Efforts) == 0 {
 			return cfg, fmt.Errorf("%s: model %q needs id, upstream and efforts", path, m.ID)
+		}
+		if m.MaxConcurrent < 0 {
+			return cfg, fmt.Errorf("%s: model %q: max_concurrent must not be negative", path, m.ID)
 		}
 	}
 	return cfg, nil
@@ -164,6 +172,7 @@ type proxy struct {
 	daySpent float64
 	models   []Model
 	client   *http.Client
+	slots    map[string]chan struct{} // per upstream model, for max_concurrent
 
 	mu       sync.Mutex
 	runSpent float64
@@ -200,6 +209,7 @@ func runProxy() error {
 		return err
 	}
 	p.models, p.runCap, p.dayCap = cfg.Models, cfg.Limits.RunUSD, cfg.Limits.DayUSD
+	p.slots = newSlots(p.models)
 	if p.daySpent, err = spentToday("PROXY_DAY_SPENT_USD"); err != nil {
 		return err
 	}
@@ -454,6 +464,12 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("model %q is not allowed; allowed: %s", requested, strings.Join(allowed, ", ")))
 		return
 	}
+	release, err := p.acquire(r.Context(), m)
+	if err != nil {
+		return // CodeAF gave up on the call while it waited
+	}
+	defer release()
+	// Checked after the wait, since other calls may have spent the cap.
 	if reason := p.overCap(); reason != "" {
 		writeError(w, http.StatusPaymentRequired, reason)
 		return
@@ -494,6 +510,42 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.relayStream(w, response.Body, m)
+}
+
+// newSlots makes one semaphore per upstream model that has a max_concurrent.
+func newSlots(models []Model) map[string]chan struct{} {
+	slots := map[string]chan struct{}{}
+	for _, m := range models {
+		if m.MaxConcurrent > 0 {
+			slots[m.Upstream] = make(chan struct{}, m.MaxConcurrent)
+		}
+	}
+	return slots
+}
+
+// acquire waits for one of the model's call slots, so that no more than
+// max_concurrent calls to it are in flight upstream. Waiting is logged, so the
+// proxy log shows how much a run was held up by the limit.
+func (p *proxy) acquire(ctx context.Context, m Model) (func(), error) {
+	slot, ok := p.slots[m.Upstream]
+	if !ok {
+		return func() {}, nil
+	}
+	release := func() { <-slot }
+	select {
+	case slot <- struct{}{}:
+		return release, nil
+	default:
+	}
+	start := time.Now()
+	select {
+	case slot <- struct{}{}:
+		log.Printf("waited %.1fs for a slot on %s (max %d at once)", time.Since(start).Seconds(), m.Upstream, cap(slot))
+		return release, nil
+	case <-ctx.Done():
+		log.Printf("call to %s abandoned after waiting %.1fs for a slot (max %d at once)", m.Upstream, time.Since(start).Seconds(), cap(slot))
+		return nil, ctx.Err()
+	}
 }
 
 func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model) {

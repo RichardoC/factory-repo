@@ -58,8 +58,16 @@ Three workflow artifacts are uploaded, none of them encrypted:
 
   The synthetic.new key (`SYNTHETIC_API_KEY` secret) is held only by the proxy. It is
   passed in on stdin, not through the environment.
-- Model choice: every seat (worker, planner, checker) runs on
-  **GLM-5.3-Flash** ($0.15 in / $0.50 out per M tokens).
+- Model choice: the seats are spread across models, because the synthetic.new
+  subscription allows only **2 calls to each model at once**:
+  - the worker runs on **GLM-5.3-Flash** ($0.15 in / $0.50 out per M tokens);
+  - the planner and checker run on **DeepSeek-V4.1-Flash** ($0.60 / $1.20).
+  - CodeAF runs at most 2 tasks at once (`task.parallel`), so the workers
+    fit in GLM-5.3-Flash's 2 slots.
+  - The proxy enforces the limit per model (`max_concurrent` in
+    `models.json`): a call past it waits for a slot instead of reaching
+    synthetic.new. Each wait is written to the proxy log, so the
+    diagnostics show whether a run was held up by it.
   - Escalation is switched off for now. CodeAF's cascade
     ([`panel.json`](.github/codeaf/panel.json)) would escalate to
     **DeepSeek-V4.1-Flash** ($0.60 / $1.20) and then **GLM-5.3** ($1.40 / $4.40),
@@ -145,13 +153,16 @@ Three workflow artifacts are uploaded, none of them encrypted:
   create and approve pull requests* (for `gh pr create` with `GITHUB_TOKEN`).
 - Configuration lives in files, not workflow variables:
   - [`models.json`](.github/codeaf/models.json): the spend caps (`limits`) and the
-    allowed models with their prices (USD per million tokens);
+    allowed models with their prices (USD per million tokens) and how many calls
+    each may have in flight (`max_concurrent`);
   - [`panel.json`](.github/codeaf/panel.json): the escalation order (not used for
     now, see above);
   - [`codeaf-config.json`](.github/codeaf/codeaf-config.json): CodeAF's own settings
-    (seat models, budgets, telemetry and Model Pool off), installed as its profile
-    config.
+    (seat models, how many tasks run at once, budgets, telemetry and Model Pool
+    off), installed as its profile config.
 
-  Keep the three consistent when changing models. The only CodeAF setting left in
+  Keep the three consistent when changing models. Put seats that run at the
+  same time on different models, and keep `task.parallel` no higher than the
+  worker model's `max_concurrent`. The only CodeAF setting left in
   the environment is the endpoint (`CODEAF_BASE_URL`), because CodeAF reads it from
   nowhere else. The panel path (`CODEAF_MODELS`) would be the second one.

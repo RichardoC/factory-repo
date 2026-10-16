@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"io"
 	"math"
@@ -10,7 +11,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func testModels(t *testing.T) []Model {
@@ -198,6 +201,135 @@ func TestProxyEndToEnd(t *testing.T) {
 	defer models.Body.Close()
 	if first, _ := bufio.NewReader(models.Body).ReadString('}'); !strings.Contains(first, "zai-org/glm-5.3-flash") {
 		t.Errorf("catalog starts %q", first)
+	}
+}
+
+func TestModelsHaveTheSubscriptionsConcurrencyLimit(t *testing.T) {
+	for _, m := range testModels(t) {
+		if m.MaxConcurrent != 2 {
+			t.Errorf("%s: max_concurrent %d, want 2 (synthetic.new allows 2 calls per model at once)", m.ID, m.MaxConcurrent)
+		}
+	}
+}
+
+// codeaf-config.json's seats are allowed models, and CodeAF never runs more
+// tasks at once than the worker model has slots.
+func TestCodeAFConfigFitsTheConcurrencyLimit(t *testing.T) {
+	data, err := os.ReadFile("codeaf-config.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	models := testModels(t)
+	seat := func(key string) Model {
+		id, _ := cfg[key].(string)
+		return mustResolve(t, models, id)
+	}
+	worker := seat("models.tiers.worker")
+	seat("models.tiers.mastermind")
+	seat("models.tiers.high")
+	parallel, ok := cfg["task.parallel"].(float64)
+	if !ok || parallel < 1 || int(parallel) > worker.MaxConcurrent {
+		t.Errorf("task.parallel %v: want 1..%d, the worker model's max_concurrent", cfg["task.parallel"], worker.MaxConcurrent)
+	}
+}
+
+// The proxy never has more than max_concurrent calls to one model in flight
+// upstream; the rest wait, and other models aren't held up by them.
+func TestProxyLimitsCallsPerModel(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		inFlight = map[string]int{}
+		peak     = map[string]int{}
+	)
+	hold := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct{ Model string }
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		inFlight[body.Model]++
+		peak[body.Model] = max(peak[body.Model], inFlight[body.Model])
+		mu.Unlock()
+		if body.Model == "hf:zai-org/GLM-5.3-Flash" {
+			<-hold
+		}
+		mu.Lock()
+		inFlight[body.Model]--
+		mu.Unlock()
+		_, _ = io.WriteString(w, `{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer upstream.Close()
+	models := testModels(t)
+	p := &proxy{upstream: upstream.URL, apiKey: "k", ledger: filepath.Join(t.TempDir(), "l.jsonl"), runCap: 5, dayCap: 20,
+		models: models, client: upstream.Client(), slots: newSlots(models)}
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	call := func(model string) int {
+		response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"model":"`+model+`","messages":[]}`))
+		if err != nil {
+			t.Error(err)
+			return 0
+		}
+		defer response.Body.Close()
+		_, _ = io.Copy(io.Discard, response.Body)
+		return response.StatusCode
+	}
+	var wg sync.WaitGroup
+	for range 5 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if status := call("zai-org/glm-5.3-flash"); status != 200 {
+				t.Errorf("flash call: %d", status)
+			}
+		}()
+	}
+	// While five Flash calls are queued behind two held ones, another
+	// model still gets through.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		n := inFlight["hf:zai-org/GLM-5.3-Flash"]
+		mu.Unlock()
+		if n == 2 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if status := call("deepseek-ai/deepseek-v4.1-flash"); status != 200 {
+		t.Errorf("deepseek call while flash is full: %d", status)
+	}
+	close(hold)
+	wg.Wait()
+	if got := peak["hf:zai-org/GLM-5.3-Flash"]; got != 2 {
+		t.Errorf("peak flash calls in flight upstream: %d, want 2", got)
+	}
+}
+
+func TestAcquireGivesUpWhenTheCallerDoes(t *testing.T) {
+	m := Model{Upstream: "u", MaxConcurrent: 1}
+	p := &proxy{slots: newSlots([]Model{m})}
+	release, err := p.acquire(context.Background(), m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := p.acquire(ctx, m); err == nil {
+		t.Fatal("second acquire got a slot past max_concurrent 1")
+	}
+	release()
+	again, err := p.acquire(context.Background(), m)
+	if err != nil {
+		t.Fatal("slot not given back:", err)
+	}
+	again()
+	if _, err := p.acquire(context.Background(), Model{Upstream: "unlimited"}); err != nil {
+		t.Fatal("a model with no max_concurrent must not wait:", err)
 	}
 }
 
