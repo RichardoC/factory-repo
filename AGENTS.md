@@ -27,7 +27,13 @@ Instructions for any coding agent working in this repository, including CodeAF
 
 ## Repository layout
 
-- `app/` holds the applications, one Go module per directory.
+This is a monorepo: several independent applications live side by side, and
+more will be added.
+
+- `app/<name>/` holds one application each. Each is its own Go module with its own
+  `go.mod` (and its own Go version), README and licence. Treat an app's
+  directory as its boundary: a change for one app shouldn't touch another
+  app's files unless the task says so.
 - `.github/` holds the CodeAF harness and CI. Agents running under the CodeAF workflow
   can't change it: edits there are discarded.
 

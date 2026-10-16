@@ -3,6 +3,12 @@
 An experiment in running [CodeAF](https://github.com/Agent-Field/CodeAF) entirely inside
 GitHub: issues go in, CodeAF does the work in GitHub Actions, and pull requests come out.
 
+It is set up as a monorepo:
+- applications live under `app/<name>/`, each its own Go module with its own README
+  and licence;
+- CI checks every module separately;
+- the CodeAF harness and CI live in `.github/`.
+
 ## Using it
 
 | You do | CodeAF does |
