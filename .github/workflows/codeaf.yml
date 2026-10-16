@@ -11,10 +11,12 @@
 # response, refuses models outside .github/codeaf/models.json and enforces the
 # per-run and per-day spend caps set in that file.
 #
-# Three jobs, split by privilege (AGENTS.md, "Security rules"):
+# Jobs, split by privilege (AGENTS.md, "Security rules"):
 #   gate     decides whether this event may run at all (read-only)
 #   run      runs CodeAF. The agent has a shell here, so this job holds no write
-#            token; it hands over a patch and an encrypted diagnostics bundle.
+#            token; it hands over a patch, CodeAF's state and diagnostics.
+#   handoff  asks the CodeAF state workflow (codeaf-state.yml) to merge this
+#            run's state into the bundle shared by all runs
 #   publish  a fresh runner with write access. It treats everything from `run`
 #            as untrusted data: it checks and applies the patch, then commits,
 #            pushes, opens the PR and posts the report.
@@ -84,7 +86,7 @@ jobs:
       issues: read
       pull-requests: read
     outputs:
-      day_before: ${{ steps.spent.outputs.usd }}
+      day_before: ${{ steps.shared.outputs.day_usd }}
       # Only routes publish to the approval-gated environment. publish checks
       # the patch itself and never trusts this to mean "no .github/ changes".
       touches_harness: ${{ steps.package.outputs.touches_harness }}
@@ -99,8 +101,7 @@ jobs:
             echo "BRIEF_PATH=$RUNNER_TEMP/brief.md"
             echo "RESULT_PATH=$RUNNER_TEMP/out/codeaf-result.json"
             echo "LEDGER_PATH=$RUNNER_TEMP/out/codeaf-ledger.jsonl"
-            echo "SPEND_DIR=$RUNNER_TEMP/codeaf-spend"
-            echo "STATE_DIR=$RUNNER_TEMP/codeaf-state"
+            echo "SHARED_DIR=$RUNNER_TEMP/codeaf-shared"
             echo "CODEAF_HOME=$RUNNER_TEMP/codeaf-home"
             echo "HARNESS=$RUNNER_TEMP/harness/harness"
             echo "TOOLS=$RUNNER_TEMP/tools"
@@ -147,49 +148,26 @@ jobs:
           git -C "$RUNNER_TEMP/codeaf-src" checkout --detach "$CODEAF_REF"
           (cd "$RUNNER_TEMP/codeaf-src" && CGO_ENABLED=0 go build -trimpath -o "$TOOLS/codeaf" ./cmd/codeaf)
 
-      # Everything restored from the Actions cache below was written by an
-      # earlier job in which the agent had a shell: it is untrusted input and is
-      # validated before use (AGENTS.md, "Caches and carried state").
-      - name: Restore today's spend
-        id: day
-        run: echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+      # The state shared by all runs (.github/codeaf/state.go): CodeAF's memory
+      # db, its router events and model ratings, and the day's spend. Only the
+      # CodeAF state workflow (codeaf-state.yml) writes it, from runs' packed
+      # state, which it checks; `state load` checks it again before CodeAF
+      # starts, and fails the run if it is not a valid bundle.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ env.SPEND_DIR }}
-          key: codeaf-spend-${{ steps.day.outputs.date }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: codeaf-spend-${{ steps.day.outputs.date }}-
-      - name: Read today's spend
-        id: spent
-        run: |
-          mkdir -p "$SPEND_DIR"
-          spent=$(head -c 64 "$SPEND_DIR/day-total" 2>/dev/null || true)
-          spent=${spent:-0}
-          # A plain non-negative number or nothing: anything else stops the run
-          # rather than reaching $GITHUB_OUTPUT or loosening the daily cap.
-          if ! [[ "$spent" =~ ^[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
-            echo "::error::cached day total is not a valid number; refusing to run"; exit 1
-          fi
-          echo "usd=$spent" >> "$GITHUB_OUTPUT"
-          echo "Spent so far today: \$$spent (caps are in .github/codeaf/models.json)"
-
-      - name: Restore CodeAF state
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ env.STATE_DIR }}
-          key: codeaf-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: codeaf-state-v1-
-      - name: Load CodeAF state
-        # Only the model-rating ledger is carried, rebuilt from validated
-        # numbers about models in models.json. CodeAF's memory db and event log
-        # are not carried: they hold text that would reach future prompts.
+          path: ${{ env.SHARED_DIR }}
+          key: codeaf-shared-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: codeaf-shared-v1-
+      - name: Load the shared state
+        id: shared
         run: |
           mkdir -p "$CODEAF_HOME"
-          "$HARNESS" ledger "$STATE_DIR/router-ledger.json" "$CODEAF_HOME/router-ledger.json"
+          "$HARNESS" state load "$SHARED_DIR" "$CODEAF_HOME"
 
       - name: Start pricing proxy
         env:
           SYNTHETIC_API_KEY: ${{ secrets.SYNTHETIC_API_KEY }}
-          PROXY_DAY_SPENT_USD: ${{ steps.spent.outputs.usd }}
+          PROXY_DAY_SPENT_USD: ${{ steps.shared.outputs.day_usd }}
           PROXY_LEDGER: ${{ env.LEDGER_PATH }}
         run: |
           # The key goes in on stdin so it is not in the proxy's environment,
@@ -227,7 +205,7 @@ jobs:
       - name: Package the changes as a patch
         id: package
         # Not on cancel: partial work from a cancelled run is never handed on.
-        # (Spend and state below are still saved, so a cancelled run's cost counts.)
+        # (Its state below is still packed, so a cancelled run's cost counts.)
         if: ${{ !cancelled() }}
         run: |
           # Changes under .github/ are included, but publish only applies them
@@ -241,86 +219,51 @@ jobs:
             echo "::notice::the patch changes .github/; publishing waits for a maintainer's approval"
           fi
 
-      - name: Save today's spend
+      - name: Pack CodeAF's state
+        # What CodeAF left in its home and what the run cost (the proxy's
+        # in-memory total), for the CodeAF state workflow to merge into the
+        # shared bundle, which checks it all again first.
         if: always()
         env:
-          DAY_SPENT_BEFORE: ${{ steps.spent.outputs.usd }}
-        run: |
-          # From the proxy's in-memory total when it answers; if the proxy is
-          # gone, from the ledger file, which the agent could have edited.
-          # The directory is recreated so nothing the agent left in it (extra
-          # files, symlinks) is written through or cached.
-          total=$("$HARNESS" spend)
-          rm -rf "$SPEND_DIR" && mkdir -p "$SPEND_DIR"
-          printf '%s\n' "$total" > "$SPEND_DIR/day-total"
-          echo "Spent today, including this run: \$$(cat "$SPEND_DIR/day-total")"
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+          BASE_GENERATION: ${{ steps.shared.outputs.generation }}
+        run: '"$HARNESS" state pack "$CODEAF_HOME" "$RUNNER_TEMP/state-out"'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          path: ${{ env.SPEND_DIR }}
-          key: codeaf-spend-${{ steps.day.outputs.date }}-${{ github.run_id }}-${{ github.run_attempt }}
-      - name: Keep CodeAF state
-        if: always()
-        run: |
-          rm -rf "$STATE_DIR" && mkdir -p "$STATE_DIR"
-          "$HARNESS" ledger "$CODEAF_HOME/router-ledger.json" "$STATE_DIR/router-ledger.json"
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: always()
-        with:
-          path: ${{ env.STATE_DIR }}
-          key: codeaf-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          name: codeaf-state-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/state-out
+          if-no-files-found: ignore
+          retention-days: 14
 
-      - name: Encrypt diagnostics
-        # Artifacts on a public repository can be downloaded by any signed-in
-        # GitHub user, so the brief, transcripts, logs and CodeAF's state
-        # (memory db, event log, raw ledger; kept for audit, never restored)
-        # are encrypted with GnuPG (AEAD, AES-256) to the OpenPGP public key in
-        # the CODEAF_ARTIFACT_PUBLIC_KEY secret, using a throwaway keyring.
-        # That secret holds only a public key, so exposing it to this untrusted
-        # step costs nothing; the private key is never given to any workflow.
-        # Without a usable key nothing is uploaded, rather than anything in
-        # the clear. Only regular files are copied, so a planted symlink
-        # can't pull in other files.
+      - name: Collect diagnostics
+        # Not encrypted, so anyone can see why a run went the way it did: the
+        # brief, CodeAF's stderr, its run records (prompts, model replies,
+        # tool output), its call log and usage, and the proxy log. This is a
+        # public repository, so any signed-in GitHub user can download them.
+        # No secret is in this job's environment once the proxy has started,
+        # and token-shaped strings are redacted as a backstop. Only regular
+        # files are copied, so a planted symlink can't pull other files in.
         if: always()
-        env:
-          ARTIFACT_PUBLIC_KEY: ${{ secrets.CODEAF_ARTIFACT_PUBLIC_KEY }}
         run: |
-          pubkey="$RUNNER_TEMP/artifact-pub.asc"
-          printf '%s\n' "$ARTIFACT_PUBLIC_KEY" > "$pubkey"
-          if ! grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$pubkey"; then
-            echo "::warning::CODEAF_ARTIFACT_PUBLIC_KEY is not set to an OpenPGP public key; diagnostics not uploaded"
-            exit 0
-          fi
-          GNUPGHOME=$(mktemp -d "$RUNNER_TEMP/gpg.XXXXXX"); export GNUPGHOME
-          chmod 700 "$GNUPGHOME"
           bundle="$RUNNER_TEMP/diagnostics"
-          rm -rf "$bundle" && mkdir -p "$bundle/state"
+          rm -rf "$bundle" && mkdir -p "$bundle"
           for f in "$BRIEF_PATH" "$RUNNER_TEMP/codeaf.stderr" "$RUNNER_TEMP/proxy.log"; do
-            [ -f "$f" ] && [ ! -L "$f" ] && cp "$f" "$bundle/"
+            if [ -f "$f" ] && [ ! -L "$f" ]; then cp "$f" "$bundle/"; fi
           done
-          for f in graph.db router-events.jsonl router-ledger.json; do
-            src="$CODEAF_HOME/$f"
-            if [ -f "$src" ] && [ ! -L "$src" ] && [ "$(stat -c %s "$src")" -le 104857600 ]; then
-              cp "$src" "$bundle/state/$f"
-            fi
-          done
-          [ -d "$CODEAF_HOME/runs" ] && cp -r --no-dereference "$CODEAF_HOME/runs" "$bundle/runs"
-          mkdir -p "$RUNNER_TEMP/out-enc"
-          tar -C "$bundle" -czf "$RUNNER_TEMP/diagnostics.tar.gz" .
-          rm -rf "$bundle"
-          if ! gpg --batch --yes --trust-model always --recipient-file "$pubkey" \
-              --output "$RUNNER_TEMP/out-enc/diagnostics.tar.gz.gpg" --encrypt "$RUNNER_TEMP/diagnostics.tar.gz"; then
-            echo "::warning::encryption failed (is CODEAF_ARTIFACT_PUBLIC_KEY a valid key?); diagnostics not uploaded"
-            rm -f "$RUNNER_TEMP/out-enc/diagnostics.tar.gz.gpg"
+          if [ -d "$CODEAF_HOME" ]; then
+            (cd "$CODEAF_HOME" && find runs logs v3/usage.jsonl router-events.jsonl router-ledger.json \
+              -type f -size -100M -print0 2>/dev/null | xargs -0 -r cp --parents -t "$bundle/") || true
           fi
-          rm -rf "$RUNNER_TEMP/diagnostics.tar.gz" "$GNUPGHOME"
+          tokens='(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)'
+          grep -rlZE "$tokens" "$bundle" | xargs -0 -r sed -i -E "s/$tokens/[redacted]/g"
+          du -sh "$bundle"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: codeaf-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/out-enc/diagnostics.tar.gz.gpg
+          path: ${{ runner.temp }}/diagnostics
           if-no-files-found: ignore
-          retention-days: 90
+          retention-days: 30
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         # The patch, its base commit, CodeAF's result and the cost ledger: all of
@@ -331,6 +274,22 @@ jobs:
           path: ${{ runner.temp }}/out
           if-no-files-found: ignore
           retention-days: 14
+
+  handoff:
+    # Starts the state merge as soon as the run job is done. Waiting for the
+    # whole run to complete would hold it until publish ends, which can wait
+    # hours for an approval, and until the merge no run sees this run's spend.
+    needs: run
+    if: ${{ always() && needs.run.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: gh workflow run codeaf-state.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH"
 
   publish:
     needs: [gate, run]
