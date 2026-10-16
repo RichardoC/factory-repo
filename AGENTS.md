@@ -25,6 +25,17 @@ Instructions for any coding agent working in this repository, including CodeAF
 - Back a performance claim with a benchmark (`go test -bench`), and give before and
   after numbers.
 
+## Models and concurrency
+
+- The synthetic.new subscription allows only 2 calls to each model at once.
+  Calls past that wait in the harness proxy (`max_concurrent` in
+  `.github/codeaf/models.json`), so more parallel work on one model only
+  queues.
+- Spread work that runs at the same time across models. CodeAF's seats are
+  on different models (`.github/codeaf/codeaf-config.json`), and
+  `task.parallel` there is no higher than the worker model's
+  `max_concurrent`. Keep both true when changing models or seats.
+
 ## Repository layout
 
 This is a monorepo: several independent applications live side by side, and
