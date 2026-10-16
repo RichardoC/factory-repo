@@ -66,28 +66,20 @@ workflow artifact.
 - Artifacts on a public repo can be downloaded by any signed-in GitHub user. The
   diagnostics (brief, transcripts, logs, and CodeAF's memory db, event log and
   raw ledger, which are kept for audit and never restored) are therefore encrypted
-  with OpenSSL CMS (AES-256-GCM) to the RSA certificate in the
-  `CODEAF_ARTIFACT_PUBLIC_KEY` secret. Until that secret holds a valid
-  certificate, they are not uploaded at all. To create the key pair and set the
-  secret:
+  with GnuPG to the OpenPGP public key in the `CODEAF_ARTIFACT_PUBLIC_KEY` secret.
+  Until that secret holds a usable key, they are not uploaded at all. To create
+  the key (Ed25519, with a Curve25519 encryption subkey) and set the secret:
 
   ```sh
-  mkdir -p ~/.config/codeaf && chmod 700 ~/.config/codeaf && cd ~/.config/codeaf
-  openssl req -x509 -newkey rsa:4096 -nodes -keyout artifact-key.pem \
-    -out artifact-cert.pem -subj "/CN=codeaf-artifacts" -days 3650
-  chmod 600 artifact-key.pem
-  gh secret set CODEAF_ARTIFACT_PUBLIC_KEY --repo RichardoC/factory-repo < artifact-cert.pem
+  gpg --quick-generate-key "codeaf-artifacts" default default never
+  gpg --armor --export codeaf-artifacts \
+    | gh secret set CODEAF_ARTIFACT_PUBLIC_KEY --repo RichardoC/factory-repo
   ```
 
-  Decrypt a downloaded artifact with:
-
-  ```sh
-  openssl cms -decrypt -binary -inform DER -in diagnostics.tar.gz.cms \
-    -inkey ~/.config/codeaf/artifact-key.pem | tar xz
-  ```
-
-  Keep `artifact-key.pem` yourself. No workflow uses the private key, and a
-  GitHub secret can't be read back, so it is only useful as a secret for backup.
+  Decrypt a downloaded artifact with
+  `gpg --decrypt diagnostics.tar.gz.gpg | tar xz`. The private key stays in your
+  own GnuPG keyring; no workflow uses it. Back it up with
+  `gpg --armor --export-secret-keys codeaf-artifacts`.
 - The rules for future changes are in
   [`AGENTS.md`](AGENTS.md#security-rules-for-changing-the-harness).
 - Protecting `main`: [`CODEOWNERS`](.github/CODEOWNERS) makes @RichardoC the owner of

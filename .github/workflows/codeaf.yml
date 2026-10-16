@@ -255,23 +255,25 @@ jobs:
         # Artifacts on a public repository can be downloaded by any signed-in
         # GitHub user, so the brief, transcripts, logs and CodeAF's state
         # (memory db, event log, raw ledger; kept for audit, never restored)
-        # are encrypted with OpenSSL CMS (AES-256-GCM, authenticated) to the
-        # RSA certificate in the CODEAF_ARTIFACT_PUBLIC_KEY secret. That secret
-        # holds only a public certificate, so exposing it to this untrusted
+        # are encrypted with GnuPG (AEAD, AES-256) to the OpenPGP public key in
+        # the CODEAF_ARTIFACT_PUBLIC_KEY secret, using a throwaway keyring.
+        # That secret holds only a public key, so exposing it to this untrusted
         # step costs nothing; the private key is never given to any workflow.
-        # Without a valid certificate nothing is uploaded, rather than anything
-        # in the clear. Only regular files are copied, so a planted symlink
+        # Without a usable key nothing is uploaded, rather than anything in
+        # the clear. Only regular files are copied, so a planted symlink
         # can't pull in other files.
         if: always()
         env:
           ARTIFACT_PUBLIC_KEY: ${{ secrets.CODEAF_ARTIFACT_PUBLIC_KEY }}
         run: |
-          cert="$RUNNER_TEMP/artifact-cert.pem"
-          printf '%s\n' "$ARTIFACT_PUBLIC_KEY" > "$cert"
-          if ! openssl x509 -in "$cert" -noout -text 2>/dev/null | grep -qE 'Public Key Algorithm: rsaEncryption'; then
-            echo "::warning::CODEAF_ARTIFACT_PUBLIC_KEY is not set to an RSA certificate; diagnostics not uploaded"
+          pubkey="$RUNNER_TEMP/artifact-pub.asc"
+          printf '%s\n' "$ARTIFACT_PUBLIC_KEY" > "$pubkey"
+          if ! grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$pubkey"; then
+            echo "::warning::CODEAF_ARTIFACT_PUBLIC_KEY is not set to an OpenPGP public key; diagnostics not uploaded"
             exit 0
           fi
+          GNUPGHOME=$(mktemp -d "$RUNNER_TEMP/gpg.XXXXXX"); export GNUPGHOME
+          chmod 700 "$GNUPGHOME"
           bundle="$RUNNER_TEMP/diagnostics"
           rm -rf "$bundle" && mkdir -p "$bundle/state"
           for f in "$BRIEF_PATH" "$RUNNER_TEMP/codeaf.stderr" "$RUNNER_TEMP/proxy.log"; do
@@ -287,14 +289,17 @@ jobs:
           mkdir -p "$RUNNER_TEMP/out-enc"
           tar -C "$bundle" -czf "$RUNNER_TEMP/diagnostics.tar.gz" .
           rm -rf "$bundle"
-          openssl cms -encrypt -binary -aes-256-gcm -outform DER \
-            -in "$RUNNER_TEMP/diagnostics.tar.gz" -out "$RUNNER_TEMP/out-enc/diagnostics.tar.gz.cms" "$cert"
-          rm -f "$RUNNER_TEMP/diagnostics.tar.gz"
+          if ! gpg --batch --yes --trust-model always --recipient-file "$pubkey" \
+              --output "$RUNNER_TEMP/out-enc/diagnostics.tar.gz.gpg" --encrypt "$RUNNER_TEMP/diagnostics.tar.gz"; then
+            echo "::warning::encryption failed (is CODEAF_ARTIFACT_PUBLIC_KEY a valid key?); diagnostics not uploaded"
+            rm -f "$RUNNER_TEMP/out-enc/diagnostics.tar.gz.gpg"
+          fi
+          rm -rf "$RUNNER_TEMP/diagnostics.tar.gz" "$GNUPGHOME"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: codeaf-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/out-enc/diagnostics.tar.gz.cms
+          path: ${{ runner.temp }}/out-enc/diagnostics.tar.gz.gpg
           if-no-files-found: ignore
           retention-days: 90
 
