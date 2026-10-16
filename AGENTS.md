@@ -114,9 +114,15 @@ hostile, whether through prompt injection or a compromised model.
 - `codeaf-state.yml` runs no agent and handles no secret. It reads other runs'
   artifacts as untrusted data and holds only `actions: write`, for the
   artifacts and the cache.
-- `CODEAF_HARNESS_TOKEN` (needed because `GITHUB_TOKEN` can't push workflow
-  changes) lives only as a secret of the `codeaf-harness` environment, and is
-  read only after that approval check.
+- Approved harness patches are pushed as a GitHub App, never as a person.
+  This is needed because `GITHUB_TOKEN` can't push workflow changes.
+  - The app's `CODEAF_APP_ID` and `CODEAF_APP_PRIVATE_KEY` are secrets of the
+    `codeaf-harness` environment only, and are read only after that approval
+    check.
+  - The key only signs the request for an installation token, which is
+    scoped to this repository with `contents` and `workflows` write.
+  - Don't widen the app's permissions or its installation, and don't use its
+    key anywhere else.
 
 ### Artifacts
 
