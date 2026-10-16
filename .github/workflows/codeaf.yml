@@ -1,0 +1,447 @@
+# CodeAF (https://github.com/Agent-Field/CodeAF) running entirely inside GitHub Actions.
+#
+# Triggers, all gated on the `codeaf` label (adding a label needs triage access):
+#   * an issue gets the `codeaf` label     -> CodeAF works the issue, opens a PR
+#   * `/codeaf <text>` comment on a labelled issue or PR, or a "changes requested"
+#     review on a labelled PR, from an OWNER/MEMBER/COLLABORATOR
+#                                            -> CodeAF continues on that PR's branch
+#
+# Models come from synthetic.new through `harness proxy` (.github/codeaf/main.go), which serves
+# CodeAF a catalog with synthetic.new's real prices, adds usage.cost to every
+# response, refuses models outside .github/codeaf/models.json and enforces the
+# per-run and per-day spend caps set in that file.
+#
+# Three jobs, split by privilege (AGENTS.md, "Security rules"):
+#   gate     decides whether this event may run at all (read-only)
+#   run      runs CodeAF. The agent has a shell here, so this job holds no write
+#            token; it hands over a patch and an encrypted diagnostics bundle.
+#   publish  a fresh runner with write access. It treats everything from `run`
+#            as untrusted data: it checks and applies the patch, then commits,
+#            pushes, opens the PR and posts the report.
+name: CodeAF
+
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+
+env:
+  CODEAF_LABEL: codeaf
+  CODEAF_REF: 6e73ac7752ae1d33c629be52a49d2b79ffcaad6d # Agent-Field/codeaf main, 2026-10-15
+
+jobs:
+  gate:
+    # Cheap pre-filter so unrelated comments don't even start a runner job.
+    if: >-
+      (github.event_name == 'issues' && github.event.label.name == 'codeaf') ||
+      (github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/codeaf')) ||
+      (github.event_name == 'pull_request_review' && (github.event.review.state == 'changes_requested' || startsWith(github.event.review.body, '/codeaf')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    outputs:
+      run: ${{ steps.gate.outputs.run }}
+      mode: ${{ steps.gate.outputs.mode }}
+      number: ${{ steps.gate.outputs.number }}
+      branch: ${{ steps.gate.outputs.branch }}
+      base: ${{ steps.gate.outputs.base }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Always the default branch. On pull_request_review events the
+          # default ref is the PR's merge commit, i.e. PR code.
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/codeaf
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: .github/codeaf/go.mod
+          cache: false
+      - id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: cd .github/codeaf && go run . gate
+
+  run:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: codeaf-run-${{ needs.gate.outputs.number }}
+      cancel-in-progress: false
+    # No write access of any kind: the agent can read anything this job can.
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    outputs:
+      day_before: ${{ steps.spent.outputs.usd }}
+    env:
+      MODE: ${{ needs.gate.outputs.mode }}
+      NUMBER: ${{ needs.gate.outputs.number }}
+      BRANCH: ${{ needs.gate.outputs.branch }}
+    steps:
+      - name: Paths
+        run: |
+          {
+            echo "BRIEF_PATH=$RUNNER_TEMP/brief.md"
+            echo "RESULT_PATH=$RUNNER_TEMP/out/codeaf-result.json"
+            echo "LEDGER_PATH=$RUNNER_TEMP/out/codeaf-ledger.jsonl"
+            echo "SPEND_DIR=$RUNNER_TEMP/codeaf-spend"
+            echo "STATE_DIR=$RUNNER_TEMP/codeaf-state"
+            echo "CODEAF_HOME=$RUNNER_TEMP/codeaf-home"
+            echo "HARNESS=$RUNNER_TEMP/harness/harness"
+            echo "TOOLS=$RUNNER_TEMP/tools"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Always the default branch, so the harness (including the proxy that
+          # receives the API key) is built from reviewed code, never from a PR.
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Build the harness
+        # Built from the default branch before the working branch is checked
+        # out, and before CodeAF starts. The agent could still swap the binary
+        # (same user), which is why nothing after CodeAF in this job holds a
+        # secret or a write token.
+        run: |
+          cp -r .github/codeaf "$RUNNER_TEMP/harness"
+          (cd "$RUNNER_TEMP/harness" && go build -trimpath -o harness .)
+
+      - name: Check out the working branch
+        run: |
+          # Continue an existing CodeAF branch if there is one, else branch
+          # from the default branch checked out above.
+          if git fetch --depth=1 origin "refs/heads/$BRANCH" 2>/dev/null; then
+            git checkout -B "$BRANCH" FETCH_HEAD
+          else
+            git checkout -B "$BRANCH"
+          fi
+          mkdir -p "$RUNNER_TEMP/out"
+          git rev-parse HEAD > "$RUNNER_TEMP/out/base-commit"
+
+      - name: Build CodeAF
+        # Always from the pinned source, never from a cache: a cached binary was
+        # written by an earlier job the agent ran in.
+        run: |
+          git clone --filter=blob:none https://github.com/Agent-Field/codeaf "$RUNNER_TEMP/codeaf-src"
+          git -C "$RUNNER_TEMP/codeaf-src" checkout --detach "$CODEAF_REF"
+          (cd "$RUNNER_TEMP/codeaf-src" && CGO_ENABLED=0 go build -trimpath -o "$TOOLS/codeaf" ./cmd/codeaf)
+
+      # Everything restored from the Actions cache below was written by an
+      # earlier job in which the agent had a shell: it is untrusted input and is
+      # validated before use (AGENTS.md, "Caches and carried state").
+      - name: Restore today's spend
+        id: day
+        run: echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.SPEND_DIR }}
+          key: codeaf-spend-${{ steps.day.outputs.date }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: codeaf-spend-${{ steps.day.outputs.date }}-
+      - name: Read today's spend
+        id: spent
+        run: |
+          mkdir -p "$SPEND_DIR"
+          spent=$(head -c 64 "$SPEND_DIR/day-total" 2>/dev/null || true)
+          spent=${spent:-0}
+          # A plain non-negative number or nothing: anything else stops the run
+          # rather than reaching $GITHUB_OUTPUT or loosening the daily cap.
+          if ! [[ "$spent" =~ ^[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+            echo "::error::cached day total is not a valid number; refusing to run"; exit 1
+          fi
+          echo "usd=$spent" >> "$GITHUB_OUTPUT"
+          echo "Spent so far today: \$$spent (caps are in .github/codeaf/models.json)"
+
+      - name: Restore CodeAF state
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.STATE_DIR }}
+          key: codeaf-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: codeaf-state-v1-
+      - name: Load CodeAF state
+        # Only the model-rating ledger is carried, rebuilt from validated
+        # numbers about models in models.json. CodeAF's memory db and event log
+        # are not carried: they hold text that would reach future prompts.
+        run: |
+          mkdir -p "$CODEAF_HOME"
+          "$HARNESS" ledger "$STATE_DIR/router-ledger.json" "$CODEAF_HOME/router-ledger.json"
+
+      - name: Start pricing proxy
+        env:
+          SYNTHETIC_API_KEY: ${{ secrets.SYNTHETIC_API_KEY }}
+          PROXY_DAY_SPENT_USD: ${{ steps.spent.outputs.usd }}
+          PROXY_LEDGER: ${{ env.LEDGER_PATH }}
+        run: |
+          # The key goes in on stdin so it is not in the proxy's environment,
+          # where the CodeAF job (same user) could read it.
+          key="$SYNTHETIC_API_KEY"; unset SYNTHETIC_API_KEY
+          printf '%s\n' "$key" | nohup "$HARNESS" proxy > "$RUNNER_TEMP/proxy.log" 2>&1 &
+          for _ in $(seq 30); do curl -fsS http://127.0.0.1:8787/healthz && exit 0; sleep 1; done
+          cat "$RUNNER_TEMP/proxy.log"; exit 1
+
+      - name: Write the brief
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: '"$HARNESS" brief'
+
+      - name: Run CodeAF
+        # CodeAF's settings (seat models, budgets, telemetry off) are in
+        # .github/codeaf/codeaf-config.json, installed as its profile config.
+        # Only the endpoint and the escalation panel stay in the environment:
+        # CodeAF reads those two from nowhere else.
+        env:
+          CODEAF_BASE_URL: http://127.0.0.1:8787/v1
+          CODEAF_MODELS: ${{ runner.temp }}/harness/panel.json
+        run: |
+          cp "$RUNNER_TEMP/harness/codeaf-config.json" "$CODEAF_HOME/config.json"
+          set +e
+          "$TOOLS/codeaf" do "$(cat "$BRIEF_PATH")" --dir . --json --yes-spend --timeout 100m \
+            > "$RESULT_PATH" 2> "$RUNNER_TEMP/codeaf.stderr"
+          echo "codeaf exit code: $?"
+          tail -n 80 "$RUNNER_TEMP/codeaf.stderr"
+          "$HARNESS" summary
+          exit 0
+
+      # From here on, this job only packages results. Nothing it produces is
+      # trusted by `publish`.
+      - name: Package the changes as a patch
+        if: always()
+        run: |
+          # .github/ is never taken from CodeAF; publish refuses it too.
+          git -c core.hooksPath=/dev/null add -A -- . ':!.github'
+          git -c core.hooksPath=/dev/null diff --cached --binary --no-ext-diff --no-textconv HEAD \
+            > "$RUNNER_TEMP/out/changes.patch"
+          echo "Patch: $(wc -c < "$RUNNER_TEMP/out/changes.patch") bytes"
+
+      - name: Save today's spend
+        if: always()
+        env:
+          DAY_SPENT_BEFORE: ${{ steps.spent.outputs.usd }}
+        run: |
+          # From the proxy's in-memory total when it answers; if the proxy is
+          # gone, from the ledger file, which the agent could have edited.
+          # The directory is recreated so nothing the agent left in it (extra
+          # files, symlinks) is written through or cached.
+          total=$("$HARNESS" spend)
+          rm -rf "$SPEND_DIR" && mkdir -p "$SPEND_DIR"
+          printf '%s\n' "$total" > "$SPEND_DIR/day-total"
+          echo "Spent today, including this run: \$$(cat "$SPEND_DIR/day-total")"
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: always()
+        with:
+          path: ${{ env.SPEND_DIR }}
+          key: codeaf-spend-${{ steps.day.outputs.date }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Keep CodeAF state
+        if: always()
+        run: |
+          rm -rf "$STATE_DIR" && mkdir -p "$STATE_DIR"
+          "$HARNESS" ledger "$CODEAF_HOME/router-ledger.json" "$STATE_DIR/router-ledger.json"
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: always()
+        with:
+          path: ${{ env.STATE_DIR }}
+          key: codeaf-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Encrypt diagnostics
+        # Artifacts on a public repository can be downloaded by any signed-in
+        # GitHub user, so the brief, transcripts, logs and CodeAF's state
+        # (memory db, event log, raw ledger; kept for audit, never restored)
+        # are encrypted with GnuPG (AEAD, AES-256) to the OpenPGP public key in
+        # the CODEAF_ARTIFACT_PUBLIC_KEY secret, using a throwaway keyring.
+        # That secret holds only a public key, so exposing it to this untrusted
+        # step costs nothing; the private key is never given to any workflow.
+        # Without a usable key nothing is uploaded, rather than anything in
+        # the clear. Only regular files are copied, so a planted symlink
+        # can't pull in other files.
+        if: always()
+        env:
+          ARTIFACT_PUBLIC_KEY: ${{ secrets.CODEAF_ARTIFACT_PUBLIC_KEY }}
+        run: |
+          pubkey="$RUNNER_TEMP/artifact-pub.asc"
+          printf '%s\n' "$ARTIFACT_PUBLIC_KEY" > "$pubkey"
+          if ! grep -q 'BEGIN PGP PUBLIC KEY BLOCK' "$pubkey"; then
+            echo "::warning::CODEAF_ARTIFACT_PUBLIC_KEY is not set to an OpenPGP public key; diagnostics not uploaded"
+            exit 0
+          fi
+          GNUPGHOME=$(mktemp -d "$RUNNER_TEMP/gpg.XXXXXX"); export GNUPGHOME
+          chmod 700 "$GNUPGHOME"
+          bundle="$RUNNER_TEMP/diagnostics"
+          rm -rf "$bundle" && mkdir -p "$bundle/state"
+          for f in "$BRIEF_PATH" "$RUNNER_TEMP/codeaf.stderr" "$RUNNER_TEMP/proxy.log"; do
+            [ -f "$f" ] && [ ! -L "$f" ] && cp "$f" "$bundle/"
+          done
+          for f in graph.db router-events.jsonl router-ledger.json; do
+            src="$CODEAF_HOME/$f"
+            if [ -f "$src" ] && [ ! -L "$src" ] && [ "$(stat -c %s "$src")" -le 104857600 ]; then
+              cp "$src" "$bundle/state/$f"
+            fi
+          done
+          [ -d "$CODEAF_HOME/runs" ] && cp -r --no-dereference "$CODEAF_HOME/runs" "$bundle/runs"
+          mkdir -p "$RUNNER_TEMP/out-enc"
+          tar -C "$bundle" -czf "$RUNNER_TEMP/diagnostics.tar.gz" .
+          rm -rf "$bundle"
+          if ! gpg --batch --yes --trust-model always --recipient-file "$pubkey" \
+              --output "$RUNNER_TEMP/out-enc/diagnostics.tar.gz.gpg" --encrypt "$RUNNER_TEMP/diagnostics.tar.gz"; then
+            echo "::warning::encryption failed (is CODEAF_ARTIFACT_PUBLIC_KEY a valid key?); diagnostics not uploaded"
+            rm -f "$RUNNER_TEMP/out-enc/diagnostics.tar.gz.gpg"
+          fi
+          rm -rf "$RUNNER_TEMP/diagnostics.tar.gz" "$GNUPGHOME"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: codeaf-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/out-enc/diagnostics.tar.gz.gpg
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        # The patch, its base commit, CodeAF's result and the cost ledger: all of
+        # it is published on the PR anyway. `publish` reads it as untrusted data.
+        if: always()
+        with:
+          name: codeaf-output-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/out
+          if-no-files-found: ignore
+          retention-days: 14
+
+  publish:
+    needs: [gate, run]
+    if: always() && needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: codeaf-publish-${{ needs.gate.outputs.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write # dispatch CI on the pushed branch (pushes by GITHUB_TOKEN don't trigger workflows)
+    env:
+      MODE: ${{ needs.gate.outputs.mode }}
+      NUMBER: ${{ needs.gate.outputs.number }}
+      BRANCH: ${{ needs.gate.outputs.branch }}
+      BASE: ${{ needs.gate.outputs.base }}
+      RUN_RESULT: ${{ needs.run.result }}
+    steps:
+      - name: Paths
+        run: |
+          {
+            echo "IN=$RUNNER_TEMP/in"
+            echo "RESULT_PATH=$RUNNER_TEMP/in/codeaf-result.json"
+            echo "LEDGER_PATH=$RUNNER_TEMP/in/codeaf-ledger.jsonl"
+            echo "HARNESS=$RUNNER_TEMP/harness/harness"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Always the default branch: this job holds a write token, so it must
+          # never build or run PR code (the default ref on review events).
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: .github/codeaf/go.mod
+          cache: false
+
+      - name: Build the harness
+        # From the default branch's checkout on this fresh runner, never from
+        # a PR or anything the run job produced.
+        run: |
+          cp -r .github/codeaf "$RUNNER_TEMP/harness"
+          (cd "$RUNNER_TEMP/harness" && go build -trimpath -o harness .)
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          name: codeaf-output-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/in
+
+      - name: Apply the patch
+        id: apply
+        run: |
+          git config user.name  "codeaf[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git fetch --depth=1 origin "refs/heads/$BRANCH" 2>/dev/null; then
+            git checkout -B "$BRANCH" FETCH_HEAD
+          else
+            git checkout -B "$BRANCH"
+          fi
+          patch="$IN/changes.patch"
+          changed=0
+          if [ -f "$patch" ] && [ ! -L "$patch" ] && [ -s "$patch" ]; then
+            # Untrusted input: size-capped, must apply to the commit it was made
+            # from, and may not touch .github/ or any .git path.
+            if [ "$(stat -c %s "$patch")" -gt 52428800 ]; then
+              echo "::error::patch is over 50 MB; refusing it"; exit 1
+            fi
+            if [ "$(cat "$IN/base-commit" 2>/dev/null)" != "$(git rev-parse HEAD)" ]; then
+              echo "::error::the branch moved while CodeAF ran; refusing to apply a stale patch"; exit 1
+            fi
+            git apply --index --binary "$patch"
+            if git diff --cached --name-only | grep -qE '^\.github/|(^|/)\.git(/|$)'; then
+              echo "::error::patch touches .github/ or a .git path; refusing it"; exit 1
+            fi
+            changed=$(git diff --cached --name-only | wc -l)
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          if [ "$changed" -gt 0 ]; then
+            git commit -q -m "codeaf: work for #$NUMBER" -m "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          fi
+          git log --oneline -3
+
+      - name: Push and open/update PR
+        id: pr
+        if: steps.apply.outputs.changed != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/$BRANCH"
+          pr=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')
+          if [ -z "$pr" ]; then
+            title=$(gh issue view "$NUMBER" --json title --jq .title)
+            pr_url=$(gh pr create --base "$BASE" --head "$BRANCH" --title "$title" \
+              --body "Closes #$NUMBER
+
+          Opened by the [CodeAF workflow]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID). Comment \`/codeaf <instructions>\` (or request changes in a review) to have CodeAF continue on this branch.")
+            pr=${pr_url##*/}
+            gh pr edit "$pr" --add-label "$CODEAF_LABEL"
+          fi
+          echo "number=$pr" >> "$GITHUB_OUTPUT"
+          gh workflow run ci.yml --ref "$BRANCH" || echo "::warning::could not dispatch CI"
+
+      - name: Report
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          DAY_SPENT_BEFORE: ${{ needs.run.outputs.day_before }}
+          CHANGED: ${{ steps.apply.outputs.changed }}
+          OUTCOME: ${{ needs.run.result != 'success' && 'run job failed' || (job.status != 'success' && 'publishing failed' || (steps.apply.outputs.changed != '0' && 'changes pushed' || 'no changes')) }}
+        run: |
+          "$HARNESS" report > "$RUNNER_TEMP/report.md"
+          cat "$RUNNER_TEMP/report.md" >> "$GITHUB_STEP_SUMMARY"
+          target="${{ steps.pr.outputs.number }}"
+          [ -n "$target" ] || target="$NUMBER"
+          gh issue comment "$target" --body-file "$RUNNER_TEMP/report.md"
+          if [ "$target" != "$NUMBER" ] && [ "$MODE" = issue ]; then
+            gh issue comment "$NUMBER" --body "CodeAF opened #$target for this issue."
+          fi

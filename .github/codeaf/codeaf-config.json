@@ -1,0 +1,11 @@
+{
+  "api_key": "via-local-proxy",
+  "models.tiers.worker": "zai-org/glm-5.3-flash",
+  "models.tiers.mastermind": "zai-org/glm-5.3-flash",
+  "models.tiers.high": "zai-org/glm-5.3-flash",
+  "models.crew.task_cap": 5,
+  "models.crew.cap": 20,
+  "daily_budget_usd": 20,
+  "telemetry": false,
+  "model_pool": "off"
+}
