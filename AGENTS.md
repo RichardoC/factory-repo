@@ -113,9 +113,10 @@ hostile, whether through prompt injection or a compromised model.
   from it. On `pull_request_review` events the default ref is the PR's merge
   commit, which is PR code.
 - `publish` treats the run job's outputs and artifacts as untrusted data. It
-  checks the patch's size and that its base commit matches (a new branch
-  starts from that commit only after the API confirms the default branch
-  contains it), applies it with
+  checks the patch's size and that its base commit matches. For a new
+  branch whose base the API confirms the default branch contains, it
+  instead merges the patch onto the default branch with `git apply --3way`,
+  starting from the base only on a conflict. It applies it with
   `git apply`, which runs nothing and refuses `.git` paths, then refuses the
   result if any staged path (rename detection off) is under `.github/` but
   outside `.github/codeaf/`, unless a maintainer approved it. Keep it that

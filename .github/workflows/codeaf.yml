@@ -404,24 +404,24 @@ jobs:
         run: |
           git config user.name  "codeaf[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          moved=false
           if git fetch --depth=1 origin "refs/heads/$BRANCH" 2>/dev/null; then
             git checkout -B "$BRANCH" FETCH_HEAD
           else
-            # A new branch starts from the commit CodeAF started from, so a
-            # merge to the default branch while CodeAF ran doesn't make the
-            # patch stale; the PR shows any conflict. That commit comes from
-            # the run job, so it is untrusted: it is used only if it is a
-            # full SHA that the default branch (checked out above) contains.
-            start=HEAD
+            # A new branch. If the default branch moved while CodeAF ran, the
+            # patch is merged onto it (below) rather than refused as stale.
+            # The commit CodeAF started from comes from the run job, so it is
+            # untrusted: it is used only if it is a full SHA that the default
+            # branch (checked out above) contains.
             base=$(head -c 64 "$IN/base-commit" 2>/dev/null | tr -d '\n' || true)
             if [[ "$base" =~ ^[0-9a-f]{40}$ ]] && [ "$base" != "$(git rev-parse HEAD)" ]; then
               status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$base...$(git rev-parse HEAD)" --jq .status 2>/dev/null || true)
+              # Fetching the base commit gives the 3-way merge its preimages.
               if [ "$status" = ahead ] && git fetch --depth=1 origin "$base" 2>/dev/null; then
-                echo "The default branch moved while CodeAF ran; starting $BRANCH from $base"
-                start=$base
+                moved=true
               fi
             fi
-            git checkout -B "$BRANCH" "$start"
+            git checkout -B "$BRANCH"
           fi
           patch="$IN/changes.patch"
           changed=0
@@ -434,10 +434,25 @@ jobs:
             if [ "$(stat -c %s "$patch")" -gt 52428800 ]; then
               echo "::error::patch is over 50 MB; refusing it"; exit 1
             fi
-            if [ "$(cat "$IN/base-commit" 2>/dev/null)" != "$(git rev-parse HEAD)" ]; then
-              echo "::error::the branch moved while CodeAF ran; refusing to apply a stale patch"; exit 1
+            if [ "$moved" = true ]; then
+              # Merged onto the current default branch. A branch started from
+              # the old base instead would differ from the default branch in
+              # any workflow changed since, which GitHub refuses to let
+              # GITHUB_TOKEN push. Only if the merge conflicts does the branch
+              # start from the base, so the PR shows the conflict.
+              echo "The default branch moved while CodeAF ran; merging the patch onto it"
+              if ! git apply --index --binary --3way "$patch"; then
+                echo "::warning::the patch conflicts with the default branch; starting $BRANCH from $base"
+                git reset -q --hard
+                git checkout -q -B "$BRANCH" "$base"
+                git apply --index --binary "$patch"
+              fi
+            else
+              if [ "$(cat "$IN/base-commit" 2>/dev/null)" != "$(git rev-parse HEAD)" ]; then
+                echo "::error::the branch moved while CodeAF ran; refusing to apply a stale patch"; exit 1
+              fi
+              git apply --index --binary "$patch"
             fi
-            git apply --index --binary "$patch"
             if git diff --cached --name-only | grep -qE '(^|/)\.git(/|$)'; then
               echo "::error::patch touches a .git path; refusing it"; exit 1
             fi
