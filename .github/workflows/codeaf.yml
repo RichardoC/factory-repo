@@ -394,13 +394,28 @@ jobs:
         id: apply
         env:
           HARNESS_APPROVED: ${{ steps.approval.outputs.approved }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name  "codeaf[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           if git fetch --depth=1 origin "refs/heads/$BRANCH" 2>/dev/null; then
             git checkout -B "$BRANCH" FETCH_HEAD
           else
-            git checkout -B "$BRANCH"
+            # A new branch starts from the commit CodeAF started from, so a
+            # merge to the default branch while CodeAF ran doesn't make the
+            # patch stale; the PR shows any conflict. That commit comes from
+            # the run job, so it is untrusted: it is used only if it is a
+            # full SHA that the default branch (checked out above) contains.
+            start=HEAD
+            base=$(head -c 64 "$IN/base-commit" 2>/dev/null | tr -d '\n' || true)
+            if [[ "$base" =~ ^[0-9a-f]{40}$ ]] && [ "$base" != "$(git rev-parse HEAD)" ]; then
+              status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$base...$(git rev-parse HEAD)" --jq .status 2>/dev/null || true)
+              if [ "$status" = ahead ] && git fetch --depth=1 origin "$base" 2>/dev/null; then
+                echo "The default branch moved while CodeAF ran; starting $BRANCH from $base"
+                start=$base
+              fi
+            fi
+            git checkout -B "$BRANCH" "$start"
           fi
           patch="$IN/changes.patch"
           changed=0
