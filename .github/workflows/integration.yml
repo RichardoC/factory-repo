@@ -1,0 +1,45 @@
+# Issue #69: opt-in integration suite for kube-sqlite3-vfs.
+#
+# This file changes .github/, so per AGENTS.md it publishes only after a
+# maintainer approves the codeaf-harness environment deployment, and takes
+# effect only once merged. It is deliberately separate from ci.yml so it is
+# one minimal, separately-approvable change.
+#
+# Opt-in by design: workflow_dispatch only, so nothing runs on push or PR.
+# A maintainer runs it by hand when they want the envtest integration tests
+# (pkg/vfs/vfs_integration_test.go, behind the `integration` build tag) to
+# run against a real kube-apiserver. No caching of envtest binaries between
+# runs: AGENTS.md forbids carrying toolchains or caches between runs.
+
+name: Integration tests (issue #69)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  envtest:
+    name: kube-sqlite3-vfs integration tests (issue #69, envtest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: app/kube-sqlite3-vfs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: app/kube-sqlite3-vfs/go.mod
+          cache: false
+      - name: Install setup-envtest
+        # Pinned to the exact module version (release-0.25 as of 2026-10-12):
+        # AGENTS.md builds tools from pinned sources only.
+        run: go install sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.25.3-0.20261012174806-32759fab3119
+      - name: Set KUBEBUILDER_ASSETS
+        run: echo "KUBEBUILDER_ASSETS=$(setup-envtest use 1.37.0 -p path)" >> "$GITHUB_ENV"
+      - name: Integration tests (issue #69)
+        run: go test -race -count=1 -tags integration ./pkg/vfs
