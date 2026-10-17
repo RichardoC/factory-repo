@@ -113,7 +113,48 @@ func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Lo
 	// `vfs=kube-sqlite3-vfs` instructs sqlite to use the custom VFS
 	// implementation; the name must match the one passed to
 	// sqlite3vfs.RegisterVFS above.
-	db, err := sql.Open("sqlite3", "file2.db?_journal=MEMORY&_cache_size=-256&vfs=kube-sqlite3-vfs")
+	//
+	// The journal mode is DELETE, not MEMORY (issue #68). An in-memory
+	// journal leaves no on-cluster record of an uncommitted transaction, so
+	// a crash — an evicted pod, a killed process — cannot be rolled back
+	// and very likely corrupts the database. In DELETE mode SQLite opens
+	// "<db>-journal" through this same VFS, so the rollback journal is
+	// itself a set of sector ConfigMaps and a hot journal can be played
+	// back by the next opener: `Access` answers from cluster truth, and
+	// `Delete` removes every journal sector with one xDelete per file.
+	//
+	// DELETE over TRUNCATE/PERSIST, by API calls per commit. All three
+	// store the journal out of memory, so the difference is entirely in
+	// what happens at the end of the transaction:
+	//
+	//   - DELETE issues one xDelete at commit; the VFS turns that into one
+	//     LIST of the journal's sectors plus one Delete per sector (plus
+	//     one Delete of the journal's lockfile), after which the journal
+	//     is gone and no later transaction pays anything for it.
+	//   - TRUNCATE and PERSIST keep the journal file on the cluster, so
+	//     the next write transaction reuses it and pays again: a header
+	//     rewrite through xWrite (one UPDATE per touched sector), plus the
+	//     xAccess that SQLite performs to discover the file and the xOpen
+	//     that reopens it. Those are per-transaction costs that DELETE pays
+	//     exactly once, at commit.
+	//
+	// Measured on the fake clientset with
+	// `go test ./pkg/vfs -run ZZZ -bench BenchmarkSQLiteInsert1000Rows -benchtime 10x`
+	// (see the module README): a committed 1000-row transaction costs 25.00
+	// api-calls/op with _journal=MEMORY and 65.00 api-calls/op with
+	// _journal=DELETE — a delta of 40 API calls for the journal writes
+	// plus its deletion. That is the price of a rollback that can actually
+	// be rolled back after a crash, paid once per commit; TRUNCATE/PERSIST
+	// would add the header rewrite and the extra xAccess/xOpen on every
+	// later transaction without buying anything this VFS needs.
+	//
+	// A database written by an older build with _journal=MEMORY is still
+	// an ordinary SQLite database in DELETE mode on the cluster: the
+	// journal mode is a per-connection decision, no on-cluster layout
+	// depends on it, and the "no journal sectors" state is exactly what
+	// `Access` already reports for a name with no sectors — so such a
+	// database opens here and recovers normally.
+	db, err := sql.Open("sqlite3", "file2.db?_journal=DELETE&_cache_size=-256&vfs=kube-sqlite3-vfs")
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}

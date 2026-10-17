@@ -1331,15 +1331,44 @@ func (v *vfs) Delete(name string, dirSync bool) error {
 	return sqlite3vfs.IOError
 }
 
-// Access implements sqlite3vfs.VFS. It reports every file as accessible,
-// except sqlite's side files, which never exist in the cluster: sqlite
-// fails with "unable to open database file: invalid argument" when it tries
-// to read them while they are empty.
+// Access implements sqlite3vfs.VFS. It reports whether the named file
+// exists in the cluster, so SQLite can tell a rollback journal it must
+// recover from a journal it has yet to create.
+//
+// This used to be a blanket "sqlite side files never exist": every name
+// ending in "-wal" or "-journal" answered false. That was a lie for the
+// rollback journal, and it broke crash recovery: on the first read after a
+// crash SQLite calls xAccess on <db>-journal to decide whether a hot
+// journal is present. A false answer tells it there is nothing to roll
+// back, so the half-written transaction is accepted as committed — data
+// corruption — even though the journal's ConfigMaps are sitting in the
+// cluster. A real filesystem answers from the directory, and so does this
+// one now: the "-journal" name exists exactly when it has at least one
+// sector ConfigMap.
+//
+// The "-wal" answer stays false: this VFS has no WAL support, so a WAL never
+// exists here and saying otherwise would send SQLite down a path this VFS
+// cannot serve. Every other name keeps answering true, as before.
 func (v *vfs) Access(name string, flags sqlite3vfs.AccessFlag) (bool, error) {
 	v.logger.Debug("Access", "name", name, "flags", flags)
-	if strings.HasSuffix(name, "-wal") || strings.HasSuffix(name, "-journal") {
+	if strings.HasSuffix(name, "-wal") {
 		return false, nil
 	}
+	if strings.HasSuffix(name, "-journal") {
+		// Cluster truth: LIST this exact journal name's sector ConfigMaps
+		// and report existence from the count, exactly as a filesystem
+		// would report from its directory entry.
+		f := NewFile(name, v)
+		cms, err := f.listSectorConfigMaps()
+		if err != nil {
+			v.logger.Error("Access: list journal sector configmaps", "name", name, "err", err)
+
+			return false, err
+		}
+
+		return len(cms) > 0, nil
+	}
+
 	return true, nil
 }
 

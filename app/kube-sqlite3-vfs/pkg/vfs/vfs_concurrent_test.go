@@ -25,7 +25,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -479,28 +478,6 @@ func TestConcurrentReaderSeesConsistentDataWhileWriterHoldsTx(t *testing.T) {
 	}
 }
 
-// journalVisibleVFS wraps a vfs to answer xAccess(SQLITE_ACCESS_EXISTS) for
-// sqlite's rollback-journal names from the cluster truth — whether the
-// journal's sector ConfigMaps exist — instead of the base VFS's blanket
-// "sqlite side files never exist". The base answer keeps hasHotJournal
-// (pager.c) from ever reaching xCheckReservedLock, so the cgo inversion
-// this package works around would be invisible to any test: SQLite would
-// never ask the question the workaround fixes. A real local filesystem
-// reports the journal's existence, and this wrapper emulates exactly that
-// much of one; everything else is the base VFS.
-type journalVisibleVFS struct{ *vfs }
-
-func (w journalVisibleVFS) Access(name string, flags sqlite3vfs.AccessFlag) (bool, error) {
-	if strings.HasSuffix(name, "-journal") {
-		cms, err := NewFile(name, w.vfs).listSectorConfigMaps()
-		if err != nil {
-			return false, err
-		}
-		return len(cms) > 0, nil
-	}
-	return w.vfs.Access(name, flags)
-}
-
 // openRollbackJournalSQLDB opens one sqlite connection through the named
 // VFS in sqlite's default DELETE journal mode — with a rollback journal on
 // the "disk", which is what makes hasHotJournal (and with it
@@ -538,19 +515,22 @@ func openRollbackJournalSQLDB(tb testing.TB, vfsName, fileName string) *sql.DB {
 // what SQLite finally consumes.
 //
 // TWO conditions make that failure observable. The journal must be visible
-// to B, which journalVisibleVFS supplies through xAccess — the base VFS
-// answers "sqlite side files never exist" and would keep SQLite from ever
-// reaching hasHotJournal. And the journal's magic byte at offset 0 must be
-// non-zero, because hasHotJournal returns before calling xCheckReservedLock
-// when it reads zero there; SQLite writes that magic only for a file that
-// advertises SQLITE_IOCAP_SAFE_APPEND, so TestFileAdvertisesSafeAppend pins
-// the flag and keeps this test from quietly going vacuous again. Verified by
-// reverting the negation with the flag in place: this test fails with
-// "database is locked", and passes with it.
+// to B through xAccess — since issue #68 the base VFS reports a
+// "-journal" name's existence from the cluster (its sector ConfigMaps), as
+// a real filesystem reports from its directory, so SQLite reaches
+// hasHotJournal. (Before that change the base answered "sqlite side files
+// never exist" and kept SQLite from ever asking.) And the journal's magic
+// byte at offset 0 must be non-zero, because hasHotJournal returns before
+// calling xCheckReservedLock when it reads zero there; SQLite writes that
+// magic only for a file that advertises SQLITE_IOCAP_SAFE_APPEND, so
+// TestFileAdvertisesSafeAppend pins the flag and keeps this test from
+// quietly going vacuous again. Verified by reverting the negation with the
+// flag in place: this test fails with "database is locked", and passes with
+// it.
 func TestCheckReservedLockCrossesCGOBoundary(t *testing.T) {
 	v1, v2 := newContendingVFSInstances(t)
 	vfs1Name := registerUniqueVFS(t, v1)
-	vfs2Name := registerUniqueVFS(t, journalVisibleVFS{v2})
+	vfs2Name := registerUniqueVFS(t, v2)
 	fileName := newSQLFileName()
 
 	dbA := openRollbackJournalSQLDB(t, vfs1Name, fileName)
