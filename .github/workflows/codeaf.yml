@@ -186,13 +186,18 @@ jobs:
       - name: Check out the working branch
         run: |
           # Continue an existing CodeAF branch if there is one, else branch
-          # from the default branch checked out above.
-          if git fetch --depth=1 origin "refs/heads/$BRANCH" 2>/dev/null; then
+          # from the default branch checked out above. A plan run (issue
+          # #61) has no working branch: the gate leaves BRANCH empty, and
+          # the run stays on the default branch checked out above and
+          # creates no branch of its own -- it is read-only.
+          mkdir -p "$RUNNER_TEMP/out"
+          if [ -z "$BRANCH" ]; then
+            :
+          elif git fetch --depth=1 origin "refs/heads/$BRANCH" 2>/dev/null; then
             git checkout -B "$BRANCH" FETCH_HEAD
           else
             git checkout -B "$BRANCH"
           fi
-          mkdir -p "$RUNNER_TEMP/out"
           git rev-parse HEAD > "$RUNNER_TEMP/out/base-commit"
 
       - name: Merge the PR base branch
@@ -599,14 +604,26 @@ jobs:
 
       - name: Apply the patch
         id: apply
-        # Review and plan modes: publish never applies or pushes anything
-        # (a plan run is read-only; its output is proposals, issue #61).
-        if: needs.gate.outputs.mode != 'review' && needs.gate.outputs.mode != 'plan'
+        # Review mode: publish never applies or pushes anything. A plan run
+        # (issue #61) is read-only the same way -- its output is proposals --
+        # but the step still runs so it can write the outputs the "Push and
+        # open/update PR" step below reads: that step's condition counts an
+        # empty changed as "changed", and the step cannot be guarded here
+        # because it references secrets, which the workflow policy refuses
+        # to let a patch edit. Plan mode exits before anything is applied,
+        # with changed=0 and merged=false, so the push step skips.
+        if: needs.gate.outputs.mode != 'review'
         env:
           HARNESS_APPROVED: ${{ steps.approval.outputs.approved }}
           GITHUB_TOKEN: ${{ github.token }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          if [ "$MODE" = plan ]; then
+            echo "changed=0" >> "$GITHUB_OUTPUT"
+            echo "policy_approved=false" >> "$GITHUB_OUTPUT"
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           git config user.name  "codeaf[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           # The default branch's workflows, as checked out above, before any

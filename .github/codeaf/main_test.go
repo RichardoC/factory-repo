@@ -2660,3 +2660,114 @@ func TestLoadConfigPlanner(t *testing.T) {
 		t.Fatalf("committed models.json planner: got %+v; want 3, 12, 5", cfg.Planner)
 	}
 }
+
+// TestDecidePlanDispatch covers the planner dispatch (issue #61): plan=true
+// with no issue, pr, review or profile input runs in plan mode — the
+// validated lane, the default branch as base, and no issue number and no
+// branch, because the plan run is read-only. Plan mixed with any of those
+// inputs is refused, and so is any plan value but the exact "true": the
+// input is untrusted, and a half-plan dispatch must not silently demote to
+// another mode. A plan dispatch never looks an issue or PR up.
+func TestDecidePlanDispatch(t *testing.T) {
+	t.Setenv("GITHUB_REPOSITORY", "RichardoC/factory-repo")
+	t.Setenv("GITHUB_RUN_ID", "42")
+	noLookup := func(int) (item, error) { t.Fatal("unexpected PR lookup"); return item{}, nil }
+	noIssueLookup := func(int) (item, error) { t.Fatal("unexpected issue lookup"); return item{}, nil }
+	decide := func(inputs map[string]string) Decision {
+		ev := event{Inputs: inputs}
+		ev.Repository.DefaultBranch = "main"
+		got, err := Decide("workflow_dispatch", ev, "codeaf", noLookup, noIssueLookup)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	t.Run("plan dispatch runs", func(t *testing.T) {
+		got := decide(map[string]string{"plan": "true"})
+		if !got.Run || got.Mode != "plan" || got.Reason == "" {
+			t.Fatalf("Decide = %+v; want a plan run", got)
+		}
+		if got.Number != 0 || got.Branch != "" {
+			t.Fatalf("Decide = %+v; want no issue number and no branch", got)
+		}
+		if got.Base != "main" {
+			t.Fatalf("base = %q; want the default branch", got.Base)
+		}
+		if got.Lane != 0 || got.Profile != "" {
+			t.Fatalf("Decide = %+v; want lane 0 and no profile", got)
+		}
+	})
+	t.Run("plan dispatch carries its lane", func(t *testing.T) {
+		got := decide(map[string]string{"plan": "true", "lane": "2"})
+		if !got.Run || got.Mode != "plan" || got.Lane != 2 {
+			t.Fatalf("Decide = %+v; want a plan run on lane 2", got)
+		}
+	})
+	for name, value := range map[string]string{
+		"issue":   "3",
+		"pr":      "7",
+		"review":  "7",
+		"profile": "cheap",
+	} {
+		t.Run("plan with "+name+" is refused", func(t *testing.T) {
+			got := decide(map[string]string{"plan": "true", name: value})
+			if got.Run {
+				t.Fatalf("Decide = %+v; want a skip", got)
+			}
+			if got.Reason == "" {
+				t.Fatal("a refused dispatch must say why")
+			}
+		})
+	}
+	for _, raw := range []string{"TRUE", "True", "1", "yes", "false"} {
+		t.Run("plan="+raw+" is not a plan dispatch", func(t *testing.T) {
+			got := decide(map[string]string{"plan": raw})
+			if got.Run {
+				t.Fatalf("Decide = %+v; want a skip", got)
+			}
+		})
+	}
+}
+
+// TestGatePlanOutputs covers the gate's printed outputs for a plan run
+// (issue #61): run, reason and lane always; mode, an empty number, an empty
+// branch, the default branch as base and an empty profile for the run.
+// number=0 and the empty branch are what the run job and publish read, so
+// their shape is part of the gate's contract.
+func TestGatePlanOutputs(t *testing.T) {
+	t.Setenv("GITHUB_REPOSITORY", "RichardoC/factory-repo")
+	t.Setenv("GITHUB_RUN_ID", "42")
+	t.Setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+	eventPath := filepath.Join(t.TempDir(), "event.json")
+	if err := os.WriteFile(eventPath, []byte(`{"inputs":{"plan":"true","lane":"2"},"repository":{"default_branch":"main"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GITHUB_EVENT_PATH", eventPath)
+	outputPath := filepath.Join(t.TempDir(), "output")
+	t.Setenv("GITHUB_OUTPUT", outputPath)
+
+	stdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	err = runGate()
+	os.Stdout = stdout
+	w.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := io.ReadAll(r)
+	want := "run=true\nreason=plan dispatch\nlane=2\nmode=plan\nnumber=0\nbranch=\nbase=main\nprofile=\n"
+	if got := string(data); got != want {
+		t.Fatalf("stdout = %q; want %q", got, want)
+	}
+	written, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(written) != want {
+		t.Fatalf("GITHUB_OUTPUT = %q; want %q", written, want)
+	}
+}

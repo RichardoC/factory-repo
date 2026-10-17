@@ -1615,6 +1615,29 @@ func Decide(name string, ev event, labelName string, lookupPR, lookupIssue func(
 		// each concurrent run a different model. The input is untrusted,
 		// so only its digits are read; anything else is lane 0.
 		lane := dispatchLane(ev.Inputs["lane"])
+		// A plan run (issue #61) is dispatched by the queue's planner
+		// step with plan=true and nothing else but the lane: the run reads
+		// the repository and proposes issues, and writes no patch and no
+		// PR. The input is untrusted, so only the exact value "true" is a
+		// plan run, and it accepts no other target: an issue, pr, review
+		// or profile input alongside it is refused rather than silently
+		// demoted to that mode. The decision carries the validated lane,
+		// the default branch as base, and no issue number and no branch —
+		// every workflow step that reads one must treat both as empty.
+		if raw := ev.Inputs["plan"]; raw != "" {
+			switch {
+			case raw != "true":
+				return skip("plan input must be exactly true"), nil
+			case ev.Inputs["issue"] != "" || ev.Inputs["pr"] != "" ||
+				ev.Inputs["review"] != "" || ev.Inputs["profile"] != "":
+				return skip("a plan dispatch takes no issue, pr, review or profile input"), nil
+			}
+			if _, err := runID(); err != nil {
+				return Decision{}, err
+			}
+			return Decision{Run: true, Reason: "plan dispatch", Mode: "plan",
+				Base: ev.Repository.DefaultBranch, Lane: lane}, nil
+		}
 		if n, ok := dispatchIssue(ev.Inputs["pr"]); ok {
 			pr, err := lookupPR(n)
 			if err != nil {

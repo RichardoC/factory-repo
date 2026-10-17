@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -660,5 +661,66 @@ func TestNextPlanRunNoAreaConflict(t *testing.T) {
 	sameArea := []runStatus{running(3, 0, 100)}
 	if n, _, reason := Next([]item{areaIssue(5, "2024-01-01T00:00:00Z", "app/x")}, sameArea, o); n != 0 || !strings.Contains(reason, "busy") {
 		t.Fatalf("same-area issue run: Next = %d, %q; want held", n, reason)
+	}
+}
+
+// TestQueueDispatchesPassTheGate feeds the exact `-f` inputs of every
+// `gh workflow run codeaf.yml` step in codeaf-queue.yml through Decide
+// (issue #61): a queue step that dispatches a combination the gate skips
+// would start runs that die in the gate with nothing labelled and nothing
+// published, so this test fails first, on the default branch's queue.
+// Shell variables in a flag's value stand for the digits the queue sends,
+// so `-f lane=$LANE` is decided as a valid lane.
+func TestQueueDispatchesPassTheGate(t *testing.T) {
+	t.Setenv("GITHUB_REPOSITORY", "RichardoC/factory-repo")
+	t.Setenv("GITHUB_RUN_ID", "42")
+	// The queue labels the issue before dispatching it, so the lookup
+	// sees what the gate will see at run time: an open, labelled issue.
+	labelled := item{Number: 3, State: "open", Labels: []label{{Name: "codeaf"}}}
+	lookup := func(int) (item, error) { return labelled, nil }
+	data, err := os.ReadFile("../workflows/codeaf-queue.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One block per step; a step's block runs to the next "- name:" line.
+	steps := strings.Split(string(data), "\n      - name: ")
+	var flags []map[string]string
+	for _, step := range steps {
+		for _, line := range strings.Split(step, "\n") {
+			if !strings.Contains(line, "gh workflow run codeaf.yml") {
+				continue
+			}
+			inputs := map[string]string{}
+			for _, m := range regexp.MustCompile(`-f\s+"?([a-z_]+)=([^"\s]+)"?`).FindAllStringSubmatch(line, -1) {
+				value := m[2]
+				if strings.Contains(value, "$") {
+					value = "3" // a lane or number the queue resolved, digits only
+				}
+				inputs[m[1]] = value
+			}
+			if len(inputs) == 0 {
+				t.Fatalf("queue dispatch line has no -f inputs to decide: %s", line)
+			}
+			flags = append(flags, inputs)
+		}
+	}
+	if len(flags) != 2 {
+		t.Fatalf("codeaf-queue.yml dispatches codeaf.yml %d times; want 2 (issues and planner)", len(flags))
+	}
+	for _, inputs := range flags {
+		ev := event{Inputs: inputs}
+		ev.Repository.DefaultBranch = "main"
+		got, err := Decide("workflow_dispatch", ev, "codeaf", lookup, lookup)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !got.Run {
+			t.Fatalf("the queue dispatches %v and the gate skips it: %s", inputs, got.Reason)
+		}
+	}
+	// The planner's dispatch must be the one that reaches plan mode.
+	last := flags[len(flags)-1]
+	if last["plan"] != "true" {
+		t.Fatalf("the queue's last codeaf.yml dispatch is %v; want the planner's plan=true", last)
 	}
 }
