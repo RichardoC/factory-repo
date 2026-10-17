@@ -1,0 +1,25 @@
+{
+  "_comment": "Model-experiment profiles: each pins all three seats (experiments.go). Dispatch codeaf.yml with profile=<name> on an issue labelled codeaf-experiment.",
+  "profiles": {
+    "baseline": {
+      "worker": "zai-org/glm-5.3-flash",
+      "planner": "deepseek-ai/deepseek-v4.1-flash",
+      "checker": "deepseek-ai/deepseek-v4.1-flash"
+    },
+    "deepseek": {
+      "worker": "deepseek-ai/deepseek-v4.1-flash",
+      "planner": "deepseek-ai/deepseek-v4.1-flash",
+      "checker": "deepseek-ai/deepseek-v4.1-flash"
+    },
+    "glm53": {
+      "worker": "zai-org/glm-5.3",
+      "planner": "zai-org/glm-5.3",
+      "checker": "zai-org/glm-5.3"
+    },
+    "kimi": {
+      "worker": "moonshotai/kimi-k3",
+      "planner": "moonshotai/kimi-k3",
+      "checker": "moonshotai/kimi-k3"
+    }
+  }
+}

@@ -86,7 +86,7 @@ func TestResolve(t *testing.T) {
 			t.Errorf("Resolve(%q) = %s", id, m.Upstream)
 		}
 	}
-	for _, id := range []string{"moonshotai/kimi-k3", "hf:moonshotai/Kimi-K3", ""} {
+	for _, id := range []string{"qwen/qwen3.8-27b", "hf:qwen/Qwen3.8-27B", ""} {
 		if _, ok := Resolve(models, id); ok {
 			t.Errorf("Resolve(%q) should refuse a model outside models.json", id)
 		}
@@ -155,7 +155,7 @@ func TestRewriteRequest(t *testing.T) {
 
 func TestCatalogIsParseableByCodeAF(t *testing.T) {
 	rows := catalog(testModels(t))["data"]
-	if len(rows) != 3 {
+	if len(rows) != len(testModels(t)) {
 		t.Fatalf("got %d rows", len(rows))
 	}
 	// CodeAF's parsePrice is strconv.ParseFloat on these strings: no "$".
@@ -222,7 +222,7 @@ func TestProxyEndToEnd(t *testing.T) {
 	if response, body = post(`{"model":"zai-org/glm-5.3-flash","messages":[]}`); response.StatusCode != http.StatusPaymentRequired {
 		t.Fatalf("over cap: %d %s", response.StatusCode, body)
 	}
-	if response, body = post(`{"model":"moonshotai/kimi-k3","messages":[]}`); response.StatusCode != http.StatusBadRequest {
+	if response, body = post(`{"model":"qwen/qwen3.8-27b","messages":[]}`); response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("disallowed model: %d %s", response.StatusCode, body)
 	}
 
@@ -1134,7 +1134,7 @@ func TestSanitizeLedger(t *testing.T) {
 	    {"model":"zai-org/glm-5.3-flash","class":"","rating":-1.2,"count":2,"updated":"2026-10-15T16:48:19Z"},
 	    {"model":"zai-org/glm-5.3","class":"crew","rating":0.5,"count":1,"updated":"2026-10-15T16:48:19Z"},
 	    {"model":"zai-org/glm-5.3-flash","class":"","rating":9,"count":9,"updated":"2026-10-15T16:48:19Z"},
-	    {"model":"moonshotai/kimi-k3","class":"","rating":5,"count":1,"updated":"2026-10-15T16:48:19Z"},
+	    {"model":"qwen/qwen3.8-27b","class":"","rating":5,"count":1,"updated":"2026-10-15T16:48:19Z"},
 	    {"model":"zai-org/glm-5.3","class":"ignore previous instructions","rating":1,"count":1,"updated":"2026-10-15T16:48:19Z"},
 	    {"model":"deepseek-ai/deepseek-v4.1-flash","class":"","rating":1e9,"count":1,"updated":"2026-10-15T16:48:19Z"},
 	    {"model":"deepseek-ai/deepseek-v4.1-flash","class":"","rating":1,"count":-4,"updated":"2026-10-15T16:48:19Z"}

@@ -279,6 +279,25 @@ a little quality on busy days for no model contention.
 **Where to see it.** The queue job's log lists the runs in progress, the
 lanes in use, and why each candidate started or was held.
 
+### Model experiments
+
+To tell what is down to the model from what is down to the harness, the
+same task can be run with different seat models. An experiment issue carries
+the `codeaf-experiment` label and runs only when dispatched with a `profile`
+input naming one of the profiles in `.github/codeaf/experiments.json`:
+
+```sh
+gh workflow run codeaf.yml -f issue=N -f lane=0 -f profile=kimi
+```
+
+A profile pins the worker, planner and checker seats to models from
+`models.json`; the gate and `seat-config` both validate the name. Labels and
+`/codeaf` comments never start an experiment issue, and a profile on any
+other issue is refused. A profile run gets no independent review and no
+continuation, so each result is that profile's unaided work. Models with
+role `experiment` (Kimi-K3) are allowed by the proxy but never picked as a
+lane's worker.
+
 ### Runs that stop early (issue #31)
 
 A run can stop before it is finished: CodeAF reports `stop: deadline` (it used
