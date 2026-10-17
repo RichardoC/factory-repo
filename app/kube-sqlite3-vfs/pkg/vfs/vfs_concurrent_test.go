@@ -536,6 +536,17 @@ func openRollbackJournalSQLDB(tb testing.TB, vfsName, fileName string) *sql.DB {
 // the moment the negation is removed (until upstream maps the answer
 // straight through), which is the point: in-process asserts cannot see
 // what SQLite finally consumes.
+//
+// TWO conditions make that failure observable. The journal must be visible
+// to B, which journalVisibleVFS supplies through xAccess — the base VFS
+// answers "sqlite side files never exist" and would keep SQLite from ever
+// reaching hasHotJournal. And the journal's magic byte at offset 0 must be
+// non-zero, because hasHotJournal returns before calling xCheckReservedLock
+// when it reads zero there; SQLite writes that magic only for a file that
+// advertises SQLITE_IOCAP_SAFE_APPEND, so TestFileAdvertisesSafeAppend pins
+// the flag and keeps this test from quietly going vacuous again. Verified by
+// reverting the negation with the flag in place: this test fails with
+// "database is locked", and passes with it.
 func TestCheckReservedLockCrossesCGOBoundary(t *testing.T) {
 	v1, v2 := newContendingVFSInstances(t)
 	vfs1Name := registerUniqueVFS(t, v1)
@@ -609,5 +620,34 @@ func TestCheckReservedLockCrossesCGOBoundary(t *testing.T) {
 	}
 	if n != seededRows+heldRows {
 		t.Errorf("reader COUNT(*) after commit = %d, want %d", n, seededRows+heldRows)
+	}
+}
+
+// TestFileAdvertisesSafeAppend pins the device characteristic that makes
+// SQLite's hot-journal protocol work at all against this VFS (and with it
+// the cgo CheckReservedLock answer below).
+//
+// SQLite's writeJournalHdr (pager.c) writes the rollback journal's magic
+// bytes at offset 0 only when the database file advertises
+// SQLITE_IOCAP_SAFE_APPEND, or the pager runs no-sync / an in-memory
+// journal; otherwise it deliberately writes zeros, assuming a crash could
+// leave garbage appended to a partially grown file. hasHotJournal then
+// reads that first byte and treats zero as "no hot journal" — skipping its
+// xCheckReservedLock call entirely. With the flag missing, SQLite never
+// even asks the question TestCheckReservedLockCrossesCGOBoundary exists to
+// pin, so that test passes in both worlds and proves nothing. This cheap
+// assertion is what fails first when the characteristic is dropped, naming
+// the reason instead of leaving a silently vacuous cgo test behind.
+func TestFileAdvertisesSafeAppend(t *testing.T) {
+	v, _ := newTestVFS(t)
+	f := openTestFile(t, v, "safeappend.db")
+
+	got := f.DeviceCharacteristics()
+	if got&sqlite3vfs.IocapSafeAppend == 0 {
+		t.Errorf("DeviceCharacteristics() = %v, missing IocapSafeAppend: SQLite would zero the rollback journal's magic at offset 0, "+
+			"hasHotJournal would treat every journal as cold, and TestCheckReservedLockCrossesCGOBoundary would stop exercising the answer", got)
+	}
+	if got&sqlite3vfs.IocapAtomic64K == 0 {
+		t.Errorf("DeviceCharacteristics() = %v, missing IocapAtomic64K: one sector is one whole ConfigMap write", got)
 	}
 }

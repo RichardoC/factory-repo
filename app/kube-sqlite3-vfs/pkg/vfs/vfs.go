@@ -1152,9 +1152,26 @@ func (f *file) SectorSize() int64 {
 }
 
 // DeviceCharacteristics implements sqlite3vfs.File: it advertises atomic
-// 64 KiB writes, since one sector is one ConfigMap write.
+// 64 KiB writes, since one sector is one ConfigMap write, and safe appends.
+//
+// IocapSafeAppend is not cosmetic. SQLite's writeJournalHdr (pager.c) only
+// writes the rollback journal's magic bytes at offset 0 when the database
+// file advertises SQLITE_IOCAP_SAFE_APPEND (or runs no-sync / an in-memory
+// journal); otherwise it deliberately writes ZEROS there, on the assumption
+// that a crash could leave garbage appended to a partially grown file. A
+// zeroed magic makes hasHotJournal (which reads that first byte and treats
+// zero as "not a hot journal") skip its xCheckReservedLock call entirely, so
+// a live writer's journal is never recognised as live and SQLite's whole
+// hot-journal protocol is short-circuited — and the cgo workaround for the
+// upstream CheckReservedLock inversion becomes unobservable through SQLite.
+//
+// Safe append is true here in the strongest sense: a sector never grows by
+// appending to an existing object. Every sector is one ConfigMap, whole,
+// written exactly once (UPDATE or CREATE), so a partial write is impossible
+// and no garbage can ever follow the bytes a reader has already seen. This
+// is the same guarantee the unix VFS reports for SQLITE_IOCAP_SAFE_APPEND.
 func (f *file) DeviceCharacteristics() sqlite3vfs.DeviceCharacteristic {
-	return sqlite3vfs.IocapAtomic64K
+	return sqlite3vfs.IocapAtomic64K | sqlite3vfs.IocapSafeAppend
 }
 
 // NewFile returns a file object for name backed by v. The cmd tools use it
@@ -1346,8 +1363,10 @@ func (f *file) CheckReservedLock() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	_ = locked // BUG-WORLD PROBE: inversion removed
-	return locked, nil
+	// Upstream maps a true answer to *pResOut = 0 (see the bug above), so
+	// it is the NEGATED answer that must reach the shim: a held reserved
+	// lock must leave this method as false, a free one as true.
+	return !locked, nil
 }
 
 // reservedHeld reports the true answer to "does anyone — this file included
