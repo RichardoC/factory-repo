@@ -1130,6 +1130,7 @@ func TestRunWallTime(t *testing.T) {
 	auth = ""
 	setEnv("42")
 	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "")
 	if wall := runWallTime(); wall != nil {
 		t.Errorf("runWallTime without a token = %v, want nil", wall)
 	}
@@ -3213,6 +3214,7 @@ func TestProxyCommittedStreamCarriesUpstreamFailureAsAnSSEEvent(t *testing.T) {
 // either alone must do; GITHUB_TOKEN wins when both are set.
 func TestNewGitHubFallsBackToGHToken(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "")
 	t.Setenv("GH_TOKEN", "ght")
 	if g := newGitHub(); g.token != "ght" {
 		t.Fatalf("newGitHub token = %q; want the GH_TOKEN value", g.token)
