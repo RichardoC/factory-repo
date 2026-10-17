@@ -66,7 +66,7 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("harness: ")
 	if len(os.Args) < 2 {
-		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|ref-check|merge-default|search")
+		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|plan-check|plan-brief|plan-report|ref-check|merge-default|search")
 	}
 	commands := map[string]func() error{
 		"proxy":         runProxy,
@@ -84,6 +84,14 @@ func main() {
 		"review-brief":  runReviewBrief,
 		"review-config": runReviewConfig,
 		"review-report": runReviewReport,
+		// The planner trigger (issue #61): does the queue job dispatch a
+		// plan run this tick? plan-brief and plan-report, the run side of
+		// the planner, are separate commands.
+		"plan-check": runPlanCheck,
+		// The planner run side (issue #61): the plan run brief, and the
+		// publish-side report that parses its proposals.
+		"plan-brief":  runPlanBrief,
+		"plan-report": runPlanReport,
 		// The weekly upstream-pin check (issue #35): what the scheduled job
 		// should do about commits past .github/codeaf/codeaf-ref.
 		"ref-check": runRefCheck,
@@ -166,11 +174,23 @@ type Queue struct {
 	MaxParallelRuns int `json:"max_parallel_runs"`
 }
 
+// Planner is when the queue dispatches a plan run (issue #61): the queue
+// calls `harness plan-check` after its start-issues loop, and it fires only
+// while the open queued backlog is under MinBacklog and no plan run has
+// started within the last MinHours. A plan run itself proposes at most
+// MaxProposals issues (read by plan-brief, the run-side of the planner).
+type Planner struct {
+	MinBacklog   int `json:"min_backlog"`   // queued issues below which a plan run fires
+	MinHours     int `json:"min_hours"`     // hours since the last plan run before another
+	MaxProposals int `json:"max_proposals"` // proposals one plan run may open
+}
+
 // Config is models.json: the spend caps and the models CodeAF may use.
 type Config struct {
-	Limits Limits  `json:"limits"`
-	Queue  Queue   `json:"queue"`
-	Models []Model `json:"models"`
+	Limits  Limits  `json:"limits"`
+	Queue   Queue   `json:"queue"`
+	Planner Planner `json:"planner"`
+	Models  []Model `json:"models"`
 }
 
 func loadConfig(path string) (Config, error) {
@@ -204,6 +224,27 @@ func loadConfig(path string) (Config, error) {
 		cfg.Queue.MaxParallelRuns = 2
 	case cfg.Queue.MaxParallelRuns < 0:
 		return cfg, fmt.Errorf("%s: queue.max_parallel_runs must not be negative", path)
+	}
+	// The planner (issue #61) defaults to firing under a backlog of three
+	// queued issues, at most once every twelve hours, and to five proposals
+	// per plan run; a negative value is a mistake, not a wish.
+	switch {
+	case cfg.Planner.MinBacklog == 0:
+		cfg.Planner.MinBacklog = 3
+	case cfg.Planner.MinBacklog < 0:
+		return cfg, fmt.Errorf("%s: planner.min_backlog must not be negative", path)
+	}
+	switch {
+	case cfg.Planner.MinHours == 0:
+		cfg.Planner.MinHours = 12
+	case cfg.Planner.MinHours < 0:
+		return cfg, fmt.Errorf("%s: planner.min_hours must not be negative", path)
+	}
+	switch {
+	case cfg.Planner.MaxProposals == 0:
+		cfg.Planner.MaxProposals = 5
+	case cfg.Planner.MaxProposals < 0:
+		return cfg, fmt.Errorf("%s: planner.max_proposals must not be negative", path)
 	}
 	if len(cfg.Models) == 0 {
 		return cfg, fmt.Errorf("%s: no models", path)
@@ -1776,6 +1817,29 @@ func Decide(name string, ev event, labelName string, lookupPR, lookupIssue func(
 		// each concurrent run a different model. The input is untrusted,
 		// so only its digits are read; anything else is lane 0.
 		lane := dispatchLane(ev.Inputs["lane"])
+		// A plan run (issue #61) is dispatched by the queue's planner
+		// step with plan=true and nothing else but the lane: the run reads
+		// the repository and proposes issues, and writes no patch and no
+		// PR. The input is untrusted, so only the exact value "true" is a
+		// plan run, and it accepts no other target: an issue, pr, review
+		// or profile input alongside it is refused rather than silently
+		// demoted to that mode. The decision carries the validated lane,
+		// the default branch as base, and no issue number and no branch —
+		// every workflow step that reads one must treat both as empty.
+		if raw := ev.Inputs["plan"]; raw != "" {
+			switch {
+			case raw != "true":
+				return skip("plan input must be exactly true"), nil
+			case ev.Inputs["issue"] != "" || ev.Inputs["pr"] != "" ||
+				ev.Inputs["review"] != "" || ev.Inputs["profile"] != "":
+				return skip("a plan dispatch takes no issue, pr, review or profile input"), nil
+			}
+			if _, err := runID(); err != nil {
+				return Decision{}, err
+			}
+			return Decision{Run: true, Reason: "plan dispatch", Mode: "plan",
+				Base: ev.Repository.DefaultBranch, Lane: lane}, nil
+		}
 		if n, ok := dispatchIssue(ev.Inputs["pr"]); ok {
 			pr, err := lookupPR(n)
 			if err != nil {

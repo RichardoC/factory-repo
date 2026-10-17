@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -583,5 +584,143 @@ func TestNextLogs(t *testing.T) {
 				t.Fatalf("silent Next = %d, lane %d; want %d, lane %d", n2, lane2, c.start, c.lane)
 			}
 		})
+	}
+}
+
+// TestPlanRunTitleParsing covers the plan display title (issue #61): "CodeAF
+// plan" and "CodeAF plan (lane N)" are plan runs on lane 0 and N, and no
+// other shape is one. A plan title is never matched by runTitleRe — it
+// parses to issue 0 — and an issue title is never matched by runPlanRe; the
+// two shapes are disjoint.
+func TestPlanRunTitleParsing(t *testing.T) {
+	cases := []struct {
+		title string
+		lane  int
+		plan  bool
+	}{
+		{"CodeAF plan", 0, true},
+		{"CodeAF plan (lane 0)", 0, true},
+		{"CodeAF plan (lane 1)", 1, true},
+		{"CodeAF plan (lane 12)", 12, true},
+		// Not plan titles: trailing prose, letters in the lane, an issue
+		// title, anything else.
+		{"CodeAF plan run", 0, false},
+		{"CodeAF plan (lane x)", 0, false},
+		{"CodeAF plan (lane 1) extra", 0, false},
+		{"codeaf plan", 0, false},
+		{"CodeAF #3", 0, false},
+		{"CodeAF #3 (lane 1)", 0, false},
+		{"", 0, false},
+	}
+	for _, c := range cases {
+		lane, ok := runPlanFields(c.title)
+		if lane != c.lane || ok != c.plan {
+			t.Errorf("runPlanFields(%q) = (%d, %v); want (%d, %v)", c.title, lane, ok, c.lane, c.plan)
+		}
+		if got := isPlanRun(runStatus{DisplayTitle: c.title}); got != c.plan {
+			t.Errorf("isPlanRun(%q) = %v; want %v", c.title, got, c.plan)
+		}
+		// runLane reads the plan lane too, and only the plan lane.
+		if got := runLane(runStatus{DisplayTitle: c.title}); got != c.lane && c.plan {
+			t.Errorf("runLane(%q) = %d; want %d", c.title, got, c.lane)
+		}
+		// The issue-title regex still refuses plan titles: issue 0, lane 0.
+		issue, issueLane := runTitleFields(c.title)
+		if c.plan && (issue != 0 || issueLane != 0) {
+			t.Errorf("runTitleFields(%q) = (%d, %d); a plan run must parse to issue 0", c.title, issue, issueLane)
+		}
+	}
+	// An issue title still parses as before, plan parsing or no.
+	if issue, lane := runTitleFields("CodeAF #3 (lane 1)"); issue != 3 || lane != 1 {
+		t.Fatalf("runTitleFields issue title = (%d, %d); want (3, 1)", issue, lane)
+	}
+	if lane := runLane(running(3, 1, 100)); lane != 1 {
+		t.Fatalf("runLane issue title = %d; want 1", lane)
+	}
+}
+
+// TestNextPlanRunNoAreaConflict covers the queue side of plan runs: a plan
+// run in flight occupies its lane but holds no areas, so it never blocks an
+// issue run by area — and an in-flight issue run on the same area blocks a
+// second issue run just the same, plan runs or no.
+func TestNextPlanRunNoAreaConflict(t *testing.T) {
+	issues := []item{
+		areaIssue(3, "2024-01-01T00:00:00Z", "app/x"),
+		areaIssue(5, "2024-01-01T00:00:00Z", "app/x"),
+	}
+	o := nextOpts()
+	o.MaxParallelRuns = 2
+	// A plan run on lane 0 and the same-area issue still starts, on lane 1.
+	planRun := runStatus{Status: "in_progress", DatabaseId: 100, DisplayTitle: "CodeAF plan"}
+	if n, lane, _ := Next(issues, []runStatus{planRun}, o); n != 3 || lane != 1 {
+		t.Fatalf("plan run in flight: Next = %d, lane %d; want 3, 1", n, lane)
+	}
+	// An issue run on the same area blocks the same-area candidate, as
+	// always: run 100 works app/x, so #3 is held and #5 (its own area
+	// aside) is not picked either — the same area on both.
+	sameArea := []runStatus{running(3, 0, 100)}
+	if n, _, reason := Next([]item{areaIssue(5, "2024-01-01T00:00:00Z", "app/x")}, sameArea, o); n != 0 || !strings.Contains(reason, "busy") {
+		t.Fatalf("same-area issue run: Next = %d, %q; want held", n, reason)
+	}
+}
+
+// TestQueueDispatchesPassTheGate feeds the exact `-f` inputs of every
+// `gh workflow run codeaf.yml` step in codeaf-queue.yml through Decide
+// (issue #61): a queue step that dispatches a combination the gate skips
+// would start runs that die in the gate with nothing labelled and nothing
+// published, so this test fails first, on the default branch's queue.
+// Shell variables in a flag's value stand for the digits the queue sends,
+// so `-f lane=$LANE` is decided as a valid lane.
+func TestQueueDispatchesPassTheGate(t *testing.T) {
+	t.Setenv("GITHUB_REPOSITORY", "RichardoC/factory-repo")
+	t.Setenv("GITHUB_RUN_ID", "42")
+	// The queue labels the issue before dispatching it, so the lookup
+	// sees what the gate will see at run time: an open, labelled issue.
+	labelled := item{Number: 3, State: "open", Labels: []label{{Name: "codeaf"}}}
+	lookup := func(int) (item, error) { return labelled, nil }
+	data, err := os.ReadFile("../workflows/codeaf-queue.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One block per step; a step's block runs to the next "- name:" line.
+	steps := strings.Split(string(data), "\n      - name: ")
+	var flags []map[string]string
+	for _, step := range steps {
+		for _, line := range strings.Split(step, "\n") {
+			if !strings.Contains(line, "gh workflow run codeaf.yml") {
+				continue
+			}
+			inputs := map[string]string{}
+			for _, m := range regexp.MustCompile(`-f\s+"?([a-z_]+)=([^"\s]+)"?`).FindAllStringSubmatch(line, -1) {
+				value := m[2]
+				if strings.Contains(value, "$") {
+					value = "3" // a lane or number the queue resolved, digits only
+				}
+				inputs[m[1]] = value
+			}
+			if len(inputs) == 0 {
+				t.Fatalf("queue dispatch line has no -f inputs to decide: %s", line)
+			}
+			flags = append(flags, inputs)
+		}
+	}
+	if len(flags) != 2 {
+		t.Fatalf("codeaf-queue.yml dispatches codeaf.yml %d times; want 2 (issues and planner)", len(flags))
+	}
+	for _, inputs := range flags {
+		ev := event{Inputs: inputs}
+		ev.Repository.DefaultBranch = "main"
+		got, err := Decide("workflow_dispatch", ev, "codeaf", lookup, lookup)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !got.Run {
+			t.Fatalf("the queue dispatches %v and the gate skips it: %s", inputs, got.Reason)
+		}
+	}
+	// The planner's dispatch must be the one that reaches plan mode.
+	last := flags[len(flags)-1]
+	if last["plan"] != "true" {
+		t.Fatalf("the queue's last codeaf.yml dispatch is %v; want the planner's plan=true", last)
 	}
 }

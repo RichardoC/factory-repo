@@ -122,7 +122,9 @@ jobs:
           # A CodeAF run that dispatched this tick as its last job is still in
           # progress; leave it out. Digits only, or nothing is left out.
           [[ "$FINISHED_RUN" =~ ^[0-9]{1,20}$ ]] || FINISHED_RUN=""
-          gh run list --workflow=codeaf.yml --json databaseId,status,displayTitle --limit 100 \
+          # createdAt comes along for the planner (issue #61): plan-check
+          # measures its cooldown against every plan-title run's stamp.
+          gh run list --workflow=codeaf.yml --json databaseId,status,displayTitle,createdAt --limit 100 \
             | jq --arg id "$FINISHED_RUN" '[.[] | select((.databaseId | tostring) != $id)]' > runs.json
 
       - name: Start queued issues while there are free slots
@@ -167,3 +169,34 @@ jobs:
               issues.json > issues.next && mv issues.next issues.json
             jq --arg t "CodeAF #$N (lane $LANE)" '. + [{"databaseId": 0, "status": "queued", "displayTitle": $t}]' runs.json > runs.next && mv runs.next runs.json
           done
+
+      - name: Dispatch the planner when the backlog runs low
+        # Issue #61: with the slots filled by the loop above (or none taken),
+        # plan-check decides whether the backlog needs a plan run: fewer than
+        # planner.min_backlog (models.json) queued issues open and no plan run
+        # started within planner.min_hours, under the same spend threshold and
+        # lane capacity as any other run. The plan run is read-only -- it
+        # writes no patch and opens no PR; its proposals land as issues
+        # labelled codeaf-proposed, promoted to codeaf-queued by a person.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODEAF_WEEK_SPENT_USD: ${{ steps.shared.outputs.week_usd }}
+          # Scheduled events carry no repository payload; they run on the
+          # default branch, so its name is the run's own ref.
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || github.ref_name }}
+        run: |
+          # Parsed, never sourced: plan-check prints plan=1 and lane=<digits>
+          # on stdout only when a plan run should start; anything else (an
+          # empty stdout, a non-digit lane) means do nothing.
+          out=$("$HARNESS" plan-check issues.json runs.json)
+          PLAN=$(sed -n 's/^plan=//p' <<<"$out" | head -1)
+          LANE=$(sed -n 's/^lane=//p' <<<"$out" | head -1)
+          [ "$PLAN" = 1 ] || exit 0
+          [[ "$LANE" =~ ^[0-9]{1,4}$ ]] || LANE=0
+          echo "dispatching a plan run on lane $LANE"
+          gh workflow run codeaf.yml --ref "$DEFAULT_BRANCH" -f plan=true -f "lane=$LANE"
+          # Mirror the in-flight run into runs.json the way the loop does, so
+          # a later tick sees the lane taken and the plan cooldown running.
+          jq --arg t "CodeAF plan (lane $LANE)" \
+            '. + [{"databaseId": 0, "status": "queued", "displayTitle": $t, "createdAt": (now | todate)}]' \
+            runs.json > runs.next && mv runs.next runs.json

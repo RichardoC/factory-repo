@@ -2615,6 +2615,180 @@ func TestOverCapWeeklyCreditPercent(t *testing.T) {
 	}
 }
 
+// writePlannerModels writes a models.json whose planner block is planner
+// ("" for absent), everything else minimal and valid, and returns its path.
+func writePlannerModels(t *testing.T, planner string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "models.json")
+	p := ""
+	if planner != "" {
+		p = fmt.Sprintf(`,"planner":%s`, planner)
+	}
+	body := fmt.Sprintf(`{"limits":{"plan":"big","weekly_credit_usd":20,"run_credit_usd":5}%s,
+		"models":[{"id":"m","upstream":"hf:m","efforts":["high"],"max_concurrent":2,
+		"input":0.1,"output":0.25,"cache_read":0.02,"api_input":0.15,"api_cached":0.04,"api_output":0.5}]}`, p)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestLoadConfigPlanner covers the planner block (issue #61): absent or 0
+// values take the defaults (backlog 3, twelve hours, five proposals), an
+// explicit value is kept, and a negative value is an error naming the field
+// — the same handling queue.max_parallel_runs gets.
+func TestLoadConfigPlanner(t *testing.T) {
+	for _, planner := range []string{"", `{"min_backlog":0,"min_hours":0,"max_proposals":0}`} {
+		cfg, err := loadConfig(writePlannerModels(t, planner))
+		if err != nil {
+			t.Fatalf("planner %q: %v", planner, err)
+		}
+		if cfg.Planner.MinBacklog != 3 || cfg.Planner.MinHours != 12 || cfg.Planner.MaxProposals != 5 {
+			t.Fatalf("planner %q: got %+v; want defaults 3, 12, 5", planner, cfg.Planner)
+		}
+	}
+	// An explicit value is kept.
+	cfg, err := loadConfig(writePlannerModels(t, `{"min_backlog":7,"min_hours":24,"max_proposals":1}`))
+	if err != nil || cfg.Planner.MinBacklog != 7 || cfg.Planner.MinHours != 24 || cfg.Planner.MaxProposals != 1 {
+		t.Fatalf("explicit planner: %d/%d/%d, %v; want 7/24/1", cfg.Planner.MinBacklog, cfg.Planner.MinHours, cfg.Planner.MaxProposals, err)
+	}
+	// A partially set block defaults only what is missing.
+	cfg, err = loadConfig(writePlannerModels(t, `{"min_hours":6}`))
+	if err != nil || cfg.Planner.MinBacklog != 3 || cfg.Planner.MinHours != 6 || cfg.Planner.MaxProposals != 5 {
+		t.Fatalf("partial planner: %d/%d/%d, %v; want 3/6/5", cfg.Planner.MinBacklog, cfg.Planner.MinHours, cfg.Planner.MaxProposals, err)
+	}
+	// Negative values are refused, each naming its field.
+	for _, bad := range []struct{ block, field string }{
+		{`{"min_backlog":-1}`, "planner.min_backlog"},
+		{`{"min_hours":-1}`, "planner.min_hours"},
+		{`{"max_proposals":-1}`, "planner.max_proposals"},
+	} {
+		if _, err := loadConfig(writePlannerModels(t, bad.block)); err == nil || !strings.Contains(err.Error(), bad.field) || !strings.Contains(err.Error(), "must not be negative") {
+			t.Fatalf("planner %q: err=%v; want a negative-value error naming %s", bad.block, err, bad.field)
+		}
+	}
+	// The committed models.json parses, and its planner block is the
+	// documented example: 3, 12, 5.
+	cfg, err = loadConfig("models.json")
+	if err != nil {
+		t.Fatalf("committed models.json: %v", err)
+	}
+	if cfg.Planner.MinBacklog != 3 || cfg.Planner.MinHours != 12 || cfg.Planner.MaxProposals != 5 {
+		t.Fatalf("committed models.json planner: got %+v; want 3, 12, 5", cfg.Planner)
+	}
+}
+
+// TestDecidePlanDispatch covers the planner dispatch (issue #61): plan=true
+// with no issue, pr, review or profile input runs in plan mode — the
+// validated lane, the default branch as base, and no issue number and no
+// branch, because the plan run is read-only. Plan mixed with any of those
+// inputs is refused, and so is any plan value but the exact "true": the
+// input is untrusted, and a half-plan dispatch must not silently demote to
+// another mode. A plan dispatch never looks an issue or PR up.
+func TestDecidePlanDispatch(t *testing.T) {
+	t.Setenv("GITHUB_REPOSITORY", "RichardoC/factory-repo")
+	t.Setenv("GITHUB_RUN_ID", "42")
+	noLookup := func(int) (item, error) { t.Fatal("unexpected PR lookup"); return item{}, nil }
+	noIssueLookup := func(int) (item, error) { t.Fatal("unexpected issue lookup"); return item{}, nil }
+	decide := func(inputs map[string]string) Decision {
+		ev := event{Inputs: inputs}
+		ev.Repository.DefaultBranch = "main"
+		got, err := Decide("workflow_dispatch", ev, "codeaf", noLookup, noIssueLookup)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	t.Run("plan dispatch runs", func(t *testing.T) {
+		got := decide(map[string]string{"plan": "true"})
+		if !got.Run || got.Mode != "plan" || got.Reason == "" {
+			t.Fatalf("Decide = %+v; want a plan run", got)
+		}
+		if got.Number != 0 || got.Branch != "" {
+			t.Fatalf("Decide = %+v; want no issue number and no branch", got)
+		}
+		if got.Base != "main" {
+			t.Fatalf("base = %q; want the default branch", got.Base)
+		}
+		if got.Lane != 0 || got.Profile != "" {
+			t.Fatalf("Decide = %+v; want lane 0 and no profile", got)
+		}
+	})
+	t.Run("plan dispatch carries its lane", func(t *testing.T) {
+		got := decide(map[string]string{"plan": "true", "lane": "2"})
+		if !got.Run || got.Mode != "plan" || got.Lane != 2 {
+			t.Fatalf("Decide = %+v; want a plan run on lane 2", got)
+		}
+	})
+	for name, value := range map[string]string{
+		"issue":   "3",
+		"pr":      "7",
+		"review":  "7",
+		"profile": "cheap",
+	} {
+		t.Run("plan with "+name+" is refused", func(t *testing.T) {
+			got := decide(map[string]string{"plan": "true", name: value})
+			if got.Run {
+				t.Fatalf("Decide = %+v; want a skip", got)
+			}
+			if got.Reason == "" {
+				t.Fatal("a refused dispatch must say why")
+			}
+		})
+	}
+	for _, raw := range []string{"TRUE", "True", "1", "yes", "false"} {
+		t.Run("plan="+raw+" is not a plan dispatch", func(t *testing.T) {
+			got := decide(map[string]string{"plan": raw})
+			if got.Run {
+				t.Fatalf("Decide = %+v; want a skip", got)
+			}
+		})
+	}
+}
+
+// TestGatePlanOutputs covers the gate's printed outputs for a plan run
+// (issue #61): run, reason and lane always; mode, an empty number, an empty
+// branch, the default branch as base and an empty profile for the run.
+// number=0 and the empty branch are what the run job and publish read, so
+// their shape is part of the gate's contract.
+func TestGatePlanOutputs(t *testing.T) {
+	t.Setenv("GITHUB_REPOSITORY", "RichardoC/factory-repo")
+	t.Setenv("GITHUB_RUN_ID", "42")
+	t.Setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+	eventPath := filepath.Join(t.TempDir(), "event.json")
+	if err := os.WriteFile(eventPath, []byte(`{"inputs":{"plan":"true","lane":"2"},"repository":{"default_branch":"main"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GITHUB_EVENT_PATH", eventPath)
+	outputPath := filepath.Join(t.TempDir(), "output")
+	t.Setenv("GITHUB_OUTPUT", outputPath)
+
+	stdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	err = runGate()
+	os.Stdout = stdout
+	w.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := io.ReadAll(r)
+	want := "run=true\nreason=plan dispatch\nlane=2\nmode=plan\nnumber=0\nbranch=\nbase=main\nprofile=\n"
+	if got := string(data); got != want {
+		t.Fatalf("stdout = %q; want %q", got, want)
+	}
+	written, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(written) != want {
+		t.Fatalf("GITHUB_OUTPUT = %q; want %q", written, want)
+	}
+}
+
 // Issue #90: a streaming call that has to wait for a slot commits its
 // response early and receives comment lines while it waits, then the normal
 // relayed stream once the slot frees — CodeAF's watcher reads a stream with
