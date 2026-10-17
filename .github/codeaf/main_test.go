@@ -251,6 +251,42 @@ func TestModelsHaveTheSubscriptionsConcurrencyLimit(t *testing.T) {
 	}
 }
 
+// TestNewSlotsPerRunCapacity: with several runs at once, each run's slot
+// channel is its slice of the model's account-wide max_concurrent, so the
+// runs' slices never sum past it.
+func TestNewSlotsPerRunCapacity(t *testing.T) {
+	models := []Model{
+		{ID: "a", Upstream: "hf:a", MaxConcurrent: 2},
+		{ID: "b", Upstream: "hf:b", MaxConcurrent: 3},
+		{ID: "c", Upstream: "hf:c"}, // no limit, no slot channel
+	}
+	slots := newSlots(models, 2)
+	if got := cap(slots["hf:a"]); got != 1 {
+		t.Errorf("cap(hf:a) = %d; want 2/2 = 1", got)
+	}
+	if got := cap(slots["hf:b"]); got != 1 {
+		t.Errorf("cap(hf:b) = %d; want 3/2 = 1", got)
+	}
+	if _, ok := slots["hf:c"]; ok {
+		t.Error("a model without max_concurrent got a slot channel")
+	}
+	// Summed over all max_parallel_runs runs that may go at once, the
+	// slices stay within the limit wherever the config is accepted (the
+	// overflowing combinations are refused, TestPerRunSlotsSweep).
+	for mpr := 1; mpr <= 4; mpr++ {
+		for _, m := range models {
+			if m.MaxConcurrent == 0 {
+				continue
+			}
+			if sum := perRunSlots(m, mpr) * mpr; sum <= m.MaxConcurrent {
+				if got := cap(newSlots(models, mpr)[m.Upstream]); got != perRunSlots(m, mpr) {
+					t.Errorf("max_parallel_runs %d: cap(%s) = %d; want %d", mpr, m.Upstream, got, perRunSlots(m, mpr))
+				}
+			}
+		}
+	}
+}
+
 // codeaf-config.json's seats are allowed models, and CodeAF never runs more
 // tasks at once than the worker model has slots.
 func TestCodeAFConfigFitsTheConcurrencyLimit(t *testing.T) {
@@ -302,8 +338,10 @@ func TestProxyLimitsCallsPerModel(t *testing.T) {
 	}))
 	defer upstream.Close()
 	models := testModels(t)
+	// max_parallel_runs 1 gives this run the model's whole account-wide
+	// limit, so the cap below is the full max_concurrent.
 	p := &proxy{upstream: upstream.URL, apiKey: "k", ledger: filepath.Join(t.TempDir(), "l.jsonl"), runCap: 5, weekCap: 20,
-		models: models, client: upstream.Client(), slots: newSlots(models)}
+		models: models, client: upstream.Client(), slots: newSlots(models, 1)}
 	server := httptest.NewServer(p)
 	defer server.Close()
 
@@ -368,7 +406,7 @@ func TestProxyLimitsCallsPerModel(t *testing.T) {
 
 func TestAcquireGivesUpWhenTheCallerDoes(t *testing.T) {
 	m := Model{Upstream: "u", MaxConcurrent: 1}
-	p := &proxy{slots: newSlots([]Model{m})}
+	p := &proxy{slots: newSlots([]Model{m}, 1)}
 	release, waited, err := p.acquire(context.Background(), m)
 	if err != nil || waited != 0 {
 		t.Fatalf("first acquire: %v, waited %v", err, waited)
@@ -529,6 +567,96 @@ func TestDecide(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestDecideLane covers the `lane` dispatch input: digits only, because it
+// is untrusted; anything else — missing, empty, letters, a number too big
+// for an int — is lane 0. Every accepted dispatch decision carries it, in
+// the issue, pr and review modes alike, and non-dispatch events are lane 0.
+func TestDecideLane(t *testing.T) {
+	t.Setenv("GITHUB_REPOSITORY", "RichardoC/factory-repo")
+	t.Setenv("GITHUB_RUN_ID", "42")
+	labelled := []label{{Name: "codeaf"}}
+	openIssue := item{Number: 3, State: "open", Labels: labelled}
+	openPR := item{Number: 7, State: "open", Labels: labelled}
+	openPR.Head.Ref = "codeaf/issue-3"
+	openPR.Head.Repo = &struct {
+		FullName string `json:"full_name"`
+	}{FullName: "RichardoC/factory-repo"}
+	openPR.Base.Ref = "main"
+	lookup := func(int) (item, error) { return openPR, nil }
+	lookupIssue := func(int) (item, error) { return openIssue, nil }
+
+	decide := func(ev event) Decision {
+		got, err := Decide("workflow_dispatch", ev, "codeaf", lookup, lookupIssue)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !got.Run {
+			t.Fatalf("decision did not run: %+v", got)
+		}
+		return got
+	}
+	for _, c := range []struct {
+		name  string
+		input string
+		has   bool
+		want  int
+	}{
+		{"digits", "2", true, 2},
+		{"zero", "0", true, 0},
+		{"empty input", "", true, 0},
+		{"missing input", "", false, 0},
+		{"letters", "abc", true, 0},
+		{"mixed", "1x", true, 0},
+		{"negative", "-1", true, 0},
+		{"too big for an int", "99999999999999999999", true, 0},
+	} {
+		withLane := func(ev event) event {
+			if c.has {
+				if ev.Inputs == nil {
+					ev.Inputs = map[string]string{}
+				}
+				ev.Inputs["lane"] = c.input
+			}
+			return ev
+		}
+		t.Run(c.name, func(t *testing.T) {
+			issueEv := withLane(event{Inputs: map[string]string{"issue": "3"}})
+			if got := decide(issueEv); got.Lane != c.want {
+				t.Fatalf("issue dispatch: lane = %d; want %d", got.Lane, c.want)
+			}
+			prEv := withLane(event{Inputs: map[string]string{"pr": "7"}})
+			if got := decide(prEv); got.Lane != c.want || got.Mode != "pr" {
+				t.Fatalf("pr dispatch: lane = %d, mode %s; want lane %d, pr", got.Lane, got.Mode, c.want)
+			}
+			reviewEv := withLane(event{Inputs: map[string]string{"review": "7"}})
+			if got := decide(reviewEv); got.Lane != c.want || got.Mode != "review" {
+				t.Fatalf("review dispatch: lane = %d, mode %s; want lane %d, review", got.Lane, got.Mode, c.want)
+			}
+		})
+	}
+
+	// Non-dispatch events never carry a lane, even one present in the
+	// event's inputs: only workflow_dispatch reads them.
+	t.Run("label event is lane 0", func(t *testing.T) {
+		ev := event{Inputs: map[string]string{"lane": "2"}}
+		ev.Label = &label{Name: "codeaf"}
+		ev.Issue = &item{Number: 3, Labels: labelled}
+		got, err := Decide("issues", ev, "codeaf", lookup, lookupIssue)
+		if err != nil || !got.Run || got.Lane != 0 {
+			t.Fatalf("Decide = %+v, %v; want a run at lane 0", got, err)
+		}
+	})
+	t.Run("comment event is lane 0", func(t *testing.T) {
+		ev := event{}
+		ev.Issue = &item{Number: 3, Labels: labelled}
+		ev.Comment = &comment{Body: "/codeaf go", AuthorAssociation: "OWNER", User: user{Login: "RichardoC", Type: "User"}}
+		got, err := Decide("issue_comment", ev, "codeaf", lookup, lookupIssue)
+		if err != nil || !got.Run || got.Lane != 0 {
+			t.Fatalf("Decide = %+v, %v; want a run at lane 0", got, err)
+		}
+	})
 }
 
 // TestRunID pins the run-id validation behind the issue branch name.

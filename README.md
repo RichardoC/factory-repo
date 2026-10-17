@@ -171,9 +171,15 @@ Issues labelled **`codeaf-queued`** are the backlog. Every 10 minutes (and on
 demand, via *Run workflow*)
 [`codeaf-queue.yml`](.github/workflows/codeaf-queue.yml) asks the harness
 (`harness next`) to start the next run: the oldest queued issue —
-**`codeaf-priority`** jumps the queue — for which all four hold:
+**`codeaf-priority`** jumps the queue — for which all of these hold:
 
-- no CodeAF run is queued or in progress;
+- fewer than `queue.max_parallel_runs` (in
+  [`models.json`](.github/codeaf/models.json), default 2) `codeaf.yml` runs
+  are queued or in progress — issue runs, PR continuations and review runs
+  alike;
+- no area conflict with an in-flight run: areas are `app/<name>/` per app
+  and the harness `.github/`, taken from `area:` labels or paths in the
+  issue body; an issue with no area conflicts with everything;
 - every issue named in a "Depends on #N" line in its body is closed;
 - the rolling week's credit spend in the shared state is under 75% of
   `limits.weekly_credit_usd` in [`models.json`](.github/codeaf/models.json) — an
@@ -185,9 +191,11 @@ person adding it — and then by dispatching
 [`codeaf.yml`](.github/workflows/codeaf.yml) with the issue number. The
 dispatch step exists because events raised with `GITHUB_TOKEN` (labelling
 included) do not trigger other workflows; `workflow_dispatch` is the one event
-it can start. The queue starts nothing while a CodeAF run is queued or in
-progress, so queued work never overlaps. Runs started by hand (a label or a
-`/codeaf` comment) can still overlap with one; they are not held in a single
+it can start. The queue starts runs only up to the parallel-run limit, and
+never two on the same area, so queued work overlaps only where those rules
+allow ([running several tickets at once](#running-several-tickets-at-once-issue-60)).
+Runs started by hand (a label or a `/codeaf` comment) can still overlap with
+them; they are not held in a single
 concurrency group, because GitHub would cancel all but the newest pending run
 in it and silently drop a command.
 
@@ -199,7 +207,58 @@ Known failure modes:
 - if the dispatch step fails after labelling, the issue keeps `codeaf` but
   nothing runs — a maintainer runs `codeaf.yml` by hand with the issue number;
 - a self-dependency or a dependency cycle blocks the issue until its body is
-  edited.
+  edited;
+- two queue ticks in quick succession can miss a just-dispatched run in the
+  runs list, and the runs then share lane 0 — the per-model per-run slots
+  keep the account limit safe regardless.
+
+### Running several tickets at once (issue #60)
+
+The queue starts up to **`queue.max_parallel_runs`** runs at once (in
+[`models.json`](.github/codeaf/models.json), default 2). Everything
+`codeaf.yml` runs counts toward that limit while it is queued or in
+progress: issue runs, continuations of runs that stopped early, and review
+runs alike.
+
+**Lanes.** Each run the queue starts gets the lowest free lane, 0 through
+`max_parallel_runs - 1`. The lane picks the run's worker seat model from the
+allowed list in `models.json`, as `models[lane mod count]`, so two
+concurrent runs rarely compete for one model's call slots; lane 0 keeps
+today's default seat, GLM-5.3-Flash. The lane travels to the run as a
+digits-only `workflow_dispatch` input, validated by the gate and validated
+again by `seat-config` inside the run job — a missing or malformed lane
+means lane 0. The queue reads lanes back from run titles, which read
+`CodeAF #N (lane L)`; titles are untrusted data, and a title that does not
+parse counts as lane 0.
+
+**The per-model limit stays account-wide.** synthetic.new allows 2 calls to
+each model at once across the whole account, and every run has its own
+proxy, so two runs could put 4 calls on one model. Instead each run gets a
+slice of every model's `max_concurrent`: per-run slots =
+`max_concurrent / max_parallel_runs`, at least 1, with CodeAF's
+`task.parallel` set to match. The proxy enforces the slice, and `loadConfig`
+refuses a `max_parallel_runs` that would overflow a model, so runs sharing
+one model never sum past the account's 2. Manual runs (a label or a
+`/codeaf` comment) carry no lane and still overlap without coordination; the
+slice caps them at 1 call per model per run.
+
+**Area conflicts.** The queue does not start a run on an area another run is
+already working. Areas are `app/<name>/` for each app and the harness
+(`.github/`), taken from `area:harness` and `area:app/<name>` labels or from
+paths in the issue body. An issue with no area conflicts with everything,
+and so does an in-flight run whose area is unknown.
+
+**The budget.** Unchanged: the queue holds new starts once the shared
+rolling-week spend reaches 75% of `limits.weekly_credit_usd`, and all
+concurrent runs draw that budget down together.
+
+**Pricing.** At the subscription rates, DeepSeek-V4.1-Flash has the cheapest
+input price (0.06 USD/M tokens), so a non-zero lane can spend less credit
+per ticket — but it is a weaker model (`role: mid`), so the rotation trades
+a little quality on busy days for no model contention.
+
+**Where to see it.** The queue job's log lists the runs in progress, the
+lanes in use, and why each candidate started or was held.
 
 ### Runs that stop early (issue #31)
 
