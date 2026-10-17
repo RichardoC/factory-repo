@@ -219,7 +219,11 @@ whether through prompt injection or a compromised model.
   anything the default branch's cannot. The PR is labelled
   `codeaf-workflow-change`. It is merged only after the independent review
   run (on another model, with a workflow-security checklist) passes it, and
-  only by a person or Claude acting for the owner. Never widen the policy
+  only by a person or Claude acting for the owner. A patch the policy
+  refuses is not a dead end: for now (the owner's decision, 2026-10-17)
+  Claude, acting for the owner, is the maintainer here. It reviews the
+  refused workflow change and applies it by hand when sound, so keep such
+  changes minimal and explain them in the run's answer. Never widen the policy
   to allow secret-bearing steps, triggers or permissions to change without
   a maintainer, and never auto-merge a `codeaf-workflow-change` PR.
 - `codeaf-state.yml` runs no agent and handles no secret. It reads other runs'
