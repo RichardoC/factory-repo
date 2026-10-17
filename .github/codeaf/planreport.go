@@ -61,6 +61,23 @@ var (
 	// planDepToken is one "#N" dependency token; anything else on a
 	// "Depends on" line is ignored.
 	planDepToken = regexp.MustCompile(`#(\d+)`)
+	// planNumberedItem opens one numbered item (issue #119): "1. harness —
+	// Title. Verified: …". Only the number and one separator character are
+	// fixed here; whether the item is a proposal is decided by
+	// planAreaPrefix below, so ordinary numbered prose — including numbered
+	// sub-lists inside a proposal's own fields — keeps its meaning.
+	planNumberedItem = regexp.MustCompile(`^\s*[0-9]{1,3}[.)]\s+(.*)$`)
+	// planAreaPrefix reads a numbered item's leading area: "harness" or
+	// "app/<name>", case-insensitive, then a dash (en, em or plain) or a
+	// colon, then the title source. A period is deliberately not a separator:
+	// app directory names may carry dots. This leading area token is the one
+	// thing an ordinary numbered line in prose almost never has, so it is
+	// what marks the item as a closing-result proposal.
+	planAreaPrefix = regexp.MustCompile(`(?i)^\s*(harness|app/[A-Za-z0-9._-]+)\s*[-\x{2013}\x{2014}:]\s*(.*)$`)
+	// planSentenceEnd finds the first sentence end: one of . ! ? … followed
+	// by whitespace or the end of the text. A numbered item's title is the
+	// text before it, its body the rest (issue #119).
+	planSentenceEnd = regexp.MustCompile(`[.!?\x{2026}](\s|$)`)
 	// planTitleNoise collapses runs of non-alphanumerics, for title
 	// normalization in DedupeProposals.
 	planTitleNoise = regexp.MustCompile(`[^a-z0-9]+`)
@@ -139,7 +156,30 @@ func ParseProposals(answer string, max int) []Proposal {
 	}
 	var out []Proposal
 	var cur *Proposal
-	field := "" // the open field's name, or ""
+	field := ""  // the open field's name, or ""
+	numSrc := "" // a numbered item's pending title source, "" for none
+	// closeCur closes the proposal being read. A numbered item's title is
+	// split from its pending source first (issue #119): the text up to the
+	// first sentence end is the title, the rest rides ahead of the body
+	// the continuation lines gathered. Then the keep rule and the caps
+	// apply exactly as to a proposal in the section format.
+	closeCur := func() {
+		if cur == nil {
+			return
+		}
+		if numSrc != "" {
+			title, rest := planSplitSentence(numSrc)
+			cur.Title = planTitle(title)
+			if rest != "" {
+				cur.Problem = strings.TrimSpace(rest + "\n" + cur.Problem)
+			}
+			numSrc = ""
+		}
+		if planKeeps(*cur) && len(out) < max {
+			out = append(out, planFinish(*cur))
+		}
+		cur = nil
+	}
 	appendTo := func(name, line string) {
 		switch name {
 		case "problem":
@@ -160,15 +200,30 @@ func ParseProposals(answer string, max int) []Proposal {
 		}
 		line := strings.TrimSuffix(raw, "\r")
 		if m := planProposalHeader.FindStringSubmatch(line); m != nil {
-			if cur != nil && planKeeps(*cur) {
-				out = append(out, planFinish(*cur))
-				if len(out) >= max {
-					break
-				}
+			closeCur()
+			if len(out) >= max {
+				break
 			}
 			cur = &Proposal{Title: planTitle(m[1])}
 			field = ""
 			continue
+		}
+		// Issue #119: a numbered item shaped "1. harness — Title. Body" is
+		// a proposal in the closing-result form. The leading area token is
+		// what tells it apart from ordinary numbered prose; its body — the
+		// rest of the line and every continuation line up to the next item
+		// or heading — lands in Problem, where planKeeps can see it.
+		if m := planNumberedItem.FindStringSubmatch(line); m != nil {
+			if a := planAreaPrefix.FindStringSubmatch(m[1]); a != nil {
+				closeCur()
+				if len(out) >= max {
+					break
+				}
+				cur = &Proposal{Area: a[1]}
+				numSrc = a[2]
+				field = "problem"
+				continue
+			}
 		}
 		if cur == nil {
 			continue // prose before the first proposal header
@@ -191,10 +246,19 @@ func ParseProposals(answer string, max int) []Proposal {
 		}
 		appendTo(field, planClean(line))
 	}
-	if cur != nil && planKeeps(*cur) && len(out) < max {
-		out = append(out, planFinish(*cur))
-	}
+	closeCur()
 	return out
+}
+
+// planSplitSentence splits a numbered item's title source at its first
+// sentence end (issue #119): the title is the text before it, the body the
+// rest. With no sentence end the whole source is the title and the body is
+// whatever the item's continuation lines gathered.
+func planSplitSentence(s string) (title, rest string) {
+	if loc := planSentenceEnd.FindStringSubmatchIndex(s); loc != nil {
+		return strings.TrimSpace(s[:loc[0]]), strings.TrimSpace(s[loc[0]+1:])
+	}
+	return strings.TrimSpace(s), ""
 }
 
 // planKeeps reports whether a proposal survives parse: a proposal that says

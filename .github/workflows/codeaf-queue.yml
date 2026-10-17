@@ -126,6 +126,24 @@ jobs:
           # measures its cooldown against every plan-title run's stamp.
           gh run list --workflow=codeaf.yml --json databaseId,status,displayTitle,createdAt --limit 100 \
             | jq --arg id "$FINISHED_RUN" '[.[] | select((.databaseId | tostring) != $id)]' > runs.json
+          # The newest completed plan run's outcome marker (issue #119): the
+          # publish job of a plan run uploads codeaf-plan-outcome with the
+          # number of proposals it opened. plan-check cools down
+          # planner.retry_min_hours instead of planner.min_hours after a plan
+          # run that opened nothing. The marker is untrusted data, validated
+          # by plan-check before use; a missing or unreadable one reads as an
+          # unknown outcome there, which keeps the full cooldown (fail
+          # closed). Only the newest completed plan run is fetched: an older
+          # one inside the cooldown then counts as unknown, never as
+          # retry-soon.
+          rid=$(jq -r '[.[] | select(.status == "completed" and (.displayTitle | startswith("CodeAF plan")))][0].databaseId // empty' runs.json)
+          rm -rf "$RUNNER_TEMP/plan-outcome"
+          if [ -n "$rid" ] && [[ "$rid" =~ ^[0-9]{1,20}$ ]] \
+             && gh run download "$rid" -n codeaf-plan-outcome -D "$RUNNER_TEMP/plan-outcome" 2>/dev/null; then
+            echo "plan-outcome marker downloaded from plan run $rid"
+          else
+            echo "no plan-outcome marker for run ${rid:-none}; plan-check will use the full cooldown"
+          fi
 
       - name: Start queued issues while there are free slots
         # One tick fills every free slot: ticks come only when a run ends or
@@ -174,12 +192,20 @@ jobs:
         # Issue #61: with the slots filled by the loop above (or none taken),
         # plan-check decides whether the backlog needs a plan run: fewer than
         # planner.min_backlog (models.json) queued issues open and no plan run
-        # started within planner.min_hours, under the same spend threshold and
-        # lane capacity as any other run. The plan run is read-only -- it
-        # writes no patch and opens no PR; its proposals land as issues
-        # labelled codeaf-proposed, promoted to codeaf-queued by a person.
+        # started within its cooldown -- planner.min_hours, or the shorter
+        # planner.retry_min_hours after a plan run known to have opened no
+        # proposals (issue #119, PLAN_OUTCOMES_PATH below) -- under the same
+        # spend threshold and lane capacity as any other run. The plan run is
+        # read-only -- it writes no patch and opens no PR; its proposals land
+        # as issues labelled codeaf-proposed, promoted to codeaf-queued by a
+        # person.
         env:
           GH_TOKEN: ${{ github.token }}
+          # The plan-outcome marker downloaded above, if the newest completed
+          # plan run left one; validated by plan-check before use (issue
+          # #119). Unset or missing means an unknown outcome, which keeps the
+          # full planner.min_hours cooldown.
+          PLAN_OUTCOMES_PATH: ${{ runner.temp }}/plan-outcome/plan-outcome.json
           CODEAF_WEEK_SPENT_USD: ${{ steps.shared.outputs.week_usd }}
           # Scheduled events carry no repository payload; they run on the
           # default branch, so its name is the run's own ref.
