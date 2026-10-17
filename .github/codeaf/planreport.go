@@ -351,17 +351,12 @@ func runPlanReport() error {
 			return fmt.Errorf("%s is empty", name)
 		}
 	}
-	answer := ""
-	if r, _, err := readResult(); err == nil {
-		answer = r.Answer
-	}
-	if answer == "" {
-		// The result envelope's answer may be empty while the plan's text
-		// lives in the run record (issue #49's shape); read it as data.
-		if a := readTrajectoryAnswer(trajectoryPath()); a != "" {
-			answer = a
-		}
-	}
+	result, _, err := readResult()
+	// The result envelope's answer may be empty while the plan's text lives
+	// in the run record (issue #49's shape), which the run job ships beside
+	// the result in every mode (issue #134); read both as data.
+	c := readClosing(trajectoryPath())
+	answer := effectiveAnswer(result, c)
 	props := ParseProposals(answer, planMaxProposals())
 	kept, held := DedupeProposals(props, planOpenItems())
 	out := make([]planProposalOut, 0, len(kept))

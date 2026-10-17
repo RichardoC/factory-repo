@@ -322,6 +322,16 @@ continuation. At the cap the PR gets a comment and stays a draft for a person
 (a maintainer can still continue it by hand with a `/codeaf` comment). A run
 that ends with `stop: done` marks the PR ready for review.
 
+A run can also finish through its task store: CodeAF then leaves the envelope
+saying `stop: incomplete` with an empty answer, while the run record's final
+`end` line carries reason "finished in the store" and the real answer. The
+harness ships that record beside the result in every mode and reads the ending
+from it (`closing.go`), so a store-finished run counts as done — the PR is
+marked ready and no continuation starts — and the report gains a `closing` row
+saying the stop was promoted. The record is untrusted data: the promotion only
+changes the draft/ready decision, and the independent review and `publish`'s
+checks still run on the work.
+
 ### Bringing the base branch in (issue #57)
 
 A pull request that conflicts with the default branch used to stay dirty

@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -2001,7 +2000,7 @@ func TestBriefBudget(t *testing.T) {
 // TestRunSummaryShipsRunRecord covers the review-mode side of issue #49: the
 // root task's run record rides the output artifact beside the result, newest
 // regular file wins, a planted symlink is never taken, and the copy is
-// capped. Outside review mode nothing ships.
+// capped. Since issue #134 every mode ships the record, not only review.
 func TestRunSummaryShipsRunRecord(t *testing.T) {
 	home := t.TempDir()
 	out := filepath.Join(t.TempDir(), "out")
@@ -2079,7 +2078,7 @@ func TestRunSummaryShipsRunRecord(t *testing.T) {
 		}
 	})
 
-	t.Run("outside review mode nothing ships", func(t *testing.T) {
+	t.Run("every mode ships, review mode included", func(t *testing.T) {
 		_ = os.Remove(shipped)
 		t.Setenv("CODEAF_HOME", home)
 		t.Setenv("RESULT_PATH", resultPath)
@@ -2087,8 +2086,8 @@ func TestRunSummaryShipsRunRecord(t *testing.T) {
 		if _, err := captureStdout(t, runSummary); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := os.Stat(shipped); !errors.Is(err, os.ErrNotExist) {
-			t.Errorf("a non-review run shipped the record: %v", err)
+		if _, err := os.Stat(shipped); err != nil {
+			t.Errorf("a non-review run did not ship the record: %v", err)
 		}
 	})
 }

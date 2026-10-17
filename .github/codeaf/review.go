@@ -725,19 +725,26 @@ func runReviewReport() error {
 	if r, _, err := readResult(); err == nil {
 		result, haveResult = r, true
 	}
-	findings, sawSection := parseFindings(result.Answer)
+	// The envelope's answer can be empty while the review's text lives in
+	// the run record (issue #49), which the run job shipped beside this
+	// result in every mode (issue #134); the record also tells whether the
+	// run finished in the store, promoting an incomplete stop to done. Both
+	// are read as untrusted data.
+	c := readClosing(trajectoryPath())
+	findings, sawSection := parseFindings(effectiveAnswer(result, c))
 	if len(findings) == 0 {
 		// The answer carried no findings (issue #49) — it may be empty, or
 		// the review may have written them inline where the envelope never
 		// looks. Fall back to the root task's final result in the run
 		// record, which the run job shipped beside this result and which is
 		// read as untrusted data.
-		if answer := readTrajectoryAnswer(trajectoryPath()); answer != "" {
+		if answer := c.Answer; answer != "" {
 			if tf, tsec := parseFindings(answer); len(tf) > 0 {
 				findings, sawSection = tf, sawSection || tsec
 			}
 		}
 	}
+	result.Stop = effectiveStop(result, c)
 	action, body, used, err := reviewPlan(newGitHub(), pr, result, haveResult, findings, sawSection)
 	if err != nil {
 		return err
@@ -769,45 +776,6 @@ func trajectoryPath() string {
 		return p
 	}
 	return filepath.Join(filepath.Dir(os.Getenv("RESULT_PATH")), trajectoryFileName)
-}
-
-// readTrajectoryAnswer reads the root task's final result out of a run
-// record (issues #49 and #111): the last `end` line's result — the account
-// the worker gave when its loop ended, which is where a review's actual
-// text lives when the result envelope's answer is empty. The end line is
-// the record's last, so the read is capped from the tail, not the head:
-// the 36-step review of run 39062136141 pushed its end record past a
-// head-capped read, and the fallback then answered "". The record comes
-// from the untrusted run job, so it is read as data: capped, one bounded
-// struct per line, malformed lines skipped — a line the cap cuts in half
-// is just malformed — and only the result string is taken. A record that
-// cannot be read answers "".
-func readTrajectoryAnswer(path string) string {
-	file, err := os.Open(path)
-	if err != nil {
-		return ""
-	}
-	defer file.Close()
-	data, err := readRecordTail(file, maxTrajectoryBytes)
-	if err != nil {
-		return ""
-	}
-	answer := ""
-	for _, line := range strings.Split(string(data), "\n") {
-		// The line kinds and the end line's result are CodeAF's own record
-		// shape (internal/run/trajectory.go at the pin in codeaf-ref).
-		var record struct {
-			Kind   string `json:"kind"`
-			Result string `json:"result"`
-		}
-		if err := json.Unmarshal([]byte(line), &record); err != nil {
-			continue // hostile or truncated line: skipped, never fatal
-		}
-		if record.Kind == "end" && record.Result != "" {
-			answer = record.Result // the last end line is the final result
-		}
-	}
-	return answer
 }
 
 // readRecordTail reads at most max bytes from the end of an open file

@@ -1173,7 +1173,7 @@ func TestRunReviewReport(t *testing.T) {
 		if err != nil {
 			t.Fatalf("record not shipped: %v", err)
 		}
-		if got := readTrajectoryAnswer(filepath.Join(filepath.Dir(resultPath), trajectoryFileName)); got == "" {
+		if got := readClosing(filepath.Join(filepath.Dir(resultPath), trajectoryFileName)); got.Answer == "" {
 			t.Errorf("the shipped copy lost the end record: %d bytes, tail starts %q", len(data), data[:40])
 		}
 	})
