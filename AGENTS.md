@@ -27,10 +27,12 @@ Instructions for any coding agent working in this repository, including CodeAF
 
 ## Models and concurrency
 
-- The synthetic.new subscription allows only 2 calls to each model at once.
-  Calls past that wait in the harness proxy (`max_concurrent` in
-  `.github/codeaf/models.json`), so more parallel work on one model only
-  queues.
+- synthetic.new has no fixed per-model call cap any more (the October 2026
+  pricing change: concurrency is by plan priority, and the Big plan has the
+  highest). The factory sets its own cap, `max_concurrent` in
+  `.github/codeaf/models.json`; calls past it wait in the harness proxy.
+  Upstream throttling shows up as HTTP 429, which CodeAF retries; raise the
+  cap only while 429s stay rare.
 - Spread work that runs at the same time across models. CodeAF's seats are
   on different models (`.github/codeaf/codeaf-config.json`), and
   `task.parallel` there is no higher than the worker model's

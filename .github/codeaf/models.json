@@ -1,7 +1,7 @@
 {
-  "_comment": "Harness config. limits: the Big-plan spend caps (USD) the proxy enforces per workflow run and per rolling week. models: what CodeAF may use, served to it by `harness proxy` as an OpenRouter-shaped catalog; prices are USD per million tokens, from https://synthetic.new/pricing, checked 2026-10-17. input/output/cache_read are the SUBSCRIPTION rates, which draw down the weekly credit; api_input/api_cached/api_output are the API list rates, what usage past the quota (overage) costs. 'id' is what CodeAF sees; 'upstream' is the synthetic.new model id. 'max_concurrent': the synthetic.new subscription allows 2 calls to each model at once; the proxy queues calls past that. queue.max_parallel_runs is how many CodeAF runs the queue may have going at once; each run gets its own slice of every model's max_concurrent (perRunSlots: max(1, max_concurrent/max_parallel_runs), what task.parallel is set to) and its own worker seat, chosen by the lane the queue assigns. searches_per_run caps the web-search calls (harness search, POST /v2/search) one run may forward to synthetic.new; search is in the plan and draws no credit, but the cap walls off a runaway loop (issue #58).",
+  "_comment": "Harness config. limits: the Big-plan spend caps (USD) the proxy enforces per workflow run and per rolling week. models: what CodeAF may use, served to it by `harness proxy` as an OpenRouter-shaped catalog; prices are USD per million tokens, from https://synthetic.new/pricing, checked 2026-10-17. input/output/cache_read are the SUBSCRIPTION rates, which draw down the weekly credit; api_input/api_cached/api_output are the API list rates, what usage past the quota (overage) costs. 'id' is what CodeAF sees; 'upstream' is the synthetic.new model id. 'max_concurrent': how many calls the factory sends each model at once, the proxy queuing calls past it. synthetic.new no longer has a fixed per-model cap (October 2026 pricing change: concurrency is by plan priority, Big highest, with throttling to protect the service), so 8 is our own first step up from the old cap of 2, raised further only while upstream 429s stay rare; CodeAF retries a 429. queue.max_parallel_runs is how many CodeAF runs the queue may have going at once; each run gets its own slice of every model's max_concurrent (perRunSlots: max(1, max_concurrent/max_parallel_runs), what task.parallel is set to) and its own worker seat, chosen by the lane the queue assigns. searches_per_run caps the web-search calls (harness search, POST /v2/search) one run may forward to synthetic.new; search is in the plan and draws no credit, but the cap walls off a runaway loop (issue #58).",
   "queue": {
-    "max_parallel_runs": 2
+    "max_parallel_runs": 4
   },
   "limits": {
     "plan": "big",
@@ -16,7 +16,7 @@
     {
       "id": "zai-org/glm-5.3-flash",
       "upstream": "hf:zai-org/GLM-5.3-Flash",
-      "max_concurrent": 2,
+      "max_concurrent": 8,
       "name": "GLM-5.3-Flash (synthetic.new)",
       "role": "base",
       "input": 0.10,
@@ -33,7 +33,7 @@
     {
       "id": "deepseek-ai/deepseek-v4.1-flash",
       "upstream": "hf:deepseek-ai/DeepSeek-V4.1-Flash",
-      "max_concurrent": 2,
+      "max_concurrent": 8,
       "name": "DeepSeek-V4.1-Flash (synthetic.new)",
       "role": "mid",
       "input": 0.06,
@@ -49,7 +49,7 @@
     {
       "id": "zai-org/glm-5.3",
       "upstream": "hf:zai-org/GLM-5.3",
-      "max_concurrent": 2,
+      "max_concurrent": 8,
       "name": "GLM-5.3 (synthetic.new)",
       "role": "top",
       "input": 0.40,
@@ -66,7 +66,7 @@
     {
       "id": "moonshotai/kimi-k3",
       "upstream": "hf:moonshotai/Kimi-K3",
-      "max_concurrent": 2,
+      "max_concurrent": 8,
       "name": "Kimi-K3 (synthetic.new)",
       "role": "experiment",
       "input": 1.5,
