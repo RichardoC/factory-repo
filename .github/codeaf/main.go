@@ -46,16 +46,18 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("harness: ")
 	if len(os.Args) < 2 {
-		log.Fatal("usage: harness proxy|gate|next|brief|summary|state|report")
+		log.Fatal("usage: harness proxy|gate|next|brief|summary|state|report|pr-mode|continue-plan")
 	}
 	commands := map[string]func() error{
-		"proxy":   runProxy,
-		"gate":    runGate,
-		"next":    runNext,
-		"brief":   runBrief,
-		"summary": runSummary,
-		"state":   runState,
-		"report":  runReport,
+		"proxy":         runProxy,
+		"gate":          runGate,
+		"next":          runNext,
+		"brief":         runBrief,
+		"summary":       runSummary,
+		"state":         runState,
+		"report":        runReport,
+		"pr-mode":       prMode,
+		"continue-plan": runContinuePlan,
 	}
 	command, ok := commands[os.Args[1]]
 	if !ok {
@@ -884,12 +886,30 @@ func Decide(name string, ev event, labelName string, lookupPR, lookupIssue func(
 		// The queue starts runs by dispatching this workflow with the
 		// issue number in its `issue` input: a GITHUB_TOKEN-labelled
 		// event does not fire workflows, so dispatch is the machine
-		// path. The input is untrusted, so only its digits are read,
-		// and the issue it names must still pass the same checks as a
-		// labelled event: open, not a PR, and labelled labelName.
+		// path. A continuation starts the same way, with the draft PR
+		// to continue in the `pr` input (issue #31). The inputs are
+		// untrusted, so only their digits are read, and what they name
+		// must still pass the same checks as a labelled event: open,
+		// not a fork, and labelled labelName.
+		if n, ok := dispatchIssue(ev.Inputs["pr"]); ok {
+			pr, err := lookupPR(n)
+			if err != nil {
+				return Decision{}, err
+			}
+			repo := os.Getenv("GITHUB_REPOSITORY")
+			switch {
+			case pr.State != "open":
+				return skip("PR is not open"), nil
+			case pr.Head.Repo == nil || pr.Head.Repo.FullName != repo:
+				return skip("PR head is in a fork; CodeAF only pushes to branches in " + repo), nil
+			case !pr.labelled(labelName):
+				return skip("PR is not labelled " + labelName), nil
+			}
+			return Decision{Run: true, Reason: "workflow dispatch", Mode: "pr", Number: pr.Number, Branch: pr.Head.Ref, Base: pr.Base.Ref}, nil
+		}
 		n, ok := dispatchIssue(ev.Inputs["issue"])
 		if !ok {
-			return skip("workflow_dispatch needs a numeric issue input"), nil
+			return skip("workflow_dispatch needs a numeric issue or pr input"), nil
 		}
 		i, err := lookupIssue(n)
 		if err != nil {
@@ -1582,6 +1602,18 @@ func runBrief() error {
 		parts = append(parts, fmt.Sprintf("# Follow-up on pull request #%d — %s\n\nYou are continuing work on an open pull request. "+
 			"The working tree is its head branch `%s`. Address the request below; do not redo work that is already on the branch.\n\n"+
 			"## PR description\n\n%s", number, pr.Title, pr.Head.Ref, pr.Body))
+		// A continuation must say what the issue still requires
+		// (issue #31): when the PR body names the issue it closes,
+		// fetch it and add its task text. An API failure degrades to
+		// a note; it must not fail the brief.
+		if n := linkedIssue(pr.Body); n != 0 {
+			var closes item
+			if err := gh.get(fmt.Sprintf("/issues/%d", n), &closes); err != nil {
+				parts = append(parts, fmt.Sprintf("(the issue this PR closes, #%d, is unavailable: %s)\n", n, escapeMD(err.Error(), 200, true)))
+			} else {
+				parts = append(parts, fmt.Sprintf("## The issue this PR closes (#%d) — %s\n\n%s", n, escapeMD(closes.Title, 200, true), closes.Body))
+			}
+		}
 		var reviews []reviewComment
 		if err := gh.get(fmt.Sprintf("/pulls/%d/comments?per_page=100", number), &reviews); err != nil {
 			return err

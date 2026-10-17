@@ -35,7 +35,11 @@ on:
     inputs:
       issue:
         description: issue number the queue labelled codeaf
-        required: true
+        required: false
+        type: string
+      pr:
+        description: PR number a finished run wants continued
+        required: false
         type: string
 
 permissions:
@@ -364,6 +368,10 @@ jobs:
             echo "PATCH_PATH=$RUNNER_TEMP/in/changes.patch"
             echo "PUBLISH_ERRORS_PATH=$RUNNER_TEMP/publish-errors.log"
             echo "HARNESS=$RUNNER_TEMP/harness/harness"
+            # Where pr-mode writes its early-stop paragraph for the PR body
+            # and continue-plan writes the comment body to post on the PR.
+            echo "PR_BODY_EXTRA_PATH=$RUNNER_TEMP/pr-body-extra.md"
+            echo "CONTINUE_COMMENT_PATH=$RUNNER_TEMP/continue-comment.md"
           } >> "$GITHUB_ENV"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -546,21 +554,88 @@ jobs:
             echo "::error::GitHub refused the push of $BRANCH; the cause is above and in this job's log" | tee -a "$PUBLISH_ERRORS_PATH"
             exit 1
           fi
+          # How did the run end? pr-mode reads CodeAF's result (no network, no
+          # token) and prints early/ready/stop: an early stop publishes as a
+          # draft PR whose body says so, stop: done publishes ready for review.
+          "$HARNESS" pr-mode > "$RUNNER_TEMP/pr-mode.env"
+          # Its output is derived from the run job's result, so it is parsed,
+          # never sourced: only an exact "true" counts, anything else is false.
+          early=false; ready=false
+          grep -qx 'early=true' "$RUNNER_TEMP/pr-mode.env" && early=true
+          grep -qx 'ready=true' "$RUNNER_TEMP/pr-mode.env" && ready=true
+          { echo "early=$early"; echo "ready=$ready"; } >> "$GITHUB_OUTPUT"
           pr=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')
           if [ -z "$pr" ]; then
             title=$(gh issue view "$NUMBER" --json title --jq .title)
-            if ! pr_url=$(gh pr create --base "$BASE" --head "$BRANCH" --title "$title" \
-              --body "Closes #$NUMBER
-
-          Opened by the [CodeAF workflow]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID). Comment \`/codeaf <instructions>\` (or request changes in a review) to have CodeAF continue on this branch."); then
+            # The body is composed as a file so an early stop can append its
+            # paragraph (PR_BODY_EXTRA_PATH, written by pr-mode); without one
+            # the body is the one it has always been.
+            {
+              printf 'Closes #%s\n\n' "$NUMBER"
+              printf 'Opened by the [CodeAF workflow](%s/%s/actions/runs/%s). Comment `/codeaf <instructions>` (or request changes in a review) to have CodeAF continue on this branch.' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+              if [ -f "$PR_BODY_EXTRA_PATH" ]; then
+                printf '\n\n'
+                cat "$PR_BODY_EXTRA_PATH"
+              fi
+            } > "$RUNNER_TEMP/pr-body.md"
+            create_args=(--base "$BASE" --head "$BRANCH" --title "$title" --body-file "$RUNNER_TEMP/pr-body.md")
+            if [ "$early" = true ]; then
+              create_args+=(--draft) # the work is unfinished
+            fi
+            if ! pr_url=$(gh pr create "${create_args[@]}"); then
               echo "::error::could not open the pull request for $BRANCH" | tee -a "$PUBLISH_ERRORS_PATH"
               exit 1
             fi
             pr=${pr_url##*/}
             gh pr edit "$pr" --add-label "$CODEAF_LABEL"
+          else
+            # This run went onto an existing PR's branch (a /codeaf comment or
+            # a continuation): flip the draft marker to how the run ended.
+            # Either call can refuse (the PR is already in that state); the
+            # push itself is what matters, so keep going.
+            if [ "$early" = true ]; then
+              gh pr ready --undo "$pr" || true
+            elif [ "$ready" = true ]; then
+              gh pr ready "$pr" || true
+            fi
           fi
           echo "number=$pr" >> "$GITHUB_OUTPUT"
           gh workflow run ci.yml --ref "$BRANCH" || echo "::warning::could not dispatch CI"
+
+      - name: Continue or hand over
+        # Between the PR step and Report on purpose: continue-plan counts the
+        # PR's earlier CodeAF report comments, and this run's own report is
+        # posted next, so it never counts against the continuation cap.
+        # Fail-soft: a continuation that cannot start must not fail publishing
+        # (the report below still posts).
+        if: steps.pr.outputs.number != ''
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          "$HARNESS" continue-plan "$PR_NUMBER" > "$RUNNER_TEMP/continue-plan.env"
+          # Parsed, never sourced: only the three known actions are acted on.
+          action=none
+          if grep -qx 'action=continue' "$RUNNER_TEMP/continue-plan.env"; then action=continue
+          elif grep -qx 'action=cap' "$RUNNER_TEMP/continue-plan.env"; then action=cap
+          fi
+          echo "action=$action" >> "$GITHUB_OUTPUT"
+          case "$action" in
+            continue)
+              # Post the "/codeaf continue: <stop>" comment, then start the run
+              # on this PR's branch (the gate's `pr` input). If the dispatch
+              # fails, say so: a maintainer can continue it by hand.
+              gh pr comment "$PR_NUMBER" --body-file "$CONTINUE_COMMENT_PATH" \
+                && gh workflow run codeaf.yml -f pr="$PR_NUMBER" \
+                || echo "::warning::could not continue #$PR_NUMBER automatically; a maintainer can continue it by hand with a /codeaf comment on the PR"
+              ;;
+            cap)
+              # The continuation cap is reached: leave the draft to a person.
+              gh pr comment "$PR_NUMBER" --body-file "$CONTINUE_COMMENT_PATH" || true
+              ;;
+          esac
 
       - name: Report
         if: always()
