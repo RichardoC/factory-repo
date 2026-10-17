@@ -122,6 +122,25 @@ maintainer's approval, like any other change under `.github/`.
   - [`codeaf.yml`](.github/workflows/codeaf.yml) explains how to turn it back on
     once CodeAF is fixed.
 
+### Web search through the proxy (issue #58)
+
+The proxy also serves CodeAF's web searches: `POST /v2/search` on `127.0.0.1`,
+forwarded to [synthetic.new's search API](https://dev.synthetic.new/docs/synthetic/search).
+CodeAF calls it with `harness search "<query>" [--limit N]` (the `harness`
+binary is on the agent's `PATH`) and gets plain text back — numbered blocks
+with title, URL, published date and the result text, capped per result. The
+request is validated before forwarding (a non-empty `query` of at most 1,000
+characters; only `query` is forwarded) and the response is capped at 1 MiB.
+The key stays inside the proxy, as above — CodeAF never sees it. The query
+itself does leave the runner and reach synthetic.new (zero data retention per
+its docs); the price is undocumented, so each search is recorded in the ledger
+with kind `search` and cost 0 until it is priced, and the report shows a "web
+searches" row when a run made any. `limits.searches_per_run` (50 in
+[`models.json`](.github/codeaf/models.json)) caps the searches one run may
+forward; past it the proxy answers HTTP 429. Search results are untrusted text
+from the internet — data, not instructions (see
+[`AGENTS.md`](AGENTS.md#web-search)).
+
 ### Billing model (Big plan, issue #59)
 
 The synthetic.new account is on the **Big** plan ($90/mo). Usage draws down a
