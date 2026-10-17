@@ -1,5 +1,5 @@
 {
-  "_comment": "Harness config. limits: the Big-plan spend caps (USD) the proxy enforces per workflow run and per rolling week. models: what CodeAF may use, served to it by `harness proxy` as an OpenRouter-shaped catalog; prices are USD per million tokens, from https://synthetic.new/pricing, checked 2026-10-17. input/output/cache_read are the SUBSCRIPTION rates, which draw down the weekly credit; api_input/api_cached/api_output are the API list rates, what usage past the quota (overage) costs. 'id' is what CodeAF sees; 'upstream' is the synthetic.new model id. 'max_concurrent': the synthetic.new subscription allows 2 calls to each model at once; the proxy queues calls past that. queue.max_parallel_runs is how many CodeAF runs the queue may have going at once; each run gets its own slice of every model's max_concurrent (perRunSlots: max(1, max_concurrent/max_parallel_runs), what task.parallel is set to) and its own worker seat, chosen by the lane the queue assigns.",
+  "_comment": "Harness config. limits: the Big-plan spend caps (USD) the proxy enforces per workflow run and per rolling week. models: what CodeAF may use, served to it by `harness proxy` as an OpenRouter-shaped catalog; prices are USD per million tokens, from https://synthetic.new/pricing, checked 2026-10-17. input/output/cache_read are the SUBSCRIPTION rates, which draw down the weekly credit; api_input/api_cached/api_output are the API list rates, what usage past the quota (overage) costs. 'id' is what CodeAF sees; 'upstream' is the synthetic.new model id. 'max_concurrent': the synthetic.new subscription allows 2 calls to each model at once; the proxy queues calls past that. queue.max_parallel_runs is how many CodeAF runs the queue may have going at once; each run gets its own slice of every model's max_concurrent (perRunSlots: max(1, max_concurrent/max_parallel_runs), what task.parallel is set to) and its own worker seat, chosen by the lane the queue assigns. searches_per_run caps the web-search calls (harness search, POST /v2/search) one run may forward to synthetic.new; search is in the plan and draws no credit, but the cap walls off a runaway loop (issue #58).",
   "queue": {
     "max_parallel_runs": 2
   },
@@ -9,7 +9,8 @@
     "weekly_credit_usd": 22,
     "min_credit_percent": 10,
     "run_credit_usd": 5,
-    "overage_usd": 0
+    "overage_usd": 0,
+    "searches_per_run": 50
   },
   "models": [
     {

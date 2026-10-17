@@ -66,7 +66,7 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("harness: ")
 	if len(os.Args) < 2 {
-		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|ref-check|merge-default")
+		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|ref-check|merge-default|search")
 	}
 	commands := map[string]func() error{
 		"proxy":         runProxy,
@@ -93,6 +93,9 @@ func main() {
 		// from the same two parents, checked by tree hash, and refuses a
 		// result that still carries conflict markers (merge.go).
 		"merge-default": runMergeDefault,
+		// Web search through the proxy (issue #58): the CLI posts to the
+		// proxy on 127.0.0.1; the key never leaves the proxy.
+		"search": runSearch,
 	}
 	command, ok := commands[os.Args[1]]
 	if !ok {
@@ -144,6 +147,10 @@ type Limits struct {
 	// weeklyTokenLimit.percentRemaining below which, with overage 0, the
 	// proxy refuses calls. 0 means the default, 10.
 	MinCreditPercent float64 `json:"min_credit_percent"`
+	// SearchesPerRun caps how many web searches (POST /v2/search, issue #58)
+	// one run may forward. Search is in the plan and draws no credit, but a
+	// runaway loop still needs a wall; <=0 means defaultSearchesPerRun.
+	SearchesPerRun int `json:"searches_per_run"`
 }
 
 // defaultMinCreditPercent is the floor used when min_credit_percent is unset.
@@ -306,11 +313,16 @@ type proxy struct {
 	models     []Model
 	client     *http.Client
 	slots      map[string]chan struct{} // per upstream model, for max_concurrent
+	// Web search (issue #58): where forwarded searches go and this run's
+	// cap; searches counts this run's forwarded attempts under p.mu.
+	searchURL      string
+	searchesPerRun int
 
 	mu           sync.Mutex
 	runSpent     float64 // credit spent by this run
 	overage      bool    // the weekly credit is exhausted; new calls are billed at API prices
 	overageApi   float64 // API-price USD recorded past the weekly credit
+	searches     int     // web searches forwarded this run (issue #58); capped by searchesPerRun
 	quota        quota   // GET /v2/quotas at startup and every few minutes; an unknown quota never blocks
 	minCreditPct float64 // floor on quota.PercentRemaining (limits.min_credit_percent)
 }
@@ -351,6 +363,10 @@ func runProxy() error {
 	p.overageCap = cfg.Limits.OverageUSD
 	p.minCreditPct = cfg.Limits.MinCreditPercent
 	p.slots = newSlots(p.models, cfg.Queue.MaxParallelRuns)
+	// Web search (issue #58): the endpoint to forward to and the per-run cap
+	// from models.json (<=0 means defaultSearchesPerRun in the handler).
+	p.searchURL = envOr("PROXY_SEARCH_URL", defaultSearchURL)
+	p.searchesPerRun = cfg.Limits.SearchesPerRun
 	if p.weekSpent, err = spentWeek("PROXY_WEEK_SPENT_USD"); err != nil {
 		return err
 	}
@@ -393,6 +409,10 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"week_spent_credit_usd": week, "overage_api_usd": over})
 	case r.Method == http.MethodPost && strings.HasSuffix(path, "/chat/completions"):
 		p.chat(w, r)
+	case r.Method == http.MethodPost && path == "/v2/search":
+		// Web search (issue #58): the exact path only; the key stays with
+		// the proxy (search.go).
+		p.search(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "not served by the codeaf proxy: "+r.Method+" "+path)
 	}
@@ -737,6 +757,11 @@ type LedgerLine struct {
 	// Quotas carries the raw GET /v2/quotas response body on the "quotas"
 	// marker line, capped (recordQuotas); the report re-parses it from here.
 	Quotas string `json:"quotas,omitempty"`
+	// Search lines (kind "search", issue #58) carry the query's length in
+	// runes and how many results came back — never the query text, which
+	// must not land in the ledger.
+	QueryLen int `json:"query_len,omitempty"`
+	Results  int `json:"results,omitempty"`
 }
 
 func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slotWait time.Duration, chars charCounts, repaired int) {
@@ -2421,6 +2446,7 @@ func ledgerTotal(lines []LedgerLine) float64 {
 		if l.Kind == "proxy_start" {
 			continue // the start marker is not a call; unknown kinds still cost money
 		}
+		// Search lines cost 0 (issue #58); a documented price flows through CostUSD and is counted here unchanged.
 		total += l.CostUSD
 	}
 	return total
@@ -3279,6 +3305,12 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 				trimNumber(q.Limit), trimNumber(q.Requests), renews)
 		}
 		break
+	}
+	// Web searches through the proxy (issue #58): one row, and only when
+	// the run made any. Search lines cost 0 until synthetic.new documents a
+	// price; a price would flow through CostUSD into the metered row above.
+	if n := countSearches(lines); n > 0 {
+		fmt.Fprintf(&b, "| web searches | %d |\n", n)
 	}
 	if repairedArgs > 0 {
 		fmt.Fprintf(&b, "| tool-call arguments repaired | %d |\n", repairedArgs)

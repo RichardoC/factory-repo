@@ -299,6 +299,15 @@ jobs:
           fi
           echo "agent sandbox ok: no signal, no /proc/$worker/environ, no sudo for the agent user"
 
+      - name: Put the harness on the agent PATH
+        # Issue #58: the brief tells CodeAF to run `harness search` for
+        # documentation, API and error-message lookups. The binary is built
+        # from the default branch above, before the agent exists, and is
+        # installed root-owned: the agent can call it but not replace it,
+        # and /usr/local/bin is on the PATH the Run CodeAF step passes it.
+        run: |
+          sudo -n install -m 0755 -o root -g root "$HARNESS" /usr/local/bin/harness
+
       - name: Run CodeAF
         # CodeAF's settings (budgets, telemetry off) are in
         # .github/codeaf/codeaf-config.json; the harness prints them as the
