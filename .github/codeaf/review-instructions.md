@@ -33,3 +33,26 @@ Severity:
 
 Report each finding once, at the place it belongs, with what is wrong and
 why it matters — not what you would prefer.
+
+## The findings section
+
+The harness parses your findings from the answer you leave. End your answer
+with a section exactly titled `## Findings`, holding one bullet per finding,
+in exactly this form, and write nothing after it:
+
+- [high] app/zip/queue.go:42 - the mutex is released twice under the error
+  path, so a second request deadlocks
+- [low] the changelog does not mention the new flag
+
+Severity is high, medium or low. A finding without a file and line is still
+one bullet. When the review is clean, end with the section holding the single
+word `none`:
+
+## Findings
+
+none
+
+Findings written inline elsewhere in the answer (`[high] path:line - text`,
+or `[medium] the lock is held across the call`) are parsed too, but the
+section is the contract: a review whose findings never reach it is read as a
+review with none.

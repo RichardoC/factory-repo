@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -1820,4 +1821,99 @@ func TestBriefBudget(t *testing.T) {
 	if brief := runBriefInto(t, prRoutes(), "pr", prEvent); !strings.HasPrefix(brief, "You have 45 minutes and $") {
 		t.Errorf("budget line is not first: %q", brief[:60])
 	}
+}
+
+// TestRunSummaryShipsRunRecord covers the review-mode side of issue #49: the
+// root task's run record rides the output artifact beside the result, newest
+// regular file wins, a planted symlink is never taken, and the copy is
+// capped. Outside review mode nothing ships.
+func TestRunSummaryShipsRunRecord(t *testing.T) {
+	home := t.TempDir()
+	out := filepath.Join(t.TempDir(), "out")
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	resultPath := filepath.Join(out, "result.json")
+	if err := os.WriteFile(resultPath, []byte(`{"stop":"done"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mkRecord := func(run, body string, mod time.Time) string {
+		t.Helper()
+		dir := filepath.Join(home, "runs", run, "tasks", "root")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, "trajectory.jsonl")
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, mod, mod); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	shipped := filepath.Join(out, trajectoryFileName)
+
+	t.Run("the newest regular record ships beside the result", func(t *testing.T) {
+		mkRecord("older", `{"kind":"end","result":"old record"}`+"\n", time.Now().Add(-time.Hour))
+		mkRecord("newer", `{"kind":"end","result":"new record"}`+"\n", time.Now())
+		// A symlink newer still is never taken: only regular files.
+		decoy := filepath.Join(t.TempDir(), "decoy.jsonl")
+		if err := os.WriteFile(decoy, []byte(`{"kind":"end","result":"planted"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(decoy, time.Now().Add(time.Hour), time.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join(home, "runs", "planted", "tasks", "root")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(decoy, filepath.Join(dir, "trajectory.jsonl")); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("CODEAF_HOME", home)
+		t.Setenv("RESULT_PATH", resultPath)
+		t.Setenv("MODE", "review")
+		if _, err := captureStdout(t, runSummary); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(shipped)
+		if err != nil {
+			t.Fatalf("the run record was not shipped: %v", err)
+		}
+		if string(data) != `{"kind":"end","result":"new record"}`+"\n" {
+			t.Errorf("shipped record = %q, want the newest regular one", data)
+		}
+	})
+
+	t.Run("a record past the cap ships capped", func(t *testing.T) {
+		big := mkRecord("big", strings.Repeat("x", maxTrajectoryBytes+10), time.Now())
+		t.Setenv("CODEAF_HOME", home)
+		t.Setenv("RESULT_PATH", resultPath)
+		t.Setenv("MODE", "review")
+		if _, err := captureStdout(t, runSummary); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(shipped)
+		if err != nil {
+			t.Fatalf("the run record was not shipped: %v", err)
+		}
+		if len(data) != maxTrajectoryBytes {
+			t.Errorf("shipped %d bytes, want the cap %d (from %s)", len(data), maxTrajectoryBytes, big)
+		}
+	})
+
+	t.Run("outside review mode nothing ships", func(t *testing.T) {
+		_ = os.Remove(shipped)
+		t.Setenv("CODEAF_HOME", home)
+		t.Setenv("RESULT_PATH", resultPath)
+		t.Setenv("MODE", "")
+		if _, err := captureStdout(t, runSummary); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(shipped); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("a non-review run shipped the record: %v", err)
+		}
+	})
 }

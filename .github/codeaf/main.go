@@ -1840,6 +1840,16 @@ func runSummary() error {
 	delete(fields, "answer")
 	pretty, _ := json.MarshalIndent(fields, "", " ")
 	fmt.Printf("%.4000s\n", pretty)
+	// Issue #49: the review report runs in the publish job, which reads only
+	// this job's output artifact, and it falls back to the root task's run
+	// record when the result's answer carries no findings. So in review mode
+	// the record is shipped beside the result, capped here and read there as
+	// untrusted data.
+	if envOr("MODE", "") == "review" {
+		if from := shipRunRecord(); from != "" {
+			log.Printf("shipped the run record %s beside the result", from)
+		}
+	}
 	return nil
 }
 
