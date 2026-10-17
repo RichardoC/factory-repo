@@ -16,14 +16,22 @@ import (
 // ---------------------------------------------------------------- queue
 
 // runStatus is one entry of the
-// `gh run list --workflow=codeaf.yml --json status,databaseId,displayTitle`
+// `gh run list --workflow=codeaf.yml --json status,databaseId,displayTitle,createdAt`
 // array the queue reads. DatabaseId and DisplayTitle are untrusted data: the
 // title is parsed strictly, and anything that does not match the queue's own
-// shape counts as lane 0 and no known issue.
+// shape counts as lane 0 and no known issue. `gh run list --json` prints
+// camelCase keys, and the tags below must match them: a created_at tag would
+// silently drop the stamp, and the planner would read every plan run as
+// inside its cooldown.
 type runStatus struct {
 	Status       string `json:"status"`
 	DatabaseId   int    `json:"databaseId"`
 	DisplayTitle string `json:"displayTitle"`
+	// CreatedAt is the run's creation stamp (the JSON key `createdAt`), from
+	// `gh run list --json createdAt`: when the run started. The planner reads
+	// it for its cooldown; a missing or unparseable stamp makes a plan run
+	// count as inside the cooldown (fail closed).
+	CreatedAt string `json:"createdAt"`
 }
 
 // queueOptions is the environment the next command decides in.
@@ -174,8 +182,39 @@ func runTitleFields(title string) (issue, lane int) {
 	return issue, lane
 }
 
-// runLane is the lane a run was dispatched on, read out of its title.
+// runPlanRe matches the display title a plan dispatch writes (issue #61):
+// "CodeAF plan" or "CodeAF plan (lane N)". Like runTitleRe it is anchored
+// and strict: run titles are untrusted data, and anything else parses to no
+// plan run.
+var runPlanRe = regexp.MustCompile(`^CodeAF plan(?: \(lane ([0-9]+)\))?$`)
+
+// runPlanFields reads the lane out of a plan run's display title. ok is
+// false for every title that is not a plan title, issue titles included —
+// the two shapes are disjoint, so a plan run is never matched by runTitleRe
+// and parses to issue 0 there.
+func runPlanFields(title string) (lane int, ok bool) {
+	m := runPlanRe.FindStringSubmatch(title)
+	if m == nil {
+		return 0, false
+	}
+	// m[1] is empty when the suffix is absent; that is lane 0 too.
+	lane, _ = strconv.Atoi(m[1])
+	return lane, true
+}
+
+// isPlanRun reports whether a run was dispatched in plan mode (issue #61).
+func isPlanRun(r runStatus) bool {
+	_, ok := runPlanFields(r.DisplayTitle)
+	return ok
+}
+
+// runLane is the lane a run was dispatched on, read out of its title. Plan
+// runs and issue runs share the lane numbering: a plan run occupies its
+// lane like any other run, which is what keeps MaxParallelRuns honest.
 func runLane(r runStatus) int {
+	if lane, ok := runPlanFields(r.DisplayTitle); ok {
+		return lane
+	}
 	_, lane := runTitleFields(r.DisplayTitle)
 	return lane
 }
@@ -285,10 +324,16 @@ func runAreas(r runStatus, byNumber map[int]item) []string {
 
 // areaBusy finds the first in-flight run whose areas collide with the
 // candidate's, and the area to name in the log. An empty set on either side
-// conflicts with everything; when the collision is an intersection, the
-// first (sorted) shared area is named.
+// conflicts with everything — except a plan run (issue #61): a plan run
+// occupies its lane but works on no area, so it never conflicts with an
+// issue run, and two plan runs are kept apart by the planner's cooldown,
+// not by areas. When the collision is an intersection, the first (sorted)
+// shared area is named.
 func areaBusy(areas []string, inflight []runStatus, byNumber map[int]item) (busy string, r runStatus, conflict bool) {
 	for _, run := range inflight {
+		if isPlanRun(run) {
+			continue
+		}
 		other := runAreas(run, byNumber)
 		switch {
 		case len(areas) == 0 || len(other) == 0:

@@ -2597,3 +2597,66 @@ func TestOverCapWeeklyCreditPercent(t *testing.T) {
 		t.Errorf("unknown quota must never block: %q", reason)
 	}
 }
+
+// writePlannerModels writes a models.json whose planner block is planner
+// ("" for absent), everything else minimal and valid, and returns its path.
+func writePlannerModels(t *testing.T, planner string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "models.json")
+	p := ""
+	if planner != "" {
+		p = fmt.Sprintf(`,"planner":%s`, planner)
+	}
+	body := fmt.Sprintf(`{"limits":{"plan":"big","weekly_credit_usd":20,"run_credit_usd":5}%s,
+		"models":[{"id":"m","upstream":"hf:m","efforts":["high"],"max_concurrent":2,
+		"input":0.1,"output":0.25,"cache_read":0.02,"api_input":0.15,"api_cached":0.04,"api_output":0.5}]}`, p)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestLoadConfigPlanner covers the planner block (issue #61): absent or 0
+// values take the defaults (backlog 3, twelve hours, five proposals), an
+// explicit value is kept, and a negative value is an error naming the field
+// — the same handling queue.max_parallel_runs gets.
+func TestLoadConfigPlanner(t *testing.T) {
+	for _, planner := range []string{"", `{"min_backlog":0,"min_hours":0,"max_proposals":0}`} {
+		cfg, err := loadConfig(writePlannerModels(t, planner))
+		if err != nil {
+			t.Fatalf("planner %q: %v", planner, err)
+		}
+		if cfg.Planner.MinBacklog != 3 || cfg.Planner.MinHours != 12 || cfg.Planner.MaxProposals != 5 {
+			t.Fatalf("planner %q: got %+v; want defaults 3, 12, 5", planner, cfg.Planner)
+		}
+	}
+	// An explicit value is kept.
+	cfg, err := loadConfig(writePlannerModels(t, `{"min_backlog":7,"min_hours":24,"max_proposals":1}`))
+	if err != nil || cfg.Planner.MinBacklog != 7 || cfg.Planner.MinHours != 24 || cfg.Planner.MaxProposals != 1 {
+		t.Fatalf("explicit planner: %d/%d/%d, %v; want 7/24/1", cfg.Planner.MinBacklog, cfg.Planner.MinHours, cfg.Planner.MaxProposals, err)
+	}
+	// A partially set block defaults only what is missing.
+	cfg, err = loadConfig(writePlannerModels(t, `{"min_hours":6}`))
+	if err != nil || cfg.Planner.MinBacklog != 3 || cfg.Planner.MinHours != 6 || cfg.Planner.MaxProposals != 5 {
+		t.Fatalf("partial planner: %d/%d/%d, %v; want 3/6/5", cfg.Planner.MinBacklog, cfg.Planner.MinHours, cfg.Planner.MaxProposals, err)
+	}
+	// Negative values are refused, each naming its field.
+	for _, bad := range []struct{ block, field string }{
+		{`{"min_backlog":-1}`, "planner.min_backlog"},
+		{`{"min_hours":-1}`, "planner.min_hours"},
+		{`{"max_proposals":-1}`, "planner.max_proposals"},
+	} {
+		if _, err := loadConfig(writePlannerModels(t, bad.block)); err == nil || !strings.Contains(err.Error(), bad.field) || !strings.Contains(err.Error(), "must not be negative") {
+			t.Fatalf("planner %q: err=%v; want a negative-value error naming %s", bad.block, err, bad.field)
+		}
+	}
+	// The committed models.json parses, and its planner block is the
+	// documented example: 3, 12, 5.
+	cfg, err = loadConfig("models.json")
+	if err != nil {
+		t.Fatalf("committed models.json: %v", err)
+	}
+	if cfg.Planner.MinBacklog != 3 || cfg.Planner.MinHours != 12 || cfg.Planner.MaxProposals != 5 {
+		t.Fatalf("committed models.json planner: got %+v; want 3, 12, 5", cfg.Planner)
+	}
+}

@@ -381,6 +381,53 @@ Removing workflow-level workarounds is a workflow change and still needs a
 maintainer's approval (the `codeaf-harness` environment, see
 *Limits worth knowing* below).
 
+## The planner
+
+When the backlog runs low the factory now files its own next work. Every queue
+tick, after the start-issues loop,
+[`codeaf-queue.yml`](.github/workflows/codeaf-queue.yml) asks the harness
+(`harness plan-check`, issue #61) whether a **plan run** should start. It
+starts one only when all of these hold:
+
+- fewer than **`planner.min_backlog`** (in
+  [`models.json`](.github/codeaf/models.json), default 3) open issues carry
+  **`codeaf-queued`** and are not already running;
+- no plan run has started within **`planner.min_hours`** (default 12) — the
+  cooldown is read off each run's `createdAt` stamp, and a plan-titled run
+  whose stamp is missing or unparseable counts as inside the cooldown, never
+  outside it;
+- the same guards as any run: the rolling week's spend under the queue's
+  threshold, and a free lane under `queue.max_parallel_runs`.
+
+A plan run is **read-only**, like a review run: it writes no patch, opens no
+PR, and nothing it says is applied. It reads the repository (the README and
+AGENTS.md included), the open issues, the recently closed issues and PRs,
+recent CodeAF run reports, and the planner instructions in
+[`plan-instructions.md`](.github/codeaf/plan-instructions.md). It writes up to
+**`planner.max_proposals`** (default 5) proposed issues in a fixed format:
+title, problem, what to do, done when, area, and dependencies on other issues.
+After the run, `publish` runs `harness plan-report` over the answer, dedupes
+each proposal against the open issues' titles, and opens the survivors as
+issues labelled **`codeaf-proposed`** plus their area labels — **never**
+`codeaf-queued`. Proposal text comes from the run job, so it is treated as
+untrusted data: parsed as JSON with every field validated, capped and deduped,
+never executed.
+
+**How to promote a proposal.** A proposal is only a suggestion. A person with
+triage access — or Claude acting for the owner — reviews the issue, and if it
+is worth doing adds the **`codeaf-queued`** label (and may drop or replace the
+area labels). The queue then runs it like any other queued issue: same trust
+gate, same area and dependency rules, same budget. Nothing in the pipeline
+adds `codeaf-queued` to a proposal by itself.
+
+The planner aims its proposals, in order, at: bugs and gaps found in recent
+runs and reviews; the "Out of scope" or follow-up notes in closed issues; the
+feature-requests list's workarounds the harness could improve; and app work
+following each app's README TODO list. Proposals that would change
+`.github/workflows/` always say in their body that such a change needs a
+maintainer's approval (the `codeaf-harness` environment, see *Limits worth
+knowing*).
+
 ## Limits worth knowing
 
 - The agent has a shell on the runner, so treat it as having the same access as any
