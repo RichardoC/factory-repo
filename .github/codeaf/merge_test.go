@@ -1,0 +1,943 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+// The tests build real git repositories with plumbing (hash-object, mktree,
+// commit-tree), so they never need a working tree to stage from, and they
+// stand in for the compare API with git's own merge-base. Everything
+// merge.go does in production — merge-tree with an explicit base, fetching a
+// commit by id, commit-tree — is exercised against the real git binary.
+
+// gitTest runs git in dir and fails the test when it exits nonzero.
+func gitTest(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	return gitTestIn(t, dir, "", args...)
+}
+
+// gitTestIn runs git with stdin, for plumbing that reads objects.
+func gitTestIn(t *testing.T, dir, input string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Stdin = strings.NewReader(input)
+	var out, errBuf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errBuf
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
+		"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com")
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(errBuf.String()))
+	}
+	return out.String()
+}
+
+// testRepo is a scratch repository whose commits are made with plumbing. The
+// parent edges are recorded as commits are made, so the compare stub never
+// needs git history (see dagCompare).
+type testRepo struct {
+	t     *testing.T
+	dir   string
+	edges map[string][]string
+}
+
+func newTestRepo(t *testing.T) *testRepo {
+	t.Helper()
+	dir := t.TempDir()
+	gitTest(t, dir, "init", "-q", "-b", "main", ".")
+	gitTest(t, dir, "config", "user.email", "test@example.com")
+	gitTest(t, dir, "config", "user.name", "test")
+	return &testRepo{t: t, dir: dir, edges: map[string][]string{}}
+}
+
+func (r *testRepo) tree(files map[string]string) string {
+	r.t.Helper()
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var buf bytes.Buffer
+	for _, name := range names {
+		blob := strings.TrimSpace(gitTestIn(r.t, r.dir, files[name], "hash-object", "-w", "--stdin"))
+		buf.WriteString("100644 blob " + blob + "\t" + name + "\n")
+	}
+	return strings.TrimSpace(gitTestIn(r.t, r.dir, buf.String(), "mktree"))
+}
+
+func (r *testRepo) commitTree(tree string, parents []string, message string) string {
+	r.t.Helper()
+	args := []string{"commit-tree", tree}
+	for _, p := range parents {
+		args = append(args, "-p", p)
+	}
+	args = append(args, "-m", message)
+	sha := strings.TrimSpace(gitTest(r.t, r.dir, args...))
+	r.edges[sha] = append([]string(nil), parents...)
+	return sha
+}
+
+// commit writes every file given (a full snapshot) and commits the tree.
+func (r *testRepo) commit(message string, files map[string]string, parents ...string) string {
+	r.t.Helper()
+	return r.commitTree(r.tree(files), parents, message)
+}
+
+func (r *testRepo) setBranch(name, sha string) {
+	r.t.Helper()
+	gitTest(r.t, r.dir, "update-ref", "refs/heads/"+name, sha)
+}
+
+func (r *testRepo) onBranch(name string) {
+	r.t.Helper()
+	gitTest(r.t, r.dir, "symbolic-ref", "HEAD", "refs/heads/"+name)
+}
+
+func (r *testRepo) head() string {
+	r.t.Helper()
+	return strings.TrimSpace(gitTest(r.t, r.dir, "rev-parse", "HEAD"))
+}
+
+func (r *testRepo) parents(sha string) []string {
+	r.t.Helper()
+	line := strings.TrimSpace(gitTest(r.t, r.dir, "log", "--format=%P", "-1", sha))
+	if line == "" {
+		return nil
+	}
+	return strings.Fields(line)
+}
+
+func (r *testRepo) file(sha, path string) string {
+	r.t.Helper()
+	return gitTest(r.t, r.dir, "cat-file", "blob", sha+":"+path)
+}
+
+// withOrigin publishes the named branches to a bare origin, configures it to
+// allow fetching commits by id (GitHub allows reachable ids; the tests fetch
+// merge bases the same way), and points the work repo at it.
+func (r *testRepo) withOrigin(branches ...string) string {
+	r.t.Helper()
+	origin := filepath.Join(r.t.TempDir(), "origin.git")
+	if err := os.MkdirAll(origin, 0o755); err != nil {
+		r.t.Fatal(err)
+	}
+	gitTest(r.t, origin, "init", "-q", "--bare", "-b", "main", ".")
+	gitTest(r.t, origin, "config", "uploadpack.allowAnySHA1InWant", "true")
+	for _, b := range branches {
+		gitTest(r.t, r.dir, "push", "-q", origin, "refs/heads/"+b+":refs/heads/"+b)
+	}
+	gitTest(r.t, r.dir, "remote", "add", "origin", origin)
+	return origin
+}
+
+// publishCheckout mimics the publish job's checkout of the PR branch: a clone
+// of the base branch with the PR branch fetched and checked out.
+func publishCheckout(t *testing.T, origin, branch string) string {
+	t.Helper()
+	dir := t.TempDir()
+	gitTest(t, dir, "clone", "-q", origin, ".")
+	gitTest(t, dir, "config", "user.email", "test@example.com")
+	gitTest(t, dir, "config", "user.name", "test")
+	gitTest(t, dir, "fetch", "-q", "origin", "refs/heads/"+branch)
+	gitTest(t, dir, "checkout", "-q", "-B", branch, "FETCH_HEAD")
+	return dir
+}
+
+// dagCompare stands in for the compare API: the same status (head relative to
+// base) and merge base, computed from the DAG the test built. It must not use
+// git for this: the production code fetches with --depth=1, which grafts the
+// fetched branch shallow, and git merge-base would then find no common
+// history — which is exactly why the production code takes the merge base
+// from the API instead of walking local history.
+func dagCompare(r *testRepo) compareFunc {
+	return func(base, head string) (compareInfo, error) {
+		if base == head {
+			return compareInfo{Status: "identical", MergeBase: base}, nil
+		}
+		baseAnc := r.ancestors(base)
+		if baseAnc[head] {
+			return compareInfo{Status: "behind", MergeBase: head}, nil
+		}
+		headAnc := r.ancestors(head)
+		if headAnc[base] {
+			return compareInfo{Status: "ahead", MergeBase: base}, nil
+		}
+		var commons []string
+		for sha := range baseAnc {
+			if headAnc[sha] {
+				commons = append(commons, sha)
+			}
+		}
+		sort.Strings(commons)
+		if len(commons) == 0 {
+			return compareInfo{Status: "diverged"}, nil
+		}
+		return compareInfo{Status: "diverged", MergeBase: commons[0]}, nil
+	}
+}
+
+// ancestors walks the DAG the test recorded, not git history.
+func (r *testRepo) ancestors(sha string) map[string]bool {
+	out := map[string]bool{}
+	var walk func(string)
+	walk = func(s string) {
+		if out[s] {
+			return
+		}
+		out[s] = true
+		for _, p := range r.edges[s] {
+			walk(p)
+		}
+	}
+	walk(sha)
+	return out
+}
+
+func failCompare() compareFunc {
+	return func(base, head string) (compareInfo, error) {
+		return compareInfo{}, errors.New("compare unavailable")
+	}
+}
+
+// divergedConflict builds the issue #53 shape: two branches off one base that
+// changed the same region of f.txt, with pr also changing g.txt and main also
+// adding h.txt. divergedClean changes disjoint files instead.
+func divergedConflict(t *testing.T) (*testRepo, string, string, string) {
+	t.Helper()
+	r := newTestRepo(t)
+	base := r.commit("base", map[string]string{"f.txt": "a\nb\nc\n", "g.txt": "x\n"})
+	pr := r.commit("pr change", map[string]string{"f.txt": "a\nB\nc\n", "g.txt": "x\npr\n"}, base)
+	mainTip := r.commit("main change", map[string]string{"f.txt": "a\nb\nC\n", "g.txt": "x\n", "h.txt": "new\n"}, base)
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	return r, base, pr, mainTip
+}
+
+func divergedClean(t *testing.T) (*testRepo, string, string, string) {
+	t.Helper()
+	r := newTestRepo(t)
+	base := r.commit("base", map[string]string{"f.txt": "a\nb\nc\n", "g.txt": "x\n"})
+	pr := r.commit("pr change", map[string]string{"f.txt": "a\nb\nc\n", "g.txt": "x\npr\n"}, base)
+	mainTip := r.commit("main change", map[string]string{"f.txt": "a\nb\nc\n", "g.txt": "x\n", "h.txt": "new\n"}, base)
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	return r, base, pr, mainTip
+}
+
+func artifactDir(t *testing.T) (baseFile, infoFile, stateFile string) {
+	t.Helper()
+	out := t.TempDir()
+	return filepath.Join(out, "base-commit"), filepath.Join(out, "merge-info.json"), filepath.Join(out, "state.env")
+}
+
+// ---------------------------------------------------------------- merge-tree
+
+func TestMergeTreeParsesConflicts(t *testing.T) {
+	r, _, pr, mainTip := divergedConflict(t)
+	mergeBase := strings.TrimSpace(gitTest(t, r.dir, "merge-base", pr, mainTip))
+	tree, files, conflicted, err := mergeTree(r.dir, mergeBase, pr, mainTip)
+	if err != nil || !conflicted {
+		t.Fatalf("mergeTree: conflicted=%t err=%v", conflicted, err)
+	}
+	if !reflect.DeepEqual(files, []string{"f.txt"}) {
+		t.Fatalf("conflicted files = %v, want [f.txt]", files)
+	}
+	if marked := r.file(tree, "f.txt"); !strings.Contains(marked, "<<<<<<<") || !strings.Contains(marked, ">>>>>>>") {
+		t.Fatalf("merged file carries no markers: %q", marked)
+	}
+	// The same inputs must give the same tree: publish checks the run's
+	// recorded tree against its own recomputation.
+	tree2, _, _, err := mergeTree(r.dir, mergeBase, pr, mainTip)
+	if err != nil || tree2 != tree {
+		t.Fatalf("mergeTree is not deterministic: %s vs %s (%v)", tree, tree2, err)
+	}
+}
+
+func TestMergeTreeCleanHasNoFiles(t *testing.T) {
+	r, _, pr, mainTip := divergedClean(t)
+	mergeBase := strings.TrimSpace(gitTest(t, r.dir, "merge-base", pr, mainTip))
+	tree, files, conflicted, err := mergeTree(r.dir, mergeBase, pr, mainTip)
+	if err != nil || conflicted || files != nil {
+		t.Fatalf("mergeTree: conflicted=%t files=%v err=%v", conflicted, files, err)
+	}
+	if got := r.file(tree, "g.txt"); got != "x\npr\n" {
+		t.Fatalf("merged g.txt = %q", got)
+	}
+	if got := r.file(tree, "h.txt"); got != "new\n" {
+		t.Fatalf("merged h.txt = %q", got)
+	}
+}
+
+// ---------------------------------------------------------------- the run job
+
+// The run job commits the conflicted merge, makes it the base commit and
+// records it, so the brief can name the files and publish can recreate the
+// merge from the same two parents.
+func TestRunMergeCommitsConflictedMergeAndRecordsIt(t *testing.T) {
+	r, _, pr, mainTip := divergedConflict(t)
+	r.withOrigin("pr", "main")
+	baseFile, infoFile, _ := artifactDir(t)
+
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil {
+		t.Fatalf("runMerge: %v", err)
+	}
+	if got.State != mergeKindConflicted {
+		t.Fatalf("state = %q, want conflicted", got.State)
+	}
+	head := r.head()
+	if head == pr {
+		t.Fatal("the branch did not move to a merge commit")
+	}
+	if parents := r.parents(head); !reflect.DeepEqual(parents, []string{pr, mainTip}) {
+		t.Fatalf("merge parents = %v, want [%s %s]", parents, pr, mainTip)
+	}
+	// The checkout now shows the conflicted files, markers and all.
+	marked, err := os.ReadFile(filepath.Join(r.dir, "f.txt"))
+	if err != nil || !strings.Contains(string(marked), "<<<<<<<") {
+		t.Fatalf("checked-out f.txt carries no markers: %q (%v)", marked, err)
+	}
+	// The base commit is the merge commit, and the merge info records the
+	// merge for publish.
+	if base, err := os.ReadFile(baseFile); err != nil || strings.TrimSpace(string(base)) != head {
+		t.Fatalf("base-commit file = %q, want %s (%v)", base, head, err)
+	}
+	info, err := readMergeInfo(infoFile)
+	if err != nil {
+		t.Fatalf("merge info: %v", err)
+	}
+	if info.Kind != mergeKindConflicted || info.Commit != head || info.Base != pr || info.Onto != mainTip || info.Tree != got.Tree {
+		t.Fatalf("merge info = %+v", info)
+	}
+	if !reflect.DeepEqual(info.Files, []string{"f.txt"}) {
+		t.Fatalf("merge info files = %v, want [f.txt]", info.Files)
+	}
+}
+
+// A diverged branch whose trees merge cleanly gets an ordinary merge commit:
+// the branch then contains its base tip, and GitHub stops calling it dirty.
+func TestRunMergeCommitsCleanMerge(t *testing.T) {
+	r, _, pr, mainTip := divergedClean(t)
+	r.withOrigin("pr", "main")
+	baseFile, infoFile, _ := artifactDir(t)
+
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil {
+		t.Fatalf("runMerge: %v", err)
+	}
+	if got.State != mergeKindClean {
+		t.Fatalf("state = %q, want clean", got.State)
+	}
+	head := r.head()
+	if parents := r.parents(head); !reflect.DeepEqual(parents, []string{pr, mainTip}) {
+		t.Fatalf("merge parents = %v, want [%s %s]", parents, pr, mainTip)
+	}
+	info, err := readMergeInfo(infoFile)
+	if err != nil {
+		t.Fatalf("merge info: %v", err)
+	}
+	if info.Kind != mergeKindClean || info.Files != nil {
+		t.Fatalf("merge info = %+v", info)
+	}
+	if base, err := os.ReadFile(baseFile); err != nil || strings.TrimSpace(string(base)) != head {
+		t.Fatalf("base-commit file = %q, want %s (%v)", base, head, err)
+	}
+}
+
+// No merge is needed when the branch already contains the base tip, when the
+// branch is strictly behind it (publish fast-forwards instead), when HEAD is
+// not the branch the gate named, or when the compare API is unavailable.
+func TestRunMergeSkipsWhenNoMergeNeeded(t *testing.T) {
+	baseFiles := map[string]string{"f.txt": "a\n"}
+	r := newTestRepo(t)
+	base := r.commit("base", baseFiles)
+	ahead := r.commit("pr change", map[string]string{"f.txt": "a\npr\n"}, base)
+	r.setBranch("main", base) // the base tip is older: the branch contains it
+	r.setBranch("pr", ahead)
+	r.onBranch("pr")
+	r.withOrigin("pr", "main")
+	baseFile, infoFile, _ := artifactDir(t)
+
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != "none" {
+		t.Fatalf("contained base: state=%q err=%v", got.State, err)
+	}
+	if r.head() != ahead {
+		t.Fatal("the branch moved without a merge")
+	}
+	if _, err := os.Stat(infoFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("merge info written for a skipped merge: %v", err)
+	}
+
+	// Strictly behind: publish fast-forwards, the run does nothing.
+	r.setBranch("main", ahead)
+	r.setBranch("pr", base)
+	got, err = runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != "none" {
+		t.Fatalf("behind branch: state=%q err=%v", got.State, err)
+	}
+	if r.head() != base {
+		t.Fatal("the branch moved without a merge")
+	}
+
+	// A compare API failure degrades to no merge, never an error.
+	got, err = runMerge(r.dir, "pr", "main", baseFile, infoFile, failCompare())
+	if err != nil || got.State != "none" {
+		t.Fatalf("compare failure: state=%q err=%v", got.State, err)
+	}
+
+	// HEAD not on the named branch: nothing is merged.
+	r.onBranch("main")
+	got, err = runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != "none" || r.head() != ahead {
+		t.Fatalf("wrong branch: state=%q head=%s err=%v", got.State, r.head(), err)
+	}
+}
+
+// ---------------------------------------------------------------- the brief
+
+func TestMergeBriefSectionNamesConflictedFiles(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "merge-info.json")
+	info := mergeInfo{
+		Kind: mergeKindConflicted, Commit: strings.Repeat("a", 40), Base: strings.Repeat("b", 40),
+		Onto: strings.Repeat("c", 40), Tree: strings.Repeat("d", 40),
+		Files: []string{"app/main_test.go", "app/other.go"},
+	}
+	data, err := json.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	section, err := mergeBriefSection(path)
+	if err != nil {
+		t.Fatalf("mergeBriefSection: %v", err)
+	}
+	for _, want := range []string{"app/main_test.go", "app/other.go", "<<<<<<<", "resolve every conflict", "publish step refuses"} {
+		if !strings.Contains(strings.ToLower(section), strings.ToLower(want)) {
+			t.Fatalf("brief section lacks %q:\n%s", want, section)
+		}
+	}
+
+	// A clean merge tells the run the base came in without conflicts.
+	info.Kind = mergeKindClean
+	info.Files = nil
+	data, _ = json.Marshal(info)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	section, err = mergeBriefSection(path)
+	if err != nil {
+		t.Fatalf("mergeBriefSection: %v", err)
+	}
+	if strings.Contains(section, "<<<<<<<") || !strings.Contains(section, "merge commit") {
+		t.Fatalf("clean section = %q", section)
+	}
+
+	// No merge info is the normal case: an empty section, no error.
+	if section, err := mergeBriefSection(filepath.Join(dir, "absent.json")); err != nil || section != "" {
+		t.Fatalf("absent merge info: section=%q err=%v", section, err)
+	}
+
+	// A conflicted merge that cannot be read fails the brief: the run would
+	// otherwise work on marked files it was never told about.
+	if err := os.WriteFile(path, []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mergeBriefSection(path); err == nil {
+		t.Fatal("an unreadable conflicted merge must fail the brief")
+	}
+}
+
+// ---------------------------------------------------------------- publish
+
+// Publish recreates the run's conflicted merge from the same two parents: the
+// same tree (checked by hash), a merge commit whose parents are the PR head
+// it fetched and the recorded base tip.
+func TestPublishRecreatesConflictedMerge(t *testing.T) {
+	r, _, pr, mainTip := divergedConflict(t)
+	origin := r.withOrigin("pr", "main")
+	baseFile, infoFile, stateFile := artifactDir(t)
+
+	if _, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r)); err != nil {
+		t.Fatalf("runMerge: %v", err)
+	}
+	// Publish starts from a fresh checkout of the PR branch at the pushed
+	// head; the run's merge commit was never pushed.
+	pub := publishCheckout(t, origin, "pr")
+	if pubHead := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD")); pubHead != pr {
+		t.Fatalf("publish checkout at %s, want the PR head %s", pubHead, pr)
+	}
+
+	got, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, dagCompare(r))
+	if err != nil {
+		t.Fatalf("publishMerge: %v", err)
+	}
+	if got.State != mergeKindConflicted {
+		t.Fatalf("state = %q, want conflicted", got.State)
+	}
+	head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD"))
+	if parents := gitTest(t, pub, "log", "--format=%P", "-1", head); strings.Fields(parents)[0] != pr || strings.Fields(parents)[1] != mainTip {
+		t.Fatalf("recreated merge parents = %s, want [%s %s]", parents, pr, mainTip)
+	}
+	if marked, err := os.ReadFile(filepath.Join(pub, "f.txt")); err != nil || !strings.Contains(string(marked), "<<<<<<<") {
+		t.Fatalf("recreated f.txt carries no markers: %q (%v)", marked, err)
+	}
+	// The state file tells the workflow to verify the markers afterwards.
+	state, err := os.ReadFile(stateFile)
+	if err != nil || string(state) != "state=conflicted\nmerged=true\n" {
+		t.Fatalf("merge state = %q (%v)", state, err)
+	}
+	list, err := os.ReadFile(stateFile + ".files")
+	if err != nil || string(list) != "f.txt\n" {
+		t.Fatalf("conflicted file list = %q (%v)", list, err)
+	}
+}
+
+// A behind-but-clean PR gets a merge commit even when the run merged nothing:
+// publish merges the base tip first, then the patch applies on top.
+func TestPublishMergesFirstWhenClean(t *testing.T) {
+	r, base, pr, mainTip := divergedClean(t)
+	origin := r.withOrigin("pr", "main")
+	baseFile, _, stateFile := artifactDir(t)
+	if err := os.WriteFile(baseFile, []byte(pr+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pub := publishCheckout(t, origin, "pr")
+	got, err := publishMerge(pub, "pr", "main", baseFile, filepath.Join(t.TempDir(), "absent.json"), stateFile, dagCompare(r))
+	if err != nil {
+		t.Fatalf("publishMerge: %v", err)
+	}
+	if got.State != mergeKindClean {
+		t.Fatalf("state = %q, want clean", got.State)
+	}
+	head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD"))
+	if parents := gitTest(t, pub, "log", "--format=%P", "-1", head); strings.Fields(parents)[0] != pr || strings.Fields(parents)[1] != mainTip {
+		t.Fatalf("merge parents = %s, want [%s %s]", parents, pr, mainTip)
+	}
+	_ = base
+}
+
+// The branch that is strictly behind its base is fast-forwarded: the base
+// comes in with no merge commit, and the patch applies on top.
+func TestPublishFastForwardsBehindBranch(t *testing.T) {
+	r, _, _, _ := divergedClean(t)
+	origin := r.withOrigin("pr", "main")
+	baseFile, _, stateFile := artifactDir(t)
+	// main moved past the branch; the branch is its base's ancestor.
+	mainTip := strings.TrimSpace(gitTest(t, r.dir, "rev-parse", "main"))
+	prOld := strings.TrimSpace(gitTest(t, r.dir, "rev-parse", "main~1"))
+	r.setBranch("pr", prOld)
+	gitTest(t, r.dir, "push", "-qf", origin, "refs/heads/pr:refs/heads/pr")
+	if err := os.WriteFile(baseFile, []byte(prOld+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pub := publishCheckout(t, origin, "pr")
+	got, err := publishMerge(pub, "pr", "main", baseFile, filepath.Join(t.TempDir(), "absent.json"), stateFile, dagCompare(r))
+	if err != nil {
+		t.Fatalf("publishMerge: %v", err)
+	}
+	if got.State != "ff" {
+		t.Fatalf("state = %q, want ff", got.State)
+	}
+	if head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD")); head != mainTip {
+		t.Fatalf("HEAD = %s, want the fast-forwarded %s", head, mainTip)
+	}
+}
+
+// Without merge info, a patch made against a branch head that is not the one
+// publish fetched is still refused as stale.
+func TestPublishRefusesStalePatch(t *testing.T) {
+	r, base, pr, _ := divergedClean(t)
+	origin := r.withOrigin("pr", "main")
+	baseFile, _, stateFile := artifactDir(t)
+	if err := os.WriteFile(baseFile, []byte(base+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pub := publishCheckout(t, origin, "pr")
+	_, err := publishMerge(pub, "pr", "main", baseFile, filepath.Join(t.TempDir(), "absent.json"), stateFile, dagCompare(r))
+	if err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("publishMerge err = %v, want a stale refusal", err)
+	}
+	_ = pr
+}
+
+// Publish refuses a recorded merge whose recomputed tree does not match the
+// tree the run recorded: the patch's base is then unknown.
+func TestPublishRefusesTreeMismatch(t *testing.T) {
+	r, _, _, _ := divergedConflict(t)
+	origin := r.withOrigin("pr", "main")
+	baseFile, infoFile, stateFile := artifactDir(t)
+	if _, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r)); err != nil {
+		t.Fatalf("runMerge: %v", err)
+	}
+	// Tamper with the recorded tree, as a run whose artifacts disagree would.
+	info, err := readMergeInfo(infoFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info.Tree = r.tree(map[string]string{"f.txt": "tampered\n"})
+	data, _ := json.Marshal(info)
+	if err := os.WriteFile(infoFile, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pub := publishCheckout(t, origin, "pr")
+	_, err = publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, dagCompare(r))
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("publishMerge err = %v, want a tree mismatch refusal", err)
+	}
+}
+
+// Publish refuses a recorded merge naming a different PR head than the one it
+// fetched, or a base commit that is not the merge commit the info names.
+func TestPublishRefusesMergeInfoMismatch(t *testing.T) {
+	r, base, pr, _ := divergedConflict(t)
+	origin := r.withOrigin("pr", "main")
+	baseFile, infoFile, stateFile := artifactDir(t)
+	if _, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r)); err != nil {
+		t.Fatalf("runMerge: %v", err)
+	}
+	// The base commit artifact disagrees with the merge commit the info
+	// records.
+	pub := publishCheckout(t, origin, "pr")
+	if err := os.WriteFile(baseFile, []byte(base+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, dagCompare(r))
+	if err == nil || !strings.Contains(err.Error(), "base commit") {
+		t.Fatalf("base commit mismatch err = %v, want a refusal", err)
+	}
+
+	// A branch that moved between the run and publish: the recorded base is
+	// not the fetched head.
+	r.setBranch("pr", r.commit("moved", map[string]string{"f.txt": "moved\n"}, pr))
+	gitTest(t, r.dir, "push", "-qf", origin, "refs/heads/pr:refs/heads/pr")
+	pub2 := publishCheckout(t, origin, "pr")
+	_, err = publishMerge(pub2, "pr", "main", baseFile, infoFile, stateFile, dagCompare(r))
+	if err == nil || !strings.Contains(err.Error(), "another commit") {
+		t.Fatalf("stale merge info err = %v, want a base mismatch refusal", err)
+	}
+}
+
+// Publish refuses a recorded merge whose base tip is not a commit the base
+// branch contains: anything else could smuggle content in as "the base".
+func TestPublishRefusesForeignBaseTip(t *testing.T) {
+	r, base, pr, _ := divergedConflict(t)
+	origin := r.withOrigin("pr", "main")
+	// A commit on a third branch, which main does not contain.
+	stranger := r.commit("stranger work", map[string]string{"evil.txt": "evil\n"}, base)
+	r.setBranch("stranger", stranger)
+	gitTest(t, r.dir, "push", "-q", origin, "refs/heads/stranger:refs/heads/stranger")
+	baseFile, _, stateFile := artifactDir(t)
+	if err := os.WriteFile(baseFile, []byte(pr+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Commit names the value of the base-commit file (the PR head), so the
+	// fixture gets past the coherence checks and reaches the one this test
+	// is about: a base tip the base branch does not contain.
+	foreign := mergeInfo{
+		Kind: mergeKindClean, Commit: pr,
+		Base: pr, Onto: stranger, Tree: r.tree(map[string]string{"evil.txt": "evil\n"}),
+	}
+	data, _ := json.Marshal(foreign)
+	infoFile := filepath.Join(t.TempDir(), "merge-info.json")
+	if err := os.WriteFile(infoFile, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pub := publishCheckout(t, origin, "pr")
+	_, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, dagCompare(r))
+	if err == nil || !strings.Contains(err.Error(), "not contained") {
+		t.Fatalf("publishMerge err = %v, want a foreign base tip refusal", err)
+	}
+}
+
+// A conflict the run never saw (its merge info never existed) is not pushed:
+// publish keeps the patch alone rather than publishing marked files.
+func TestPublishKeepsPatchWhenMergeConflicts(t *testing.T) {
+	r, _, pr, _ := divergedConflict(t)
+	origin := r.withOrigin("pr", "main")
+	baseFile, _, stateFile := artifactDir(t)
+	if err := os.WriteFile(baseFile, []byte(pr+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pub := publishCheckout(t, origin, "pr")
+	got, err := publishMerge(pub, "pr", "main", baseFile, filepath.Join(t.TempDir(), "absent.json"), stateFile, dagCompare(r))
+	if err != nil {
+		t.Fatalf("publishMerge: %v", err)
+	}
+	if got.State != "none" || got.Commit != "" {
+		t.Fatalf("state = %q commit = %q, want no merge", got.State, got.Commit)
+	}
+	if head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD")); head != pr {
+		t.Fatalf("HEAD = %s, want the untouched PR head %s", head, pr)
+	}
+}
+
+// ---------------------------------------------------------------- verify
+
+func TestVerifyRefusesLeftoverMarkers(t *testing.T) {
+	dir := t.TempDir()
+	stateFile := filepath.Join(dir, "state.env")
+	marked := "<<<<<<< pr\npr side\n=======\nmain side\n>>>>>>> main\n"
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte(marked), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stateFile, []byte("state=conflicted\nmerged=true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stateFile+".files", []byte("f.txt\nresolved.txt\ndeleted.txt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The patch was supposed to remove the markers: publish refuses.
+	err := verifyMerge(dir, stateFile)
+	if err == nil || !strings.Contains(err.Error(), "conflict marker") {
+		t.Fatalf("verifyMerge err = %v, want a marker refusal", err)
+	}
+
+	// A fully resolved patch publishes: resolved files pass, and a conflicted
+	// file the patch deleted counts as resolved.
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("pr side\nmain side\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "resolved.txt"), []byte("settled\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyMerge(dir, stateFile); err != nil {
+		t.Fatalf("verifyMerge on a resolved patch: %v", err)
+	}
+
+	// A clean or fast-forward merge has nothing to verify.
+	if err := os.WriteFile(stateFile, []byte("state=clean\nmerged=true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte(marked), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyMerge(dir, stateFile); err != nil {
+		t.Fatalf("verifyMerge on a clean merge: %v", err)
+	}
+}
+
+func TestFindConflictMarker(t *testing.T) {
+	cases := map[string]bool{
+		"<<<<<<< HEAD\n":      true,
+		">>>>>>> main\n":      true,
+		"// <<<<<<< note\n":   false, // not at the start of the line
+		"text\n=======\n":     false,
+		"plain content\n":     false,
+		"<<<<\n":              false, // too short to be a marker
+		"a\n\n>>>>>>>  tag\n": true,
+	}
+	for text, want := range cases {
+		if _, got := findConflictMarker([]byte(text)); got != want {
+			t.Errorf("findConflictMarker(%q) = %t, want %t", text, got, want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------- validation
+
+func TestReadMergeInfoValidation(t *testing.T) {
+	dir := t.TempDir()
+	good := mergeInfo{
+		Kind: mergeKindConflicted, Commit: strings.Repeat("a", 40), Base: strings.Repeat("b", 40),
+		Onto: strings.Repeat("c", 40), Tree: strings.Repeat("d", 40), Files: []string{"f.txt"},
+	}
+	data, _ := json.Marshal(good)
+	path := filepath.Join(dir, "merge-info.json")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := readMergeInfo(path); err != nil || info.Kind != mergeKindConflicted {
+		t.Fatalf("readMergeInfo: %+v %v", info, err)
+	}
+
+	cases := map[string]mergeInfo{
+		"unknown kind":  {Kind: "weird", Commit: good.Commit, Base: good.Base, Onto: good.Onto, Tree: good.Tree},
+		"short sha":     {Kind: mergeKindClean, Commit: "abc", Base: good.Base, Onto: good.Onto, Tree: good.Tree},
+		"uppercase sha": {Kind: mergeKindClean, Commit: strings.Repeat("A", 40), Base: good.Base, Onto: good.Onto, Tree: good.Tree},
+		"path escape":   {Kind: mergeKindConflicted, Commit: good.Commit, Base: good.Base, Onto: good.Onto, Tree: good.Tree, Files: []string{"../f.txt"}},
+		"absolute path": {Kind: mergeKindConflicted, Commit: good.Commit, Base: good.Base, Onto: good.Onto, Tree: good.Tree, Files: []string{"/etc/passwd"}},
+		"newline path":  {Kind: mergeKindConflicted, Commit: good.Commit, Base: good.Base, Onto: good.Onto, Tree: good.Tree, Files: []string{"a\nb"}},
+	}
+	for name, info := range cases {
+		data, _ := json.Marshal(info)
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readMergeInfo(path); err == nil {
+			t.Errorf("readMergeInfo accepted %s", name)
+		}
+	}
+	// A path list over the cap is refused too.
+	good.Files = make([]string, 201)
+	for i := range good.Files {
+		good.Files[i] = "f" + strconv.Itoa(i) + ".txt"
+	}
+	data, _ = json.Marshal(good)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readMergeInfo(path); err == nil {
+		t.Error("readMergeInfo accepted an oversized path list")
+	}
+	// A missing file is a missing file, not a validation failure: publish
+	// tells that case apart.
+	if _, err := readMergeInfo(filepath.Join(dir, "absent.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("readMergeInfo on an absent file = %v", err)
+	}
+}
+
+func TestMergeStateFileRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	stateFile := filepath.Join(dir, "state.env")
+	if err := writeMergeState(stateFile, mergeOutcome{State: "none"}); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(stateFile); err != nil || string(data) != "state=none\nmerged=false\n" {
+		t.Fatalf("state = %q (%v)", data, err)
+	}
+	if _, err := os.Stat(stateFile + ".files"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a clean merge wrote a file list: %v", err)
+	}
+	files := []string{"one.txt", "two.txt"}
+	if err := writeMergeState(stateFile, mergeOutcome{State: mergeKindConflicted, Files: files}); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(stateFile); err != nil || string(data) != "state=conflicted\nmerged=true\n" {
+		t.Fatalf("state = %q (%v)", data, err)
+	}
+	list, err := os.ReadFile(stateFile + ".files")
+	if err != nil || string(list) != "one.txt\ntwo.txt\n" {
+		t.Fatalf("file list = %q (%v)", list, err)
+	}
+}
+
+// The full issue #57 round trip: the run commits the conflicted merge and
+// CodeAF resolves it, publish recreates the same merge from the same two
+// parents, the patch applies on it and removes the markers, and the marker
+// check passes — so the branch ends up containing its base with the conflict
+// resolved, pushed as a plain descendant of the PR head.
+func TestConflictedMergeRoundTrip(t *testing.T) {
+	r, _, pr, mainTip := divergedConflict(t)
+	origin := r.withOrigin("pr", "main")
+	baseFile, infoFile, stateFile := artifactDir(t)
+
+	// The run job: conflicted merge committed, base commit rewritten.
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != mergeKindConflicted {
+		t.Fatalf("runMerge: state=%q err=%v", got.State, err)
+	}
+
+	// CodeAF resolves the conflict and the package step stages and exports
+	// the patch (diff against the merge commit the run made).
+	resolved := "a\nB\nC\n"
+	if err := os.WriteFile(filepath.Join(r.dir, "f.txt"), []byte(resolved), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, r.dir, "add", "f.txt")
+	patch := strings.TrimSpace(gitTest(t, r.dir, "diff", "--cached", "--binary"))
+	if !strings.Contains(patch, "b/main") && !strings.Contains(patch, "f.txt") {
+		t.Fatalf("patch does not touch f.txt:\n%s", patch)
+	}
+	in := t.TempDir()
+	patchFile := filepath.Join(in, "changes.patch")
+	if err := os.WriteFile(patchFile, []byte(patch+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Publish, from a fresh checkout still at the pushed PR head.
+	pub := publishCheckout(t, origin, "pr")
+	out, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, dagCompare(r))
+	if err != nil {
+		t.Fatalf("publishMerge: %v", err)
+	}
+	if out.State != mergeKindConflicted {
+		t.Fatalf("publish state = %q, want conflicted", out.State)
+	}
+	// The patch applies strictly on the recreated merge (its tree is the
+	// one the patch was diffed against) and removes the markers.
+	gitTest(t, pub, "apply", "--index", "--binary", patchFile)
+	if staged := gitTest(t, pub, "cat-file", "blob", ":f.txt"); staged != resolved {
+		t.Fatalf("staged f.txt = %q, want the resolution %q", staged, resolved)
+	}
+	if err := verifyMerge(pub, stateFile); err != nil {
+		t.Fatalf("verifyMerge after the resolution: %v", err)
+	}
+	// Sanity: the recreated merge's parents are the fetched head and base tip.
+	head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD"))
+	parents := gitTest(t, pub, "log", "--format=%P", "-1", head)
+	if fields := strings.Fields(parents); fields[0] != pr || fields[1] != mainTip {
+		t.Fatalf("recreated merge parents = %s, want [%s %s]", parents, pr, mainTip)
+	}
+}
+
+// A base that changed .github/workflows/ since the branch point is never
+// brought in: GitHub refuses a GITHUB_TOKEN push that carries workflow
+// changes, so the run proceeds on the bare head and publish pushes the patch
+// alone, as before #57.
+func TestMergeSkipsWorkflowChanges(t *testing.T) {
+	r := newTestRepo(t)
+	base := r.commit("base", map[string]string{"f.txt": "a\n"})
+	pr := r.commit("pr change", map[string]string{"f.txt": "a\npr\n"}, base)
+	// mktree takes no nested paths, so this commit is built through an index.
+	index := filepath.Join(t.TempDir(), "index")
+	blob := func(content string) string {
+		return strings.TrimSpace(gitTestIn(t, r.dir, content, "hash-object", "-w", "--stdin"))
+	}
+	env := func(args ...string) string {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = r.dir
+		cmd.Env = append(os.Environ(), "GIT_INDEX_FILE="+index)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	env("update-index", "--add", "--cacheinfo", "100644,"+blob("a\n")+",f.txt")
+	env("update-index", "--add", "--cacheinfo", "100644,"+blob("on: push\n")+",.github/workflows/ci.yml")
+	mainTip := r.commitTree(env("write-tree"), []string{base}, "main changes a workflow")
+	r.setBranch("pr", pr)
+	r.setBranch("main", mainTip)
+	r.onBranch("pr")
+	origin := r.withOrigin("pr", "main")
+
+	baseFile, infoFile, stateFile := artifactDir(t)
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != "none" || r.head() != pr {
+		t.Fatalf("runMerge = %+v, %v (head %s); want no merge on %s", got, err, r.head(), pr)
+	}
+
+	if err := os.WriteFile(baseFile, []byte(pr+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pub := publishCheckout(t, origin, "pr")
+	got, err = publishMerge(pub, "pr", "main", baseFile, filepath.Join(t.TempDir(), "absent.json"), stateFile, dagCompare(r))
+	if err != nil || got.State != "none" {
+		t.Fatalf("publishMerge = %+v, %v; want no merge", got, err)
+	}
+	if head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD")); head != pr {
+		t.Fatalf("publish head = %s, want the untouched branch %s", head, pr)
+	}
+}

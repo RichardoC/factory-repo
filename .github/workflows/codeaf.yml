@@ -117,6 +117,8 @@ jobs:
       MODE: ${{ needs.gate.outputs.mode }}
       NUMBER: ${{ needs.gate.outputs.number }}
       BRANCH: ${{ needs.gate.outputs.branch }}
+      # Issue #57: the branch a pr run brings in — the PR base branch.
+      BASE: ${{ needs.gate.outputs.base }}
       # The time budget the brief states, and the same limit `codeaf do` gets:
       # one literal value, passed as data, never through an expression.
       CODEAF_BUDGET_MINUTES: "100"
@@ -166,6 +168,22 @@ jobs:
           fi
           mkdir -p "$RUNNER_TEMP/out"
           git rev-parse HEAD > "$RUNNER_TEMP/out/base-commit"
+
+      - name: Merge the PR base branch
+        # Issue #57: a PR that conflicts with its base stays dirty forever
+        # unless its branch comes to contain the base. Before CodeAF works,
+        # the base tip is merged into the branch: cleanly when the trees
+        # merge, otherwise as a merge commit whose files carry conflict
+        # markers, which the brief names for CodeAF to resolve. The commit
+        # exists only in this checkout — the run job has no write token and
+        # pushes nothing — and publish recreates it from the same two
+        # parents, checked by tree hash, before applying the patch
+        # (merge.go).
+        if: needs.gate.outputs.mode == 'pr'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          "$HARNESS" merge-default run "$RUNNER_TEMP/out/base-commit" "$RUNNER_TEMP/out/merge-info.json"
 
       - name: Build CodeAF
         # Always from the pinned source, never from a cache: a cached binary was
@@ -218,6 +236,9 @@ jobs:
       - name: Write the brief
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          # Issue #57: set when the step above merged the PR base branch in
+          # (naming the conflicts on a conflict), so the brief tells the run.
+          MERGE_INFO_FILE: ${{ runner.temp }}/out/merge-info.json
         run: |
           # A review run's brief asks for a review of the PR's diff against
           # the issue instead of working the issue.
@@ -534,13 +555,28 @@ jobs:
         if: needs.gate.outputs.mode != 'review'
         env:
           HARNESS_APPROVED: ${{ steps.approval.outputs.approved }}
+          GITHUB_TOKEN: ${{ github.token }}
           GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name  "codeaf[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           moved=false
+          merge_state=none
           if git fetch --depth=1 origin "refs/heads/$BRANCH" 2>/dev/null; then
             git checkout -B "$BRANCH" FETCH_HEAD
+            if [ "$MODE" = pr ]; then
+              # Issue #57: bring the PR base branch in before the patch is
+              # applied. The harness recreates the merge the run job
+              # committed (same two parents, tree hash checked) or merges
+              # the base tip itself when the run merged nothing. Everything
+              # is recomputed here from origin: the merge info the run left
+              # is validated data, never executed, and any mismatch refuses
+              # the publish.
+              "$HARNESS" merge-default publish "$IN/base-commit" "$IN/merge-info.json" "$RUNNER_TEMP/merge-state.env"
+              if grep -qx "state=clean" "$RUNNER_TEMP/merge-state.env" 2>/dev/null; then merge_state=clean; fi
+              if grep -qx "state=conflicted" "$RUNNER_TEMP/merge-state.env" 2>/dev/null; then merge_state=conflicted; fi
+              if grep -qx "state=ff" "$RUNNER_TEMP/merge-state.env" 2>/dev/null; then merge_state=ff; fi
+            fi
           else
             # A new branch. If the default branch moved while CodeAF ran, the
             # patch is merged onto it (below) rather than refused as stale.
@@ -582,10 +618,22 @@ jobs:
                 git apply --index --binary "$patch"
               fi
             else
-              if [ "$(cat "$IN/base-commit" 2>/dev/null)" != "$(git rev-parse HEAD)" ]; then
-                echo "::error::the branch moved while CodeAF ran; refusing to apply a stale patch" | tee -a "$PUBLISH_ERRORS_PATH"; exit 1
+              if [ "$MODE" = pr ]; then
+                # Issue #57: the base commit was checked by merge-default
+                # above - it is the branch head or the merge commit it
+                # recreated from the same two parents. The patch was made
+                # before that merge, so a strict apply can fail where a
+                # 3-way apply still merges cleanly.
+                if ! git apply --index --binary "$patch"; then
+                  echo "The patch does not apply strictly on the merged tree; retrying with a 3-way merge"
+                  git apply --index --binary --3way "$patch"
+                fi
+              else
+                if [ "$(cat "$IN/base-commit" 2>/dev/null)" != "$(git rev-parse HEAD)" ]; then
+                  echo "::error::the branch moved while CodeAF ran; refusing to apply a stale patch" | tee -a "$PUBLISH_ERRORS_PATH"; exit 1
+                fi
+                git apply --index --binary "$patch"
               fi
-              git apply --index --binary "$patch"
             fi
             if git diff --cached --name-only | grep -qE '(^|/)\.git(/|$)'; then
               echo "::error::patch touches a .git path; refusing it" | tee -a "$PUBLISH_ERRORS_PATH"; exit 1
@@ -600,6 +648,17 @@ jobs:
             changed=$(git diff --cached --name-only | wc -l)
           fi
           echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          # Issue #57: a conflicted merge must be fully resolved - whatever
+          # the patch did, even nothing, publish refuses while a conflict
+          # marker remains in any file the merge conflicted.
+          if [ "$MODE" = pr ] && [ "$merge_state" = conflicted ]; then
+            "$HARNESS" merge-default verify "$RUNNER_TEMP/merge-state.env"
+          fi
+          if [ "$merge_state" = none ]; then
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "merged=true" >> "$GITHUB_OUTPUT"
+          fi
           if [ "$changed" -gt 0 ]; then
             git commit -q -m "codeaf: work for #$NUMBER" -m "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           fi
@@ -607,7 +666,9 @@ jobs:
 
       - name: Push and open/update PR
         id: pr
-        if: steps.apply.outputs.changed != '0' && needs.gate.outputs.mode != 'review'
+        # Issue #57: a merge-only push (the branch brought its base in, the
+        # patch changed nothing) still moves the branch.
+        if: (steps.apply.outputs.changed != '0' || steps.apply.outputs.merged == 'true') && needs.gate.outputs.mode != 'review'
         env:
           GH_TOKEN: ${{ github.token }}
           # GITHUB_TOKEN can never push changes to .github/workflows/, so an
@@ -811,7 +872,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           WEEK_SPENT_BEFORE: ${{ needs.run.outputs.week_before }}
           CHANGED: ${{ steps.apply.outputs.changed }}
-          OUTCOME: ${{ needs.run.result != 'success' && 'run job failed' || (job.status != 'success' && 'publishing failed' || (steps.apply.outputs.changed != '0' && 'changes pushed' || 'no changes')) }}
+          OUTCOME: ${{ needs.run.result != 'success' && 'run job failed' || (job.status != 'success' && 'publishing failed' || ((steps.apply.outputs.changed != '0' || steps.apply.outputs.merged == 'true') && 'changes pushed' || 'no changes')) }}
         run: |
           "$HARNESS" report > "$RUNNER_TEMP/report.md"
           cat "$RUNNER_TEMP/report.md" >> "$GITHUB_STEP_SUMMARY"
