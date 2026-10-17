@@ -20,6 +20,16 @@
       "worker": "moonshotai/kimi-k3",
       "planner": "moonshotai/kimi-k3",
       "checker": "moonshotai/kimi-k3"
+    },
+    "infinite": {
+      "worker": "synthetic/deepseek-v4.1-flash-infinite",
+      "planner": "synthetic/deepseek-v4.1-flash-infinite",
+      "checker": "synthetic/deepseek-v4.1-flash-infinite"
+    },
+    "baseline-infinite": {
+      "worker": "zai-org/glm-5.3-flash",
+      "planner": "synthetic/deepseek-v4.1-flash-infinite",
+      "checker": "synthetic/deepseek-v4.1-flash-infinite"
     }
   }
 }
