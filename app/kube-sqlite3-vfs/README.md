@@ -31,6 +31,33 @@ client-go's fake clientset and need no cluster. `api-calls/op` is stable
 between runs; `ns/op` is not, so compare medians of several `-count=5` runs
 rather than single numbers.
 
+### Integration tests (issue #69)
+
+The tests in `pkg/vfs/vfs_integration_test.go` live behind the
+`//go:build integration` build tag (issue #69). They run against a **real
+kube-apiserver** via controller-runtime's envtest, so the resourceVersion
+compare-and-swap (409 Conflict), `AlreadyExists` on Create and label-selector
+LISTs are exercised by the API server itself rather than by hand-written fake
+reactors. Because of the build tag they are excluded from the default
+`go test ./...` — the unit tests need no cluster and no downloaded binaries.
+
+To run them, install the envtest binaries first. `setup-envtest` downloads the
+kube-apiserver and etcd binaries from the envtest-tools release storage and
+prints the directory it put them in:
+
+```sh
+go install sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.25.3-0.20261012174806-32759fab3119
+KUBEBUILDER_ASSETS="$(setup-envtest use 1.37.0 -p path)"
+```
+
+The `1.37.0` binary set matches the module's `k8s.io/*` v0.37.x dependencies.
+Then run the tagged tests; with `KUBEBUILDER_ASSETS` set (it also works to set
+it inline for one command):
+
+```sh
+go test -race -count=1 -tags integration ./pkg/vfs
+```
+
 ## How it works
 
 Creates a set of configmaps per file requested, which is named a base32 encoding of the filename
