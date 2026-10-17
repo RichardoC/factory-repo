@@ -202,7 +202,15 @@ whether through prompt injection or a compromised model.
   - changed triggers (a `workflow_dispatch` may only gain inputs);
   - changed permissions or environments;
   - a new or edited step, job env or `with` that references secrets;
-  - new jobs that aren't read-only;
+  - any change to a privileged job: one that names a secret or
+    `github.token` anywhere, has an environment or a reusable workflow, or
+    can write (its own permissions or the top level's). Its unprivileged
+    steps are frozen too, because they feed the privileged ones (they build
+    the binary the key is piped to, pick the checkout ref, set
+    `$GITHUB_ENV`). So is everything outside `jobs` in a workflow with a
+    privileged job. In practice every CodeAF workflow is frozen, and only
+    read-only jobs such as CI's can change without a maintainer;
+  - new jobs that aren't read-only, or that use `github.token`;
   - new or unpinned actions;
   - new `github.event` interpolation in `run:`.
 

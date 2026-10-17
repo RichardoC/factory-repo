@@ -26,6 +26,12 @@ package main
 //   - a step that references secrets is unchanged (it must equal a step of
 //     the same job in the default branch), and no other step, job env or
 //     job `with` may reference secrets;
+//   - a privileged job -- one that names a secret or `github.token`
+//     anywhere, has an environment or a reusable workflow, or can write
+//     (its own permissions or the top level's) -- is unchanged as a whole,
+//     and so is everything outside `jobs` in a workflow that has one: an
+//     unprivileged step can still feed a privileged one (build the binary
+//     the key is piped to, pick the checkout ref, set $GITHUB_ENV);
 //   - every action is pinned to a full commit SHA and already used, at that
 //     SHA, somewhere in the default branch's workflows (no new actions);
 //   - no new `run:` script interpolates `github.event` (script injection).
@@ -81,6 +87,35 @@ func mentionsSecrets(v any) bool {
 		}
 	})
 	return found
+}
+
+// mentionsCredentials reports whether any string inside v references a
+// secret or the workflow token (`github.token`, `secrets.GITHUB_TOKEN`).
+func mentionsCredentials(v any) bool {
+	found := false
+	walkStrings(v, func(s string) {
+		if strings.Contains(s, "secrets.") || strings.Contains(s, "secrets[") || strings.Contains(s, "github.token") {
+			found = true
+		}
+	})
+	return found
+}
+
+// privilegedJob reports whether a job holds anything a patch could steal or
+// abuse: a secret or the token (named anywhere in the job), an environment
+// (whose secrets it receives), a reusable workflow, or a write permission,
+// its own or inherited from the workflow's top level. A step that names no
+// secret can still feed one that does (it builds the binary the key is
+// piped to, picks the checkout ref, sets $GITHUB_ENV), so such a job must
+// stay exactly as it is on the default branch.
+func privilegedJob(job map[string]any, topPermissions any) bool {
+	if mentionsCredentials(job) || job["environment"] != nil || job["uses"] != nil {
+		return true
+	}
+	if perms, ok := job["permissions"]; ok {
+		return !onlyReadPermissions(perms)
+	}
+	return !onlyReadPermissions(topPermissions)
 }
 
 func walkStrings(v any, f func(string)) {
@@ -240,6 +275,37 @@ func WorkflowPolicy(before, after map[string]map[string]any) []string {
 		}
 
 		aJobs, bJobs := asMap(a["jobs"]), asMap(b["jobs"])
+		// Top-level env, defaults and concurrency reach every job, so in a
+		// workflow with a privileged job everything outside `jobs` is frozen
+		// (triggers and permissions are reported above).
+		hasPrivileged := false
+		for _, j := range bJobs {
+			if privilegedJob(asMap(j), b["permissions"]) {
+				hasPrivileged = true
+			}
+		}
+		if hasPrivileged {
+			keys := map[string]bool{}
+			for k := range a {
+				keys[k] = true
+			}
+			for k := range b {
+				keys[k] = true
+			}
+			sorted := make([]string, 0, len(keys))
+			for k := range keys {
+				sorted = append(sorted, k)
+			}
+			sort.Strings(sorted)
+			for _, k := range sorted {
+				if k == "jobs" || k == "on" || k == "permissions" {
+					continue
+				}
+				if !reflect.DeepEqual(a[k], b[k]) {
+					add("%s: top-level %s changed in a workflow with a privileged job", name, k)
+				}
+			}
+		}
 		for id := range bJobs {
 			if _, ok := aJobs[id]; !ok {
 				add("%s: job %q removed", name, id)
@@ -265,9 +331,14 @@ func WorkflowPolicy(before, after map[string]map[string]any) []string {
 				}
 				if mentionsSecrets(aj) {
 					add("%s: new job %q may not reference secrets", name, id)
+				} else if mentionsCredentials(aj) {
+					add("%s: new job %q may not reference the workflow token", name, id)
 				}
 			} else {
 				bjm := asMap(bj)
+				if (privilegedJob(bjm, b["permissions"]) || privilegedJob(aj, a["permissions"])) && !reflect.DeepEqual(aj, bjm) {
+					add("%s: job %q holds a secret, the token, an environment or a write permission, and changed; only a maintainer may change it", name, id)
+				}
 				for _, key := range []string{"permissions", "environment", "uses", "secrets"} {
 					if !reflect.DeepEqual(aj[key], bjm[key]) {
 						add("%s: job %q changed its %s", name, id, key)

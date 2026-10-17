@@ -31,6 +31,41 @@ jobs:
       - run: go vet ./...
       - run: go test -race -count=1 ./...
 
+  hygiene:
+    # Repository checks that need no Go module: workflow lint, and no build
+    # output or other large binaries committed (AGENTS.md, repository
+    # hygiene).
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: .github/codeaf/go.mod
+          cache: false
+      - name: actionlint
+        # Pinned version, built from source each run. shellcheck is off for
+        # now: the existing scripts have not been through it yet.
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          "$(go env GOPATH)/bin/actionlint" -shellcheck= .github/workflows/*.yml
+      - name: No binaries or large files
+        run: |
+          bad=0
+          while IFS= read -r -d '' f; do
+            [ -f "$f" ] || continue
+            size=$(stat -c %s "$f")
+            if [ "$size" -gt 1048576 ]; then
+              echo "::error file=$f::tracked file is $size bytes (over 1 MiB)"; bad=1
+            fi
+            if [ "$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')" = 7f454c46 ]; then
+              echo "::error file=$f::tracked file is an ELF binary"; bad=1
+            fi
+          done < <(git ls-files -z)
+          exit "$bad"
+
   modules:
     # Every Go module outside .github/ (the harness has its own job above).
     runs-on: ubuntu-latest
@@ -80,17 +115,22 @@ jobs:
         run: go test -race -count=1 ./...
 
   go:
-    # The required status check: passes when every module passed, or when
-    # there are no modules yet. Kept under this name for branch protection.
-    needs: [modules, go-module]
+    # The required status check: passes when the harness, the repository
+    # checks and every module passed (no modules yet counts as passed).
+    # Kept under this name for branch protection.
+    needs: [harness, hygiene, modules, go-module]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - env:
+          HARNESS: ${{ needs.harness.result }}
+          HYGIENE: ${{ needs.hygiene.result }}
           MODULES: ${{ needs.modules.result }}
           CHECKS: ${{ needs.go-module.result }}
         run: |
-          echo "modules: $MODULES, per-module checks: $CHECKS"
+          echo "harness: $HARNESS, hygiene: $HYGIENE, modules: $MODULES, per-module checks: $CHECKS"
+          [ "$HARNESS" = success ] || exit 1
+          [ "$HYGIENE" = success ] || exit 1
           [ "$MODULES" = success ] || exit 1
           [ "$CHECKS" = success ] || [ "$CHECKS" = skipped ]

@@ -454,6 +454,10 @@ knowing*).
     can't:
     - no new triggers, permissions or environments;
     - no new or edited steps that reference secrets;
+    - no change at all to a privileged job (one holding a secret, the
+      token, an environment or a write permission), since its unprivileged
+      steps feed its privileged ones; in practice only read-only jobs
+      such as CI's can change;
     - no new or unpinned actions;
     - no new `github.event` interpolation;
     - no new or deleted workflow files.
