@@ -25,7 +25,7 @@
 name: CodeAF
 # Countable by title: the queue parses run titles to learn which lane each
 # in-flight run sits on; a title that does not parse counts as lane 0.
-run-name: CodeAF #${{ inputs.issue || github.event.issue.number || inputs.pr || inputs.review }}${{ inputs.lane && format(' (lane {0})', inputs.lane) || '' }}
+run-name: "CodeAF #${{ inputs.issue || github.event.issue.number || github.event.pull_request.number || inputs.pr || inputs.review }}${{ inputs.lane && format(' (lane {0})', inputs.lane) || '' }}"
 
 on:
   issues:
