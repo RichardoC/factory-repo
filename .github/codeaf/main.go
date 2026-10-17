@@ -136,7 +136,14 @@ type Limits struct {
 	WeeklyCreditUSD float64 `json:"weekly_credit_usd"` // per rolling week, across runs
 	RunCreditUSD    float64 `json:"run_credit_usd"`    // per workflow run
 	OverageUSD      float64 `json:"overage_usd"`       // API-price USD past the weekly credit; 0 = stop
+	// MinCreditPercent is the floor on synthetic.new's own
+	// weeklyTokenLimit.percentRemaining below which, with overage 0, the
+	// proxy refuses calls. 0 means the default, 10.
+	MinCreditPercent float64 `json:"min_credit_percent"`
 }
+
+// defaultMinCreditPercent is the floor used when min_credit_percent is unset.
+const defaultMinCreditPercent = 10
 
 // Config is models.json: the spend caps and the models CodeAF may use.
 type Config struct {
@@ -161,6 +168,12 @@ func loadConfig(path string) (Config, error) {
 	}
 	if cfg.Limits.OverageUSD < 0 {
 		return cfg, fmt.Errorf("%s: limits.overage_usd must not be negative", path)
+	}
+	if cfg.Limits.MinCreditPercent < 0 || cfg.Limits.MinCreditPercent >= 100 {
+		return cfg, fmt.Errorf("%s: limits.min_credit_percent must be in [0, 100)", path)
+	}
+	if cfg.Limits.MinCreditPercent == 0 {
+		cfg.Limits.MinCreditPercent = defaultMinCreditPercent
 	}
 	if len(cfg.Models) == 0 {
 		return cfg, fmt.Errorf("%s: no models", path)
@@ -257,11 +270,12 @@ type proxy struct {
 	client     *http.Client
 	slots      map[string]chan struct{} // per upstream model, for max_concurrent
 
-	mu         sync.Mutex
-	runSpent   float64 // credit spent by this run
-	overage    bool    // the weekly credit is exhausted; new calls are billed at API prices
-	overageApi float64 // API-price USD recorded past the weekly credit
-	quota      quota   // GET /v2/quotas at startup; an unknown quota never blocks
+	mu           sync.Mutex
+	runSpent     float64 // credit spent by this run
+	overage      bool    // the weekly credit is exhausted; new calls are billed at API prices
+	overageApi   float64 // API-price USD recorded past the weekly credit
+	quota        quota   // GET /v2/quotas at startup and every few minutes; an unknown quota never blocks
+	minCreditPct float64 // floor on quota.PercentRemaining (limits.min_credit_percent)
 }
 
 func envFloat(name string, fallback float64) (float64, error) {
@@ -298,6 +312,7 @@ func runProxy() error {
 	p.runCap = cfg.Limits.RunCreditUSD
 	p.weekCap = cfg.Limits.WeeklyCreditUSD
 	p.overageCap = cfg.Limits.OverageUSD
+	p.minCreditPct = cfg.Limits.MinCreditPercent
 	p.slots = newSlots(p.models)
 	if p.weekSpent, err = spentWeek("PROXY_WEEK_SPENT_USD"); err != nil {
 		return err
@@ -316,12 +331,12 @@ func runProxy() error {
 	// One marker line at the top of the ledger; the report times the CodeAF
 	// session from it to the last call's end.
 	p.recordMarker("proxy_start")
-	// Ask synthetic.new for the subscription state once (issue #59 step 3).
-	// Best-effort and startup-only: it must not break the run, and it is
-	// never re-fetched mid-run — one run is short and the quota regenerates
-	// 2% of the weekly credit every ~202 minutes, so a refresh would not
-	// change any decision this run makes.
+	// Ask synthetic.new for the subscription state at start (issue #59
+	// step 3), then every few minutes: several runs share one weekly credit,
+	// so another run can use it up while this one works. /v2/quotas calls
+	// don't count against the plan. Best-effort: never breaks the run.
 	p.fetchQuotasStartup()
+	go p.refreshQuotas(quotasRefreshEvery)
 	return http.ListenAndServe(addr, p)
 }
 
@@ -774,6 +789,11 @@ type quota struct {
 	Requests float64 // subscription.requests
 	RenewsAt string  // subscription.renewsAt, as the API sent it
 	Known    bool    // both numbers parsed and passed the sanity checks
+	// PercentRemaining is weeklyTokenLimit.percentRemaining: the share of
+	// the weekly credit left, which is what actually runs out on the Big
+	// plan (the subscription request counter stays at 0).
+	PercentRemaining float64
+	PercentKnown     bool
 }
 
 // parseQuotas parses a /v2/quotas body defensively. It returns no error, only
@@ -787,6 +807,16 @@ func parseQuotas(body []byte) quota {
 		} `json:"subscription"`
 	}
 	var q quota
+	var weekly struct {
+		WeeklyTokenLimit *struct {
+			PercentRemaining json.RawMessage `json:"percentRemaining"`
+		} `json:"weeklyTokenLimit"`
+	}
+	if json.Unmarshal(body, &weekly) == nil && weekly.WeeklyTokenLimit != nil {
+		if pct, ok := jsonNumber(weekly.WeeklyTokenLimit.PercentRemaining); ok && pct >= 0 && pct <= 100 {
+			q.PercentRemaining, q.PercentKnown = pct, true
+		}
+	}
 	if err := json.Unmarshal(body, &doc); err != nil || doc.Subscription == nil {
 		return q
 	}
@@ -929,6 +959,29 @@ func (p *proxy) fetchQuotasStartup() {
 	p.mu.Unlock()
 }
 
+// quotasRefreshEvery is how often the proxy re-reads /v2/quotas mid-run.
+const quotasRefreshEvery = 5 * time.Minute
+
+// refreshQuotas re-reads /v2/quotas every interval and keeps the newest
+// parsed result that knows the weekly credit. A failed or unfamiliar read
+// keeps the previous one: a missing answer never blocks, and never unblocks.
+func (p *proxy) refreshQuotas(every time.Duration) {
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for range ticker.C {
+		ctx, cancel := context.WithTimeout(context.Background(), quotasTimeout)
+		q, _, err := fetchQuotas(ctx, &http.Client{Timeout: quotasTimeout}, quotasURL(p.upstream), p.apiKey)
+		cancel()
+		if err != nil || !q.PercentKnown {
+			continue
+		}
+		log.Printf("quotas: %.1f%% of the weekly credit left", q.PercentRemaining)
+		p.mu.Lock()
+		p.quota = q
+		p.mu.Unlock()
+	}
+}
+
 // recordQuotas appends the quotas marker: kind, ts and the raw response body,
 // capped. The report re-parses the body from the ledger.
 func (p *proxy) recordQuotas(raw string) {
@@ -971,6 +1024,12 @@ func (p *proxy) overCap() string {
 	if p.quota.Known && p.quota.Limit > 0 && p.quota.Requests >= p.quota.Limit && p.overageCap <= 0 {
 		return fmt.Sprintf("the subscription quota reports exhausted and overage is disabled (limit %s, used %s at proxy start)",
 			trimNumber(p.quota.Limit), trimNumber(p.quota.Requests))
+	}
+	// synthetic.new's own count of the weekly credit, refreshed every few
+	// minutes: below the floor, with overage disabled, stop before the
+	// account starts billing at API prices.
+	if p.quota.PercentKnown && p.overageCap <= 0 && p.quota.PercentRemaining < p.minCreditPct {
+		return fmt.Sprintf("synthetic.new reports %.1f%% of the weekly credit left, under the %.0f%% floor; overage disabled, refusing", p.quota.PercentRemaining, p.minCreditPct)
 	}
 	if p.weekSpent+p.runSpent < p.weekCap {
 		return ""

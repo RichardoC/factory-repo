@@ -129,7 +129,7 @@ The synthetic.new account is on the **Big** plan ($90/mo). Usage draws down a
 total every 202 minutes (~3.4 h) — a full refill in about a week. Past the quota,
 usage is billed at the **API list prices**, up to `limits.overage_usd`; at 0 (the
 default) the factory stops rather than pay beyond the $90. The Big plan's weekly
-credit is not published, so `weekly_credit_usd` (40) is a conservative
+credit is not published, so `weekly_credit_usd` (22, an estimate from `/v2/quotas`) is a conservative
 **assumption** — calibrate it from `GET /v2/quotas`'s `subscription.limit` once
 its units are known. `run_credit_usd` (5) caps one run; the weekly credit and the
 overage cap are shared by every run of the week through the shared state, and are

@@ -2,8 +2,9 @@
   "_comment": "Harness config. limits: the Big-plan spend caps (USD) the proxy enforces per workflow run and per rolling week. models: what CodeAF may use, served to it by `harness proxy` as an OpenRouter-shaped catalog; prices are USD per million tokens, from https://synthetic.new/pricing, checked 2026-10-17. input/output/cache_read are the SUBSCRIPTION rates, which draw down the weekly credit; api_input/api_cached/api_output are the API list rates, what usage past the quota (overage) costs. 'id' is what CodeAF sees; 'upstream' is the synthetic.new model id. 'max_concurrent': the synthetic.new subscription allows 2 calls to each model at once; the proxy queues calls past that.",
   "limits": {
     "plan": "big",
-    "plan_note": "Big plan $90/mo. The weekly credit is not published; 20 is a conservative ASSUMPTION (~$90/4.33 weeks at subscription rates; calibrate from GET /v2/quotas subscription.limit once known). run_credit_usd replaces the old run_usd. overage_usd 0 = stop rather than pay past the quota. Sized so several overlapping runs (task.parallel 2) share the week.",
-    "weekly_credit_usd": 40,
+    "plan_note": "Big plan $90/mo. The weekly credit is not published; 22 is an ESTIMATE from GET /v2/quotas on 2026-10-17 (weeklyTokenLimit.percentRemaining fell 1.41% for $0.306 of subscription-rate usage). The hard stop is synthetic.new's own percentRemaining: with overage_usd 0, the proxy refuses below min_credit_percent, re-reading /v2/quotas every 5 minutes. run_credit_usd replaces the old run_usd. overage_usd 0 = stop rather than pay past the quota.",
+    "weekly_credit_usd": 22,
+    "min_credit_percent": 10,
     "run_credit_usd": 5,
     "overage_usd": 0
   },
