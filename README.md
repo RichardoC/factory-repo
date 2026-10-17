@@ -102,13 +102,15 @@ maintainer's approval, like any other change under `.github/`.
 
   The synthetic.new key (`SYNTHETIC_API_KEY` secret) is held only by the proxy. It is
   passed in on stdin, not through the environment.
-- Model choice: the seats are spread across models, because the synthetic.new
-  subscription allows only **2 calls to each model at once**:
+- Model choice: the seats are spread across models. synthetic.new used to
+  allow only 2 calls to each model at once; since the October 2026 pricing
+  change concurrency is by plan priority instead, and the factory sets its
+  own per-model cap (`max_concurrent`, 8):
   - the worker runs on **GLM-5.3-Flash** ($0.10 in / $0.25 out per M tokens at
     subscription rates);
   - the planner and checker run on **DeepSeek-V4.1-Flash** ($0.06 / $0.30).
-  - CodeAF runs at most 2 tasks at once (`task.parallel`), so the workers
-    fit in GLM-5.3-Flash's 2 slots.
+  - CodeAF's `task.parallel` is set per run to that run's slice of the
+    worker model's `max_concurrent` (below).
   - The proxy enforces the limit per model (`max_concurrent` in
     `models.json`): a call past it waits for a slot instead of reaching
     synthetic.new. Each wait is written to the proxy log and the call
@@ -250,16 +252,16 @@ means lane 0. The queue reads lanes back from run titles, which read
 `CodeAF #N (lane L)`; titles are untrusted data, and a title that does not
 parse counts as lane 0.
 
-**The per-model limit stays account-wide.** synthetic.new allows 2 calls to
-each model at once across the whole account, and every run has its own
-proxy, so two runs could put 4 calls on one model. Instead each run gets a
+**The per-model cap is account-wide.** `max_concurrent` is meant for the
+whole account, and every run has its own proxy, so without slicing four runs
+could each put the full cap on one model. Instead each run gets a
 slice of every model's `max_concurrent`: per-run slots =
 `max_concurrent / max_parallel_runs`, at least 1, with CodeAF's
 `task.parallel` set to match. The proxy enforces the slice, and `loadConfig`
 refuses a `max_parallel_runs` that would overflow a model, so runs sharing
-one model never sum past the account's 2. Manual runs (a label or a
+one model never sum past `max_concurrent` (8 per model, at 4 runs: 2 each). Manual runs (a label or a
 `/codeaf` comment) carry no lane and still overlap without coordination; the
-slice caps them at 1 call per model per run.
+slice caps them at 2 calls per model per run.
 
 **Area conflicts.** The queue does not start a run on an area another run is
 already working. Areas are `app/<name>/` for each app and the harness

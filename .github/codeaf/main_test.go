@@ -243,10 +243,23 @@ func TestProxyEndToEnd(t *testing.T) {
 	}
 }
 
-func TestModelsHaveTheSubscriptionsConcurrencyLimit(t *testing.T) {
-	for _, m := range testModels(t) {
-		if m.MaxConcurrent != 2 {
-			t.Errorf("%s: max_concurrent %d, want 2 (synthetic.new allows 2 calls per model at once)", m.ID, m.MaxConcurrent)
+// TestModelsLeaveRoomForAHedge: every committed model has a cap, and each
+// run's slice of it is at least 2. CodeAF hedges a stalled call with a second
+// arm on the same model; with a slice of 1 the hedge waits behind the arm it
+// hedges, sends nothing, and is cut as a dead path (issue #90, run
+// 39057111594).
+func TestModelsLeaveRoomForAHedge(t *testing.T) {
+	t.Setenv("HARNESS_DIR", ".")
+	cfg, err := loadConfig("models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range cfg.Models {
+		if m.MaxConcurrent <= 0 {
+			t.Errorf("%s: max_concurrent %d, want a cap", m.ID, m.MaxConcurrent)
+		}
+		if slice := perRunSlots(m, cfg.Queue.MaxParallelRuns); slice < 2 {
+			t.Errorf("%s: per-run slice %d at max_parallel_runs %d, want at least 2", m.ID, slice, cfg.Queue.MaxParallelRuns)
 		}
 	}
 }
@@ -338,8 +351,11 @@ func TestProxyLimitsCallsPerModel(t *testing.T) {
 	}))
 	defer upstream.Close()
 	models := testModels(t)
-	// max_parallel_runs 1 gives this run the model's whole account-wide
-	// limit, so the cap below is the full max_concurrent.
+	// A cap of 2 per model, whatever models.json commits; max_parallel_runs
+	// 1 gives this run the whole cap.
+	for i := range models {
+		models[i].MaxConcurrent = 2
+	}
 	p := &proxy{upstream: upstream.URL, apiKey: "k", ledger: filepath.Join(t.TempDir(), "l.jsonl"), runCap: 5, weekCap: 20,
 		models: models, client: upstream.Client(), slots: newSlots(models, 1)}
 	server := httptest.NewServer(p)

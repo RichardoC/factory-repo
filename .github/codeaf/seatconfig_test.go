@@ -137,10 +137,10 @@ func TestSeatConfigCommittedConfig(t *testing.T) {
 		if worker, _ := config["models.tiers.worker"].(string); worker != c.worker {
 			t.Fatalf("lane %q: worker = %q; want %q", c.lane, worker, c.worker)
 		}
-		// Every committed model has max_concurrent 2, so the per-run slice
-		// at max_parallel_runs 2 is 1.
-		if parallel, ok := config["task.parallel"].(float64); !ok || parallel != 1 {
-			t.Fatalf("lane %q: task.parallel = %v; want 1", c.lane, config["task.parallel"])
+		// Every committed model has max_concurrent 8, so the per-run slice
+		// at max_parallel_runs 4 is 2.
+		if parallel, ok := config["task.parallel"].(float64); !ok || parallel != 2 {
+			t.Fatalf("lane %q: task.parallel = %v; want 2", c.lane, config["task.parallel"])
 		}
 		if _, ok := config["models.crew.task_cap"]; !ok {
 			t.Fatalf("lane %q: the config lost keys: %v", c.lane, config)
