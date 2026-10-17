@@ -227,6 +227,48 @@ jobs:
             "$HARNESS" brief
           fi
 
+      - name: Create the agent user
+        # From issue #54: the agent no longer runs as the runner user -- which
+        # has passwordless sudo on these runners and could reach the runner's
+        # own processes (run 39021136064 died when its broad kill hit
+        # Runner.Worker). It gets a fresh, unprivileged user: no sudo, no
+        # groups that carry privileges (not `docker` either -- its socket is a
+        # root equivalent here). Runners are ephemeral, so nothing to clean up.
+        run: |
+          sudo -n useradd --create-home --shell /bin/bash codeaf
+          # The image ships /home/runner as 0750, which would leave the agent
+          # user unable to traverse into the workspace or $RUNNER_TEMP at all.
+          # This adds the traverse bit only: --x for others, no read, no
+          # listing -- every file inside keeps its own mode.
+          sudo -n chmod o+x /home/runner
+
+      - name: Prove the agent user cannot reach the runner
+        # The property the run now relies on, asserted before CodeAF starts.
+        # As the agent user: kill -0 on the runner's own worker (the process
+        # whose SIGTERM ended run 39021136064 as a silent cancel) must fail,
+        # its /proc environment must be unreadable, and sudo must refuse.
+        # If any probe succeeds, agent and runner share a user again, and the
+        # run stops here -- before the agent exists, never after.
+        run: |
+          worker=$(pgrep -u "$(id -u)" -f 'Runner\.Worker' | head -1)
+          if ! [[ "$worker" =~ ^[0-9]+$ ]]; then
+            echo "::error::could not find the Runner.Worker process; cannot verify the agent sandbox"
+            exit 1
+          fi
+          if sudo -n -u codeaf bash -c "kill -0 $worker" >/dev/null 2>&1; then
+            echo "::error::the agent user can signal the runner's worker (pid $worker); the sandbox is not in effect"
+            exit 1
+          fi
+          if sudo -n -u codeaf head -c 1 "/proc/$worker/environ" >/dev/null 2>&1; then
+            echo "::error::the agent user can read the runner's process environment (pid $worker); the sandbox is not in effect"
+            exit 1
+          fi
+          if sudo -n -u codeaf sudo -n true >/dev/null 2>&1; then
+            echo "::error::the agent user has sudo; the sandbox is not in effect"
+            exit 1
+          fi
+          echo "agent sandbox ok: no signal, no /proc/$worker/environ, no sudo for the agent user"
+
       - name: Run CodeAF
         # CodeAF's settings (seat models, budgets, telemetry off) are in
         # .github/codeaf/codeaf-config.json, installed as its profile config.
@@ -251,13 +293,43 @@ jobs:
           else
             cp "$RUNNER_TEMP/harness/codeaf-config.json" "$CODEAF_HOME/config.json"
           fi
+          # The working tree and CodeAF's home are handed to the agent user
+          # for the run: it needs write access to both and to nothing else.
+          # config.json above was written first, by the runner user. "Take the
+          # tree back", the step after this one, returns both afterwards.
+          sudo -n chown -R codeaf:codeaf "$GITHUB_WORKSPACE" "$CODEAF_HOME"
           set +e
-          "$TOOLS/codeaf" do "$(cat "$BRIEF_PATH")" --dir . --json --yes-spend --timeout "${CODEAF_BUDGET_MINUTES:-100}m" \
+          # CodeAF runs as the agent user (-u codeaf), with its own home (-H)
+          # and in its own session (setsid: a new session, detached from this
+          # shell's, so it can neither signal this shell nor the runner behind
+          # it; -w makes setsid wait and return CodeAF's exit code). Only the
+          # environment it needs is passed -- the proxy endpoint, its home,
+          # and PATH for the tool shells its agent uses; sudo's env_reset
+          # drops everything else, so nothing secret reaches the agent's
+          # environment. The proxy keeps running as the runner user on
+          # 127.0.0.1, where the agent user can connect but can neither kill
+          # nor replace it. stdout and stderr are redirected by this
+          # runner-user shell, so the result file is written by the runner.
+          # shellcheck disable=SC2024  # the redirects are this shell's on purpose: the runner user, not the agent, writes the result and the stderr log
+          sudo -n -u codeaf -H env \
+            CODEAF_BASE_URL="$CODEAF_BASE_URL" \
+            CODEAF_HOME="$CODEAF_HOME" \
+            PATH="$PATH" \
+            setsid -w "$TOOLS/codeaf" "do" "$(cat "$BRIEF_PATH")" --dir . --json --yes-spend --timeout "${CODEAF_BUDGET_MINUTES:-100}m" \
             > "$RESULT_PATH" 2> "$RUNNER_TEMP/codeaf.stderr"
           echo "codeaf exit code: $?"
           tail -n 80 "$RUNNER_TEMP/codeaf.stderr"
           "$HARNESS" summary
           exit 0
+
+      - name: Take the tree back
+        # Runs even on failure and cancellation, like the packaging steps
+        # below: the patch, the state pack and the diagnostics all read the
+        # tree and CodeAF's home as the runner user. What the agent wrote
+        # stays; only the ownership changes back -- it is untrusted data
+        # either way (AGENTS.md, "Caches and carried state").
+        if: always()
+        run: sudo -n chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE" "$CODEAF_HOME"
 
       # From here on, this job only packages results. Nothing it produces is
       # trusted by `publish`.
@@ -554,6 +626,7 @@ jobs:
             b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
             now=$(date +%s)
             unsigned="$(printf '{"alg":"RS256","typ":"JWT"}' | b64url).$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((now - 60)) $((now + 540)) "$APP_ID" | b64url)"
+            # shellcheck disable=SC2016  # pre-existing: '%s' is deliberately single-quoted; directive only, no behavior change
             jwt="$unsigned.$(printf '%s' "$unsigned" | openssl dgst -sha256 -sign <(printf '%s\n' "$APP_KEY") | b64url)"
             echo "::add-mask::$jwt"
             # Each call is checked on its own, so a failure stops here with
@@ -608,6 +681,7 @@ jobs:
             # the body is the one it has always been.
             {
               printf 'Closes #%s\n\n' "$NUMBER"
+                # shellcheck disable=SC2016  # the backticks are literal markdown in the PR body; single quotes are correct
               printf 'Opened by the [CodeAF workflow](%s/%s/actions/runs/%s). Comment `/codeaf <instructions>` (or request changes in a review) to have CodeAF continue on this branch.' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
               if [ -f "$PR_BODY_EXTRA_PATH" ]; then
                 printf '\n\n'
@@ -654,8 +728,8 @@ jobs:
           "$HARNESS" continue-plan "$PR_NUMBER" > "$RUNNER_TEMP/continue-plan.env"
           # Parsed, never sourced: only the three known actions are acted on.
           action=none
-          if grep -qx 'action=continue' "$RUNNER_TEMP/continue-plan.env"; then action=continue
-          elif grep -qx 'action=cap' "$RUNNER_TEMP/continue-plan.env"; then action=cap
+          if grep -qx 'action=continue' "$RUNNER_TEMP/continue-plan.env"; then action="continue"
+          elif grep -qx 'action=cap' "$RUNNER_TEMP/continue-plan.env"; then action="cap"
           fi
           echo "action=$action" >> "$GITHUB_OUTPUT"
           case "$action" in

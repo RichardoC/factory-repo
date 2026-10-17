@@ -66,7 +66,12 @@ maintainer's approval, like any other change under `.github/`.
   - `gate` checks the event against the rules above (`harness gate`).
   - `run`, which has no write token, builds CodeAF at the commit pinned in
     [`codeaf-ref`](.github/codeaf/codeaf-ref), writes a brief from the
-    issue/PR, runs `codeaf do` headless and hands over a patch.
+    issue/PR, runs `codeaf do` headless and hands over a patch. The agent
+    runs as its own unprivileged user -- created fresh each run with no
+    sudo, handed the working tree and CodeAF's home for the run, started in
+    a session of its own -- so it can neither signal nor read the runner
+    (`Runner.Worker`, the pricing proxy) or use the runner's sudo; the
+    workflow proves that with probes before the agent starts.
   - `publish`, on a fresh runner, checks and applies the patch, then commits,
     pushes, opens or updates the PR and dispatches [CI](.github/workflows/ci.yml).
     Pushes made with `GITHUB_TOKEN` do not trigger CI on their own.
