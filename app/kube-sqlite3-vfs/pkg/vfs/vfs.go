@@ -929,6 +929,18 @@ func (f *file) adoptLockState(lock sqlite3vfs.LockType) {
 // conflicting writer, or other live holders for EXCLUSIVE — is reported as
 // sqlite3vfs.BusyError (SQLITE_BUSY), never waited out.
 //
+// A lapsed lease is a different event, and is deliberately not a BusyError:
+// when this file's own entries were pruned — the lease expired while it
+// made no lock-path call — Lock returns the distinct errLockLeaseLost
+// error after resetting the local state (see noteLeaseLost). SQLITE_BUSY
+// would send sqlite's busy handler into retrying the very same request,
+// but with the state reset that retry fails as an invalid transition, and
+// a retry that did succeed would carry on over a database another process
+// may already have rewritten — without the change-counter revalidation a
+// fresh lock acquire performs. A plain error fails the statement instead:
+// sqlite releases its locks, and the next transaction re-acquires from
+// scratch, as a fresh holder, and revalidates every cache.
+//
 // Every decision that writes is made inside the CAS against the state just
 // read (see casLock and the mutate* builders below); the local lockLevel
 // only short-circuits no-ops and invalid requests that cannot require an
