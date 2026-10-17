@@ -33,6 +33,29 @@ Three workflow artifacts are uploaded, none of them encrypted:
 - `codeaf-state-*` (14 days): what the run left in CodeAF's home, and what it
   cost, for the shared state below.
 
+### Independent review of every PR (issue #32)
+
+Every CodeAF run that opens or updates a pull request is followed by one
+**review run** — a second CodeAF run in read-only review mode. The reviewer
+sits on a different model from the worker that wrote the patch (worker
+**GLM-5.3-Flash**, reviewer **DeepSeek-V4.1-Flash**, both from
+[`models.json`](.github/codeaf/models.json)), so it does not share the same
+blind spots. It reviews the PR's diff against the issue for correctness,
+concurrency, error handling and whether the tests actually exercise the
+claims, and it re-runs the benchmarks the patch claims.
+
+It posts one findings comment on the PR, with a severity and a file:line for
+each finding. When anything is high or medium, that comment doubles as a
+`/codeaf fix` command and a fix run starts on the PR's branch, counted
+against the same continuation cap as the auto-continue feature — **2 per PR**.
+When nothing blocks, the PR gets the **`codeaf-review-passed`** label, so a
+person or a merge rule can merge with confidence.
+
+The review run never publishes anything: it has no write token, and `publish`
+applies no patch from it. Starting it goes through the same gate, spend caps
+and state merge as any other run. The workflow change itself needs a
+maintainer's approval, like any other change under `.github/`.
+
 ## How it is wired
 
 - [`.github/workflows/codeaf.yml`](.github/workflows/codeaf.yml) runs three jobs,

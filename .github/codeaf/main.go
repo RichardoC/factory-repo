@@ -14,6 +14,12 @@
 //	                 bundle into $CODEAF_HOME, pack what a run left, merge packed
 //	                 runs into a new bundle
 //	harness report   print the Markdown run report posted on the issue/PR
+//	harness review-brief   write the independent review's brief for `codeaf do`
+//	                       to $BRIEF_PATH (issue #32)
+//	harness review-config  print the CodeAF config for the review run, with
+//	                       the worker tier set to the reviewer model
+//	harness review-report  print the review's step outputs and write its
+//	                       comment body: fix run, pass label, or report only
 //
 // Trust model: the `codeaf` label can only be added by people with triage access
 // or above, and /codeaf commands are obeyed only from OWNER/MEMBER/COLLABORATOR.
@@ -46,7 +52,7 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("harness: ")
 	if len(os.Args) < 2 {
-		log.Fatal("usage: harness proxy|gate|next|brief|summary|state|report|pr-mode|continue-plan")
+		log.Fatal("usage: harness proxy|gate|next|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report")
 	}
 	commands := map[string]func() error{
 		"proxy":         runProxy,
@@ -58,6 +64,11 @@ func main() {
 		"report":        runReport,
 		"pr-mode":       prMode,
 		"continue-plan": runContinuePlan,
+		// The independent review pass (issue #32): brief, model config and
+		// report of a read-only review run on a pull request.
+		"review-brief":  runReviewBrief,
+		"review-config": runReviewConfig,
+		"review-report": runReviewReport,
 	}
 	command, ok := commands[os.Args[1]]
 	if !ok {
@@ -801,6 +812,29 @@ func (g github) get(path string, into any) error {
 	return json.NewDecoder(response.Body).Decode(into)
 }
 
+// diff fetches a pull request's diff (issue #32): the review brief embeds
+// it, so the reviewer reads what changed without touching git. The diff
+// format comes from the Accept header, and the body is returned as text.
+func (g github) diff(n int) (string, error) {
+	request, err := http.NewRequest(http.MethodGet, g.api+"/repos/"+g.repo+fmt.Sprintf("/pulls/%d", n), nil)
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("Authorization", "Bearer "+g.token)
+	request.Header.Set("Accept", "application/vnd.github.v3.diff")
+	response, err := g.client.Do(request)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(response.Body)
+		return "", fmt.Errorf("GET /pulls/%d diff: %s: %.300s", n, response.Status, data)
+	}
+	data, err := io.ReadAll(response.Body)
+	return string(data), err
+}
+
 func readEvent() (event, error) {
 	var ev event
 	data, err := os.ReadFile(os.Getenv("GITHUB_EVENT_PATH"))
@@ -814,7 +848,7 @@ func readEvent() (event, error) {
 type Decision struct {
 	Run    bool
 	Reason string
-	Mode   string // "issue" or "pr"
+	Mode   string // "issue", "pr" or "review"
 	Number int
 	Branch string
 	Base   string
@@ -906,6 +940,27 @@ func Decide(name string, ev event, labelName string, lookupPR, lookupIssue func(
 				return skip("PR is not labelled " + labelName), nil
 			}
 			return Decision{Run: true, Reason: "workflow dispatch", Mode: "pr", Number: pr.Number, Branch: pr.Head.Ref, Base: pr.Base.Ref}, nil
+		}
+		// A review run (issue #32) is dispatched the same way, with the PR
+		// to review in the `review` input: same checks as the pr input
+		// above (open, head not in a fork, labelled), but the run goes to
+		// review mode. Only consulted when the pr input is absent, so the
+		// continuation path keeps its meaning.
+		if n, ok := dispatchIssue(ev.Inputs["review"]); ok {
+			pr, err := lookupPR(n)
+			if err != nil {
+				return Decision{}, err
+			}
+			repo := os.Getenv("GITHUB_REPOSITORY")
+			switch {
+			case pr.State != "open":
+				return skip("PR is not open"), nil
+			case pr.Head.Repo == nil || pr.Head.Repo.FullName != repo:
+				return skip("PR head is in a fork; CodeAF only pushes to branches in " + repo), nil
+			case !pr.labelled(labelName):
+				return skip("PR is not labelled " + labelName), nil
+			}
+			return Decision{Run: true, Reason: "review dispatch", Mode: "review", Number: pr.Number, Branch: pr.Head.Ref, Base: pr.Base.Ref}, nil
 		}
 		n, ok := dispatchIssue(ev.Inputs["issue"])
 		if !ok {
