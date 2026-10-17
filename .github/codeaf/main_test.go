@@ -3207,3 +3207,18 @@ func TestProxyCommittedStreamCarriesUpstreamFailureAsAnSSEEvent(t *testing.T) {
 		t.Errorf("the error event is not followed by [DONE]:\n%s", got)
 	}
 }
+
+// TestNewGitHubFallsBackToGHToken pins the token fallback (issue #132): the
+// queue job's step sets only GH_TOKEN, the run jobs set GITHUB_TOKEN, and
+// either alone must do; GITHUB_TOKEN wins when both are set.
+func TestNewGitHubFallsBackToGHToken(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "ght")
+	if g := newGitHub(); g.token != "ght" {
+		t.Fatalf("newGitHub token = %q; want the GH_TOKEN value", g.token)
+	}
+	t.Setenv("GITHUB_TOKEN", "git")
+	if g := newGitHub(); g.token != "git" {
+		t.Fatalf("newGitHub token = %q; want the GITHUB_TOKEN value", g.token)
+	}
+}
