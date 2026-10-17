@@ -27,8 +27,8 @@
       "api_output": 0.50,
       "context_length": 524288,
       "input_modalities": ["text", "image"],
-      "efforts": ["high", "max"],
-      "efforts_note": "low, minimal and medium requests are sent as high, because GLM returns empty answers at low. medium was measured (2026-10-17, a real multi-step Go edit-and-test task through the live proxy, 3 repeats per case) to save 19.3% median completion tokens and 17.8% median wall time at equal correctness, which is under the 20% threshold that measurement set for switching, so high is kept (results.md, issue #24)"
+      "efforts": ["medium", "high", "max"],
+      "efforts_note": "low, minimal and medium are sent as medium (owner's decision, 2026-10-17): measured on a real multi-step Go edit-and-test task (issue #24, 3 repeats per case) medium saved 19.3% median completion tokens and 17.8% median wall time at equal correctness, and about 72% of this model's output is reasoning. low is never sent raw: GLM returns empty answers at low"
     },
     {
       "id": "deepseek-ai/deepseek-v4.1-flash",

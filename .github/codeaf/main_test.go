@@ -95,7 +95,7 @@ func TestResolve(t *testing.T) {
 
 func TestEffortFor(t *testing.T) {
 	models := testModels(t)
-	flash := mustResolve(t, models, "zai-org/glm-5.3-flash")              // high, max
+	flash := mustResolve(t, models, "zai-org/glm-5.3-flash")              // medium, high, max
 	glm := mustResolve(t, models, "zai-org/glm-5.3")                      // medium, high, max
 	deepseek := mustResolve(t, models, "deepseek-ai/deepseek-v4.1-flash") // none … max
 	off := false
@@ -105,10 +105,10 @@ func TestEffortFor(t *testing.T) {
 		want string
 	}{
 		{flash, reasoningRequest{Effort: "high"}, "high"},
-		{flash, reasoningRequest{Effort: "medium"}, "high"},
-		{flash, reasoningRequest{Effort: "low"}, "high"},
-		{flash, reasoningRequest{Effort: "minimal"}, "high"},
-		{flash, reasoningRequest{Enabled: &off}, "high"},
+		{flash, reasoningRequest{Effort: "medium"}, "medium"},
+		{flash, reasoningRequest{Effort: "low"}, "medium"},
+		{flash, reasoningRequest{Effort: "minimal"}, "medium"},
+		{flash, reasoningRequest{Enabled: &off}, "medium"},
 		{glm, reasoningRequest{Effort: "high"}, "high"},
 		{glm, reasoningRequest{Effort: "medium"}, "medium"},
 		{glm, reasoningRequest{Effort: "low"}, "medium"},
@@ -138,7 +138,7 @@ func TestRewriteRequest(t *testing.T) {
 	}
 	for key, want := range map[string]string{
 		"model":            `"hf:zai-org/GLM-5.3-Flash"`,
-		"reasoning_effort": `"high"`,
+		"reasoning_effort": `"medium"`,
 		"stream_options":   `{"include_usage":true}`,
 		"tools":            `[{"type":"function"}]`,
 	} {
