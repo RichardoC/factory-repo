@@ -99,7 +99,9 @@ jobs:
       - id: gate
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: cd .github/codeaf && go run . gate
+        # HARNESS_DIR: `go run` builds into a temp dir, and the gate reads
+        # experiments.json and models.json from beside the source.
+        run: cd .github/codeaf && HARNESS_DIR="$PWD" go run . gate
 
   run:
     needs: gate
