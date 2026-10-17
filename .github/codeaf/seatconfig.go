@@ -20,8 +20,8 @@ import (
 // anything else is lane 0. The issue and the environment are never read —
 // the seat choice comes from models.json alone.
 func runSeatConfig() error {
-	if len(os.Args) != 3 {
-		return errors.New("usage: harness seat-config LANE")
+	if len(os.Args) != 3 && len(os.Args) != 4 {
+		return errors.New("usage: harness seat-config LANE [PROFILE]")
 	}
 	lane := 0
 	if digitsOnly(os.Args[2]) {
@@ -42,7 +42,20 @@ func runSeatConfig() error {
 	if err := json.Unmarshal(data, &config); err != nil {
 		return fmt.Errorf("%s: %w", path, err)
 	}
-	config["models.tiers.worker"] = cfg.Models[lane%len(cfg.Models)].ID
+	lanes := laneModels(cfg.Models)
+	config["models.tiers.worker"] = lanes[lane%len(lanes)].ID
+	// A model experiment (experiments.go) pins all three seats. The name is
+	// validated again here; an unknown or malformed profile fails the run
+	// rather than quietly running the default seats.
+	if len(os.Args) == 4 && os.Args[3] != "" {
+		p, err := experimentProfile(os.Args[3])
+		if err != nil {
+			return err
+		}
+		config["models.tiers.worker"] = p.Worker
+		config["models.tiers.mastermind"] = p.Planner
+		config["models.tiers.high"] = p.Checker
+	}
 	if parallel := minPerRunSlots(cfg.Models, cfg.Queue.MaxParallelRuns); parallel > 0 {
 		config["task.parallel"] = parallel
 	}

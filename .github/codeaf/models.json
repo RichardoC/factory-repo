@@ -62,6 +62,23 @@
       "input_modalities": ["text"],
       "efforts": ["medium", "high", "max"],
       "efforts_note": "low, minimal and medium are all sent as medium: equal correctness (3/3 vs 3/3, 0 empty answers, 0 malformed tool calls) and a real saving (median completion 1332->854, i.e. 35.9% fewer; median wall 26.3->17.8 s, 32.1% less), so medium is sent raw to synthetic.new; low is still never sent raw because GLM returns an empty answer (tested 2026-10-15 and 2026-10-16; measured 2026-10-17, results.md, issue #24)"
+    },
+    {
+      "id": "moonshotai/kimi-k3",
+      "upstream": "hf:moonshotai/Kimi-K3",
+      "max_concurrent": 2,
+      "name": "Kimi-K3 (synthetic.new)",
+      "role": "experiment",
+      "input": 1.5,
+      "output": 7.5,
+      "cache_read": 0.23,
+      "api_input": 3.0,
+      "api_cached": 0.45,
+      "api_output": 15.0,
+      "context_length": 262144,
+      "input_modalities": ["text"],
+      "efforts": ["low", "medium", "high"],
+      "efforts_note": "role experiment: never picked by a lane, only by a model-experiment profile (experiments.json). Prices from https://synthetic.new/pricing/models, 2026-10-17. Whether it honours reasoning_effort is unverified."
     }
   ]
 }

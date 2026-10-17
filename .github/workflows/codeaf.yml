@@ -52,6 +52,10 @@ on:
         description: lane number the queue assigned, digits only
         required: false
         type: string
+      profile:
+        description: model-experiment profile from experiments.json (issues labelled codeaf-experiment only)
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -79,6 +83,7 @@ jobs:
       branch: ${{ steps.gate.outputs.branch }}
       base: ${{ steps.gate.outputs.base }}
       lane: ${{ steps.gate.outputs.lane }}
+      profile: ${{ steps.gate.outputs.profile }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -125,6 +130,9 @@ jobs:
       MODE: ${{ needs.gate.outputs.mode }}
       NUMBER: ${{ needs.gate.outputs.number }}
       LANE: ${{ needs.gate.outputs.lane }}
+      # A model experiment's profile, validated by the gate and again by
+      # seat-config; empty for every other run.
+      PROFILE: ${{ needs.gate.outputs.profile }}
       BRANCH: ${{ needs.gate.outputs.branch }}
       # Issue #57: the branch a pr run brings in — the PR base branch.
       BASE: ${{ needs.gate.outputs.base }}
@@ -334,7 +342,7 @@ jobs:
           if [ "$MODE" = review ]; then
             "$HARNESS" review-config > "$CODEAF_HOME/config.json"
           else
-            "$HARNESS" seat-config "$LANE" > "$CODEAF_HOME/config.json"
+            "$HARNESS" seat-config "$LANE" "$PROFILE" > "$CODEAF_HOME/config.json"
           fi
           # The working tree and CodeAF's home are handed to the agent user
           # for the run: it needs write access to both and to nothing else.
@@ -850,7 +858,9 @@ jobs:
         # posted next, so it never counts against the continuation cap.
         # Fail-soft: a continuation that cannot start must not fail publishing
         # (the report below still posts).
-        if: steps.pr.outputs.number != '' && needs.gate.outputs.mode != 'review'
+        # A model experiment gets neither (also for Independent review): each
+        # result is one profile's unaided work.
+        if: steps.pr.outputs.number != '' && needs.gate.outputs.mode != 'review' && needs.gate.outputs.profile == ''
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -886,7 +896,7 @@ jobs:
         # Fail-soft: a review that cannot start must not fail publishing.
         # Only once the work is finished (stop: done): an early stop is
         # continued instead, and reviewing code about to change wastes a run.
-        if: steps.pr.outputs.number != '' && steps.pr.outputs.ready == 'true' && needs.gate.outputs.mode != 'review'
+        if: steps.pr.outputs.number != '' && steps.pr.outputs.ready == 'true' && needs.gate.outputs.mode != 'review' && needs.gate.outputs.profile == ''
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ github.token }}

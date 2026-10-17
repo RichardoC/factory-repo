@@ -11,10 +11,10 @@ import (
 // seatConfigStdout runs `harness seat-config LANE` against the fixture files
 // the caller pointed HARNESS_DIR and PROXY_MODELS at, and returns what it
 // printed on stdout.
-func seatConfigStdout(t *testing.T, lane string) (string, error) {
+func seatConfigStdout(t *testing.T, args ...string) (string, error) {
 	t.Helper()
 	oldArgs := os.Args
-	os.Args = []string{"harness", "seat-config", lane}
+	os.Args = append([]string{"harness", "seat-config"}, args...)
 	defer func() { os.Args = oldArgs }()
 
 	r, w, err := os.Pipe()
@@ -115,7 +115,7 @@ func TestSeatConfig(t *testing.T) {
 func TestSeatConfigCommittedConfig(t *testing.T) {
 	t.Setenv("HARNESS_DIR", ".")
 	t.Setenv("PROXY_MODELS", "models.json")
-	models := testModels(t)
+	models := laneModels(testModels(t))
 	for _, c := range []struct {
 		lane   string
 		worker string

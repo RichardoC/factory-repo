@@ -1475,6 +1475,10 @@ type Decision struct {
 	// queue's `lane` dispatch input, digits only; anything else, and every
 	// non-dispatch event, is lane 0.
 	Lane int
+	// Profile pins every seat to a named model setup from experiments.json
+	// (a model experiment). Only dispatches of issues labelled
+	// codeaf-experiment carry one; it is validated against the file.
+	Profile string
 }
 
 func skip(reason string) Decision { return Decision{Reason: reason} }
@@ -1534,13 +1538,13 @@ func dispatchLane(raw string) int {
 // dispatch path; either is only called once the event has passed every check
 // that needs no network.
 func Decide(name string, ev event, labelName string, lookupPR, lookupIssue func(int) (item, error)) (Decision, error) {
-	issueRun := func(i item, reason string, lane int) (Decision, error) {
+	issueRun := func(i item, reason string, lane int, profile string) (Decision, error) {
 		id, err := runID()
 		if err != nil {
 			return Decision{}, err
 		}
 		return Decision{Run: true, Reason: reason, Mode: "issue", Number: i.Number,
-			Branch: fmt.Sprintf("codeaf/issue-%d-%s", i.Number, id), Base: ev.Repository.DefaultBranch, Lane: lane}, nil
+			Branch: fmt.Sprintf("codeaf/issue-%d-%s", i.Number, id), Base: ev.Repository.DefaultBranch, Lane: lane, Profile: profile}, nil
 	}
 	var target *item
 	var trigger *comment
@@ -1553,7 +1557,10 @@ func Decide(name string, ev event, labelName string, lookupPR, lookupIssue func(
 		if len(ev.Issue.PullRequest) > 0 {
 			return skip("labelled a PR; PRs act on " + command + " commands"), nil
 		}
-		return issueRun(*ev.Issue, "issue labelled", 0)
+		if ev.Issue.labelled(experimentLabel) {
+			return skip("experiment issues run only by a profile dispatch"), nil
+		}
+		return issueRun(*ev.Issue, "issue labelled", 0, "")
 	case "workflow_dispatch":
 		// The queue starts runs by dispatching this workflow with the
 		// issue number in its `issue` input: a GITHUB_TOKEN-labelled
@@ -1620,7 +1627,21 @@ func Decide(name string, ev event, labelName string, lookupPR, lookupIssue func(
 		case !i.labelled(labelName):
 			return skip("issue is not labelled " + labelName), nil
 		}
-		return issueRun(i, "workflow dispatch", lane)
+		// A model experiment pins every seat to a named profile; profiles
+		// are only for issues labelled codeaf-experiment, and those run only
+		// with one.
+		profile, hasProfile := ev.Inputs["profile"], ev.Inputs["profile"] != ""
+		switch {
+		case i.labelled(experimentLabel) && !hasProfile:
+			return skip("experiment issues run only with a profile"), nil
+		case !i.labelled(experimentLabel) && hasProfile:
+			return skip("profiles are only for issues labelled " + experimentLabel), nil
+		case hasProfile:
+			if _, err := experimentProfile(profile); err != nil {
+				return skip(err.Error()), nil
+			}
+		}
+		return issueRun(i, "workflow dispatch", lane, profile)
 	case "issue_comment":
 		target, trigger = ev.Issue, ev.Comment
 		if trigger != nil {
@@ -1649,8 +1670,11 @@ func Decide(name string, ev event, labelName string, lookupPR, lookupIssue func(
 	case trigger.User.Type == "Bot":
 		return skip("bot comment"), nil
 	}
+	if target.labelled(experimentLabel) {
+		return skip("experiment issues run only by a profile dispatch"), nil
+	}
 	if name == "issue_comment" && len(target.PullRequest) == 0 {
-		return issueRun(*target, "command on issue", 0)
+		return issueRun(*target, "command on issue", 0, "")
 	}
 	pr, err := lookupPR(target.Number)
 	if err != nil {
@@ -1688,7 +1712,7 @@ func runGate() error {
 	}
 	outputs := fmt.Sprintf("run=%t\nreason=%s\nlane=%d\n", decision.Run, decision.Reason, decision.Lane)
 	if decision.Run {
-		outputs += fmt.Sprintf("mode=%s\nnumber=%d\nbranch=%s\nbase=%s\n", decision.Mode, decision.Number, decision.Branch, decision.Base)
+		outputs += fmt.Sprintf("mode=%s\nnumber=%d\nbranch=%s\nbase=%s\nprofile=%s\n", decision.Mode, decision.Number, decision.Branch, decision.Base, decision.Profile)
 	}
 	fmt.Print(outputs)
 	if path := os.Getenv("GITHUB_OUTPUT"); path != "" {
