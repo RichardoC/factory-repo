@@ -56,9 +56,10 @@ more will be added.
 ## Security rules for changing the harness
 
 These apply to any change to `.github/` (workflows, `.github/codeaf/`), whoever
-makes it. The CodeAF agent runs arbitrary shell commands as the job's user, and
-its task text can come from anyone who opens an issue. Assume it may be
-hostile, whether through prompt injection or a compromised model.
+makes it. The CodeAF agent runs arbitrary shell commands as a separate,
+unprivileged user of its own (see "Privilege separation" below), and its task
+text can come from anyone who opens an issue. Assume it may be hostile,
+whether through prompt injection or a compromised model.
 
 ### Caches and carried state
 
@@ -94,14 +95,38 @@ hostile, whether through prompt injection or a compromised model.
   the bundle that is negative or not a number fails the run. A run's own spend
   that can't be right counts as the whole per-run cap.
 - Record spend from the proxy's in-memory total, not from files the agent can
-  edit. The harness falls back to the ledger file only if the proxy is gone,
-  and the agent (same user) could even replace the proxy. Runs that overlap
+  edit. The harness falls back to the ledger file only if the proxy is gone.
+  The proxy runs as the runner user and the agent as the `codeaf` user, so the
+  agent can neither kill nor replace the proxy; before the user separation
+  (issue #54) it could, which is why the rule stays. Runs that overlap
   each start from the day total as it was, so together they can pass the daily
   cap. So for a hard budget, also set a spending limit on the synthetic.new
   account itself.
 
 ### Privilege separation
 
+- The agent runs as its own unprivileged user (`codeaf`), created fresh in
+  every `run` job: no sudo, no privilege-carrying groups (not `docker`
+  either -- its socket is a root equivalent on these runners). The working
+  tree and `$CODEAF_HOME` are handed to it (chowned) for the run and taken
+  back afterwards, `/home/runner` keeps its 0750 mode plus one traverse bit,
+  and CodeAF starts in a session of its own (`setsid`).
+- What the agent can reach now: what the `codeaf` user owns -- the working
+  tree, `$CODEAF_HOME`, its home -- and what world permissions allow, which
+  by design includes the brief, the proxy log and the diagnostics-destined
+  files. What it cannot: signal, ptrace or read the runner's processes
+  (`Runner.Worker`, the proxy); read or write runner-owned files beyond
+  world permissions; use the runner's passwordless sudo; kill, replace or
+  read the proxy's memory, its spend total or the cost ledger. The workflow
+  asserts this before CodeAF starts (probes as `codeaf`: `kill -0` and
+  `/proc/PID/environ` on the runner's worker, `sudo -n true`) and stops the
+  run if any probe succeeds.
+- What does not change: everything the agent writes is untrusted data, as
+  the rest of this section and "Caches and carried state" say; `publish`
+  still checks the patch, and the state merge still re-checks the bundle.
+  The launch line passes the agent user only `CODEAF_BASE_URL`,
+  `CODEAF_HOME` and `PATH` (sudo's env_reset drops the rest), and the
+  synthetic.new key still reaches the proxy alone, on stdin.
 - The job that runs CodeAF (`run`) gets no write token and no secret other
   than the proxy's key on stdin. Anything that needs write access (commit,
   push, PR, comments, CI dispatch) happens in `publish`, on a fresh runner.
@@ -165,7 +190,9 @@ hostile, whether through prompt injection or a compromised model.
 - Never put a secret in the environment of the step that runs CodeAF, or
   anywhere it can read it. The synthetic.new key goes only to the proxy, on
   stdin. Keep `persist-credentials: false` on checkouts, and push with the
-  token only after CodeAF has exited.
+  token only after CodeAF has exited. The launch line gives the agent user
+  only the environment listed under "Privilege separation"; sudo's
+  env_reset strips everything else, and no secret is ever passed through it.
 - Don't add `pull_request_target`, and don't run PR-head code in a job that
   has secrets or write permissions.
 - Keep the trust gate: the `codeaf` label (triage access or above) and
