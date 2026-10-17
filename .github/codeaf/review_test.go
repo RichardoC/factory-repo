@@ -228,6 +228,66 @@ func TestParseFindings(t *testing.T) {
 		t.Errorf("two inline findings on one line = %+v, want a.go then b.go", findings)
 	}
 
+	// Several findings on one line, separated by `;` (issue #111): run
+	// 39062136141 closed with one paragraph in exactly this shape, and
+	// each finding must keep its own text, not swallow the rest of the
+	// line. The `FINDINGS (n, …):` prefix is prose, not a finding.
+	paragraph := "FINDINGS (3, 2 blocking): [medium] main.go:1155 - the mutex is released twice under the error path; " +
+		"[medium] queue.go:20 - the queue never drains when a send fails; " +
+		"[low] docs/readme.md:3 - typo in the flag name"
+	findings, sawSection = parseFindings(paragraph)
+	if sawSection {
+		t.Error("a FINDINGS paragraph counted as sawSection")
+	}
+	if len(findings) != 3 {
+		t.Fatalf("FINDINGS paragraph = %d findings, want 3: %+v", len(findings), findings)
+	}
+	wantParagraph := []struct {
+		severity string
+		path     string
+		line     int
+		text     string
+	}{
+		{"medium", "main.go", 1155, "the mutex is released twice under the error path"},
+		{"medium", "queue.go", 20, "the queue never drains when a send fails"},
+		{"low", "docs/readme.md", 3, "typo in the flag name"},
+	}
+	for i, w := range wantParagraph {
+		f := findings[i]
+		if f.Severity != w.severity || f.Path != w.path || f.Line != w.line || f.Text != w.text || !f.Recognized {
+			t.Errorf("paragraph findings[%d] = %+v, want %v", i, f, w)
+		}
+	}
+
+	// A `;` before a word that is not a severity is not a boundary: the
+	// word is prose and stays in the text, never a finding.
+	multiline := "The review is complete.\n\n" +
+		"[high] a.go:1 - use the slow path; see the notes on [the queue](x) first; " +
+		"[low] b.go:2 - second"
+	findings, _ = parseFindings(multiline)
+	if len(findings) != 2 || findings[0].Path != "a.go" || findings[0].Text != "use the slow path; see the notes on [the queue](x) first" ||
+		findings[1].Path != "b.go" || findings[1].Text != "second" {
+		t.Errorf("chained parse = %+v, want a.go with its full text then b.go", findings)
+	}
+
+	// A hostile FINDINGS paragraph — markdown, a mention, a very long
+	// line — parses as findings and the renderer escapes and caps it,
+	// never carrying it verbatim.
+	hostileParagraph := "FINDINGS (2, 1 blocking): [high] " + strings.Repeat("x/", 200) + "deep.go:1 - | pipes | and <!-- html comments --> and @alice; " +
+		"[low] b.go:2 - " + strings.Repeat("long ", 2000) + "text"
+	findings, _ = parseFindings(hostileParagraph)
+	if len(findings) != 2 || findings[0].Path != strings.Repeat("x/", 200)+"deep.go" || findings[1].Path != "b.go" {
+		t.Fatalf("hostile paragraph = %+v", findings)
+	}
+	if findings[0].Text != "| pipes | and <!-- html comments --> and @alice" {
+		t.Errorf("hostile paragraph text was rewritten: %q", findings[0].Text)
+	}
+	table := reviewTable(findings)
+	assertReviewBodyClean(t, table)
+	if !strings.Contains(table, strings.Repeat("x/", 12)) || len(table) > 4096 {
+		t.Errorf("hostile paragraph table not capped: %d bytes", len(table))
+	}
+
 	// The same finding reached by both passes is kept once.
 	findings, _ = parseFindings("## Findings\n\n- [high] app/x/main.go:42 - the mutex is released twice\n" +
 		"[high] app/x/main.go:42 - the mutex is released twice\n")
@@ -426,7 +486,9 @@ func TestReviewPlan(t *testing.T) {
 	assertReviewBodyClean(t, body)
 
 	// An unfinished review whose findings are not blocking stays advisory:
-	// the stop reason named, the findings shown, no label and no fix.
+	// the findings shown, no label and no fix — but the report says the run
+	// ended early after finishing its review, not that nothing was found
+	// (issue #111).
 	server = commentsServer(t, reportComments(1), http.StatusOK)
 	ghEnv(t, server)
 	lowOnly := []Finding{{Severity: "low", Path: "docs/readme.md", Line: 3, Text: "typo", Recognized: true}}
@@ -437,10 +499,13 @@ func TestReviewPlan(t *testing.T) {
 	if action != "report-only" {
 		t.Fatalf("early stop with low findings: action = %q", action)
 	}
-	for _, want := range []string{"`deadline`", "incomplete review", "inline `[severity]` notes", "| severity | location | finding |"} {
+	for _, want := range []string{"`deadline`", "after finishing its review", "| severity | location | finding |"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("advisory early-stop body missing %q: %q", want, body)
 		}
+	}
+	if strings.Contains(body, "No findings section") {
+		t.Errorf("a finished review must not read as one with no findings: %q", body)
 	}
 	if strings.Contains(body, reviewPassedLabel) || strings.HasPrefix(body, command+" fix:") {
 		t.Errorf("an advisory review must not label or fix: %q", body)
@@ -458,7 +523,7 @@ func TestReviewPlan(t *testing.T) {
 	if action != "report-only" {
 		t.Fatalf("early stop without findings: action = %q", action)
 	}
-	if !strings.Contains(body, "No findings section and no inline findings") {
+	if !strings.Contains(body, "no findings section and no inline findings were found in the answer or the run record") {
 		t.Errorf("advisory body does not say where it looked: %q", body)
 	}
 	assertReviewBodyClean(t, body)
@@ -964,16 +1029,101 @@ func TestRunReviewReport(t *testing.T) {
 		assertReviewBodyClean(t, string(data))
 	})
 
-	t.Run("an oversized run record is capped, not read whole", func(t *testing.T) {
+	t.Run("a long run record is read from its tail, still capped", func(t *testing.T) {
 		server := commentsServer(t, reportComments(1), http.StatusOK)
 		ghEnv(t, server)
 		setArgs("7")
 		writeReviewResult(t, stopIncomplete, "")
-		// The findings sit past the cap, in an end record the reader must
-		// never reach: padding first, then the record.
+		// The end record is the record's last line (issue #111): the
+		// 36-step review of run 39062136141 pushed it past a read capped
+		// from the head, and the report threw the review away. Padding
+		// before the ending no longer hides it — but the read stays
+		// capped at maxTrajectoryBytes.
 		padding := strings.Repeat("#", maxTrajectoryBytes) + "\n"
-		writeTrajectory(t, padding+`{"kind":"end","result":"[high] app/x/main.go:42 - beyond the cap\n"}
-`)
+		writeTrajectory(t, padding+`{"kind":"end","result":"[high] app/x/main.go:42 - beyond the head, in the tail\n"}`)
+		reviewLedger(t)
+		t.Setenv("REVIEW_COMMENT_PATH", comment)
+		out, err := captureStdout(t, runReviewReport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != "action=fix\nused=0\nblocking=1\n" {
+			t.Errorf("tail read: stdout = %q", out)
+		}
+		data, err := os.ReadFile(comment)
+		if err != nil {
+			t.Fatalf("comment not written: %v", err)
+		}
+		assertReviewBodyClean(t, string(data))
+
+		// What follows the end record can still push it out of reach: a
+		// record ending in megabytes of garbage is read as its tail, the
+		// end record outside the cap is never seen, and the garbage is
+		// skipped, not fatal.
+		trailing := strings.Repeat("{", 2*maxTrajectoryBytes) + "\n"
+		writeTrajectory(t, padding+`{"kind":"end","result":"[high] app/x/main.go:42 - out of reach\n"}`+"\n"+trailing)
+		out, err = captureStdout(t, runReviewReport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != "action=report-only\nused=0\nblocking=0\n" {
+			t.Errorf("end record out of reach: stdout = %q", out)
+		}
+	})
+
+	t.Run("the run that prompted issue #111 is reported as a review", func(t *testing.T) {
+		// Run 39062136141: a 36-step review, an empty envelope answer, a
+		// closing result holding one FINDINGS paragraph, stop incomplete.
+		// The findings must act, not read as "no findings found".
+		server := commentsServer(t, reportComments(1), http.StatusOK)
+		ghEnv(t, server)
+		setArgs("7")
+		writeReviewResult(t, stopIncomplete, "")
+		var record strings.Builder
+		for step := 1; step <= 36; step++ {
+			fmt.Fprintf(&record, "{\"kind\":\"step\",\"step\":%d,\"command\":\"go test ./...\",\"observation\":\"ok\"}\n", step)
+		}
+		record.WriteString("{\"kind\":\"end\",\"step\":0,\"steps\":36,\"result\":\"" +
+			"The review is complete. Reported in the answer under ## Findings.\\n\\n" +
+			"FINDINGS (3, 2 blocking): [medium] main.go:1155 - the mutex is released twice under the error path; " +
+			"[medium] queue.go:20 - the queue never drains when a send fails; " +
+			"[low] docs/readme.md:3 - typo in the flag name\"}\n")
+		writeTrajectory(t, record.String())
+		reviewLedger(t)
+		t.Setenv("REVIEW_COMMENT_PATH", comment)
+		out, err := captureStdout(t, runReviewReport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != "action=fix\nused=0\nblocking=2\n" {
+			t.Fatalf("stdout = %q, want a fix run for the 2 blocking findings", out)
+		}
+		data, err := os.ReadFile(comment)
+		if err != nil {
+			t.Fatalf("comment not written: %v", err)
+		}
+		body := string(data)
+		for _, want := range []string{
+			"| `medium` | main.go:1155 | the mutex is released twice under the error path |",
+			"| `medium` | queue.go:20 | the queue never drains when a send fails |",
+			"| `low` | docs/readme.md:3 | typo in the flag name |",
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("finding table missing %q in %q", want, body)
+			}
+		}
+		assertReviewBodyClean(t, body)
+	})
+
+	t.Run("an incomplete run whose review finished with only low findings", func(t *testing.T) {
+		// Issue #111: the closing result holds a finished review, so the
+		// report lists its findings and says the run ended incomplete
+		// after finishing its review — never "no findings found".
+		server := commentsServer(t, reportComments(1), http.StatusOK)
+		ghEnv(t, server)
+		setArgs("7")
+		writeReviewResult(t, stopIncomplete, "")
+		writeTrajectory(t, `{"kind":"end","result":"FINDINGS (1, 0 blocking): [low] docs/readme.md:3 - typo in the flag name"}`)
 		reviewLedger(t)
 		t.Setenv("REVIEW_COMMENT_PATH", comment)
 		out, err := captureStdout(t, runReviewReport)
@@ -981,7 +1131,50 @@ func TestRunReviewReport(t *testing.T) {
 			t.Fatal(err)
 		}
 		if out != "action=report-only\nused=0\nblocking=0\n" {
-			t.Errorf("stdout = %q", out)
+			t.Fatalf("stdout = %q, want report-only", out)
+		}
+		data, err := os.ReadFile(comment)
+		if err != nil {
+			t.Fatalf("comment not written: %v", err)
+		}
+		body := string(data)
+		for _, want := range []string{"after finishing its review", "| `low` | docs/readme.md:3 | typo in the flag name |"} {
+			if !strings.Contains(body, want) {
+				t.Errorf("body missing %q: %q", want, body)
+			}
+		}
+		if strings.Contains(body, "no findings section") {
+			t.Errorf("a finished review must not read as one with no findings: %q", body)
+		}
+		assertReviewBodyClean(t, body)
+	})
+
+	t.Run("a long run record ships its tail, end record included", func(t *testing.T) {
+		// The run job ships the record beside the result; the copy must
+		// keep the record's ending (issue #111), where the end record of
+		// a long run lives, not its head.
+		home := t.TempDir()
+		t.Setenv("CODEAF_HOME", home)
+		recordDir := filepath.Join(home, "runs", "42", "tasks", "root")
+		if err := os.MkdirAll(recordDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		padding := strings.Repeat("#", maxTrajectoryBytes) + "\n"
+		record := padding + `{"kind":"end","result":"[high] app/x/main.go:42 - shipped from the tail\n"}` + "\n"
+		if err := os.WriteFile(filepath.Join(recordDir, "trajectory.jsonl"), []byte(record), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		resultPath := writeReviewResult(t, stopIncomplete, "")
+		t.Setenv("TRAJECTORY_PATH", "")
+		if shipped := shipRunRecord(); shipped == "" {
+			t.Fatal("shipRunRecord found nothing")
+		}
+		data, err := os.ReadFile(filepath.Join(filepath.Dir(resultPath), trajectoryFileName))
+		if err != nil {
+			t.Fatalf("record not shipped: %v", err)
+		}
+		if got := readTrajectoryAnswer(filepath.Join(filepath.Dir(resultPath), trajectoryFileName)); got == "" {
+			t.Errorf("the shipped copy lost the end record: %d bytes, tail starts %q", len(data), data[:40])
 		}
 	})
 
