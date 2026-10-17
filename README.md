@@ -23,11 +23,14 @@ Nothing else triggers it. Only people with triage access can add labels, and `/c
 commands are obeyed only from repository owners, members and collaborators, so
 outside contributors cannot spend the API budget. PRs from forks are ignored.
 
-Every run posts a report comment with CodeAF's outcome, a per-model cost table and
-the run's timing figures (wall time, time with a call in flight, tokens/s, longest call).
+Every run posts a report comment with CodeAF's outcome, a per-model cost table —
+including each model's reasoning share (exact from reasoning tokens, or an estimate
+labeled “(chars)” from character counts when the model does not report them) — and the
+run's timing figures (wall time, time with a call in flight, tokens/s, longest call).
 Three workflow artifacts are uploaded, none of them encrypted:
 - `codeaf-output-*` (14 days): the patch, its base commit, CodeAF's JSON result
-  and the call ledger (each call's start and duration, slot wait and reasoning tokens);
+  and the call ledger (each call's start and duration, slot wait, reasoning tokens,
+  and the reasoning/output character counts backing the estimate);
 - `codeaf-diagnostics-*` (30 days): the brief, CodeAF's stderr, its run records
   (prompts, replies, tool output), call log and usage, and the proxy log;
 - `codeaf-state-*` (14 days): what the run left in CodeAF's home, and what it
@@ -271,3 +274,15 @@ so only it sends `low`/`minimal`/`medium` as `medium`; glm-5.3-flash keeps `high
 | glm-5.3-flash | high | 1231 | 24.1 | 3/3 |
 | glm-5.3 | medium | 854 | 17.8 | 3/3 |
 | glm-5.3 | high | 1332 | 26.3 | 3/3 |
+
+### GLM reasoning share (issue #25)
+
+synthetic.new never sends `completion_tokens_details.reasoning_tokens` for GLM, so its
+reasoning-token column reads `—` and the exact reasoning share is unavailable. GLM does
+stream its reasoning as `reasoning_content` (and returns it in the non-streamed `message`),
+so the proxy counts those characters — plus the visible `content` and tool-call argument
+characters — out of the chunk/response decode it already performs, records them in the
+ledger as `reasoning_chars`/`output_chars`, and the report renders such models' reasoning
+share as an estimate labeled “(chars)” (`reasoning ÷ (reasoning + visible output)`).
+Models that do report reasoning tokens keep the exact token-based share. Character counts
+are bytes, not runes; the proportion — not the absolute figure — is what the estimate uses.

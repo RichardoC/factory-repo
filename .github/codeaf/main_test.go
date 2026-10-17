@@ -551,8 +551,8 @@ func TestReport(t *testing.T) {
 		reportMarker,
 		"| stop / ok | `done` / `true` |",
 		"**$0.0025** this run · $1.2025 today (cap $5/run, $20/day)",
-		"| `zai-org/glm-5.3` | 1.4 · 0.26 · 4.4 | 2 | 1000 | 0 | 200 | — | $0.0023 (+1 unpriced) |",
-		"| `zai-org/glm-5.3-flash` | 0.15 · 0.04 · 0.5 | 1 | 1000 | 400 | 200 | — | $0.0002 |",
+		"| `zai-org/glm-5.3` | 1.4 · 0.26 · 4.4 | 2 | 1000 | 0 | 200 | — | — | $0.0023 (+1 unpriced) |",
+		"| `zai-org/glm-5.3-flash` | 0.15 · 0.04 · 0.5 | 1 | 1000 | 400 | 200 | — | — | $0.0002 |",
 		// Old-format ledger lines: the timing figures degrade to em-dashes.
 		"| run job wall time | — |",
 		"| time with a call in flight | — |",
@@ -703,6 +703,120 @@ func TestProxyRecordsReasoningTokens(t *testing.T) {
 	}
 }
 
+// GLM never sends completion_tokens_details.reasoning_tokens (issue #20) but
+// streams its reasoning as reasoning_content, in both the SSE delta and the
+// JSON message. The proxy counts those characters — plus the visible content
+// and tool-call arguments — from the decode it already performs, records them
+// as reasoning_chars/output_chars, and leaves the reasoning text passing
+// through to CodeAF untouched.
+func TestProxyCountsReasoningChars(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		usage := `{"prompt_tokens":100,"completion_tokens":60}`
+		if body["stream"] == true {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\n")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"n\"}}]}}]}\n\n")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ame\\\":\\\"x\\\"}\"}}]}}]}\n\n")
+			_, _ = io.WriteString(w, "data: {\"choices\":[],\"usage\":"+usage+"}\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, `{"choices":[`+
+			`{"message":{"reasoning_content":"abc","content":null,"tool_calls":[{"id":"t1","type":"function","function":{"name":"f","arguments":"{\"x\":1}"}}]}},`+
+			`{"message":{"content":"de"}}],"model":"x","usage":`+usage+`}`)
+	}))
+	defer upstream.Close()
+
+	ledger := filepath.Join(t.TempDir(), "ledger.jsonl")
+	p := &proxy{upstream: upstream.URL, apiKey: "k", ledger: ledger, runCap: 5, dayCap: 20,
+		models: testModels(t), client: upstream.Client()}
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	post := func(body string) string {
+		t.Helper()
+		response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		data, _ := io.ReadAll(response.Body)
+		return string(data)
+	}
+
+	// The JSON call: reasoning 3 ("abc"), output 7 + 2 = 9; the null
+	// content of the first choice must not re-count the reasoning.
+	jsonBody := post(`{"model":"zai-org/glm-5.3-flash","messages":[]}`)
+	if !strings.Contains(jsonBody, `"reasoning_content":"abc"`) {
+		t.Errorf("JSON response no longer carries reasoning_content: %s", jsonBody)
+	}
+	// The streamed call: reasoning 5 ("think"), output 5 + 12 = 17.
+	streamBody := post(`{"model":"zai-org/glm-5.3","stream":true,"messages":[]}`)
+	if !strings.Contains(streamBody, `"reasoning_content":"think"`) {
+		t.Errorf("stream no longer carries reasoning_content: %s", streamBody)
+	}
+	if !strings.Contains(streamBody, `"content":"he"`) || !strings.Contains(streamBody, `ame\":\"x\"}`) {
+		t.Errorf("stream content/tool arguments were not passed through: %s", streamBody)
+	}
+
+	lines, err := readLedger(ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != 2 {
+		t.Fatalf("ledger has %d lines", len(lines))
+	}
+	if lines[0].ReasoningChars != 3 || lines[0].OutputChars != 9 {
+		t.Errorf("JSON chars = (%d, %d), want (3, 9)", lines[0].ReasoningChars, lines[0].OutputChars)
+	}
+	if lines[1].ReasoningChars != 5 || lines[1].OutputChars != 17 {
+		t.Errorf("streamed chars = (%d, %d), want (5, 17)", lines[1].ReasoningChars, lines[1].OutputChars)
+	}
+	if lines[0].ReasoningTokens != nil || lines[1].ReasoningTokens != nil {
+		t.Error("reasoning_tokens recorded although upstream sent none")
+	}
+	raw, err := os.ReadFile(ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	texts := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	for i, want := range []string{`"reasoning_chars":3,"output_chars":9`, `"reasoning_chars":5,"output_chars":17`} {
+		if !strings.Contains(texts[i], want) {
+			t.Errorf("ledger line %d lacks %s: %s", i+1, want, texts[i])
+		}
+	}
+}
+
+// The report shows each model's reasoning share: exactly from reasoning
+// tokens when they were reported, and as a character-count estimate (labeled
+// "(chars)") for models like GLM that never send them (issue #25). Ledger
+// lines from before the change degrade to an em-dash.
+func TestReportReasoningShare(t *testing.T) {
+	result := Result{Stop: "done"}
+	tokens := 50
+	lines := []LedgerLine{
+		{Model: "zai-org/glm-5.3-flash", ReasoningChars: 60, OutputChars: 40, CostUSD: 0.0002, UsageSeen: true},
+		{Model: "zai-org/glm-5.3", PromptTokens: 100, CompletionTokens: 200, ReasoningTokens: &tokens,
+			ReasoningChars: 10, OutputChars: 10, CostUSD: 0.0023, UsageSeen: true},
+		{Model: "zai-org/glm-5.3", Stream: true},
+	}
+	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
+	report := Report(result, true, lines, cfg, nil, ReportInputs{}, func(string) string { return "" })
+	for _, want := range []string{
+		"| `zai-org/glm-5.3-flash` | 0.15 · 0.04 · 0.5 | 1 | 0 | 0 | 0 | — | ~60% (chars) | $0.0002 |",
+		"| `zai-org/glm-5.3` | 1.4 · 0.26 · 4.4 | 2 | 100 | 0 | 200 | 50 | 25% | $0.0023 (+1 unpriced) |",
+		"(chars) is an estimate",
+	} {
+		if !strings.Contains(report, want) {
+			t.Errorf("report lacks %q:\n%s", want, report)
+		}
+	}
+}
+
 // The proxy opens its ledger with one proxy_start marker line, which carries
 // no start, tokens or cost.
 func TestRecordMarker(t *testing.T) {
@@ -754,8 +868,8 @@ func TestReportTiming(t *testing.T) {
 		"255.6 tok/s", // (45003+1000) output tokens over the 3m in flight
 		"| longest single call | 2m30s · 1000 tok · `zai-org/glm-5.3` |",
 		"| queued at the model limit | 1m30s |",
-		"| `zai-org/glm-5.3-flash` | 0.15 · 0.04 · 0.5 | 1 | 1000 | 0 | 45003 | 321 | $0.0225 |",
-		"| `zai-org/glm-5.3` | 1.4 · 0.26 · 4.4 | 1 | 1000 | 0 | 1000 | — | $0.0044 |",
+		"| `zai-org/glm-5.3-flash` | 0.15 · 0.04 · 0.5 | 1 | 1000 | 0 | 45003 | 321 | 0.7% | $0.0225 |",
+		"| `zai-org/glm-5.3` | 1.4 · 0.26 · 4.4 | 1 | 1000 | 0 | 1000 | — | — | $0.0044 |",
 		"**$0.0269** this run", // marker line adds nothing to the metered total
 	} {
 		if !strings.Contains(report, want) {
@@ -780,7 +894,7 @@ func TestReportTiming(t *testing.T) {
 		"| output tok/s while in flight | — |",
 		"| longest single call | — |",
 		"| queued at the model limit | — |",
-		"| `zai-org/glm-5.3-flash` | 0.15 · 0.04 · 0.5 | 1 | 1000 | 0 | 200 | — | $0.0001 |",
+		"| `zai-org/glm-5.3-flash` | 0.15 · 0.04 · 0.5 | 1 | 1000 | 0 | 200 | — | — | $0.0001 |",
 	} {
 		if !strings.Contains(report, want) {
 			t.Errorf("old-format report lacks %q:\n%s", want, report)
@@ -928,8 +1042,8 @@ func TestReportGroupsUnknownModels(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		"| `(other)` | — · — · — | 2 | 200 | 0 | 500 | — | $0.7500 |",
-		"| `zai-org/glm-5.3` | 1.4 · 0.26 · 4.4 | 1 | 1000 | 0 | 200 | — | $0.0023 |",
+		"| `(other)` | — · — · — | 2 | 200 | 0 | 500 | — | — | $0.7500 |",
+		"| `zai-org/glm-5.3` | 1.4 · 0.26 · 4.4 | 1 | 1000 | 0 | 200 | — | — | $0.0023 |",
 		"| longest single call | 2m0s · 500 tok · `(other)` |",
 	} {
 		if !strings.Contains(report, want) {
@@ -975,7 +1089,7 @@ func TestReportDropsAbsurdTiming(t *testing.T) {
 		"| CodeAF session (proxy start → last call end) | 31m0s |",
 		"| longest single call | 1m0s · 10000000 tok · `zai-org/glm-5.3` |",
 		"| queued at the model limit | 24h0m0s |",
-		"| `zai-org/glm-5.3` | 1.4 · 0.26 · 4.4 | 4 | 10000000 | 0 | 10000000 | 10000000 | $0.0100 (+3 unpriced) |",
+		"| `zai-org/glm-5.3` | 1.4 · 0.26 · 4.4 | 4 | 10000000 | 0 | 10000000 | 10000000 | 100% | $0.0100 (+3 unpriced) |",
 	} {
 		if !strings.Contains(report, want) {
 			t.Errorf("report lacks %q:\n%s", want, report)
