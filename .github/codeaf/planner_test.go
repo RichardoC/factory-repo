@@ -15,7 +15,8 @@ import (
 
 // planOpts is the planner the tests decide in: a $10 weekly credit, the
 // three default labels, two parallel runs, and the issue-#61 example
-// thresholds (backlog under 3, one plan run per 12 hours).
+// thresholds (backlog under 3, one plan run per 12 hours) plus the issue
+// #119 retry cooldown of 2 hours after a plan run that opened nothing.
 func planOpts() planOptions {
 	return planOptions{
 		QueuedLabel:     "codeaf-queued",
@@ -24,6 +25,7 @@ func planOpts() planOptions {
 		MaxParallelRuns: 2,
 		MinBacklog:      3,
 		MinHours:        12,
+		RetryMinHours:   2,
 	}
 }
 
@@ -133,6 +135,81 @@ func TestPlanCheckCooldown(t *testing.T) {
 	issueRun := []runStatus{planRun("completed", "CodeAF #7 (lane 0)", stampAgo(1), 101)}
 	if _, ok, _ := PlanCheck(issues, issueRun, planOpts()); !ok {
 		t.Fatal("recent issue run: not a plan run, want a plan run")
+	}
+}
+
+// TestPlanCheckCooldownRetry covers the issue-#119 retry cooldown: a plan
+// run known to have opened no proposals cools down for retry_min_hours (2h)
+// instead of min_hours (12h); a run that opened proposals, one with an
+// unknown outcome and one with a bad stamp all keep the full cooldown, and
+// so does a zero-proposal run when RetryMinHours is unset (a direct caller
+// without the config default) — fail closed.
+func TestPlanCheckCooldownRetry(t *testing.T) {
+	issues := []item{planIssue(1, "codeaf-queued"), planIssue(2, "codeaf-queued")} // below the threshold
+	empty := map[int]int{100: 0}
+	some := map[int]int{100: 3}
+	opts := func(outcomes map[int]int, retry int) planOptions {
+		o := planOpts()
+		o.Outcomes = outcomes
+		o.RetryMinHours = retry
+		return o
+	}
+	// An empty plan run 3h old: the 2h retry cooldown has elapsed.
+	if _, ok, _ := PlanCheck(issues, []runStatus{planRun("completed", "CodeAF plan", stampAgo(3), 100)}, opts(empty, 2)); !ok {
+		t.Fatal("3h old empty plan run: retry cooldown elapsed, want a plan run")
+	}
+	// An empty plan run 1h old still holds, on the 2h cooldown.
+	if _, ok, reason := PlanCheck(issues, []runStatus{planRun("completed", "CodeAF plan", stampAgo(1), 100)}, opts(empty, 2)); ok || !strings.Contains(reason, "cooldown 2h") {
+		t.Fatalf("1h old empty plan run: ok=%v reason=%q; want hold on the 2h retry cooldown", ok, reason)
+	}
+	// A run that opened proposals keeps the full 12h cooldown.
+	if _, ok, reason := PlanCheck(issues, []runStatus{planRun("completed", "CodeAF plan", stampAgo(11), 100)}, opts(some, 2)); ok || !strings.Contains(reason, "cooldown 12h") {
+		t.Fatalf("11h old plan run with proposals: ok=%v reason=%q; want hold on the 12h cooldown", ok, reason)
+	}
+	// An unknown outcome (no marker) keeps the full 12h cooldown.
+	if _, ok, _ := PlanCheck(issues, []runStatus{planRun("completed", "CodeAF plan", stampAgo(11), 100)}, opts(nil, 2)); ok {
+		t.Fatal("11h old plan run with unknown outcome: want hold on the 12h cooldown")
+	}
+	// A zero-proposal run with an unparseable stamp fails closed.
+	if _, ok, _ := PlanCheck(issues, []runStatus{planRun("completed", "CodeAF plan", "yesterday", 100)}, opts(empty, 2)); ok {
+		t.Fatal("empty plan run with a bad stamp: want hold")
+	}
+	// Without a retry cooldown (RetryMinHours unset) even a known-empty run
+	// keeps the full cooldown.
+	if _, ok, _ := PlanCheck(issues, []runStatus{planRun("completed", "CodeAF plan", stampAgo(11), 100)}, opts(empty, 0)); ok {
+		t.Fatal("empty plan run with retry unset: want hold on the 12h cooldown")
+	}
+}
+
+// TestReadPlanOutcomes covers the marker reader (issue #119): a valid
+// marker answers its run id -> proposals map, an absent path answers no
+// outcome, and a malformed or negative one is an error the caller turns
+// into no outcome (the full cooldown, never the short one).
+func TestReadPlanOutcomes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "plan-outcome.json")
+	if err := os.WriteFile(path, []byte(`{"run_id":39067465547,"proposals":0,"held":0}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outcomes, err := readPlanOutcomes(path)
+	if err != nil || outcomes[39067465547] != 0 {
+		t.Fatalf("valid marker: outcomes=%v err=%v; want {39067465547: 0}", outcomes, err)
+	}
+	// An unset or missing path is no outcome, not an error.
+	if outcomes, err := readPlanOutcomes(""); err != nil || outcomes != nil {
+		t.Fatalf("unset path: outcomes=%v err=%v; want nil, nil", outcomes, err)
+	}
+	if outcomes, err := readPlanOutcomes(filepath.Join(dir, "absent.json")); err != nil || outcomes != nil {
+		t.Fatalf("missing file: outcomes=%v err=%v; want nil, nil", outcomes, err)
+	}
+	// Malformed JSON and out-of-range fields are errors.
+	for _, bad := range []string{`{not json`, `{"run_id":0,"proposals":0}`, `{"run_id":-1,"proposals":0}`, `{"run_id":5,"proposals":-1}`, `{"run_id":5,"held":-1}`} {
+		if err := os.WriteFile(path, []byte(bad), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readPlanOutcomes(path); err == nil {
+			t.Fatalf("marker %q: want an error", bad)
+		}
 	}
 }
 
@@ -372,6 +449,35 @@ func TestRunPlanCheck(t *testing.T) {
 	if out, err := planCheckStdout(t, low, fresh); err != nil || out != "" {
 		t.Fatalf("cooldown: planCheckStdout = %q, %v; wanted nothing", out, err)
 	}
+	// Issue #119: a completed plan run 3h old is inside the 12h cooldown,
+	// so a hold; with the outcome marker that says it opened nothing, the
+	// 2h retry cooldown has elapsed and the plan run fires. A malformed or
+	// invalid marker reads as an unknown outcome: the hold stays.
+	recent := writePlanRuns(t, []runStatus{planRun("completed", "CodeAF plan", stampAgo(3), 104)})
+	if out, err := planCheckStdout(t, low, recent); err != nil || out != "" {
+		t.Fatalf("3h old plan run: planCheckStdout = %q, %v; wanted nothing", out, err)
+	}
+	marker := filepath.Join(t.TempDir(), "plan-outcome.json")
+	t.Setenv("PLAN_OUTCOMES_PATH", marker)
+	if err := os.WriteFile(marker, []byte(`{"run_id":104,"proposals":0,"held":0}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := planCheckStdout(t, low, recent); err != nil || out != "plan=1\nlane=0\n" {
+		t.Fatalf("3h old empty plan run with a marker: planCheckStdout = %q, %v; want plan=1, lane=0", out, err)
+	}
+	if err := os.WriteFile(marker, []byte(`{not json`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := planCheckStdout(t, low, recent); err != nil || out != "" {
+		t.Fatalf("malformed marker: planCheckStdout = %q, %v; wanted nothing", out, err)
+	}
+	if err := os.WriteFile(marker, []byte(`{"run_id":104,"proposals":-1}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := planCheckStdout(t, low, recent); err != nil || out != "" {
+		t.Fatalf("invalid marker: planCheckStdout = %q, %v; wanted nothing", out, err)
+	}
+	t.Setenv("PLAN_OUTCOMES_PATH", "")
 	// Without the week's spend total the command refuses, like `harness
 	// next`.
 	t.Setenv("CODEAF_WEEK_SPENT_USD", "")

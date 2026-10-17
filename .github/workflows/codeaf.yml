@@ -1002,8 +1002,21 @@ jobs:
           [ "$maxp" -ge 1 ] || maxp=5
           # The open issues plan-report dedupes proposal titles against.
           gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" > "$OPEN_ISSUES_PATH"
-          if ! "$HARNESS" plan-report; then
+          plan_report_ok=0
+          held=0
+          if report=$("$HARNESS" plan-report); then
+            plan_report_ok=1
+            # Parsed, never sourced: digits only, else 0.
+            h=$(sed -n 's/^proposals=[0-9]\{1,4\} held=\([0-9]\{1,4\}\)$/\1/p' <<<"$report")
+            [[ "$h" =~ ^[0-9]{1,4}$ ]] || h=0
+            held=$h
+          else
             echo "::warning::plan-report failed; no proposals were opened"
+          fi
+          if [ "$plan_report_ok" != 1 ]; then
+            # No marker is written: plan-check then reads the outcome as
+            # unknown and keeps the full planner.min_hours cooldown (issue
+            # #119, fail closed).
             exit 0
           fi
           count=$(jq 'length' "$PROPOSALS_PATH" 2>/dev/null) || count=0
@@ -1017,7 +1030,8 @@ jobs:
           # the title must be non-empty, the labels an array of strings.
           # codeaf-queued is filtered out and never passed anywhere below --
           # promoting a proposal is always a person's act (issue #61).
-          jq -c '.[:'"$maxp"'] | .[]' "$PROPOSALS_PATH" 2>/dev/null | while IFS= read -r p; do
+          opened=0
+          while IFS= read -r p; do
             [ -n "$p" ] || continue
             title=$(jq -r '.title // empty' <<<"$p")
             if [ -z "$title" ]; then
@@ -1037,11 +1051,34 @@ jobs:
             done < <(jq -r '[(.labels // [])[] | select(type == "string")] | unique | .[]' <<<"$p")
             if gh issue create --title "$title" --body-file "$body_file" --label codeaf-proposed ${label_args+"${label_args[@]}"}; then
               echo "opened proposal: $title"
+              opened=$((opened+1))
             else
               echo "::warning::could not open the proposal issue: $title"
             fi
             rm -f "$body_file"
-          done
+          done < <(jq -c '.[:'"$maxp"'] | .[]' "$PROPOSALS_PATH" 2>/dev/null)
+          # The plan run's outcome marker (issue #119): how many proposals
+          # this step actually opened, for the queue's plan-check, which
+          # cools down planner.retry_min_hours instead of the full
+          # planner.min_hours after a plan run that opened nothing. Written
+          # only when plan-report succeeded; a missing marker reads as an
+          # unknown outcome there, which keeps the full cooldown.
+          mkdir -p "$RUNNER_TEMP/plan-outcome"
+          printf '{"run_id": %s, "proposals": %d, "held": %d}\n' "$GITHUB_RUN_ID" "$opened" "$held" \
+            > "$RUNNER_TEMP/plan-outcome/plan-outcome.json"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        # The plan run's outcome marker (issue #119), for the queue job's
+        # plan-check. Uploaded best effort: a missing marker reads as an
+        # unknown outcome in plan-check, which keeps the full cooldown.
+        if: ${{ !cancelled() && needs.gate.outputs.mode == 'plan' }}
+        continue-on-error: true
+        with:
+          name: codeaf-plan-outcome
+          path: ${{ runner.temp }}/plan-outcome
+          if-no-files-found: ignore
+          retention-days: 14
+          overwrite: true
 
       - name: Report
         # In review mode the findings comment below carries the spend line

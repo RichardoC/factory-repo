@@ -56,3 +56,8 @@ Write one section per proposal, in exactly this shape:
 - A proposal with an empty `Problem` and an empty `What to do` is dropped.
 - Everything you write outside these proposal sections is read as prose, not
   as proposals; the machine parser takes nothing from it.
+- The plan report reads your FINAL ANSWER — the result you close the root
+  task with (`plandb done ... --result '...'`) — not the task store and not
+  any file you wrote. Repeat every proposal there, in exactly the
+  `### Proposal:` format above. A run whose proposals never reach the final
+  answer opens no issues.

@@ -6,6 +6,7 @@
   "planner": {
     "min_backlog": 3,
     "min_hours": 12,
+    "retry_min_hours": 2,
     "max_proposals": 5
   },
   "limits": {

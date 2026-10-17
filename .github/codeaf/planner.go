@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -29,6 +30,16 @@ type planOptions struct {
 	// MinHours is planner.min_hours: no plan run may have started within
 	// this many hours.
 	MinHours int
+	// RetryMinHours is planner.retry_min_hours: the shorter cooldown that
+	// replaces MinHours after a plan run that opened no proposals (issue
+	// #119). A run that proposed nothing has nothing to show for its 12
+	// hours, so the next attempt waits only this long.
+	RetryMinHours int
+	// Outcomes maps a completed plan run's databaseId to the number of
+	// proposals the publish job opened for it (issue #119), read from the
+	// marker the publish job uploads. A run absent from the map has an
+	// unknown outcome, which keeps the full MinHours: fail closed.
+	Outcomes map[int]int
 	// Logf is where the planner explains itself; nil discards.
 	Logf func(string, ...any)
 }
@@ -46,10 +57,13 @@ type planOptions struct {
 //   - the backlog: open, non-PR issues labelled QueuedLabel and NOT labelled
 //     Label must number fewer than MinBacklog;
 //   - the cooldown: no run in the list — queued, in progress or completed —
-//     carries a plan title whose created_at is an RFC3339 stamp within
-//     MinHours. A plan-title run with a missing or unparseable stamp counts
-//     as inside the cooldown: an unknown age must not wave a plan run
-//     through (fail closed).
+//     carries a plan title whose created_at is an RFC3339 stamp within its
+//     cooldown. The cooldown is MinHours, except for a plan run whose known
+//     outcome (Outcomes, issue #119) is zero proposals opened: for that run
+//     it is RetryMinHours — the run proposed nothing, so the full MinHours
+//     would only delay the retry. A plan-title run with a missing or
+//     unparseable stamp counts as inside the cooldown whatever its outcome:
+//     an unknown age must not wave a plan run through (fail closed).
 //
 // PlanCheck is deterministic and pure except for Logf: the only clock it
 // reads is the one the created_at stamps and MinHours are measured against.
@@ -106,10 +120,12 @@ func PlanCheck(issues []item, runs []runStatus, o planOptions) (lane int, ok boo
 	if backlog >= o.MinBacklog {
 		return refuse(fmt.Sprintf("backlog sufficient (%d queued, need fewer than %d)", backlog, o.MinBacklog))
 	}
-	// (d) Cooldown: one plan run per MinHours, read off the created_at
-	// stamp every run carries. An unparseable or missing stamp on a
-	// plan-title run is treated as inside the cooldown, never outside it.
-	horizon := time.Duration(o.MinHours) * time.Hour
+	// (d) Cooldown: one plan run per cooldown, read off the created_at
+	// stamp every run carries. A completed plan run known to have opened
+	// no proposals (issue #119) cools down for RetryMinHours instead of
+	// MinHours; an unknown outcome keeps the full MinHours. An unparseable
+	// or missing stamp on a plan-title run is treated as inside the
+	// cooldown whatever the outcome, never outside it.
 	for _, r := range runs {
 		if !isPlanRun(r) {
 			continue
@@ -118,8 +134,12 @@ func PlanCheck(issues []item, runs []runStatus, o planOptions) (lane int, ok boo
 		if err != nil {
 			return refuse(fmt.Sprintf("plan cooldown active (run %d: created_at %q unparseable)", r.DatabaseId, r.CreatedAt))
 		}
-		if age := time.Since(t); age < horizon {
-			return refuse(fmt.Sprintf("plan cooldown active (run %d started %.1fh ago, cooldown %dh)", r.DatabaseId, age.Hours(), o.MinHours))
+		cooldown := o.MinHours
+		if n, known := o.Outcomes[r.DatabaseId]; known && n == 0 && o.RetryMinHours > 0 {
+			cooldown = o.RetryMinHours
+		}
+		if age := time.Since(t); age < time.Duration(cooldown)*time.Hour {
+			return refuse(fmt.Sprintf("plan cooldown active (run %d started %.1fh ago, cooldown %dh)", r.DatabaseId, age.Hours(), cooldown))
 		}
 	}
 	logf("plan-check: dispatching plan run on lane %d", lane)
@@ -158,6 +178,13 @@ func runPlanCheck() error {
 	if err != nil {
 		return err
 	}
+	outcomes, err := readPlanOutcomes(os.Getenv("PLAN_OUTCOMES_PATH"))
+	if err != nil {
+		// Untrusted data that fails validation: ignore it, and the full
+		// cooldown applies (fail closed), like a missing marker.
+		log.Printf("plan-check: ignoring the plan-outcome marker: %v", err)
+		outcomes = nil
+	}
 	lane, ok, reason := PlanCheck(issues, runs, planOptions{
 		QueuedLabel:     envOr("CODEAF_QUEUED_LABEL", "codeaf-queued"),
 		Label:           envOr("CODEAF_LABEL", "codeaf"),
@@ -166,6 +193,8 @@ func runPlanCheck() error {
 		MaxParallelRuns: cfg.Queue.MaxParallelRuns,
 		MinBacklog:      cfg.Planner.MinBacklog,
 		MinHours:        cfg.Planner.MinHours,
+		RetryMinHours:   cfg.Planner.RetryMinHours,
+		Outcomes:        outcomes,
 		Logf:            log.Printf,
 	})
 	if !ok {
@@ -174,4 +203,41 @@ func runPlanCheck() error {
 	}
 	fmt.Printf("plan=1\nlane=%d\n", lane)
 	return nil
+}
+
+// planOutcome is the marker the publish job of a plan run uploads (issue
+// #119): the run's own databaseId and how many proposals its publish step
+// opened as issues. plan-check reads it so a run that opened nothing cools
+// down for planner.retry_min_hours instead of planner.min_hours.
+type planOutcome struct {
+	RunID     int `json:"run_id"`
+	Proposals int `json:"proposals"`
+	Held      int `json:"held"`
+}
+
+// readPlanOutcomes reads the marker file path points at and returns its
+// run id -> proposals-opened map. The marker comes from the untrusted run
+// job, so every field is validated: run_id positive, proposals and held
+// not negative. An absent or unset path answers no outcome; a present but
+// malformed one is an error, which the caller turns into no outcome — the
+// full cooldown, never the short one.
+func readPlanOutcomes(path string) (map[int]int, error) {
+	if path == "" {
+		return nil, nil
+	}
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var o planOutcome
+	if err := json.Unmarshal(data, &o); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if o.RunID <= 0 || o.Proposals < 0 || o.Held < 0 {
+		return nil, fmt.Errorf("%s: run_id %d, proposals %d, held %d is not a valid plan outcome", path, o.RunID, o.Proposals, o.Held)
+	}
+	return map[int]int{o.RunID: o.Proposals}, nil
 }

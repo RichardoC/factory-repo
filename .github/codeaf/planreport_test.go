@@ -513,6 +513,145 @@ func TestRunPlanReportRequiresEnv(t *testing.T) {
 	}
 }
 
+// closingResultFixture is the root task's closing result of plan run
+// 39067465547 (issue #119), rebuilt line for line from the five proposals
+// it named: a numbered list, each item "N. harness — Title. Verified: …",
+// not the "### Proposal:" sections the output contract asks for. The
+// answer envelope of that run was empty, so this text is all plan-report
+// gets once the record ships (issue #119, item 1).
+const closingResultFixture = `1. harness — Ship the root task's closing result for plan runs. Verified: readSummary ships the run record only when MODE == review (.github/codeaf/main.go, around line 2705), so a plan run's proposals never reach the output artifact plan-report reads.
+2. harness — Parse the numbered-list proposal shape too. Verified: plan-report's fallback looks for <dir of RESULT_PATH>/codeaf-trajectory.jsonl, which plan mode never writes; publish downloads only codeaf-output, and the record survives only in the diagnostics artifact.
+3. harness — Require the proposals in the plan brief's final answer. Verified: the brief states the proposal format only as the output contract, and a run that closes with plandb done leaves the proposals in the task store, where plan-report never looks.
+4. harness — Shorten the cooldown after a plan run that opened nothing. Verified: plan-check only knows whether a plan run started within planner.min_hours (12h), so a run that opened zero proposals still blocks the next one for 12 hours.
+5. harness — Test the plan-mode closing result end to end. Verified: main_test.go pins review-ships and empty-mode-doesn't with no plan case, and planreport_test.go has no fixture from run 39067465547.
+`
+
+// TestParseProposalsNumberedList covers the closing-result shape (issue
+// #119): a numbered item whose leading token is a known area is a
+// proposal — title up to the first sentence end, area normalized, body in
+// Problem — while a numbered line without one stays prose; continuation
+// lines ride into the body, and section-format proposals still parse
+// beside numbered ones.
+func TestParseProposalsNumberedList(t *testing.T) {
+	// The two leading numbered lines name no known area: prose before the
+	// first item, never proposals. The widget item shows a colon after the
+	// area but a sentence end only mid-body; the fourth wraps its body onto
+	// the next line; the section-format proposal still parses after them.
+	props := ParseProposals("0. plain numbered line without an area prefix\n"+
+		"9. app/a/b — a two-segment area is no area\n"+
+		"1. harness — Ship the closing result. Verified: readSummary ships only in review mode.\n"+
+		"2. HARNESS — Parse the numbered shape? Verified: the fallback never fires.\n"+
+		"3. app/widget — Fix the widget queue. Verified: the lane test fails.\n"+
+		"4. harness — No sentence end here but\nthe body wraps onto the next line.\n"+
+		"### Proposal: From the section format\n- Problem: p\n- What to do: w\n", 20)
+	if len(props) != 5 {
+		t.Fatalf("got %d proposals (%+v), want 5", len(props), props)
+	}
+	if props[0].Title != "Ship the closing result" || props[0].Area != "harness" {
+		t.Errorf("first: title %q area %q", props[0].Title, props[0].Area)
+	}
+	if !strings.HasPrefix(props[0].Problem, "Verified: readSummary") {
+		t.Errorf("first body = %q, want the text after the title", props[0].Problem)
+	}
+	if props[1].Title != "Parse the numbered shape" || props[1].Area != "harness" {
+		t.Errorf("second: title %q area %q; want the ? sentence end and a normalized area", props[1].Title, props[1].Area)
+	}
+	if props[2].Title != "Fix the widget queue" || props[2].Area != "app/widget" {
+		t.Errorf("third: title %q area %q; want the app area", props[2].Title, props[2].Area)
+	}
+	if props[2].Problem != "Verified: the lane test fails." {
+		t.Errorf("third body = %q", props[2].Problem)
+	}
+	// No sentence end on the item's first line: the whole source is the
+	// title, the wrapped line is the body.
+	if props[3].Title != "No sentence end here but" || props[3].Problem != "the body wraps onto the next line." {
+		t.Errorf("fourth: title %q body %q", props[3].Title, props[3].Problem)
+	}
+	// The section-format proposal still parses, after the numbered ones.
+	if props[4].Title != "From the section format" || props[4].Problem != "p" || props[4].What != "w" {
+		t.Errorf("fifth: %+v", props[4])
+	}
+	// Numbered lines that name no known area never become proposals — here
+	// they sat before the first section header, so they are prose.
+	for _, p := range props {
+		if strings.Contains(p.Title, "plain numbered") || strings.Contains(p.Title, "two-segment") {
+			t.Errorf("a numbered line without a known area became a proposal: %+v", p)
+		}
+	}
+	// A numbered item whose only sentence end closes its text — a title
+	// and no body — is dropped, like a section proposal with no Problem.
+	if alone := ParseProposals("1. app/solo — A title and nothing after the period.\n", 20); len(alone) != 0 {
+		t.Errorf("a body-less numbered item became a proposal: %+v", alone)
+	}
+	// A numbered sub-list inside a section-format field stays field text:
+	// without a leading area token it cannot close the proposal.
+	inner := ParseProposals("### Proposal: Outer\n- Problem: before\n1. first sub-point\n2. second sub-point\n- What to do: w\n", 20)
+	if len(inner) != 1 || inner[0].Title != "Outer" {
+		t.Fatalf("inner sub-list: got %+v, want one proposal", inner)
+	}
+	if !strings.Contains(inner[0].Problem, "1. first sub-point") || !strings.Contains(inner[0].Problem, "2. second sub-point") {
+		t.Errorf("sub-list lines lost from Problem: %q", inner[0].Problem)
+	}
+	if inner[0].What != "w" {
+		t.Errorf("What = %q after the sub-list; want the field to resume", inner[0].What)
+	}
+}
+
+// TestRunPlanReportClosingResultFallback reproduces plan run 39067465547
+// (issue #119): the answer envelope is empty, the root task's closing
+// result rides the shipped run record, and its five numbered proposals
+// parse with their harness area labels.
+func TestRunPlanReportClosingResultFallback(t *testing.T) {
+	dir := t.TempDir()
+	proposalsPath := filepath.Join(dir, "proposals.json")
+	trajectory := `{"kind":"start"}
+` +
+		`{"kind":"end","result":` + planJSONString(closingResultFixture) + `}
+`
+	if err := os.WriteFile(filepath.Join(dir, "codeaf-trajectory.jsonl"), []byte(trajectory), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RESULT_PATH", filepath.Join(dir, "missing.json"))
+	t.Setenv("PROPOSALS_PATH", proposalsPath)
+	t.Setenv("OPEN_ISSUES_PATH", "")
+	t.Setenv("TRAJECTORY_PATH", "")
+
+	out, err := captureStdout(t, func() error { return runPlanReport() })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(out); got != "proposals=5 held=0" {
+		t.Fatalf("stdout = %q, want %q (the run's proposals=0 held=0 is the bug)", got, "proposals=5 held=0")
+	}
+	data, err := os.ReadFile(proposalsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []planProposalOut
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatalf("not valid JSON: %v", err)
+	}
+	want := []string{
+		"Ship the root task's closing result for plan runs",
+		"Parse the numbered-list proposal shape too",
+		"Require the proposals in the plan brief's final answer",
+		"Shorten the cooldown after a plan run that opened nothing",
+		"Test the plan-mode closing result end to end",
+	}
+	for i, e := range entries {
+		if e.Title != want[i] {
+			t.Errorf("entry %d title = %q, want %q", i, e.Title, want[i])
+		}
+		labels := []string{proposedLabel, "area:harness"}
+		if len(e.Labels) != 2 || e.Labels[0] != labels[0] || e.Labels[1] != labels[1] {
+			t.Errorf("entry %d labels = %v, want %v", i, e.Labels, labels)
+		}
+		if !strings.HasPrefix(e.Body, "### Proposal: "+want[i]) || !strings.Contains(e.Body, "Verified:") {
+			t.Errorf("entry %d body does not carry the title and the Verified body: %.120s", i, e.Body)
+		}
+	}
+}
+
 // planJSONString marshals s as one JSON string.
 func planJSONString(s string) string {
 	data, err := json.Marshal(s)

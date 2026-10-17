@@ -183,6 +183,10 @@ type Planner struct {
 	MinBacklog   int `json:"min_backlog"`   // queued issues below which a plan run fires
 	MinHours     int `json:"min_hours"`     // hours since the last plan run before another
 	MaxProposals int `json:"max_proposals"` // proposals one plan run may open
+	// RetryMinHours is planner.retry_min_hours: the shorter cooldown after a
+	// plan run that opened no proposals (issue #119). Such a run proposed
+	// nothing, so waiting out the full min_hours only delays the retry.
+	RetryMinHours int `json:"retry_min_hours"`
 }
 
 // Config is models.json: the spend caps and the models CodeAF may use.
@@ -245,6 +249,12 @@ func loadConfig(path string) (Config, error) {
 		cfg.Planner.MaxProposals = 5
 	case cfg.Planner.MaxProposals < 0:
 		return cfg, fmt.Errorf("%s: planner.max_proposals must not be negative", path)
+	}
+	switch {
+	case cfg.Planner.RetryMinHours == 0:
+		cfg.Planner.RetryMinHours = 2
+	case cfg.Planner.RetryMinHours < 0:
+		return cfg, fmt.Errorf("%s: planner.retry_min_hours must not be negative", path)
 	}
 	if len(cfg.Models) == 0 {
 		return cfg, fmt.Errorf("%s: no models", path)
@@ -2702,8 +2712,11 @@ func runSummary() error {
 	// this job's output artifact, and it falls back to the root task's run
 	// record when the result's answer carries no findings. So in review mode
 	// the record is shipped beside the result, capped here and read there as
-	// untrusted data.
-	if envOr("MODE", "") == "review" {
+	// untrusted data. Issue #119: plan mode ships it too — a plan run's
+	// proposals can live only in the root task's closing result (the answer
+	// envelope is often empty), and plan-report's fallback reads this same
+	// copy out of the output artifact the publish job downloads.
+	if mode := envOr("MODE", ""); mode == "review" || mode == "plan" {
 		if from := shipRunRecord(); from != "" {
 			log.Printf("shipped the run record %s beside the result", from)
 		}
