@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // nextOpts is the queue the tests decide in: a $10 weekly credit and the
@@ -108,7 +111,7 @@ func TestNextParallelRuns(t *testing.T) {
 }
 
 func TestNextSpendThreshold(t *testing.T) {
-	issues := []item{queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued")}
+	issues := []item{areaIssue(3, "2024-01-01T00:00:00Z", "app/x")}
 	o := nextOpts()   // weekly credit $10
 	o.WeekSpent = 7.5 // exactly 0.75 of the credit
 	if n, _, reason := Next(issues, nil, o); n != 0 || reason != "spend threshold reached" {
@@ -137,7 +140,7 @@ func TestNextSpentEnv(t *testing.T) {
 }
 
 func TestNextDependsOn(t *testing.T) {
-	candidate := queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued")
+	candidate := queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued", "area:app/x")
 	dep := queuedIssue(12, "2024-01-02T00:00:00Z")
 	openPR := queuedIssue(13, "2024-01-02T00:00:00Z")
 	openPR.PullRequest = json.RawMessage(`{"number":13}`)
@@ -153,7 +156,7 @@ func TestNextDependsOn(t *testing.T) {
 	unknownDep.Body = "Depends on #99"
 	mixed := candidate
 	mixed.Body = "Depends on #12, #13"
-	other := queuedIssue(7, "2024-01-03T00:00:00Z", "codeaf-queued")
+	other := queuedIssue(7, "2024-01-03T00:00:00Z", "codeaf-queued", "area:app/x")
 
 	cases := []struct {
 		name   string
@@ -192,13 +195,13 @@ func withBody(it item, body string) item {
 }
 
 func TestNextOrdering(t *testing.T) {
-	oldest := queuedIssue(7, "2024-01-01T00:00:00Z", "codeaf-queued")
-	newer := queuedIssue(6, "2024-06-01T00:00:00Z", "codeaf-queued")
-	priority := queuedIssue(9, "2024-09-01T00:00:00Z", "codeaf-queued", "codeaf-priority")
-	priorityOlder := queuedIssue(4, "2024-02-01T00:00:00Z", "codeaf-queued", "codeaf-priority")
-	twin := queuedIssue(5, "2024-03-01T00:00:00Z", "codeaf-queued")
-	twinLater := queuedIssue(11, "2024-03-01T00:00:00Z", "codeaf-queued")
-	badStamp := queuedIssue(1, "not-a-date", "codeaf-queued")
+	oldest := queuedIssue(7, "2024-01-01T00:00:00Z", "codeaf-queued", "area:app/x")
+	newer := queuedIssue(6, "2024-06-01T00:00:00Z", "codeaf-queued", "area:app/x")
+	priority := queuedIssue(9, "2024-09-01T00:00:00Z", "codeaf-queued", "codeaf-priority", "area:app/x")
+	priorityOlder := queuedIssue(4, "2024-02-01T00:00:00Z", "codeaf-queued", "codeaf-priority", "area:app/x")
+	twin := queuedIssue(5, "2024-03-01T00:00:00Z", "codeaf-queued", "area:app/x")
+	twinLater := queuedIssue(11, "2024-03-01T00:00:00Z", "codeaf-queued", "area:app/x")
+	badStamp := queuedIssue(1, "not-a-date", "codeaf-queued", "area:app/x")
 
 	if n, _, _ := Next([]item{newer, oldest}, nil, nextOpts()); n != 7 {
 		t.Fatalf("oldest first: Next = %d", n)
@@ -394,7 +397,7 @@ func TestNextAreas(t *testing.T) {
 		{"body path on the busy area holds", []item{issue5, bodyHeld}, []runStatus{held}, 0},
 		{"body path elsewhere starts", []item{issue5, bodyFree}, []runStatus{held}, 3},
 		{"no area conflicts with a run", []item{issue5, queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued")}, []runStatus{held}, 0},
-		{"no area starts when nothing runs", []item{queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued")}, nil, 3},
+		{"no area is held even with nothing running", []item{queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued")}, nil, 0},
 		{"an unknown in-flight issue conflicts", []item{issue5, areaIssue(3, "2024-01-01T00:00:00Z", "app/x")},
 			[]runStatus{{Status: "in_progress", DatabaseId: 7, DisplayTitle: "CodeAF #99 (lane 0)"}}, 0},
 		{"a garbage title conflicts", []item{issue5, areaIssue(3, "2024-01-01T00:00:00Z", "app/x")},
@@ -561,7 +564,7 @@ func TestNextLogs(t *testing.T) {
 			runs: []runStatus{running(5, 0, 100)},
 			want: []string{
 				"runs in progress: 1/2, lanes in use: 0 (run 100)",
-				"holding #3: no area; conflicts with run 100",
+				"holding #3: no area label",
 			},
 		},
 	}
@@ -722,5 +725,136 @@ func TestQueueDispatchesPassTheGate(t *testing.T) {
 	last := flags[len(flags)-1]
 	if last["plan"] != "true" {
 		t.Fatalf("the queue's last codeaf.yml dispatch is %v; want the planner's plan=true", last)
+	}
+}
+
+// TestRunAreasOfPullRequest covers the PR side of the area rule (issue #132):
+// an in-flight review run titled `CodeAF #124` takes its areas from the issue
+// its PR closes (#119, area:harness) united with the PR's changed files (here
+// under .github/, the same harness area). An app candidate starts on the free
+// lane; a harness candidate is held with the usual busy reason.
+func TestRunAreasOfPullRequest(t *testing.T) {
+	o := nextOpts()
+	o.MaxParallelRuns = 2
+	o.PRFiles = map[int][]string{124: {".github/codeaf/planreport.go"}}
+	pr := queuedIssue(124, "2024-01-01T00:00:00Z", "codeaf")
+	pr.Body = "Closes #119"
+	pr.PullRequest = json.RawMessage(`{"number":124}`)
+	linked := areaIssue(119, "2024-01-01T00:00:00Z", "harness")
+	review := runStatus{Status: "in_progress", DatabaseId: 39072194971, DisplayTitle: "CodeAF #124"}
+	byNumber := map[int]item{124: pr, 119: linked}
+
+	if got := runAreas(review, byNumber, o.PRFiles); !slices.Equal(got, []string{"harness"}) {
+		t.Fatalf("runAreas = %v; want [harness]", got)
+	}
+	issues := []item{pr, linked, areaIssue(3, "2024-01-01T00:00:00Z", "app/kube-sqlite3-vfs")}
+	if n, lane, _ := Next(issues, []runStatus{review}, o); n != 3 || lane != 1 {
+		t.Fatalf("app candidate vs PR review run: Next = %d, lane %d; want 3, 1", n, lane)
+	}
+	held := []item{pr, linked, areaIssue(4, "2024-01-01T00:00:00Z", "harness")}
+	if n, _, reason := Next(held, []runStatus{review}, o); n != 0 || reason != "area harness busy (run 39072194971)" {
+		t.Fatalf("harness candidate vs PR review run: Next = %d, %q; want held", n, reason)
+	}
+}
+
+// TestRunAreasFromChangedFilesOnly covers a PR with no `Closes` line and no
+// area labels: its areas come from its changed files alone.
+func TestRunAreasFromChangedFilesOnly(t *testing.T) {
+	o := nextOpts()
+	o.MaxParallelRuns = 2
+	o.PRFiles = map[int][]string{10: {"app/x/main.go", "app/x/util/a.go"}}
+	pr := queuedIssue(10, "2024-01-01T00:00:00Z", "codeaf")
+	pr.PullRequest = json.RawMessage(`{"number":10}`)
+	review := runStatus{Status: "in_progress", DatabaseId: 5, DisplayTitle: "CodeAF #10"}
+
+	if got := runAreas(review, map[int]item{10: pr}, o.PRFiles); !slices.Equal(got, []string{"app/x"}) {
+		t.Fatalf("runAreas = %v; want [app/x]", got)
+	}
+	// A candidate on the same area is held; another area starts.
+	if n, _, _ := Next([]item{pr, areaIssue(3, "2024-01-01T00:00:00Z", "app/x")}, []runStatus{review}, o); n != 0 {
+		t.Fatalf("same-area candidate: Next = %d; want held", n)
+	}
+	if n, _, _ := Next([]item{pr, areaIssue(3, "2024-01-01T00:00:00Z", "app/y")}, []runStatus{review}, o); n != 3 {
+		t.Fatalf("other-area candidate: Next = %d; want 3", n)
+	}
+}
+
+// TestNoAreaIssueIsHeldNotBlocking covers the candidate side of issue #132:
+// an issue with no area label and no path in its body is held with reason
+// "no area label", never started, and the next candidate with an area still
+// starts.
+func TestNoAreaIssueIsHeldNotBlocking(t *testing.T) {
+	o := nextOpts()
+	var lines []string
+	o.Logf = func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
+	if n, _, reason := Next([]item{queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued")}, nil, o); n != 0 || reason != "no area label" {
+		t.Fatalf("area-less candidate alone: Next = %d, %q; want 0, no area label", n, reason)
+	}
+	issues := []item{queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued"), areaIssue(5, "2024-01-01T00:00:00Z", "app/x")}
+	n, lane, _ := Next(issues, nil, o)
+	if n != 5 || lane != 0 {
+		t.Fatalf("area-less candidate first: Next = %d, lane %d; want 5, 0", n, lane)
+	}
+	if !slices.Contains(lines, "holding #3: no area label") {
+		t.Fatalf("log lines = %v; want the no-area hold", lines)
+	}
+}
+
+// TestPRRunWithUnknownAreasStillBlocks pins the unchanged fail-closed rule: a
+// PR run with no `Closes` line, no area labels and no entry in prFiles has an
+// empty area set, which conflicts with every candidate.
+func TestPRRunWithUnknownAreasStillBlocks(t *testing.T) {
+	o := nextOpts()
+	o.MaxParallelRuns = 2
+	pr := queuedIssue(10, "2024-01-01T00:00:00Z", "codeaf")
+	pr.PullRequest = json.RawMessage(`{"number":10}`)
+	review := runStatus{Status: "in_progress", DatabaseId: 100, DisplayTitle: "CodeAF #10"}
+	if got := runAreas(review, map[int]item{10: pr}, nil); len(got) != 0 {
+		t.Fatalf("runAreas = %v; want none", got)
+	}
+	if n, _, reason := Next([]item{pr, areaIssue(3, "2024-01-01T00:00:00Z", "app/x")}, []runStatus{review}, o); n != 0 || reason != "area app/x busy (run 100)" {
+		t.Fatalf("Next = %d, %q; want held on the unknown PR run", n, reason)
+	}
+}
+
+// TestHoldCommentIsPostedOnce covers the hold comment (issue #132) against a
+// fake API: the first call posts the marker comment, the second — with the
+// comment present — posts nothing.
+func TestHoldCommentIsPostedOnce(t *testing.T) {
+	posts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues/7/comments":
+			body := "[]"
+			if posts > 0 {
+				body = `[{"body":"an earlier note <!-- codeaf-queue-hold -->"}]`
+			}
+			fmt.Fprint(w, body)
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/issues/7/comments":
+			posts++
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	g := github{api: server.URL, repo: "o/r", token: "t", client: &http.Client{Timeout: 5 * time.Second}}
+
+	body := holdCommentBody(7)
+	if !strings.Contains(body, queueHoldMarker) || !strings.Contains(body, "area:harness") || strings.Contains(body, "untrusted") {
+		t.Fatalf("holdCommentBody = %q", body)
+	}
+	if err := ensureHoldComment(g, 7); err != nil {
+		t.Fatal(err)
+	}
+	if posts != 1 {
+		t.Fatalf("first call posted %d comments; want 1", posts)
+	}
+	if err := ensureHoldComment(g, 7); err != nil {
+		t.Fatal(err)
+	}
+	if posts != 1 {
+		t.Fatalf("second call posted again (%d posts); want the marker to stop it", posts)
 	}
 }
