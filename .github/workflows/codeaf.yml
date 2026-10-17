@@ -51,7 +51,6 @@ permissions:
 
 env:
   CODEAF_LABEL: codeaf
-  CODEAF_REF: 6e73ac7752ae1d33c629be52a49d2b79ffcaad6d # Agent-Field/codeaf main, 2026-10-15
 
 jobs:
   gate:
@@ -170,8 +169,19 @@ jobs:
 
       - name: Build CodeAF
         # Always from the pinned source, never from a cache: a cached binary was
-        # written by an earlier job the agent ran in.
+        # written by an earlier job the agent ran in. The pin lives in
+        # .github/codeaf/codeaf-ref, so a bump is a config change under
+        # .github/codeaf/ that publishes like app code — not a workflow edit
+        # that would need maintainer approval every time.
         run: |
+          # The run job checked out the default branch fully, so the pin file is
+          # here. Read it with plain shell and validate it before any other use;
+          # it is never written to GITHUB_ENV or GITHUB_OUTPUT.
+          CODEAF_REF=$(tr -d "[:space:]" 2>/dev/null < .github/codeaf/codeaf-ref || true)
+          if ! [[ "$CODEAF_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::.github/codeaf/codeaf-ref is missing or is not exactly 40 lowercase hex characters (a full commit SHA); fix the pin file"
+            exit 1
+          fi
           git clone --filter=blob:none https://github.com/Agent-Field/codeaf "$RUNNER_TEMP/codeaf-src"
           git -C "$RUNNER_TEMP/codeaf-src" checkout --detach "$CODEAF_REF"
           (cd "$RUNNER_TEMP/codeaf-src" && CGO_ENABLED=0 go build -trimpath -o "$TOOLS/codeaf" ./cmd/codeaf)

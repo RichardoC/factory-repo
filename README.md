@@ -64,8 +64,9 @@ maintainer's approval, like any other change under `.github/`.
 - [`.github/workflows/codeaf.yml`](.github/workflows/codeaf.yml) runs three jobs,
   each checked out at the default branch:
   - `gate` checks the event against the rules above (`harness gate`).
-  - `run`, which has no write token, builds CodeAF at a pinned commit, writes a
-    brief from the issue/PR, runs `codeaf do` headless and hands over a patch.
+  - `run`, which has no write token, builds CodeAF at the commit pinned in
+    [`codeaf-ref`](.github/codeaf/codeaf-ref), writes a brief from the
+    issue/PR, runs `codeaf do` headless and hands over a patch.
   - `publish`, on a fresh runner, checks and applies the patch, then commits,
     pushes, opens or updates the PR and dispatches [CI](.github/workflows/ci.yml).
     Pushes made with `GITHUB_TOKEN` do not trigger CI on their own.
@@ -159,6 +160,32 @@ report comments — the first report is the run that opened the PR, not a
 continuation. At the cap the PR gets a comment and stays a draft for a person
 (a maintainer can still continue it by hand with a `/codeaf` comment). A run
 that ends with `stop: done` marks the PR ready for review.
+
+### Keeping CodeAF current (issue #35)
+
+The CodeAF version is pinned by a full commit SHA in
+[`codeaf-ref`](.github/codeaf/codeaf-ref), a config file under `.github/codeaf/`
+rather than a workflow variable: [`codeaf.yml`](.github/workflows/codeaf.yml)
+reads it from the default-branch checkout and refuses to run if the file is
+missing or not exactly 40 hex characters. A bump is now a one-line change to
+that file, which publishes like app code and needs no maintainer approval —
+unlike the old hardcoded `CODEAF_REF` env in the workflow, which made every
+bump a workflow edit that needs one.
+
+Every Monday morning [`codeaf-ref-check.yml`](.github/workflows/codeaf-ref-check.yml)
+(scheduled, and on demand via *Run workflow*) compares the pin with upstream
+`Agent-Field/codeaf` `main` (`harness ref-check`). When upstream has moved, it
+opens — or updates, if one exists — **one** issue, labelled
+**`codeaf-ref-update`** and **`codeaf-queued`** for the queue, listing the
+upstream commits since the pin and asking CodeAF to say which of the
+workarounds documented in this README they make unnecessary, and to bump the
+pin and remove those workarounds only if a test run on a small task succeeds.
+When the pin has caught up, the check closes the issue again.
+
+A bump can also be done by hand: edit the pin file to the new full commit SHA.
+Removing workflow-level workarounds is a workflow change and still needs a
+maintainer's approval (the `codeaf-harness` environment, see
+*Limits worth knowing* below).
 
 ## Limits worth knowing
 

@@ -1,0 +1,143 @@
+# Weekly check that the CodeAF version pin (.github/codeaf/codeaf-ref) is
+# current with upstream Agent-Field/codeaf main, so fixes for bugs we have
+# worked around reach the factory instead of waiting for someone to bump the
+# pin by hand.
+#
+# Every Monday morning (and on demand, via workflow_dispatch) it builds the
+# harness from the default branch and asks it (`harness ref-check`) to compare
+# the pin with upstream:
+#   * upstream has not moved -> the open `codeaf-ref-update` issue, if any, is
+#     closed again; otherwise nothing happens;
+#   * upstream has moved -> it opens (or updates) the one `codeaf-ref-update`
+#     issue, labelled `codeaf-queued` for the queue, asking CodeAF to read the
+#     upstream commits since the pin, say which of this repository's documented
+#     workarounds they make unnecessary, and bump the pin — removing only the
+#     workarounds proven unnecessary — if a test run on a small task succeeds.
+#
+# Security posture (AGENTS.md, "Security rules"): the only credential is
+# github.token, and `issues: write` is needed only for the label, the issue and
+# the close calls. The harness is built from the default branch, never from a
+# PR. Every value handed to gh arrives through --title-file/--body-file/
+# --add-label or is checked against a strict pattern first; nothing from the
+# pin file, the API responses or decision.json is interpolated raw into a
+# shell string.
+name: CodeAF ref check
+
+on:
+  # Weekly, Mondays 05:37 UTC: off the hour, away from the top-of-hour rush
+  # GitHub's scheduler sees.
+  schedule:
+    - cron: "37 5 * * 1"
+  workflow_dispatch:
+
+# Two checks never overlap; the second waits for the first to finish.
+concurrency:
+  group: codeaf-ref-check
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write # open/update/close the `codeaf-ref-update` issue
+  actions: write # start the queue once the issue is open
+
+jobs:
+  ref-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Paths
+        run: |
+          {
+            # Same path as in codeaf.yml and codeaf-queue.yml.
+            echo "HARNESS=$RUNNER_TEMP/harness/harness"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Always the default branch: this job holds a token with a write
+          # scope, so it must never build or run PR code. Scheduled events
+          # carry no repository payload, hence the ref fallback: they run on
+          # the default branch, so its name is the run's own ref.
+          ref: ${{ github.event.repository.default_branch || github.ref_name }}
+          sparse-checkout: .github/codeaf
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: .github/codeaf/go.mod
+          cache: false
+      - name: Build the harness
+        # Exactly as in codeaf.yml and codeaf-queue.yml: from the default
+        # branch's checkout, never from a PR or anything an earlier job
+        # produced.
+        run: |
+          cp -r .github/codeaf "$RUNNER_TEMP/harness"
+          (cd "$RUNNER_TEMP/harness" && go build -trimpath -o harness .)
+
+      - name: Fetch the upstream state and the open ref-update issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Compare the pin with upstream main. A failure means the pin may no
+          # longer exist upstream (or GitHub could not be reached): fail the
+          # step loudly, never guess with an empty compare.
+          if ! gh api "repos/Agent-Field/codeaf/compare/$(tr -d "[:space:]" < .github/codeaf/codeaf-ref)...main" > compare.json; then
+            echo "::error::could not compare .github/codeaf/codeaf-ref with Agent-Field/codeaf main; the pinned commit may no longer exist upstream"
+            exit 1
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/issues?labels=codeaf-ref-update&state=open&per_page=100" > issues.json
+
+      - name: Decide
+        # A non-zero exit fails the job: ref-check validates the pin again and
+        # refuses malformed JSON, so the check fails closed.
+        run: |
+          "$HARNESS" ref-check .github/codeaf/codeaf-ref compare.json issues.json > decision.json
+          cat decision.json
+
+      - name: Act on the decision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Scheduled events carry no repository payload, hence the ref
+          # fallback (same as the checkout above).
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || github.ref_name }}
+        run: |
+          # Parsed with jq, never sourced: only the four known actions are
+          # acted on, and the issue number is digits-only before any use
+          # (defense in depth; ref-check already guarantees both).
+          action=$(jq -r '.action // "none"' decision.json)
+          # Empty default, never 0: an absent or null number must fail the
+          # digit check below, not silently become the passing value "0".
+          n=$(jq -r '.issue_number // empty' decision.json)
+          [[ "$n" =~ ^[0-9]{1,20}$ ]] || n=""
+          if { [ "$action" = update ] || [ "$action" = close ]; } && [ -z "$n" ]; then
+            echo "::error::ref-check returned $action with an absent, null or non-digit issue number; refusing to act"
+            exit 1
+          fi
+          case "$action" in
+            create)
+              # The label may exist already; that is fine.
+              gh label create codeaf-ref-update --color D93F0B --description "upstream CodeAF moved past the pin" || true
+              gh issue create \
+                --title "$(jq -r .title decision.json)" \
+                --body-file <(jq -r .body decision.json) \
+                --label codeaf-ref-update \
+                --label codeaf-queued
+              # Start the queue now: an issue labelled with GITHUB_TOKEN fires
+              # no event, so otherwise the bump waits for the queue's schedule.
+              gh workflow run codeaf-queue.yml --ref "$DEFAULT_BRANCH" || true
+              ;;
+            update)
+              gh issue edit "$n" \
+                --body-file <(jq -r .body decision.json) \
+                --add-label codeaf-ref-update \
+                --add-label codeaf-queued
+              ;;
+            close)
+              gh issue close "$n" --comment "The pin in .github/codeaf/codeaf-ref is current with upstream; closing."
+              ;;
+            none)
+              echo "upstream CodeAF has not moved past the pin; nothing to do"
+              ;;
+            *)
+              echo "ref-check returned no known action; doing nothing"
+              ;;
+          esac
