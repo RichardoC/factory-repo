@@ -316,6 +316,10 @@ type proxy struct {
 	models     []Model
 	client     *http.Client
 	slots      map[string]chan struct{} // per upstream model, for max_concurrent
+	// Issue #90: how long a streaming client may hear nothing before the
+	// proxy proves the path with an SSE comment line; 0 means the 10s
+	// default (shorter in tests).
+	heartbeatEvery time.Duration
 	// Web search (issue #58): where forwarded searches go and this run's
 	// cap; searches counts this run's forwarded attempts under p.mu.
 	searchURL      string
@@ -1130,14 +1134,36 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("model %q is not allowed; allowed: %s", requested, strings.Join(allowed, ", ")))
 		return
 	}
-	release, slotWait, err := p.acquire(r.Context(), m)
+	// Issue #90: a streaming call that cannot get a slot at once commits its
+	// response — 200, text/event-stream — and heartbeats while it waits, so
+	// CodeAF's watcher never reads the silence as a dead path. out stays nil
+	// while the response is uncommitted and real status codes stay possible;
+	// once it is set, every later failure goes out as an SSE event, because
+	// the status line can no longer change.
+	var out *sseSink
+	var beat func()
+	if wantsStream(body) {
+		beat = func() {
+			if out == nil {
+				out = newSSESink(w, p.heartbeatInterval())
+			}
+			out.commit()
+			out.comment(slotWaitComment)
+		}
+	}
+	release, slotWait, err := p.acquire(r.Context(), m, beat)
 	if err != nil {
 		return // CodeAF gave up on the call while it waited
 	}
 	defer release()
+	defer func() {
+		if out != nil && out.beats > 0 {
+			log.Printf("%d heartbeat(s) sent to the client for %s", out.beats, m.Upstream)
+		}
+	}()
 	// Checked after the wait, since other calls may have spent the cap.
 	if reason := p.overCap(); reason != "" {
-		writeError(w, http.StatusPaymentRequired, reason)
+		p.fail(w, out, http.StatusPaymentRequired, reason)
 		return
 	}
 	// One malformed tool call left in the history makes upstream refuse every
@@ -1148,13 +1174,13 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	stream, err := RewriteRequest(body, m)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		p.fail(w, out, http.StatusBadRequest, err.Error())
 		return
 	}
 	payload, _ := json.Marshal(body)
 	request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, p.upstream+"/chat/completions", bytes.NewReader(payload))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+		p.fail(w, out, http.StatusInternalServerError, err.Error())
 		return
 	}
 	request.Header.Set("Authorization", "Bearer "+p.apiKey)
@@ -1167,7 +1193,7 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	response, err := p.client.Do(request)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "upstream unreachable: "+err.Error())
+		p.fail(w, out, http.StatusBadGateway, "upstream unreachable: "+err.Error())
 		return
 	}
 	defer response.Body.Close()
@@ -1175,16 +1201,158 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 	if response.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(response.Body)
 		log.Printf("upstream %d for %s: %.300s", response.StatusCode, m.Upstream, data)
-		w.Header().Set("Content-Type", response.Header.Get("Content-Type"))
-		w.WriteHeader(response.StatusCode)
-		_, _ = w.Write(data)
+		if out == nil {
+			w.Header().Set("Content-Type", response.Header.Get("Content-Type"))
+			w.WriteHeader(response.StatusCode)
+			_, _ = w.Write(data)
+			return
+		}
+		// Committed: the pass-through becomes an SSE error event carrying
+		// the upstream's status, since this response is already 200.
+		p.fail(w, out, response.StatusCode, fmt.Sprintf("upstream %d: %s", response.StatusCode, capString(string(data), 500)))
 		return
 	}
 	if !stream {
 		p.relayJSON(w, response.Body, m, started, slotWait, repaired)
 		return
 	}
-	p.relayStream(w, response.Body, m, started, slotWait, repaired)
+	if out == nil {
+		out = newSSESink(w, p.heartbeatInterval())
+	}
+	p.relayStream(out, response.Body, m, started, slotWait, repaired)
+}
+
+// wantsStream reports whether the request asked for a streamed response, from
+// the raw body: the rewritten body is built later, and the decision to
+// heartbeat while waiting for a slot cannot wait for the rewrite (issue #90).
+func wantsStream(body map[string]json.RawMessage) bool {
+	var stream bool
+	_ = json.Unmarshal(body["stream"], &stream)
+	return stream
+}
+
+// fail reports a failure to the client: a real status while the response is
+// not committed, an SSE error event once it is — past the commit the status
+// line cannot change, and CodeAF's chunk decoder reads an error object from
+// a data line, so a cap refusal is still read as a refusal (issue #90).
+func (p *proxy) fail(w http.ResponseWriter, out *sseSink, status int, message string) {
+	if out == nil {
+		writeError(w, status, message)
+		return
+	}
+	log.Printf("-> %d %s", status, message)
+	out.errorEvent(status, message)
+}
+
+// Heartbeat comments (issue #90): CodeAF's SSE reader calls alive for
+// every `: ` comment line and its arm watcher counts them as beats, so a
+// comment proves the path is alive without counting as a first token.
+// OpenRouter sends `: OPENROUTER PROCESSING` lines for the same reason.
+const (
+	slotWaitComment      = "codeaf-proxy waiting for a model slot"
+	upstreamQuietComment = "codeaf-proxy upstream quiet"
+)
+
+// defaultHeartbeat is how long a streaming client may hear nothing before the
+// proxy proves the path with a comment line (issue #90).
+const defaultHeartbeat = 10 * time.Second
+
+// heartbeatInterval is the quiet threshold: defaultHeartbeat unless the proxy
+// was built with a shorter one (tests).
+func (p *proxy) heartbeatInterval() time.Duration {
+	if p.heartbeatEvery > 0 {
+		return p.heartbeatEvery
+	}
+	return defaultHeartbeat
+}
+
+// sseSink writes to a streaming client. Every write takes the mutex, so a
+// heartbeat comment never lands inside a relayed line (issue #90); beats
+// counts the comments sent, for the per-call log.
+type sseSink struct {
+	w         http.ResponseWriter
+	flusher   http.Flusher
+	every     time.Duration // quiet threshold for the upstream-quiet beat
+	mu        sync.Mutex
+	committed bool      // the 200 is out: failures go as SSE events now
+	lastWrite time.Time // the last line or comment, for the quiet beat
+	beats     int       // comment lines sent, for the per-call log
+}
+
+// newSSESink wraps w without committing it: real status codes stay possible
+// until commit runs.
+func newSSESink(w http.ResponseWriter, every time.Duration) *sseSink {
+	flusher, _ := w.(http.Flusher)
+	return &sseSink{w: w, flusher: flusher, every: every}
+}
+
+// commit writes the streaming headers and the 200. After it the status line
+// cannot change, so every later failure goes out as an SSE event.
+func (s *sseSink) commit() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.committed {
+		return
+	}
+	s.committed = true
+	s.lastWrite = time.Now()
+	s.w.Header().Set("Content-Type", "text/event-stream")
+	s.w.Header().Set("Cache-Control", "no-cache")
+	s.w.WriteHeader(http.StatusOK)
+}
+
+// comment writes one SSE comment line and flushes it.
+func (s *sseSink) comment(text string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fmt.Fprintf(s.w, ": %s\n\n", text)
+	s.beats++
+	s.lastWrite = time.Now()
+	if s.flusher != nil {
+		s.flusher.Flush()
+	}
+}
+
+// line writes one relayed line and flushes it.
+func (s *sseSink) line(b []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, _ = s.w.Write(b)
+	s.lastWrite = time.Now()
+	if s.flusher != nil {
+		s.flusher.Flush()
+	}
+}
+
+// quietBeat sends the upstream-quiet heartbeat when nothing has gone to the
+// client for a full interval: the relay's ticker calls it, and a stream that
+// is being relayed resets lastWrite on every line, so a live upstream is
+// never interrupted by a comment.
+func (s *sseSink) quietBeat() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.committed || time.Since(s.lastWrite) < s.every {
+		return
+	}
+	fmt.Fprintf(s.w, ": %s\n\n", upstreamQuietComment)
+	s.beats++
+	if s.flusher != nil {
+		s.flusher.Flush()
+	}
+}
+
+// errorEvent sends a failure as a mid-stream error object — the shape
+// OpenRouter uses and CodeAF's chunk decoder reads — followed by [DONE],
+// which ends the stream cleanly.
+func (s *sseSink) errorEvent(status int, message string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	payload, _ := json.Marshal(map[string]any{"error": map[string]any{"code": status, "message": message}})
+	fmt.Fprintf(s.w, "data: %s\n\n", payload)
+	fmt.Fprintf(s.w, "data: [DONE]\n\n")
+	if s.flusher != nil {
+		s.flusher.Flush()
+	}
 }
 
 // newSlots makes one semaphore per upstream model that has a
@@ -1204,8 +1372,11 @@ func newSlots(models []Model, maxParallelRuns int) map[string]chan struct{} {
 // acquire waits for one of the model's call slots, so that no more than
 // max_concurrent calls to it are in flight upstream. Waiting is logged, so the
 // proxy log shows how much a run was held up by the limit; the wait is also
-// returned, and the ledger records it per call.
-func (p *proxy) acquire(ctx context.Context, m Model) (func(), time.Duration, error) {
+// returned, and the ledger records it per call. Issue #90: while a call
+// waits, beat is called at once and then every heartbeat interval, so a
+// streaming client whose response is already committed sees the path is
+// alive; a nil beat (non-streaming calls) waits silently, as before.
+func (p *proxy) acquire(ctx context.Context, m Model, beat func()) (func(), time.Duration, error) {
 	slot, ok := p.slots[m.Upstream]
 	if !ok {
 		return func() {}, 0, nil
@@ -1217,15 +1388,27 @@ func (p *proxy) acquire(ctx context.Context, m Model) (func(), time.Duration, er
 	default:
 	}
 	start := time.Now()
-	select {
-	case slot <- struct{}{}:
-		wait := time.Since(start)
-		log.Printf("waited %.1fs for a slot on %s (max %d at once)", wait.Seconds(), m.Upstream, cap(slot))
-		return release, wait, nil
-	case <-ctx.Done():
-		wait := time.Since(start)
-		log.Printf("call to %s abandoned after waiting %.1fs for a slot (max %d at once)", m.Upstream, wait.Seconds(), cap(slot))
-		return nil, wait, ctx.Err()
+	// beats stays a nil channel — its case never fires — when beat is nil.
+	var beats <-chan time.Time
+	if beat != nil {
+		beat()
+		ticker := time.NewTicker(p.heartbeatInterval())
+		defer ticker.Stop()
+		beats = ticker.C
+	}
+	for {
+		select {
+		case slot <- struct{}{}:
+			wait := time.Since(start)
+			log.Printf("waited %.1fs for a slot on %s (max %d at once)", wait.Seconds(), m.Upstream, cap(slot))
+			return release, wait, nil
+		case <-beats:
+			beat()
+		case <-ctx.Done():
+			wait := time.Since(start)
+			log.Printf("call to %s abandoned after waiting %.1fs for a slot (max %d at once)", m.Upstream, wait.Seconds(), cap(slot))
+			return nil, wait, ctx.Err()
+		}
 	}
 }
 
@@ -1291,14 +1474,34 @@ func RewriteChunk(data []byte, m Model, chars *charCounts) ([]byte, *Usage) {
 	return out, usage
 }
 
-func (p *proxy) relayStream(w http.ResponseWriter, upstream io.Reader, m Model, started time.Time, slotWait time.Duration, repaired int) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusOK)
-	flusher, _ := w.(http.Flusher)
+// relayStream relays the upstream SSE stream to the client, one line at a
+// time, each flushed. Issue #90: while upstream stays quiet for a full
+// heartbeat interval, a comment line goes to the client, so its watcher never
+// reads the silence as a dead path — and a comment never counts as a first
+// token. Comment and relayed lines share the sink's mutex, so they never
+// interleave mid-line, and the ticker goroutine is stopped and joined before
+// the call is recorded, so nothing is written after the stream ends.
+func (p *proxy) relayStream(out *sseSink, upstream io.Reader, m Model, started time.Time, slotWait time.Duration, repaired int) {
+	out.commit()
 	var usage *Usage
 	var chars charCounts
 	reader := bufio.NewReaderSize(upstream, 1<<16)
+	quiet := time.NewTicker(out.every)
+	defer quiet.Stop()
+	stop := make(chan struct{})
+	var done sync.WaitGroup
+	done.Add(1)
+	go func() {
+		defer done.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-quiet.C:
+				out.quietBeat()
+			}
+		}
+	}()
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
@@ -1313,10 +1516,7 @@ func (p *proxy) relayStream(w http.ResponseWriter, upstream io.Reader, m Model, 
 					trimmed = append([]byte("data: "), rewritten...)
 				}
 			}
-			_, _ = w.Write(append(trimmed, '\n'))
-			if flusher != nil {
-				flusher.Flush()
-			}
+			out.line(append(trimmed, '\n'))
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
@@ -1325,6 +1525,8 @@ func (p *proxy) relayStream(w http.ResponseWriter, upstream io.Reader, m Model, 
 			break
 		}
 	}
+	close(stop)
+	done.Wait()
 	p.record(m, usage, true, started, slotWait, chars, repaired)
 }
 

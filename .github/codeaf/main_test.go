@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -423,24 +424,24 @@ func TestProxyLimitsCallsPerModel(t *testing.T) {
 func TestAcquireGivesUpWhenTheCallerDoes(t *testing.T) {
 	m := Model{Upstream: "u", MaxConcurrent: 1}
 	p := &proxy{slots: newSlots([]Model{m}, 1)}
-	release, waited, err := p.acquire(context.Background(), m)
+	release, waited, err := p.acquire(context.Background(), m, nil)
 	if err != nil || waited != 0 {
 		t.Fatalf("first acquire: %v, waited %v", err, waited)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
-	if _, waited, err := p.acquire(ctx, m); err == nil {
+	if _, waited, err := p.acquire(ctx, m, nil); err == nil {
 		t.Fatal("second acquire got a slot past max_concurrent 1")
 	} else if waited < 10*time.Millisecond {
 		t.Errorf("abandoned acquire reported %v of waiting, want at least the 10ms it waited", waited)
 	}
 	release()
-	again, waited, err := p.acquire(context.Background(), m)
+	again, waited, err := p.acquire(context.Background(), m, nil)
 	if err != nil {
 		t.Fatal("slot not given back:", err)
 	}
 	again()
-	if _, waited, err := p.acquire(context.Background(), Model{Upstream: "unlimited"}); err != nil || waited != 0 {
+	if _, waited, err := p.acquire(context.Background(), Model{Upstream: "unlimited"}, nil); err != nil || waited != 0 {
 		t.Fatalf("a model with no max_concurrent must not wait: %v, %v", err, waited)
 	}
 }
@@ -2611,5 +2612,424 @@ func TestOverCapWeeklyCreditPercent(t *testing.T) {
 	p.quota = quota{}
 	if reason := p.overCap(); reason != "" {
 		t.Errorf("unknown quota must never block: %q", reason)
+	}
+}
+
+// Issue #90: a streaming call that has to wait for a slot commits its
+// response early and receives comment lines while it waits, then the normal
+// relayed stream once the slot frees — CodeAF's watcher reads a stream with
+// nothing at all as a dead path and hedges it.
+func TestProxyHeartbeatsWhileWaitingForASlot(t *testing.T) {
+	models := []Model{mustResolve(t, testModels(t), "zai-org/glm-5.3")}
+	models[0].MaxConcurrent = 1 // one slot per run, as with Kimi-K3
+	const interval = 20 * time.Millisecond
+	hold := make(chan struct{})
+	firstIn := make(chan struct{})
+	var mu sync.Mutex
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+		if n == 1 {
+			close(firstIn) // the first call is in flight, holding the only slot
+			<-hold
+		}
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	p := &proxy{upstream: upstream.URL, apiKey: "k", ledger: filepath.Join(t.TempDir(), "l.jsonl"),
+		runCap: 5, weekCap: 20, models: models, client: upstream.Client(),
+		slots: newSlots(models, 1), heartbeatEvery: interval}
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		response, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
+			strings.NewReader(`{"model":"zai-org/glm-5.3","stream":true,"messages":[]}`))
+		if err != nil {
+			return
+		}
+		defer response.Body.Close()
+		_, _ = io.Copy(io.Discard, response.Body)
+	}()
+	<-firstIn
+
+	second, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"zai-org/glm-5.3","stream":true,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Body.Close()
+	if second.StatusCode != http.StatusOK || second.Header.Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("waiting stream: %d %s, want a committed 200 text/event-stream", second.StatusCode, second.Header.Get("Content-Type"))
+	}
+	// Comment lines arrive while the slot is still held.
+	reader := bufio.NewReader(second.Body)
+	comments := 0
+	for comments < 2 {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("reading while waiting (got %d comment(s)): %v", comments, err)
+		}
+		if strings.HasPrefix(line, ": "+slotWaitComment) {
+			comments++
+		}
+	}
+	close(hold)
+	<-firstDone
+	rest, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(rest)
+	if !strings.Contains(got, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]") || !strings.Contains(got, "data: [DONE]") {
+		t.Errorf("the relayed stream is not intact after the wait:\n%s", got)
+	}
+	if !strings.Contains(got, `"model":"zai-org/glm-5.3"`) {
+		t.Errorf("model id not rewritten back to CodeAF's:\n%s", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 2 {
+		t.Errorf("upstream saw %d calls, want 2", calls)
+	}
+}
+
+// Issue #90: a streaming call that waits for a slot and then hits the cap
+// gets the refusal as an SSE error event — the status line is already 200 —
+// followed by [DONE], not a hung or empty stream.
+func TestProxyWaitingStreamGetsTheCapRefusalAsAnSSEEvent(t *testing.T) {
+	models := []Model{mustResolve(t, testModels(t), "zai-org/glm-5.3")}
+	models[0].MaxConcurrent = 1
+	const interval = 20 * time.Millisecond
+	hold := make(chan struct{})
+	firstIn := make(chan struct{})
+	var mu sync.Mutex
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		if n == 1 {
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+			close(firstIn)
+			<-hold
+		}
+		// $0.00228 of usage: past the $0.0005 run cap once it is recorded.
+		_, _ = io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":200}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	p := &proxy{upstream: upstream.URL, apiKey: "k", ledger: filepath.Join(t.TempDir(), "l.jsonl"),
+		runCap: 0.0005, weekCap: 20, models: models, client: upstream.Client(),
+		slots: newSlots(models, 1), heartbeatEvery: interval}
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		response, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
+			strings.NewReader(`{"model":"zai-org/glm-5.3","stream":true,"messages":[]}`))
+		if err != nil {
+			return
+		}
+		defer response.Body.Close()
+		_, _ = io.Copy(io.Discard, response.Body)
+	}()
+	<-firstIn
+
+	second, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"zai-org/glm-5.3","stream":true,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Body.Close()
+	if second.StatusCode != http.StatusOK {
+		t.Fatalf("waiting stream: %d, want the committed 200", second.StatusCode)
+	}
+	reader := bufio.NewReader(second.Body)
+	for line := mustLine(t, reader); ; line = mustLine(t, reader) {
+		if strings.HasPrefix(line, ": "+slotWaitComment) {
+			break
+		}
+	}
+	close(hold)
+	<-firstDone
+	rest, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(rest)
+	if !strings.Contains(got, `data: {"error":{"code":402`) || !strings.Contains(got, "per-run credit cap") {
+		t.Errorf("the cap refusal did not arrive as an SSE error event:\n%s", got)
+	}
+	if !strings.Contains(got, "data: [DONE]") {
+		t.Errorf("the error event is not followed by [DONE]:\n%s", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Errorf("upstream saw %d calls, want 1 (the refused call must not reach it)", calls)
+	}
+}
+
+// Issue #90: an upstream that pauses mid-stream for longer than the heartbeat
+// interval yields comment lines between intact data lines.
+func TestProxyHeartbeatsWhenUpstreamIsQuiet(t *testing.T) {
+	const interval = 20 * time.Millisecond
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]}\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush() // the pause must reach the proxy before the rest does
+		}
+		time.Sleep(8 * interval) // the long tool-call pause, shortened
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"two\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	p := &proxy{upstream: upstream.URL, apiKey: "k", ledger: filepath.Join(t.TempDir(), "l.jsonl"),
+		runCap: 5, weekCap: 20, models: testModels(t), client: upstream.Client(),
+		heartbeatEvery: interval}
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"zai-org/glm-5.3","stream":true,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(body)
+	one := strings.Index(got, `"content":"one"`)
+	two := strings.Index(got, `"content":"two"`)
+	if one < 0 || two < one {
+		t.Fatalf("data lines did not arrive in order:\n%s", got)
+	}
+	between := got[one:two]
+	if !strings.Contains(between, ": "+upstreamQuietComment) {
+		t.Errorf("no heartbeat comment between the data lines:\n%s", got)
+	}
+	for _, line := range []string{
+		"data: {\"choices\":[{\"delta\":{\"content\":\"one\"}}]",
+		"data: {\"choices\":[{\"delta\":{\"content\":\"two\"}}]",
+		"data: [DONE]",
+	} {
+		if !strings.Contains(got, line) {
+			t.Errorf("data line did not arrive intact: %q", line)
+		}
+	}
+}
+
+// Issue #90: nothing is written after the stream ends, and the quiet ticker
+// goroutine is gone once the relay returns (run under -race).
+func TestProxyNoHeartbeatAfterTheStreamEnds(t *testing.T) {
+	const interval = 20 * time.Millisecond
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	p := &proxy{upstream: upstream.URL, apiKey: "k", ledger: filepath.Join(t.TempDir(), "l.jsonl"),
+		runCap: 5, weekCap: 20, models: testModels(t), client: upstream.Client(),
+		heartbeatEvery: interval}
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"zai-org/glm-5.3","stream":true,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(body)
+	if !strings.HasSuffix(got, "data: [DONE]\n\n") {
+		t.Errorf("the stream does not end with [DONE]:\n%s", got)
+	}
+	if tail := got[strings.LastIndex(got, "data: [DONE]"):]; strings.Contains(tail, ": "+upstreamQuietComment) {
+		t.Errorf("a heartbeat was written after the stream ended:\n%s", got)
+	}
+	// The ticker goroutine exits: no relayStream frame remains anywhere.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		buf := make([]byte, 1<<20)
+		buf = buf[:runtime.Stack(buf, true)]
+		if !strings.Contains(string(buf), "relayStream") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("a relayStream goroutine is still alive after the stream ended")
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Issue #90: with a slot free at once, a streaming call keeps today's real
+// status codes — the 402 cap refusal stays a JSON body, and an upstream
+// non-200 passes through with its own status.
+func TestProxyNoWaitStreamKeepsTheStatusCodes(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"message":"rate limited"}}`)
+	}))
+	defer upstream.Close()
+
+	newProxy := func() *proxy {
+		return &proxy{upstream: upstream.URL, apiKey: "k", ledger: filepath.Join(t.TempDir(), "l.jsonl"),
+			runCap: 5, weekCap: 20, models: testModels(t), client: upstream.Client(),
+			overageCap: 0, quota: quota{Known: true, Limit: 10, Requests: 10}}
+	}
+
+	// The cap refusal: a real 402 with the JSON error shape, not a stream.
+	p := newProxy()
+	server := httptest.NewServer(p)
+	defer server.Close()
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"zai-org/glm-5.3","stream":true,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusPaymentRequired {
+		t.Errorf("uncommitted cap refusal: %d, want 402", response.StatusCode)
+	}
+	if ct := response.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("uncommitted cap refusal content type %q, want application/json", ct)
+	}
+	if !strings.Contains(string(body), `"code":402`) || strings.Contains(string(body), "data: [DONE]") {
+		t.Errorf("uncommitted cap refusal body:\n%s", body)
+	}
+
+	// The upstream 429 passes through with its own status and body.
+	p = newProxy()
+	p.quota = quota{} // let the call through to upstream
+	server2 := httptest.NewServer(p)
+	defer server2.Close()
+	response, err = http.Post(server2.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"zai-org/glm-5.3","stream":true,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("upstream pass-through: %d, want 429", response.StatusCode)
+	}
+	if !strings.Contains(string(body), "rate limited") {
+		t.Errorf("upstream body not passed through:\n%s", body)
+	}
+}
+
+// mustLine reads the next line from reader, failing the test on error.
+func mustLine(t *testing.T, reader *bufio.Reader) string {
+	t.Helper()
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading a line: %v", err)
+	}
+	return line
+}
+
+// Issue #90: once the response is committed, an upstream non-200 goes out as
+// an SSE error event carrying the upstream's status — the pass-through of a
+// real status is no longer possible.
+func TestProxyCommittedStreamCarriesUpstreamFailureAsAnSSEEvent(t *testing.T) {
+	models := []Model{mustResolve(t, testModels(t), "zai-org/glm-5.3")}
+	models[0].MaxConcurrent = 1
+	const interval = 20 * time.Millisecond
+	hold := make(chan struct{})
+	firstIn := make(chan struct{})
+	var mu sync.Mutex
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n == 1 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+			close(firstIn)
+			<-hold
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"message":"rate limited"}}`)
+	}))
+	defer upstream.Close()
+
+	p := &proxy{upstream: upstream.URL, apiKey: "k", ledger: filepath.Join(t.TempDir(), "l.jsonl"),
+		runCap: 5, weekCap: 20, models: models, client: upstream.Client(),
+		slots: newSlots(models, 1), heartbeatEvery: interval}
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		response, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
+			strings.NewReader(`{"model":"zai-org/glm-5.3","stream":true,"messages":[]}`))
+		if err != nil {
+			return
+		}
+		defer response.Body.Close()
+		_, _ = io.Copy(io.Discard, response.Body)
+	}()
+	<-firstIn
+
+	second, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"zai-org/glm-5.3","stream":true,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Body.Close()
+	if second.StatusCode != http.StatusOK {
+		t.Fatalf("waiting stream: %d, want the committed 200", second.StatusCode)
+	}
+	reader := bufio.NewReader(second.Body)
+	for line := mustLine(t, reader); ; line = mustLine(t, reader) {
+		if strings.HasPrefix(line, ": "+slotWaitComment) {
+			break
+		}
+	}
+	close(hold)
+	<-firstDone
+	rest, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(rest)
+	if !strings.Contains(got, `data: {"error":{"code":429`) || !strings.Contains(got, "rate limited") {
+		t.Errorf("the upstream 429 did not arrive as an SSE error event:\n%s", got)
+	}
+	if !strings.Contains(got, "data: [DONE]") {
+		t.Errorf("the error event is not followed by [DONE]:\n%s", got)
 	}
 }
