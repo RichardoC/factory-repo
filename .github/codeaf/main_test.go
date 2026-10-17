@@ -2425,3 +2425,15 @@ func TestRedactQuotasBody(t *testing.T) {
 		t.Errorf("non-JSON body: %q", got)
 	}
 }
+
+// Credit figures are strings in synthetic.new's body; numbers survive
+// redaction, anything else does not.
+func TestRedactQuotasBodyKeepsNumberStrings(t *testing.T) {
+	raw := `{"weeklyTokenLimit":{"maxCredits":"$120.50","remainingCredits":"117.29","percentRemaining":97.3,"note":"$1 off for you@example.com"}}`
+	got := redactQuotasBody(raw)
+	for _, want := range []string{`"maxCredits":"$120.50"`, `"remainingCredits":"117.29"`, `"percentRemaining":97.3`, `"note":"[redacted]"`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("redacted body lacks %s: %s", want, got)
+		}
+	}
+}
