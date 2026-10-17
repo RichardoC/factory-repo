@@ -23,6 +23,9 @@
 #            as untrusted data: it checks and applies the patch, then commits,
 #            pushes, opens the PR and posts the report.
 name: CodeAF
+# Countable by title: the queue parses run titles to learn which lane each
+# in-flight run sits on; a title that does not parse counts as lane 0.
+run-name: CodeAF #${{ inputs.issue || github.event.issue.number || inputs.pr || inputs.review }}${{ inputs.lane && format(' (lane {0})', inputs.lane) || '' }}
 
 on:
   issues:
@@ -43,6 +46,10 @@ on:
         type: string
       review:
         description: PR number a finished run wants independently reviewed
+        required: false
+        type: string
+      lane:
+        description: lane number the queue assigned, digits only
         required: false
         type: string
 
@@ -71,6 +78,7 @@ jobs:
       number: ${{ steps.gate.outputs.number }}
       branch: ${{ steps.gate.outputs.branch }}
       base: ${{ steps.gate.outputs.base }}
+      lane: ${{ steps.gate.outputs.lane }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -116,6 +124,7 @@ jobs:
     env:
       MODE: ${{ needs.gate.outputs.mode }}
       NUMBER: ${{ needs.gate.outputs.number }}
+      LANE: ${{ needs.gate.outputs.lane }}
       BRANCH: ${{ needs.gate.outputs.branch }}
       # Issue #57: the branch a pr run brings in — the PR base branch.
       BASE: ${{ needs.gate.outputs.base }}
@@ -291,10 +300,11 @@ jobs:
           echo "agent sandbox ok: no signal, no /proc/$worker/environ, no sudo for the agent user"
 
       - name: Run CodeAF
-        # CodeAF's settings (seat models, budgets, telemetry off) are in
-        # .github/codeaf/codeaf-config.json, installed as its profile config.
-        # Only the endpoint stays in the environment: CodeAF reads it from
-        # nowhere else.
+        # CodeAF's settings (budgets, telemetry off) are in
+        # .github/codeaf/codeaf-config.json; the harness prints them as the
+        # profile config, with the seat models from models.json that the
+        # run's lane selects. Only the endpoint stays in the environment:
+        # CodeAF reads it from nowhere else.
         #
         # CODEAF_MODELS (the escalation panel, .github/codeaf/panel.json) is
         # deliberately not set. With a panel, CodeAF's router checks every reply
@@ -308,11 +318,14 @@ jobs:
         run: |
           # In review mode the harness prints the reviewer seat's config (its
           # model differs from the worker's, so the review does not share the
-          # patch author's blind spots); otherwise the profile config above.
+          # patch author's blind spots); review-config is unchanged. For other
+          # modes the seat models come from models.json, chosen by the
+          # gate-validated lane and validated again inside seat-config (a bad
+          # lane means lane 0) — never from the issue.
           if [ "$MODE" = review ]; then
             "$HARNESS" review-config > "$CODEAF_HOME/config.json"
           else
-            cp "$RUNNER_TEMP/harness/codeaf-config.json" "$CODEAF_HOME/config.json"
+            "$HARNESS" seat-config "$LANE" > "$CODEAF_HOME/config.json"
           fi
           # The working tree and CodeAF's home are handed to the agent user
           # for the run: it needs write access to both and to nothing else.

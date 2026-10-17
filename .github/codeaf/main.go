@@ -7,7 +7,10 @@
 //	harness gate     decide whether this GitHub event may run CodeAF; writes step
 //	                 outputs (run, reason, mode, number, branch, base)
 //	harness next     pick the queued issue CodeAF should work next and print
-//	                 its number, or nothing; the queue job labels it to start
+//	                 its number and lane, or nothing; the queue job labels it
+//	                 to start
+//	harness seat-config  print the CodeAF config for one lane: the worker seat
+//	                 and task.parallel for that run's slice of the models
 //	harness brief    write the task brief for `codeaf do` to $BRIEF_PATH
 //	harness summary  print CodeAF's JSON result without its long answer
 //	harness state    the state shared between runs (state.go): load the shared
@@ -63,7 +66,7 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("harness: ")
 	if len(os.Args) < 2 {
-		log.Fatal("usage: harness proxy|gate|next|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|ref-check|merge-default")
+		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|ref-check|merge-default")
 	}
 	commands := map[string]func() error{
 		"proxy":         runProxy,
@@ -75,6 +78,7 @@ func main() {
 		"report":        runReport,
 		"pr-mode":       prMode,
 		"continue-plan": runContinuePlan,
+		"seat-config":   runSeatConfig, // the lane's CodeAF config (issue #60)
 		// The independent review pass (issue #32): brief, model config and
 		// report of a read-only review run on a pull request.
 		"review-brief":  runReviewBrief,
@@ -145,9 +149,17 @@ type Limits struct {
 // defaultMinCreditPercent is the floor used when min_credit_percent is unset.
 const defaultMinCreditPercent = 10
 
+// Queue is how many CodeAF runs the queue may have going at once. Every
+// concurrent run gets its own slice of each model's account-wide
+// max_concurrent (perRunSlots) and its own worker seat (its lane).
+type Queue struct {
+	MaxParallelRuns int `json:"max_parallel_runs"`
+}
+
 // Config is models.json: the spend caps and the models CodeAF may use.
 type Config struct {
 	Limits Limits  `json:"limits"`
+	Queue  Queue   `json:"queue"`
 	Models []Model `json:"models"`
 }
 
@@ -175,6 +187,14 @@ func loadConfig(path string) (Config, error) {
 	if cfg.Limits.MinCreditPercent == 0 {
 		cfg.Limits.MinCreditPercent = defaultMinCreditPercent
 	}
+	// The queue defaults to two parallel runs; a negative value is a
+	// mistake, not a wish to run none.
+	switch {
+	case cfg.Queue.MaxParallelRuns == 0:
+		cfg.Queue.MaxParallelRuns = 2
+	case cfg.Queue.MaxParallelRuns < 0:
+		return cfg, fmt.Errorf("%s: queue.max_parallel_runs must not be negative", path)
+	}
 	if len(cfg.Models) == 0 {
 		return cfg, fmt.Errorf("%s: no models", path)
 	}
@@ -185,8 +205,25 @@ func loadConfig(path string) (Config, error) {
 		if m.MaxConcurrent < 0 {
 			return cfg, fmt.Errorf("%s: model %q: max_concurrent must not be negative", path, m.ID)
 		}
+		// Each concurrent run gets a slice of the model's account-wide
+		// limit, so the runs' slices must not sum past it.
+		if m.MaxConcurrent > 0 && perRunSlots(m, cfg.Queue.MaxParallelRuns)*cfg.Queue.MaxParallelRuns > m.MaxConcurrent {
+			return cfg, fmt.Errorf("%s: model %q: max_parallel_runs %d: per-run slots would sum past the account limit (%d x %d > max_concurrent %d)",
+				path, m.ID, cfg.Queue.MaxParallelRuns, perRunSlots(m, cfg.Queue.MaxParallelRuns), cfg.Queue.MaxParallelRuns, m.MaxConcurrent)
+		}
 	}
 	return cfg, nil
+}
+
+// perRunSlots is one run's slice of a model's account-wide max_concurrent:
+// with max_parallel_runs runs possible at once, each may hold at most
+// max(1, max_concurrent/max_parallel_runs) calls to the model, so the runs
+// together never put more than max_concurrent calls on it.
+func perRunSlots(m Model, maxParallelRuns int) int {
+	if maxParallelRuns < 1 {
+		maxParallelRuns = 1
+	}
+	return max(1, m.MaxConcurrent/maxParallelRuns)
 }
 
 func configPath() string {
@@ -313,7 +350,7 @@ func runProxy() error {
 	p.weekCap = cfg.Limits.WeeklyCreditUSD
 	p.overageCap = cfg.Limits.OverageUSD
 	p.minCreditPct = cfg.Limits.MinCreditPercent
-	p.slots = newSlots(p.models)
+	p.slots = newSlots(p.models, cfg.Queue.MaxParallelRuns)
 	if p.weekSpent, err = spentWeek("PROXY_WEEK_SPENT_USD"); err != nil {
 		return err
 	}
@@ -1122,12 +1159,15 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 	p.relayStream(w, response.Body, m, started, slotWait, repaired)
 }
 
-// newSlots makes one semaphore per upstream model that has a max_concurrent.
-func newSlots(models []Model) map[string]chan struct{} {
+// newSlots makes one semaphore per upstream model that has a
+// max_concurrent, sized to this run's slice perRunSlots(m, maxParallelRuns):
+// several runs at once each hold a slice, and the slices must never sum past
+// the model's account-wide limit.
+func newSlots(models []Model, maxParallelRuns int) map[string]chan struct{} {
 	slots := map[string]chan struct{}{}
 	for _, m := range models {
 		if m.MaxConcurrent > 0 {
-			slots[m.Upstream] = make(chan struct{}, m.MaxConcurrent)
+			slots[m.Upstream] = make(chan struct{}, perRunSlots(m, maxParallelRuns))
 		}
 	}
 	return slots
@@ -1402,6 +1442,11 @@ type Decision struct {
 	Number int
 	Branch string
 	Base   string
+	// Lane is the seat the run takes: models.json's models[lane mod
+	// len(models)] becomes the run's worker model. It comes from the
+	// queue's `lane` dispatch input, digits only; anything else, and every
+	// non-dispatch event, is lane 0.
+	Lane int
 }
 
 func skip(reason string) Decision { return Decision{Reason: reason} }
@@ -1441,18 +1486,33 @@ func dispatchIssue(raw string) (int, bool) {
 	return n, true
 }
 
+// dispatchLane reads the `lane` input of a workflow_dispatch: digits only,
+// like the other dispatch inputs, because it is untrusted. Anything else —
+// missing, empty, non-digits, a number too big for an int — is lane 0, the
+// default seat.
+func dispatchLane(raw string) int {
+	if !digitsOnly(raw) {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
 // Decide applies the trust rules to one event. lookupPR fetches a PR when the
 // event only carries its issue form, and lookupIssue fetches an issue for the
 // dispatch path; either is only called once the event has passed every check
 // that needs no network.
 func Decide(name string, ev event, labelName string, lookupPR, lookupIssue func(int) (item, error)) (Decision, error) {
-	issueRun := func(i item, reason string) (Decision, error) {
+	issueRun := func(i item, reason string, lane int) (Decision, error) {
 		id, err := runID()
 		if err != nil {
 			return Decision{}, err
 		}
 		return Decision{Run: true, Reason: reason, Mode: "issue", Number: i.Number,
-			Branch: fmt.Sprintf("codeaf/issue-%d-%s", i.Number, id), Base: ev.Repository.DefaultBranch}, nil
+			Branch: fmt.Sprintf("codeaf/issue-%d-%s", i.Number, id), Base: ev.Repository.DefaultBranch, Lane: lane}, nil
 	}
 	var target *item
 	var trigger *comment
@@ -1465,7 +1525,7 @@ func Decide(name string, ev event, labelName string, lookupPR, lookupIssue func(
 		if len(ev.Issue.PullRequest) > 0 {
 			return skip("labelled a PR; PRs act on " + command + " commands"), nil
 		}
-		return issueRun(*ev.Issue, "issue labelled")
+		return issueRun(*ev.Issue, "issue labelled", 0)
 	case "workflow_dispatch":
 		// The queue starts runs by dispatching this workflow with the
 		// issue number in its `issue` input: a GITHUB_TOKEN-labelled
@@ -1475,6 +1535,10 @@ func Decide(name string, ev event, labelName string, lookupPR, lookupIssue func(
 		// untrusted, so only their digits are read, and what they name
 		// must still pass the same checks as a labelled event: open,
 		// not a fork, and labelled labelName.
+		// The lane dispatches the run to a worker seat: the queue hands
+		// each concurrent run a different model. The input is untrusted,
+		// so only its digits are read; anything else is lane 0.
+		lane := dispatchLane(ev.Inputs["lane"])
 		if n, ok := dispatchIssue(ev.Inputs["pr"]); ok {
 			pr, err := lookupPR(n)
 			if err != nil {
@@ -1489,7 +1553,7 @@ func Decide(name string, ev event, labelName string, lookupPR, lookupIssue func(
 			case !pr.labelled(labelName):
 				return skip("PR is not labelled " + labelName), nil
 			}
-			return Decision{Run: true, Reason: "workflow dispatch", Mode: "pr", Number: pr.Number, Branch: pr.Head.Ref, Base: pr.Base.Ref}, nil
+			return Decision{Run: true, Reason: "workflow dispatch", Mode: "pr", Number: pr.Number, Branch: pr.Head.Ref, Base: pr.Base.Ref, Lane: lane}, nil
 		}
 		// A review run (issue #32) is dispatched the same way, with the PR
 		// to review in the `review` input: same checks as the pr input
@@ -1510,7 +1574,7 @@ func Decide(name string, ev event, labelName string, lookupPR, lookupIssue func(
 			case !pr.labelled(labelName):
 				return skip("PR is not labelled " + labelName), nil
 			}
-			return Decision{Run: true, Reason: "review dispatch", Mode: "review", Number: pr.Number, Branch: pr.Head.Ref, Base: pr.Base.Ref}, nil
+			return Decision{Run: true, Reason: "review dispatch", Mode: "review", Number: pr.Number, Branch: pr.Head.Ref, Base: pr.Base.Ref, Lane: lane}, nil
 		}
 		n, ok := dispatchIssue(ev.Inputs["issue"])
 		if !ok {
@@ -1528,7 +1592,7 @@ func Decide(name string, ev event, labelName string, lookupPR, lookupIssue func(
 		case !i.labelled(labelName):
 			return skip("issue is not labelled " + labelName), nil
 		}
-		return issueRun(i, "workflow dispatch")
+		return issueRun(i, "workflow dispatch", lane)
 	case "issue_comment":
 		target, trigger = ev.Issue, ev.Comment
 		if trigger != nil {
@@ -1558,7 +1622,7 @@ func Decide(name string, ev event, labelName string, lookupPR, lookupIssue func(
 		return skip("bot comment"), nil
 	}
 	if name == "issue_comment" && len(target.PullRequest) == 0 {
-		return issueRun(*target, "command on issue")
+		return issueRun(*target, "command on issue", 0)
 	}
 	pr, err := lookupPR(target.Number)
 	if err != nil {
@@ -1594,7 +1658,7 @@ func runGate() error {
 	if err != nil {
 		return err
 	}
-	outputs := fmt.Sprintf("run=%t\nreason=%s\n", decision.Run, decision.Reason)
+	outputs := fmt.Sprintf("run=%t\nreason=%s\nlane=%d\n", decision.Run, decision.Reason, decision.Lane)
 	if decision.Run {
 		outputs += fmt.Sprintf("mode=%s\nnumber=%d\nbranch=%s\nbase=%s\n", decision.Mode, decision.Number, decision.Branch, decision.Base)
 	}

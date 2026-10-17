@@ -7,6 +7,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -30,6 +32,17 @@ func queuedIssue(n int, created string, labels ...string) item {
 	return it
 }
 
+// areaIssue builds a queued issue carrying an area: "harness" or "app/<name>".
+func areaIssue(n int, created, area string) item {
+	return queuedIssue(n, created, "codeaf-queued", "area:"+area)
+}
+
+// running builds an in-flight run whose title names issue n on a lane.
+func running(n, lane, dbid int) runStatus {
+	return runStatus{Status: "in_progress", DatabaseId: dbid,
+		DisplayTitle: fmt.Sprintf("CodeAF #%d (lane %d)", n, lane)}
+}
+
 func TestNextNothingQueued(t *testing.T) {
 	pr := queuedIssue(9, "2024-01-01T00:00:00Z", "codeaf-queued")
 	pr.PullRequest = json.RawMessage(`{"number":9}`)
@@ -47,23 +60,49 @@ func TestNextNothingQueued(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if n, reason := Next(c.issues, nil, nextOpts()); n != 0 || reason != "nothing queued" {
+			if n, _, reason := Next(c.issues, nil, nextOpts()); n != 0 || reason != "nothing queued" {
 				t.Fatalf("Next = %d, %q; want 0, nothing queued", n, reason)
 			}
 		})
 	}
 }
 
-func TestNextBlocksOnARun(t *testing.T) {
-	issues := []item{queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued")}
+// TestNextParallelRuns covers `harness next` with N runs in progress: with
+// queue.max_parallel_runs 2 the issue starts while fewer than two CodeAF
+// runs are queued or in progress, and is held at two. Queued counts like
+// in_progress; completed does not count. The candidate and the in-flight
+// issues carry different areas, so only the capacity can hold it.
+func TestNextParallelRuns(t *testing.T) {
+	issues := []item{
+		areaIssue(3, "2024-01-01T00:00:00Z", "app/x"),
+		areaIssue(5, "2024-01-01T00:00:00Z", "app/y"),
+		areaIssue(7, "2024-01-01T00:00:00Z", "app/z"),
+	}
+	o := nextOpts() // weekly credit $10
+	o.MaxParallelRuns = 2
+
+	if n, lane, _ := Next(issues, nil, o); n != 3 || lane != 0 {
+		t.Fatalf("no runs: Next = %d, lane %d; want 3, 0", n, lane)
+	}
+	// One in flight, queued or in_progress alike: the issue starts, on the
+	// one free lane.
 	for _, status := range []string{"queued", "in_progress"} {
-		if n, reason := Next(issues, []runStatus{{Status: status}}, nextOpts()); n != 0 || reason != "a CodeAF run is in progress or waiting" {
-			t.Fatalf("%s run: Next = %d, %q", status, n, reason)
+		r := running(5, 0, 100)
+		r.Status = status
+		if n, lane, _ := Next(issues, []runStatus{r}, o); n != 3 || lane != 1 {
+			t.Fatalf("%s run: Next = %d, lane %d; want 3, 1", status, n, lane)
 		}
 	}
-	// A completed run does not block.
-	if n, _ := Next(issues, []runStatus{{Status: "completed"}, {Status: "completed"}}, nextOpts()); n != 3 {
-		t.Fatalf("after completed runs Next = %d", n)
+	// Two in flight: at the capacity, held.
+	two := []runStatus{running(5, 0, 100), running(7, 1, 101)}
+	if n, _, reason := Next(issues, two, o); n != 0 || reason != "lane capacity full" {
+		t.Fatalf("two runs: Next = %d, %q; want 0, lane capacity full", n, reason)
+	}
+	// Completed runs do not count.
+	done := []runStatus{{Status: "completed", DatabaseId: 100, DisplayTitle: "CodeAF #5 (lane 0)"},
+		{Status: "completed", DatabaseId: 101, DisplayTitle: "CodeAF #7 (lane 1)"}}
+	if n, _, _ := Next(issues, done, o); n != 3 {
+		t.Fatalf("after completed runs Next = %d; want 3", n)
 	}
 }
 
@@ -71,11 +110,11 @@ func TestNextSpendThreshold(t *testing.T) {
 	issues := []item{queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued")}
 	o := nextOpts()   // weekly credit $10
 	o.WeekSpent = 7.5 // exactly 0.75 of the credit
-	if n, reason := Next(issues, nil, o); n != 0 || reason != "spend threshold reached" {
+	if n, _, reason := Next(issues, nil, o); n != 0 || reason != "spend threshold reached" {
 		t.Fatalf("at the threshold Next = %d, %q", n, reason)
 	}
 	o.WeekSpent = 7.4999
-	if n, _ := Next(issues, nil, o); n != 3 {
+	if n, _, _ := Next(issues, nil, o); n != 3 {
 		t.Fatalf("just under the threshold Next = %d", n)
 	}
 }
@@ -133,7 +172,7 @@ func TestNextDependsOn(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			n, reason := Next(c.issues, nil, nextOpts())
+			n, _, reason := Next(c.issues, nil, nextOpts())
 			if n != c.want || (c.reason != "" && reason != c.reason) {
 				t.Fatalf("Next = %d, %q; want %d, %q", n, reason, c.want, c.reason)
 			}
@@ -160,24 +199,24 @@ func TestNextOrdering(t *testing.T) {
 	twinLater := queuedIssue(11, "2024-03-01T00:00:00Z", "codeaf-queued")
 	badStamp := queuedIssue(1, "not-a-date", "codeaf-queued")
 
-	if n, _ := Next([]item{newer, oldest}, nil, nextOpts()); n != 7 {
+	if n, _, _ := Next([]item{newer, oldest}, nil, nextOpts()); n != 7 {
 		t.Fatalf("oldest first: Next = %d", n)
 	}
-	if n, _ := Next([]item{oldest, priority, newer}, nil, nextOpts()); n != 9 {
+	if n, _, _ := Next([]item{oldest, priority, newer}, nil, nextOpts()); n != 9 {
 		t.Fatalf("priority jumps the queue: Next = %d", n)
 	}
-	if n, _ := Next([]item{priority, priorityOlder}, nil, nextOpts()); n != 4 {
+	if n, _, _ := Next([]item{priority, priorityOlder}, nil, nextOpts()); n != 4 {
 		t.Fatalf("two priority issues, oldest first: Next = %d", n)
 	}
-	if n, _ := Next([]item{twinLater, twin}, nil, nextOpts()); n != 5 {
+	if n, _, _ := Next([]item{twinLater, twin}, nil, nextOpts()); n != 5 {
 		t.Fatalf("tie-break by number: Next = %d", n)
 	}
-	if n, _ := Next([]item{badStamp, newer}, nil, nextOpts()); n != 6 {
+	if n, _, _ := Next([]item{badStamp, newer}, nil, nextOpts()); n != 6 {
 		t.Fatalf("unparseable created_at sorts last: Next = %d", n)
 	}
 	// The same input twice picks the same issue, whatever the order.
-	a, _ := Next([]item{newer, oldest, priority}, nil, nextOpts())
-	b, _ := Next([]item{priority, oldest, newer}, nil, nextOpts())
+	a, _, _ := Next([]item{newer, oldest, priority}, nil, nextOpts())
+	b, _, _ := Next([]item{priority, oldest, newer}, nil, nextOpts())
 	if a != 9 || b != 9 {
 		t.Fatalf("Next is not deterministic: %d then %d", a, b)
 	}
@@ -272,14 +311,15 @@ func TestRunNext(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	issues := `[{"number":3,"state":"open","created_at":"2024-01-01T00:00:00Z","labels":[{"name":"codeaf-queued"}]},
-	            {"number":9,"state":"open","created_at":"2024-02-01T00:00:00Z","body":"Depends on #3","labels":[{"name":"codeaf-queued"}]}]`
+	issues := `[{"number":3,"state":"open","created_at":"2024-01-01T00:00:00Z","labels":[{"name":"codeaf-queued"},{"name":"area:app/x"}]},
+	            {"number":9,"state":"open","created_at":"2024-02-01T00:00:00Z","body":"Depends on #3","labels":[{"name":"codeaf"},{"name":"area:app/y"}]}]`
 	write(issuesPath, issues)
 	write(runsPath, `[{"status":"completed"}]`)
 
-	// A queued issue is picked, and nothing but its number is printed.
+	// A queued issue is picked, and the stdout carries exactly the
+	// GITHUB_OUTPUT lines: the number, then the lane.
 	t.Setenv("CODEAF_WEEK_SPENT_USD", "1")
-	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "3\n" {
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "number=3\nlane=0\n" {
 		t.Fatalf("runNext printed %q, %v", out, err)
 	}
 
@@ -289,9 +329,18 @@ func TestRunNext(t *testing.T) {
 		t.Fatalf("runNext printed %q, %v; wanted nothing", out, err)
 	}
 
-	// A run in progress: empty stdout, no error.
+	// One run in progress on another area: the issue starts on the free
+	// lane.
 	write(issuesPath, issues)
-	write(runsPath, `[{"status":"in_progress"}]`)
+	write(runsPath, `[{"status":"in_progress","databaseId":100,"displayTitle":"CodeAF #9 (lane 0)"}]`)
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "number=3\nlane=1\n" {
+		t.Fatalf("runNext printed %q, %v", out, err)
+	}
+
+	// Two runs in progress, the queue's max_parallel_runs: empty stdout,
+	// no error.
+	write(runsPath, `[{"status":"in_progress","databaseId":100,"displayTitle":"CodeAF #9 (lane 0)"},
+	                  {"status":"queued","databaseId":101,"displayTitle":"CodeAF #11 (lane 1)"}]`)
 	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "" {
 		t.Fatalf("runNext printed %q, %v; wanted nothing", out, err)
 	}
@@ -318,5 +367,221 @@ func TestRunNext(t *testing.T) {
 	}
 	if _, err := runNextStdout(t, filepath.Join(dir, "missing.json"), runsPath); err == nil {
 		t.Fatal("runNext accepted a missing file")
+	}
+}
+
+// TestNextAreas covers area conflicts: an area comes from a label
+// (area:harness, area:app/<name>) or from paths in the body, an issue with
+// no area conflicts with everything, and so does a run whose issue cannot be
+// worked out (title does not parse, issue not in the open list).
+func TestNextAreas(t *testing.T) {
+	o := nextOpts()
+	o.MaxParallelRuns = 2
+	issue5 := areaIssue(5, "2024-01-01T00:00:00Z", "harness") // the in-flight run's issue
+	held := runStatus{Status: "in_progress", DatabaseId: 100, DisplayTitle: "CodeAF #5 (lane 0)"}
+	bodyHeld := withBody(queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued"), "touch .github/workflows/ci.yml")
+	bodyFree := withBody(queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued"), "paths app/x/main.go")
+
+	cases := []struct {
+		name   string
+		issues []item
+		runs   []runStatus
+		want   int
+	}{
+		{"same label area holds", []item{issue5, areaIssue(3, "2024-01-01T00:00:00Z", "harness")}, []runStatus{held}, 0},
+		{"different label area starts", []item{issue5, areaIssue(3, "2024-01-01T00:00:00Z", "app/x")}, []runStatus{held}, 3},
+		{"body path on the busy area holds", []item{issue5, bodyHeld}, []runStatus{held}, 0},
+		{"body path elsewhere starts", []item{issue5, bodyFree}, []runStatus{held}, 3},
+		{"no area conflicts with a run", []item{issue5, queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued")}, []runStatus{held}, 0},
+		{"no area starts when nothing runs", []item{queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued")}, nil, 3},
+		{"an unknown in-flight issue conflicts", []item{issue5, areaIssue(3, "2024-01-01T00:00:00Z", "app/x")},
+			[]runStatus{{Status: "in_progress", DatabaseId: 7, DisplayTitle: "CodeAF #99 (lane 0)"}}, 0},
+		{"a garbage title conflicts", []item{issue5, areaIssue(3, "2024-01-01T00:00:00Z", "app/x")},
+			[]runStatus{{Status: "in_progress", DatabaseId: 7, DisplayTitle: "queued: something"}}, 0},
+		{"a queued run holds its area too", []item{issue5, areaIssue(3, "2024-01-01T00:00:00Z", "harness")},
+			[]runStatus{{Status: "queued", DatabaseId: 100, DisplayTitle: "CodeAF #5 (lane 0)"}}, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if n, _, _ := Next(c.issues, c.runs, o); n != c.want {
+				t.Fatalf("Next = %d; want %d", n, c.want)
+			}
+		})
+	}
+}
+
+// TestNextLanes covers lane assignment: the new run gets the lowest lane in
+// [0, max_parallel_runs) no in-flight run occupies, a lane parsed out of
+// range still occupies its value but in-range lanes are assigned regardless,
+// and two runs never share a lane.
+func TestNextLanes(t *testing.T) {
+	o := nextOpts()
+	o.MaxParallelRuns = 3
+	cand := areaIssue(3, "2024-01-01T00:00:00Z", "app/z")
+	i4 := areaIssue(4, "2024-01-01T00:00:00Z", "app/x")
+	i6 := areaIssue(6, "2024-01-01T00:00:00Z", "app/y")
+	issues := []item{cand, i4, i6}
+	// A title without the lane suffix parses to lane 0.
+	noSuffix := func(n, dbid int) runStatus {
+		return runStatus{Status: "in_progress", DatabaseId: dbid, DisplayTitle: fmt.Sprintf("CodeAF #%d", n)}
+	}
+
+	cases := []struct {
+		name string
+		runs []runStatus
+		lane int
+	}{
+		{"nothing in flight", nil, 0},
+		{"lane 0 taken", []runStatus{running(4, 0, 100)}, 1},
+		{"lane 1 taken", []runStatus{running(4, 1, 100)}, 0},
+		{"lanes 0 and 1 taken", []runStatus{running(4, 0, 100), running(6, 1, 101)}, 2},
+		{"an out-of-range lane does not block in-range lanes", []runStatus{running(4, 9, 100)}, 0},
+		{"two runs on lane 0 never share it with a third", []runStatus{noSuffix(4, 100), noSuffix(6, 101)}, 1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			n, lane, _ := Next(issues, c.runs, o)
+			if n != 3 || lane != c.lane {
+				t.Fatalf("Next = %d, lane %d; want 3, lane %d", n, lane, c.lane)
+			}
+		})
+	}
+}
+
+// TestRunLane pins the strict parse of an in-flight run's display title,
+// which is untrusted data: only "CodeAF #<n>" and "CodeAF #<n> (lane <n>)"
+// match, and anything else — wrong prefix, letters in the lane, trailing
+// prose, the empty title — is lane 0. A lane that parses out of range still
+// comes back as its value; only Next's assignment is limited to the range.
+func TestRunLane(t *testing.T) {
+	cases := []struct {
+		title string
+		want  int
+	}{
+		{"CodeAF #3", 0},
+		{"CodeAF #3 (lane 0)", 0},
+		{"CodeAF #3 (lane 1)", 1},
+		{"CodeAF #3 (lane 12)", 12},
+		{"CodeAF #3 (lane 99)", 99}, // out of range, still its value
+		{"CodeAF #3 (lane abc)", 0}, // lane letters
+		{"CodeAF #3 (lane )", 0},
+		{"CodeAF #3 (lane -1)", 0},
+		{"harness next #3", 0}, // wrong prefix
+		{"CodeAF 3", 0},
+		{"codeaf #3 (lane 1)", 0}, // case
+		{"CodeAF #3 (lane 1) extra", 0},
+		{"", 0}, // empty title
+	}
+	for _, c := range cases {
+		if got := runLane(runStatus{DisplayTitle: c.title}); got != c.want {
+			t.Errorf("runLane(%q) = %d; want %d", c.title, got, c.want)
+		}
+	}
+	// The issue number parses out of the same title.
+	if issue, lane := runTitleFields("CodeAF #3 (lane 12)"); issue != 3 || lane != 12 {
+		t.Fatalf("runTitleFields = %d, %d; want 3, 12", issue, lane)
+	}
+	if issue, _ := runTitleFields("CodeAF #3"); issue != 3 {
+		t.Fatalf("runTitleFields issue = %d; want 3", issue)
+	}
+}
+
+// TestIssueAreas covers the area sources: labels win, body paths add to
+// them, the set is sorted, and an issue that names nothing has none.
+func TestIssueAreas(t *testing.T) {
+	it := queuedIssue(3, "2024-01-01T00:00:00Z", "area:app/y")
+	it.Body = "see .github/workflows/ci.yml, then app/z/main.go, and app/x."
+	got := issueAreas(it)
+	want := []string{"app/x", "app/y", "app/z", "harness"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("issueAreas = %v; want %v", got, want)
+	}
+	if areas := issueAreas(queuedIssue(4, "2024-01-01T00:00:00Z")); len(areas) != 0 {
+		t.Fatalf("issueAreas = %v; want none", areas)
+	}
+	// Both sources naming one area, and paths that name nothing.
+	it = queuedIssue(5, "2024-01-01T00:00:00Z", "area:harness")
+	it.Body = "app/ alone, wrap/z inside a word, but the area is app/x"
+	if got := issueAreas(it); !slices.Equal(got, []string{"app/x", "harness"}) {
+		t.Fatalf("issueAreas = %v; want [app/x harness]", got)
+	}
+}
+
+// TestNextLogs pins what the queue shows: one line for the runs in progress
+// with their lanes, a reason line per held candidate, and the started line.
+func TestNextLogs(t *testing.T) {
+	// The in-flight issue carries the active label, so it is not a
+	// candidate; the others queue.
+	inFlightIssue := func(area string) item {
+		return queuedIssue(5, "2024-01-01T00:00:00Z", "codeaf-queued", "codeaf", "area:"+area)
+	}
+	cases := []struct {
+		name   string
+		issues []item
+		runs   []runStatus
+		want   []string
+		start  int // the issue started, or 0
+		lane   int
+	}{
+		{
+			name: "a start",
+			issues: []item{
+				areaIssue(3, "2024-01-01T00:00:00Z", "app/y"), // same area as the run: held
+				areaIssue(4, "2024-01-01T00:00:00Z", "app/z"),
+				inFlightIssue("app/y"),
+			},
+			runs: []runStatus{running(5, 0, 100)},
+			want: []string{
+				"runs in progress: 1/2, lanes in use: 0 (run 100)",
+				"holding #3: area app/y busy (run 100)",
+				"starting #4 (lane 1): next queued issue",
+			},
+			start: 4, lane: 1,
+		},
+		{
+			name: "capacity holds everything",
+			issues: []item{
+				areaIssue(3, "2024-01-01T00:00:00Z", "app/x"),
+				inFlightIssue("app/y"),
+				queuedIssue(6, "2024-01-01T00:00:00Z", "codeaf-queued", "codeaf", "area:app/z"),
+			},
+			runs: []runStatus{running(5, 0, 100), running(6, 1, 101)},
+			want: []string{
+				"runs in progress: 2/2, lanes in use: 0 (run 100), 1 (run 101)",
+				"holding #3: lane capacity full",
+			},
+		},
+		{
+			name: "an issue with no area",
+			issues: []item{
+				queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued"),
+				inFlightIssue("app/y"),
+			},
+			runs: []runStatus{running(5, 0, 100)},
+			want: []string{
+				"runs in progress: 1/2, lanes in use: 0 (run 100)",
+				"holding #3: no area; conflicts with run 100",
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var lines []string
+			o := nextOpts()
+			o.MaxParallelRuns = 2
+			o.Logf = func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
+			n, lane, _ := Next(c.issues, c.runs, o)
+			if n != c.start || lane != c.lane {
+				t.Fatalf("Next = %d, lane %d; want %d, lane %d", n, lane, c.start, c.lane)
+			}
+			if !slices.Equal(lines, c.want) {
+				t.Fatalf("log lines:\n%s\nwant:\n%s", strings.Join(lines, "\n"), strings.Join(c.want, "\n"))
+			}
+			// Without a Logf, Next still decides (the nil log is discarded).
+			o.Logf = nil
+			if n2, lane2, _ := Next(c.issues, c.runs, o); n2 != c.start || lane2 != c.lane {
+				t.Fatalf("silent Next = %d, lane %d; want %d, lane %d", n2, lane2, c.start, c.lane)
+			}
+		})
 	}
 }

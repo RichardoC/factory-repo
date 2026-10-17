@@ -6,11 +6,16 @@
 # the open issues and the recent CodeAF runs:
 #   * issues labelled `codeaf-queued` are the backlog, oldest first unless they
 #     carry the `codeaf-priority` label;
-#   * an issue may start a run only when no CodeAF run is queued or in
-#     progress, every issue named in a "Depends on #N" line in its body is
-#     closed, and the rolling week's credit spend in the shared state is
-#     under the threshold (75% of limits.weekly_credit_usd in
-#     .github/codeaf/models.json).
+#   * an issue may start a run only while fewer than queue.max_parallel_runs
+#     (models.json, default 2) codeaf.yml runs are queued or in progress —
+#     issue runs, PR continuations and review runs alike — with no area
+#     conflict with an in-flight run (areas are app/<name>/ and the harness
+#     .github/, from area: labels or body paths; no area conflicts with
+#     everything), every issue named in a "Depends on #N" line in its body
+#     closed, and the rolling week's credit spend in the shared state under
+#     the threshold (75% of limits.weekly_credit_usd in
+#     .github/codeaf/models.json). The queue assigns each run a lane so
+#     concurrent runs sit on different seat models.
 # It marks the chosen issue with the `codeaf` label — the same trust gate a
 # person uses (codeaf.yml's gate refuses any run whose issue lacks it) — and
 # then dispatches codeaf.yml. The dispatch step exists because events raised
@@ -117,7 +122,7 @@ jobs:
           # A CodeAF run that dispatched this tick as its last job is still in
           # progress; leave it out. Digits only, or nothing is left out.
           [[ "$FINISHED_RUN" =~ ^[0-9]{1,20}$ ]] || FINISHED_RUN=""
-          gh run list --workflow=codeaf.yml --json databaseId,status --limit 100 \
+          gh run list --workflow=codeaf.yml --json databaseId,status,displayTitle --limit 100 \
             | jq --arg id "$FINISHED_RUN" '[.[] | select((.databaseId | tostring) != $id)]' > runs.json
 
       - name: Pick the next queued issue
@@ -127,19 +132,25 @@ jobs:
         env:
           CODEAF_WEEK_SPENT_USD: ${{ steps.shared.outputs.week_usd }}
         run: |
-          n=$("$HARNESS" next issues.json runs.json)
-          echo "n=$n" >> "$GITHUB_OUTPUT"
-          echo "next issue: ${n:-none}"
+          # harness next prints GITHUB_OUTPUT lines (number=, lane=) on its
+          # stdout, empty while it holds the pick; its human log (runs in
+          # progress, lanes in use, why each candidate started or was held)
+          # goes to stderr.
+          "$HARNESS" next issues.json runs.json >> "$GITHUB_OUTPUT"
 
       - name: Label the issue and start the run
-        if: steps.next.outputs.n != ''
+        if: steps.next.outputs.number != ''
         env:
           GH_TOKEN: ${{ github.token }}
           # Scheduled events carry no repository payload; they run on the
           # default branch, so its name is the run's own ref.
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch || github.ref_name }}
-          N: ${{ steps.next.outputs.n }}
+          N: ${{ steps.next.outputs.number }}
+          LANE: ${{ steps.next.outputs.lane }}
         run: |
+          # The lane is untrusted tool output, re-validated here before it is
+          # dispatched; anything not digits-only means lane 0.
+          case "$LANE" in ""|*[!0-9]*) LANE=0 ;; esac
           gh issue edit "$N" --add-label "$CODEAF_LABEL"
           # Best effort: once the run has started, `codeaf-queued` has said
           # all it can; a failure here only leaves a stale label.
@@ -147,4 +158,4 @@ jobs:
           # GITHUB_TOKEN's events do not trigger workflows, so the label alone
           # would not start codeaf.yml. workflow_dispatch is the one event
           # GITHUB_TOKEN can start, so the queue dispatches it itself.
-          gh workflow run codeaf.yml --ref "$DEFAULT_BRANCH" -f "issue=$N"
+          gh workflow run codeaf.yml --ref "$DEFAULT_BRANCH" -f "issue=$N" -f "lane=$LANE"

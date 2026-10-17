@@ -189,3 +189,76 @@ func TestHealthzWeeklyAndOverage(t *testing.T) {
 		t.Fatalf("healthz = %+v", health)
 	}
 }
+
+// writeQueueModels writes a models.json with one model of the given
+// max_concurrent and an optional queue object; an empty queue omits the key.
+func writeQueueModels(t *testing.T, queue string, maxConcurrent int) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "models.json")
+	q := ""
+	if queue != "" {
+		q = fmt.Sprintf(`,"queue":%s`, queue)
+	}
+	body := fmt.Sprintf(`{"limits":{"plan":"big","weekly_credit_usd":20,"run_credit_usd":5}%s,
+		"models":[{"id":"m","upstream":"hf:m","efforts":["high"],"max_concurrent":%d,
+		"input":0.1,"output":0.25,"cache_read":0.02,"api_input":0.15,"api_cached":0.04,"api_output":0.5}]}`,
+		q, maxConcurrent)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestLoadConfigQueue covers queue.max_parallel_runs: absent or 0 defaults
+// to 2, a negative value is refused, and a value whose per-run slots would
+// sum past a model's account-wide max_concurrent is refused.
+func TestLoadConfigQueue(t *testing.T) {
+	for _, queue := range []string{"", `{"max_parallel_runs":2}`, `{"max_parallel_runs":0}`} {
+		cfg, err := loadConfig(writeQueueModels(t, queue, 2))
+		if err != nil || cfg.Queue.MaxParallelRuns != 2 {
+			t.Fatalf("queue %q: max_parallel_runs = %d, %v; want 2", queue, cfg.Queue.MaxParallelRuns, err)
+		}
+	}
+	// An explicit value is kept, and exactly at the model's limit fits.
+	cfg, err := loadConfig(writeQueueModels(t, `{"max_parallel_runs":2}`, 2))
+	if err != nil || cfg.Queue.MaxParallelRuns != 2 {
+		t.Fatalf("queue 2: %d, %v", cfg.Queue.MaxParallelRuns, err)
+	}
+	// Negative is refused.
+	if _, err := loadConfig(writeQueueModels(t, `{"max_parallel_runs":-1}`, 2)); err == nil || !strings.Contains(err.Error(), "must not be negative") {
+		t.Fatalf("negative queue: %v", err)
+	}
+	// Past a model's max_concurrent the per-run slots would sum past the
+	// account limit, and the config is refused.
+	if _, err := loadConfig(writeQueueModels(t, `{"max_parallel_runs":3}`, 2)); err == nil || !strings.Contains(err.Error(), "sum past the account limit") {
+		t.Fatalf("overflowing queue: %v", err)
+	}
+	// The committed models.json parses and is accepted as committed.
+	if _, err := loadConfig("models.json"); err != nil {
+		t.Fatalf("committed models.json: %v", err)
+	}
+}
+
+// TestPerRunSlotsSweep sweeps max_concurrent 1..4 against max_parallel_runs
+// 1..4: the per-run slots always number at least 1, and whenever they would
+// sum past the model's account-wide max_concurrent, loadConfig refuses the
+// config instead.
+func TestPerRunSlotsSweep(t *testing.T) {
+	for mc := 1; mc <= 4; mc++ {
+		for mpr := 1; mpr <= 4; mpr++ {
+			slots := perRunSlots(Model{ID: "m", MaxConcurrent: mc}, mpr)
+			if slots < 1 {
+				t.Errorf("perRunSlots(max_concurrent %d, max_parallel_runs %d) = %d; want at least 1", mc, mpr, slots)
+				continue
+			}
+			_, err := loadConfig(writeQueueModels(t, fmt.Sprintf(`{"max_parallel_runs":%d}`, mpr), mc))
+			if sum := slots * mpr; sum <= mc {
+				if err != nil {
+					t.Errorf("max_concurrent %d, max_parallel_runs %d: %d slots x %d = %d fits, but loadConfig refused: %v", mc, mpr, slots, mpr, sum, err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "sum past the account limit") {
+				t.Errorf("max_concurrent %d, max_parallel_runs %d: %d slots x %d = %d > %d, but loadConfig accepted", mc, mpr, slots, mpr, sum, mc)
+			}
+		}
+	}
+}
