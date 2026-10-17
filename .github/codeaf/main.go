@@ -436,6 +436,62 @@ func RewriteRequest(body map[string]json.RawMessage, m Model) (stream bool, err 
 	return stream, nil
 }
 
+// charCounts tallies the characters one call produced, split into the
+// reasoning text and the visible output. GLM streams its reasoning as
+// reasoning_content and reports no reasoning_tokens (issue #20), so the
+// report estimates those models' reasoning share from these counts. len()
+// counts UTF-8 bytes rather than runes; for a share estimate the proportion
+// is the same, and counting bytes is free.
+type charCounts struct {
+	reasoning int
+	output    int
+}
+
+// addPart reads reasoning_content, content and tool-call arguments out of one
+// already-decoded delta (streamed) or message (JSON) object and adds their
+// lengths. Missing keys and JSON nulls add nothing. Streamed tool-call
+// arguments arrive in fragments, whose lengths add up to the whole.
+func (c *charCounts) addPart(part map[string]json.RawMessage) {
+	if part == nil {
+		return
+	}
+	// A fresh string per field: unmarshalling a JSON null leaves the target
+	// untouched, so a reused variable would carry the previous field's text
+	// (a null content would re-count the reasoning) into the wrong bucket.
+	var reasoning string
+	if json.Unmarshal(part["reasoning_content"], &reasoning) == nil {
+		c.reasoning += len(reasoning)
+	}
+	var content string
+	if json.Unmarshal(part["content"], &content) == nil {
+		c.output += len(content)
+	}
+	var calls []struct {
+		Function struct {
+			Arguments string `json:"arguments"`
+		} `json:"function"`
+	}
+	if json.Unmarshal(part["tool_calls"], &calls) == nil {
+		for _, call := range calls {
+			c.output += len(call.Function.Arguments)
+		}
+	}
+}
+
+// addChoices walks the choices array of an already-decoded response and adds
+// each choice's part ("delta" when streamed, "message" in a JSON response).
+func (c *charCounts) addChoices(choices []map[string]json.RawMessage, part string) {
+	for _, choice := range choices {
+		if choice == nil {
+			continue
+		}
+		var p map[string]json.RawMessage
+		if json.Unmarshal(choice[part], &p) == nil {
+			c.addPart(p)
+		}
+	}
+}
+
 // LedgerLine is one call, as appended to the ledger and read by report.
 // Kind marks lines that are not calls: the proxy writes one "proxy_start"
 // marker when it starts, which the report times the session from.
@@ -448,10 +504,16 @@ type LedgerLine struct {
 	CompletionTokens int       `json:"completion_tokens"`
 	// ReasoningTokens is completion_tokens_details.reasoning_tokens. A nil
 	// means upstream did not report it; a known zero records 0.
-	ReasoningTokens *int    `json:"reasoning_tokens,omitempty"`
-	CostUSD         float64 `json:"cost_usd"`
-	Stream          bool    `json:"stream"`
-	UsageSeen       bool    `json:"usage_seen"`
+	ReasoningTokens *int `json:"reasoning_tokens,omitempty"`
+	// ReasoningChars and OutputChars count the characters of reasoning_content
+	// and of the visible content plus tool-call arguments. GLM sends no
+	// reasoning_tokens (issue #20), so the report estimates its reasoning
+	// share from these counts. Both stay 0 when the call produced no text.
+	ReasoningChars int     `json:"reasoning_chars,omitempty"`
+	OutputChars    int     `json:"output_chars,omitempty"`
+	CostUSD        float64 `json:"cost_usd"`
+	Stream         bool    `json:"stream"`
+	UsageSeen      bool    `json:"usage_seen"`
 	// Start is when the upstream request was issued, after any wait for a
 	// slot; ts is when the call ended. SlotWaitS is how long the call queued
 	// for a model slot. Old ledgers carry neither.
@@ -460,9 +522,10 @@ type LedgerLine struct {
 	Kind      string    `json:"kind,omitempty"`
 }
 
-func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slotWait time.Duration) {
+func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slotWait time.Duration, chars charCounts) {
 	line := LedgerLine{Time: time.Now().UTC(), Model: m.ID, Upstream: m.Upstream, Stream: stream,
-		Start: start.UTC(), SlotWaitS: slotWait.Seconds()}
+		Start: start.UTC(), SlotWaitS: slotWait.Seconds(),
+		ReasoningChars: chars.reasoning, OutputChars: chars.output}
 	if usage != nil {
 		line.UsageSeen = true
 		line.PromptTokens, line.CachedTokens, line.CompletionTokens = usage.PromptTokens, usage.cached(), usage.CompletionTokens
@@ -643,15 +706,24 @@ func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, st
 			usage = nil
 		}
 	}
+	// The characters are counted out of the decode above: the choices are
+	// read from it directly, so counting adds no second parse of the payload.
+	var chars charCounts
+	var choices []map[string]json.RawMessage
+	if json.Unmarshal(payload["choices"], &choices) == nil {
+		chars.addChoices(choices, "message")
+	}
 	payload["model"], _ = json.Marshal(m.ID)
-	p.record(m, usage, false, started, slotWait)
+	p.record(m, usage, false, started, slotWait, chars)
 	writeJSON(w, http.StatusOK, payload)
 }
 
 // RewriteChunk rewrites one SSE data payload: the model id back to CodeAF's,
 // and usage.cost added when the chunk carries usage. It returns the usage it
-// found, if any.
-func RewriteChunk(data []byte, m Model) ([]byte, *Usage) {
+// found, if any, and adds the chunk's reasoning and output characters to
+// chars when it is not nil. The payload is decoded once, and the choices are
+// read out of that decode, so counting adds no second parse of the chunk.
+func RewriteChunk(data []byte, m Model, chars *charCounts) ([]byte, *Usage) {
 	var chunk map[string]json.RawMessage
 	if json.Unmarshal(data, &chunk) != nil {
 		return data, nil
@@ -667,6 +739,12 @@ func RewriteChunk(data []byte, m Model) ([]byte, *Usage) {
 			usage = nil
 		}
 	}
+	if chars != nil {
+		var choices []map[string]json.RawMessage
+		if json.Unmarshal(chunk["choices"], &choices) == nil {
+			chars.addChoices(choices, "delta")
+		}
+	}
 	out, err := json.Marshal(chunk)
 	if err != nil {
 		return data, usage
@@ -680,6 +758,7 @@ func (p *proxy) relayStream(w http.ResponseWriter, upstream io.Reader, m Model, 
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
 	var usage *Usage
+	var chars charCounts
 	reader := bufio.NewReaderSize(upstream, 1<<16)
 	for {
 		line, err := reader.ReadBytes('\n')
@@ -688,7 +767,7 @@ func (p *proxy) relayStream(w http.ResponseWriter, upstream io.Reader, m Model, 
 			if data, ok := bytes.CutPrefix(trimmed, []byte("data:")); ok {
 				data = bytes.TrimSpace(data)
 				if len(data) > 0 && !bytes.Equal(data, []byte("[DONE]")) {
-					rewritten, found := RewriteChunk(data, m)
+					rewritten, found := RewriteChunk(data, m, &chars)
 					if found != nil {
 						usage = found
 					}
@@ -707,7 +786,7 @@ func (p *proxy) relayStream(w http.ResponseWriter, upstream io.Reader, m Model, 
 			break
 		}
 	}
-	p.record(m, usage, true, started, slotWait)
+	p.record(m, usage, true, started, slotWait, chars)
 }
 
 // ---------------------------------------------------------------- GitHub
@@ -1992,6 +2071,20 @@ type modelTotals struct {
 	cost                             float64
 	reasoning                        int
 	reasoningKnown                   bool // whether any call reported reasoning tokens
+	reasoningChars, outputChars      int  // character counts, for models that do not
+}
+
+// sharePct renders a share of a whole as a percent, one decimal under 10% so
+// small shares do not round up to a bare "1%".
+func sharePct(part, whole int) string {
+	if whole <= 0 {
+		return "—"
+	}
+	pct := 100 * float64(part) / float64(whole)
+	if pct < 10 {
+		return fmt.Sprintf("%.1f%%", pct)
+	}
+	return fmt.Sprintf("%.0f%%", pct)
 }
 
 // ---------------------------------------------------------------- untrusted text
@@ -2436,6 +2529,8 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 			t.reasoning += clampTokens(*l.ReasoningTokens)
 			t.reasoningKnown = true
 		}
+		t.reasoningChars += clampTokens(l.ReasoningChars)
+		t.outputChars += clampTokens(l.OutputChars)
 		if !l.UsageSeen {
 			t.unpriced++
 		}
@@ -2626,8 +2721,9 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 			ids = append(ids, id)
 		}
 		sort.Slice(ids, func(i, j int) bool { return totals[ids[i]].cost > totals[ids[j]].cost })
-		b.WriteString("| model | $/M in · cached · out | calls | input tok | cached tok | output tok | reasoning tok | cost |\n")
-		b.WriteString("|---|---|---:|---:|---:|---:|---:|---:|\n")
+		b.WriteString("| model | $/M in · cached · out | calls | input tok | cached tok | output tok | reasoning tok | reasoning share | cost |\n")
+		b.WriteString("|---|---|---:|---:|---:|---:|---:|---:|---:|\n")
+		estimated := false
 		for _, id := range ids {
 			t := totals[id]
 			p, known := prices[id]
@@ -2643,8 +2739,22 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 			if t.reasoningKnown {
 				reasoning = strconv.Itoa(t.reasoning)
 			}
-			fmt.Fprintf(&b, "| `%s` | %s · %s · %s | %d | %d | %d | %d | %s | %s |\n", id,
-				inPrice, cachedPrice, outPrice, t.calls, t.in, t.cached, t.out, reasoning, cost)
+			// The share is exact when reasoning tokens were reported; models
+			// that do not send them (GLM) get an estimate from the character
+			// counts of reasoning text and visible output (issue #25).
+			share := "—"
+			switch {
+			case t.reasoningKnown:
+				share = sharePct(t.reasoning, t.out)
+			case t.reasoningChars > 0 || t.outputChars > 0:
+				share = "~" + sharePct(t.reasoningChars, t.reasoningChars+t.outputChars) + " (chars)"
+				estimated = true
+			}
+			fmt.Fprintf(&b, "| `%s` | %s · %s · %s | %d | %d | %d | %d | %s | %s | %s |\n", id,
+				inPrice, cachedPrice, outPrice, t.calls, t.in, t.cached, t.out, reasoning, share, cost)
+		}
+		if estimated {
+			b.WriteString("“reasoning share” marked (chars) is an estimate: those models send no reasoning_tokens, so it is the reasoning text's share of the characters of reasoning text plus visible output (content and tool-call arguments).\n")
 		}
 		b.WriteString("\n")
 	}
