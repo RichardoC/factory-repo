@@ -106,6 +106,24 @@ func openSQLDB(tb testing.TB, vfsName, fileName string) *sql.DB {
 	return db
 }
 
+// openSQLDBWithJournal is openSQLDB with the journal mode of the DSN chosen
+// by the caller ("MEMORY", "DELETE", ...) instead of hardcoded. It exists so
+// benchmarks and tests that need a journal stored through the VFS can have
+// one without changing openSQLDB's DSN, and with it the numbers the existing
+// in-memory-journal benchmarks report.
+func openSQLDBWithJournal(tb testing.TB, vfsName, fileName, journalMode string) *sql.DB {
+	tb.Helper()
+	dsn := fmt.Sprintf("file:%s?_journal=%s&vfs=%s", fileName, journalMode, vfsName)
+	db, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		tb.Fatalf("sql.Open(%q) failed: %v", dsn, err)
+	}
+	// One connection at a time, as the module's main does: the VFS has no
+	// real multi-connection locking story.
+	db.SetMaxOpenConns(1)
+	return db
+}
+
 func fillPattern(p []byte) {
 	for i := range p {
 		p[i] = byte(i % 251)
@@ -2051,4 +2069,217 @@ func TestSQLiteMultiSector64KiBPages(t *testing.T) {
 	db2 := openSQLDB(t, vfsName, fileName)
 	defer db2.Close()
 	verifyRows(db2, "after reopen")
+}
+
+// --- Rollback journal files through the VFS (issue #68) ---
+//
+// SQLite opens "<db>-journal" through the same VFS it opens the database
+// with, so a rollback journal must be an ordinary file here: Access answers
+// from cluster truth, and Open/Delete/Truncate/FileSize key off
+// base32(RawName) like any other name. These tests pin that on a "-journal"
+// name; the crash-recovery tests that drive real SQLite live in
+// vfs_journal_test.go.
+
+func TestAccessJournalReflectsClusterTruth(t *testing.T) {
+	v, fcs := newTestVFS(t)
+	const journal = "truth.db-journal"
+
+	// No sector ConfigMaps for this journal: it does not exist, so SQLite
+	// must be told so (this is what sends it looking for a hot journal).
+	got, err := v.Access(journal, sqlite3vfs.AccessExists)
+	if err != nil {
+		t.Fatalf("Access(%q): %v", journal, err)
+	}
+	if got {
+		t.Errorf("Access(%q) with no sectors = true, want false", journal)
+	}
+
+	// Seed two sectors of journal data: the journal now exists on the
+	// cluster and Access must say so.
+	jf := NewFile(journal, v)
+	seedMultiSectorFile(t, fcs, jf, multiSectorLen)
+	if n := len(listSectorConfigMaps(t, fcs, jf)); n != 2 {
+		t.Fatalf("setup: want 2 journal sectors, got %d", n)
+	}
+
+	got, err = v.Access(journal, sqlite3vfs.AccessExists)
+	if err != nil {
+		t.Fatalf("Access(%q): %v", journal, err)
+	}
+	if !got {
+		t.Errorf("Access(%q) with 2 sectors = false, want true", journal)
+	}
+
+	// Only the journal's own sectors count: a database of the same stem
+	// must not make the journal appear to exist.
+	other, err := v.Access("truth.db", sqlite3vfs.AccessExists)
+	if err != nil {
+		t.Fatalf("Access(%q): %v", "truth.db", err)
+	}
+	if !other {
+		t.Errorf("Access(%q) = false, want true (non-side files always exist)", "truth.db")
+	}
+}
+
+func TestAccessWalAlwaysFalse(t *testing.T) {
+	v, fcs := newTestVFS(t)
+	const wal = "truth.db-wal"
+
+	// A WAL is never supported, so it never exists — even with sectors
+	// seeded under that name, which this VFS has no way to serve.
+	if got, err := v.Access(wal, sqlite3vfs.AccessExists); err != nil || got {
+		t.Errorf("Access(%q) with no sectors = (%v, %v), want (false, nil)", wal, got, err)
+	}
+	wf := NewFile(wal, v)
+	seedMultiSectorFile(t, fcs, wf, multiSectorLen)
+	if got, err := v.Access(wal, sqlite3vfs.AccessExists); err != nil || got {
+		t.Errorf("Access(%q) with sectors seeded = (%v, %v), want (false, nil)", wal, got, err)
+	}
+}
+
+func TestAccessOtherNamesAlwaysTrue(t *testing.T) {
+	v, _ := newTestVFS(t)
+	for _, name := range []string{"plain.db", "plain.db-journal-backup", "journal", "x.db-shm", "x.db-journall"} {
+		got, err := v.Access(name, sqlite3vfs.AccessExists)
+		if err != nil {
+			t.Fatalf("Access(%q): %v", name, err)
+		}
+		if !got {
+			t.Errorf("Access(%q) = false, want true (only -wal/-journal are special)", name)
+		}
+	}
+}
+
+func TestOpenNonexistentJournalIsZeroLength(t *testing.T) {
+	v, fcs := newTestVFS(t)
+	const journal = "fresh.db-journal"
+
+	// Opening a journal that has no sectors must succeed and look like a
+	// zero-length file, exactly as opening a fresh database does: Open
+	// pre-creates the empty sector 0 the size computation expects.
+	f := openTestFile(t, v, journal)
+
+	// The lockfile was created and sector 0 exists, empty.
+	getLockfileConfigMap(t, fcs, f)
+	cms := listSectorConfigMaps(t, fcs, f)
+	if len(cms) != 1 {
+		t.Fatalf("after Open(%q): %d sector configmaps, want 1", journal, len(cms))
+	}
+	if idx, ok := f.sectorIndexFromConfigMapName(cms[0].Name); !ok || idx != 0 {
+		t.Errorf("sector configmap name %q does not parse as index 0", cms[0].Name)
+	}
+	if got := cms[0].BinaryData["sector"]; len(got) != 0 {
+		t.Errorf("fresh journal sector 0 holds %d bytes, want 0", len(got))
+	}
+
+	size, err := f.FileSize()
+	if err != nil {
+		t.Fatalf("FileSize on fresh journal: %v", err)
+	}
+	if size != 0 {
+		t.Errorf("FileSize on fresh journal = %d, want 0", size)
+	}
+}
+
+func TestJournalFileSizeOpenTruncateRoundTrip(t *testing.T) {
+	v, fcs := newTestVFS(t)
+	const journal = "work.db-journal"
+
+	f := openTestFile(t, v, journal)
+	seedMultiSectorFile(t, fcs, f, multiSectorLen)
+
+	// FileSize keys off base32(RawName) like any file: two sectors seeded
+	// means multiSectorLen bytes, seen through a second VFS instance too.
+	size, err := f.FileSize()
+	if err != nil {
+		t.Fatalf("FileSize: %v", err)
+	}
+	if size != int64(multiSectorLen) {
+		t.Fatalf("FileSize on journal = %d, want %d", size, multiSectorLen)
+	}
+
+	v2, _ := newTestVFS(t)
+	_ = v2 // a second instance would see the same sectors; the name is cluster-wide
+
+	// Truncate to a mid-sector-1 length shortens that sector in place: both
+	// sectors remain (sector 0 whole, sector 1 holding the kept prefix).
+	const keep = int64(SectorSize) + 100
+	if err := f.Truncate(keep); err != nil {
+		t.Fatalf("Truncate(%d): %v", keep, err)
+	}
+	cms := listSectorConfigMaps(t, fcs, f)
+	if len(cms) != 2 {
+		t.Fatalf("after Truncate(%d): %d sector configmaps, want 2", keep, len(cms))
+	}
+	size, err = f.FileSize()
+	if err != nil {
+		t.Fatalf("FileSize after truncate: %v", err)
+	}
+	if size != keep {
+		t.Errorf("FileSize after Truncate = %d, want %d", size, keep)
+	}
+
+	// Truncate to a sector-aligned length drops the sectors past it.
+	if err := f.Truncate(int64(SectorSize)); err != nil {
+		t.Fatalf("Truncate(%d): %v", SectorSize, err)
+	}
+	if n := len(listSectorConfigMaps(t, fcs, f)); n != 1 {
+		t.Errorf("after Truncate to one sector: %d journal sector configmaps, want 1", n)
+	}
+
+	// Truncate to 0 leaves no sector ConfigMaps of the journal at all.
+	if err := f.Truncate(0); err != nil {
+		t.Fatalf("Truncate(0): %v", err)
+	}
+	if n := len(listSectorConfigMaps(t, fcs, f)); n != 0 {
+		t.Errorf("after Truncate(0): %d journal sector configmaps, want 0", n)
+	}
+}
+
+func TestDeleteJournalRemovesAllSectorsAndLockfile(t *testing.T) {
+	v, fcs := newTestVFS(t)
+	const journal = "hot.db-journal"
+
+	jf := openTestFile(t, v, journal)
+	seedMultiSectorFile(t, fcs, jf, multiSectorLen)
+	if n := len(listSectorConfigMaps(t, fcs, jf)); n != 2 {
+		t.Fatalf("setup: want 2 journal sectors before delete, got %d", n)
+	}
+
+	// A database of the same stem keeps its own state: Delete of the
+	// journal must not touch it.
+	df := openTestFile(t, v, "hot.db")
+	seedMultiSectorFile(t, fcs, df, multiSectorLen)
+
+	if err := v.Delete(journal, false); err != nil {
+		t.Fatalf("Delete(%q): %v", journal, err)
+	}
+
+	if n := len(listSectorConfigMaps(t, fcs, jf)); n != 0 {
+		t.Errorf("after Delete(%q): %d journal sector configmaps, want 0", journal, n)
+	}
+	if _, err := fcs.CoreV1().ConfigMaps(testNamespace).Get(t.Context(), jf.LockFileName(), metav1.GetOptions{}); !kerrors.IsNotFound(err) {
+		t.Errorf("journal lockfile get after delete: err = %v, want NotFound", err)
+	}
+	// The journal is now gone by cluster truth, so Access says so.
+	if got, err := v.Access(journal, sqlite3vfs.AccessExists); err != nil || got {
+		t.Errorf("Access(%q) after Delete = (%v, %v), want (false, nil)", journal, got, err)
+	}
+
+	// The same-stem database is untouched.
+	if n := len(listSectorConfigMaps(t, fcs, df)); n != 2 {
+		t.Errorf("same-stem database lost sectors: %d, want 2", n)
+	}
+	if _, err := fcs.CoreV1().ConfigMaps(testNamespace).Get(t.Context(), df.LockFileName(), metav1.GetOptions{}); err != nil {
+		t.Errorf("same-stem database lockfile after journal Delete: %v", err)
+	}
+}
+
+func TestDeleteNonexistentJournalSucceeds(t *testing.T) {
+	v, _ := newTestVFS(t)
+	// SQLite deletes the journal at the end of every transaction; the
+	// common case is a journal name with nothing behind it.
+	if err := v.Delete("never.db-journal", false); err != nil {
+		t.Errorf("Delete of nonexistent journal = %v, want nil", err)
+	}
 }

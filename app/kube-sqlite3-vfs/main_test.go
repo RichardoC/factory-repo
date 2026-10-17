@@ -94,8 +94,11 @@ func TestRunWithClientInsertsAndCommits1000Rows(t *testing.T) {
 	}
 
 	// The committed database must be readable through a fresh connection
-	// over the same VFS: 1000 rows on the books table.
-	db, err := sql.Open("sqlite3", "file2.db?_query_only=true&_journal=MEMORY&mode=ro&sqlite_os_trace=&vfs=kube-sqlite3-vfs")
+	// over the same VFS: 1000 rows on the books table. The reader opens the
+	// same way the writer now does (issue #68): _journal=DELETE, so a hot
+	// journal left by a crashed writer would be rolled back rather than
+	// read through as if committed.
+	db, err := sql.Open("sqlite3", "file2.db?_query_only=true&_journal=DELETE&mode=ro&sqlite_os_trace=&vfs=kube-sqlite3-vfs")
 	if err != nil {
 		t.Fatalf("reopen database over the VFS: %v", err)
 	}
@@ -113,6 +116,41 @@ func TestRunWithClientInsertsAndCommits1000Rows(t *testing.T) {
 	}
 	if lockfiles := listConfigMaps(t, fcs, "data=lockfile"); len(lockfiles) != 1 {
 		t.Errorf("lockfile ConfigMaps = %d, want 1", len(lockfiles))
+	}
+
+	// A clean commit leaves NO journal behind (issue #68): _journal=DELETE
+	// removes "<db>-journal" at commit, so after runWithClient has
+	// committed and closed, the on-cluster layout must contain no sector
+	// ConfigMap of the journal file — no stray "<base32(file2.db-journal)>"
+	// sectors. The layout is readable: journal sectors carry the same
+	// data=sector label as the database's own, and their ConfigMap name is
+	// the base32 encoding of the journal file name, which the database's
+	// sectors never share. A leftover journal would mean the commit never
+	// deleted it, and the next opener would pay a spurious recovery.
+	journalSectors := 0
+	for _, cm := range listConfigMaps(t, fcs, "data=sector") {
+		if idx, ok := sectorIndexFromName(cm.Name); !ok {
+			t.Errorf("sector ConfigMap %q has no trailing -<index>", cm.Name)
+			continue
+		} else {
+			_ = idx
+		}
+		if cm.Data["filename"] == "file2.db-journal" {
+			journalSectors++
+		}
+	}
+	if journalSectors != 0 {
+		t.Errorf("journal sector ConfigMaps left after a clean commit = %d, want 0 (DELETE must delete the journal at commit)", journalSectors)
+	}
+	// The journal file must not exist by cluster truth either, which is
+	// what the VFS's Access reports for a "-journal" name: it exists
+	// exactly when it has at least one sector ConfigMap.
+	if journal := listConfigMaps(t, fcs, "data=sector"); len(journal) != 0 {
+		for _, cm := range journal {
+			if cm.Data["filename"] != "file2.db" {
+				t.Errorf("unexpected sector ConfigMap for %q after a clean commit, want only file2.db", cm.Data["filename"])
+			}
+		}
 	}
 }
 

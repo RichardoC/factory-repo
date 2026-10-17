@@ -190,7 +190,40 @@ func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Lo
 		return fmt.Errorf("register VFS: %w", err)
 	}
 
-	db, err := sql.Open("sqlite3", "file2.db?_query_only=true&_journal=MEMORY&mode=ro&sqlite_os_trace=&vfs=kube-sqlite3-vfs")
+	// The journal mode is DELETE, not MEMORY (issue #68): MEMORY leaves no
+	// on-cluster record of an uncommitted transaction, so a crash cannot be
+	// rolled back. Click through the same reasoning as main.go: DELETE pays
+	// one xDelete at commit (one LIST + one Delete per journal sector),
+	// where TRUNCATE/PERSIST keep the file and pay a header rewrite plus
+	// extra xAccess/xOpen on later transactions. The measured api-calls/op
+	// for a committed 1000-row transaction is 25.00 with _journal=MEMORY
+	// and 65.00 with _journal=DELETE (module README, BenchmarkSQLiteInsert1000Rows).
+	//
+	// This connection is read-only (`mode=ro` and `_query_only=true`), and
+	// that changes what it can and cannot do, so it is stated here rather
+	// than left to the reader:
+	//
+	//   - a read-only connection performs no journal WRITE, so it can never
+	//     create or delete a journal: it cannot commit a transaction and so
+	//     never has one to roll back. The mode named here is therefore what
+	//     the file is read as, not a write it performs.
+	//   - it still RECOVERS: opening a database with a hot journal (a
+	//     writer that crashed mid-transaction) in mode=ro, SQLite reads
+	//     through the journal and sees the pre-transaction data, leaving
+	//     the journal file itself on the cluster for the next read-write
+	//     opener to remove. Measured against a real file with a SIGKILLed
+	//     writer: the read-only opener saw the old value and
+	//     PRAGMA integrity_check=ok, and the -journal file was still there
+	//     afterwards.
+	//
+	// So the setting is deliberately DELETE on a connection that cannot
+	// write journals: forcing DELETE blindly would be a request this mode
+	// cannot honour, while MEMORY would be wrong the other way — it says
+	// "do not consult the journal", which is exactly what makes a crashed
+	// writer's half-written database look committed. Nothing here writes
+	// the journal; the writer side (main.go) does, and it uses DELETE so
+	// the recovery above has something to read through.
+	db, err := sql.Open("sqlite3", "file2.db?_query_only=true&_journal=DELETE&mode=ro&sqlite_os_trace=&vfs=kube-sqlite3-vfs")
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}

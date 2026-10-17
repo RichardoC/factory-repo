@@ -11,8 +11,8 @@ package vfs
 // (both recorded with -benchtime=10x, before and after the optimisation) are
 // tabulated in the module README.
 //
-// Every benchmark seeds its sectors up front. The SQLite insert benchmark
-// runs at 64 KiB pages — the configuration main.go and the cmd tools use —
+// Every benchmark seeds its sectors up front. The SQLite insert benchmarks
+// run at 64 KiB pages — the configuration main.go and the cmd tools use —
 // and its transaction spans several 64 KiB sectors.
 
 import (
@@ -166,6 +166,84 @@ func BenchmarkSQLiteInsert1000Rows(b *testing.B) {
 		vfsName := registerUniqueVFS(b, v)
 		fileName := newSQLFileName()
 		db := openSQLDB(b, vfsName, fileName)
+		// 64 KiB pages, as main.go and the cmd tools use. page_size is only
+		// honoured while the database is still empty, so it must come
+		// before the first CREATE TABLE.
+		if _, err := db.Exec("PRAGMA page_size=65536"); err != nil {
+			b.Fatalf("PRAGMA page_size=65536: %v", err)
+		}
+		if _, err := db.Exec(`CREATE TABLE books (
+			id text NOT NULL PRIMARY KEY,
+			title text
+		)`); err != nil {
+			b.Fatalf("CREATE TABLE: %v", err)
+		}
+		fcs.ClearActions()
+		b.StartTimer()
+
+		tx, err := db.Begin()
+		if err != nil {
+			b.Fatalf("Begin: %v", err)
+		}
+		stmt, err := tx.Prepare("INSERT INTO books (id, title) VALUES (?, ?)")
+		if err != nil {
+			b.Fatalf("Prepare: %v", err)
+		}
+		for r := 0; r < rows; r++ {
+			if _, err := stmt.Exec(fmt.Sprintf("r-%06d", r), fmt.Sprintf("title %06d %0180d", r, r)); err != nil {
+				b.Fatalf("insert %d: %v", r, err)
+			}
+		}
+		if err := stmt.Close(); err != nil {
+			b.Fatalf("stmt.Close: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			b.Fatalf("Commit: %v", err)
+		}
+		calls += int64(len(fcs.Actions()))
+		b.StopTimer()
+
+		size, err := NewFile(fileName, v).FileSize()
+		if err != nil {
+			b.Fatalf("FileSize: %v", err)
+		}
+		if size <= SectorSize {
+			b.Fatalf("database stayed at %d bytes: the transaction never left the first 64 KiB sector, so this benchmark would not span several sectors", size)
+		}
+		if err := db.Close(); err != nil {
+			b.Fatalf("db.Close: %v", err)
+		}
+	}
+	b.ReportMetric(float64(calls)/float64(b.N), "api-calls/op")
+}
+
+// BenchmarkSQLiteInsert1000RowsJournalDelete is BenchmarkSQLiteInsert1000Rows
+// verbatim except for the SQLite journal mode: it opens the database with
+// _journal=DELETE instead of _journal=MEMORY, so the transaction's rollback
+// journal is stored through this VFS as its own "<db>-journal" file (a
+// sector ConfigMap per 64 KiB) rather than in process memory. One benchmark
+// iteration is one committed 1000-row transaction; api-calls/op is the
+// number of Kubernetes API calls that transaction costs, journal writes and
+// the journal's post-commit deletion included.
+//
+// Everything else is deliberately identical — the same 64 KiB page_size
+// before the first CREATE TABLE, the same CREATE TABLE before
+// ClearActions, the same 1000-row prepared-insert transaction under
+// ClearActions/len(fcs.Actions())/ReportMetric("api-calls/op"), and the same
+// assertion that the database grew past one 64 KiB sector — so the two
+// benchmarks' api-calls/op are directly comparable and the difference is
+// exactly what the on-cluster journal costs. The existing benchmark and its
+// numbers are untouched: the DSN journal mode comes from a separate helper
+// (openSQLDBWithJournal), not from a change to openSQLDB.
+func BenchmarkSQLiteInsert1000RowsJournalDelete(b *testing.B) {
+	const rows = 1000
+	var calls int64
+	for range b.N {
+		b.StopTimer()
+		v, fcs := newTestVFS(b)
+		vfsName := registerUniqueVFS(b, v)
+		fileName := newSQLFileName()
+		db := openSQLDBWithJournal(b, vfsName, fileName, "DELETE")
 		// 64 KiB pages, as main.go and the cmd tools use. page_size is only
 		// honoured while the database is still empty, so it must come
 		// before the first CREATE TABLE.
