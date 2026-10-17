@@ -10,11 +10,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -47,13 +51,22 @@ var (
 	markdownHeader = regexp.MustCompile(`^#{1,6}(\s|$)`)
 )
 
-// parseFindings reads the machine-readable findings out of a reviewer's
-// answer (issue #32). The contract is a markdown section whose header line
-// matches ^#{1,6}\s*findings\b case-insensitively; only bullets inside that
-// section — until the next markdown header or the end of the answer — count,
-// and sawSection reports whether the header was present at all. A bullet is
-// [severity], a path, a line number, a separator and the text; malformed
-// bullets are ignored. Text and path are never truncated at parse time; the
+// parseFindings reads the findings out of a reviewer's answer (issues #32
+// and #49). Two passes run over every line, sharing one cap:
+//
+//   - the section pass (issue #32): a markdown section whose header line
+//     matches ^#{1,6}\s*findings\b case-insensitively, holding one bullet
+//     per finding — [severity], a path, a line number, a separator and the
+//     text; malformed bullets are ignored, and sawSection reports whether
+//     the header was present at all;
+//   - the inline pass (issue #49): findings written anywhere in the answer
+//     as [severity] path:line - text, or as [severity] text with no
+//     location — the forms a review that never reached the section still
+//     uses (run 39010363221 wrote "Findings: [high] …" into its result and
+//     was read as a review with no findings).
+//
+// The same finding found by both passes is kept once. Findings are capped at
+// maxReviewFindings; text and path are never truncated at parse time — the
 // comment renderer escapes and caps them.
 func parseFindings(answer string) (findings []Finding, sawSection bool) {
 	inSection := false
@@ -68,19 +81,98 @@ func parseFindings(answer string) (findings []Finding, sawSection bool) {
 			inSection = false
 			continue
 		}
-		if !inSection {
-			continue
+		if inSection {
+			if f, ok := parseFinding(line); ok && !duplicateFinding(findings, f) {
+				findings = append(findings, f)
+			}
 		}
-		f, ok := parseFinding(line)
-		if !ok {
-			continue
+		for _, f := range parseInlineFindings(line) {
+			if !duplicateFinding(findings, f) {
+				findings = append(findings, f)
+			}
 		}
-		findings = append(findings, f)
 		if len(findings) >= maxReviewFindings {
-			break // cap reached: ignore the rest
+			return findings[:maxReviewFindings], sawSection // cap reached: ignore the rest
 		}
 	}
 	return findings, sawSection
+}
+
+// inlineSeverityToken is a bracketed single word anywhere in a line, the
+// shape every inline finding opens with. The word is short and holds no
+// spaces or brackets, so a markdown link, a footnote or a task list cannot
+// pass for one.
+var inlineSeverityToken = regexp.MustCompile(`\[[A-Za-z0-9_-]{1,24}\]`)
+
+// locationShaped matches text that opens like a path:line location. A token
+// followed by such text was meant as a located finding; when the location
+// never completes — no separator, no line digits — the line is dropped
+// rather than read as a finding whose text is the half-written location.
+var locationShaped = regexp.MustCompile(`^\s*\S+:\d+`)
+
+// parseInlineFindings reads the findings written inline on one line (issue
+// #49), in either form the lenient contract accepts: [severity] path:line -
+// text — the shape the section bullets use, with or without a bullet — or
+// [severity] text with no location, which only counts when the severity word
+// is one of high, medium and low. Every bracketed token on the line gets its
+// chance, so one line may carry several findings.
+func parseInlineFindings(line string) []Finding {
+	var out []Finding
+	for i := 0; i < len(line); {
+		m := inlineSeverityToken.FindStringIndex(line[i:])
+		if m == nil {
+			break // no severity token anywhere in the rest of the line
+		}
+		token := line[i+m[0]+1 : i+m[1]-1]
+		rest := line[i+m[1]:]
+		i += m[1] // every path consumes the token, whether it reads or not
+		if f, ok := parseFinding("[" + token + "]" + rest); ok {
+			out = append(out, f)
+			continue
+		}
+		if locationShaped.MatchString(rest) {
+			continue // a broken location is dropped, never read as text
+		}
+		if f, ok := textOnlyFinding(token, rest); ok {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// textOnlyFinding reads the no-location form: a recognized severity word,
+// whitespace, and text that opens with a letter or digit — the guard that
+// keeps bracketed notes like [TODO] fix me, a task list or a stray :42 from
+// becoming findings.
+func textOnlyFinding(token, rest string) (Finding, bool) {
+	lower := asciiLower(token)
+	if lower != "high" && lower != "medium" && lower != "low" {
+		return Finding{}, false
+	}
+	if rest == "" || (rest[0] != ' ' && rest[0] != '\t') {
+		return Finding{}, false // the text needs whitespace after the severity
+	}
+	text := strings.TrimLeft(rest, " \t")
+	if text == "" {
+		return Finding{}, false
+	}
+	if r, _ := utf8.DecodeRuneInString(text); !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+		return Finding{}, false
+	}
+	return Finding{Severity: token, Text: text, Recognized: true}, true
+}
+
+// duplicateFinding reports whether the same finding is already held: the
+// severity read case-insensitively, and path, line and text exactly. The
+// section pass and the inline pass read the same bullets, so the double is
+// dropped and the finding is kept once.
+func duplicateFinding(findings []Finding, f Finding) bool {
+	for _, g := range findings {
+		if asciiLower(g.Severity) == asciiLower(f.Severity) && g.Path == f.Path && g.Line == f.Line && g.Text == f.Text {
+			return true
+		}
+	}
+	return false
 }
 
 // parseFinding parses one bullet of the findings section: an optional - or *
@@ -241,11 +333,15 @@ func reviewerModel(cfg Config, workerID string) (Model, error) {
 
 // ---------------------------------------------------------------- the decision
 
-// reviewPlan decides what follows an independent review (issue #32):
+// reviewPlan decides what follows an independent review (issues #32 and #49):
 //
-//   - no result at all: report-only — nothing can be concluded;
-//   - a result that is not stop "done": report-only — an incomplete review
-//     never blocks and never labels, and its findings so far are advisory;
+//   - no result at all and no findings from either source: report-only —
+//     nothing can be concluded;
+//   - a result that is not stop "done": the review is incomplete, and an
+//     incomplete review never labels — but findings parsed from the answer
+//     or the run record still act (issue #49): blocking findings start a fix
+//     run exactly as in a finished review, and only when neither source
+//     carries findings does the review stay advisory, as it did before;
 //   - a finished review with high or medium findings: a fix run, started as
 //     a continuation and counted against the continuation cap (issue #31);
 //     at the cap, report-only and a person takes over;
@@ -259,48 +355,54 @@ func reviewerModel(cfg Config, workerID string) (Model, error) {
 // answer text reaches it unescaped. A failing comments fetch is an error,
 // like continuePlan.
 func reviewPlan(gh github, pr int, result Result, haveResult bool, findings []Finding, sawSection bool) (action string, body string, used int, err error) {
-	if !haveResult {
+	stop := sanitizeStop(result.Stop)
+	blocking := blockingFindings(findings)
+	if !haveResult && len(findings) == 0 {
 		return "report-only", reviewReportBody(
 			"The review produced no result: its output is missing or unparseable, so nothing can be concluded from this run. "+
 				"No label is added and no fix run starts; a maintainer can re-run the review.",
 			nil, result.Model, stopUnknown), 0, nil
 	}
-	stop := sanitizeStop(result.Stop)
-	if !readyForReview(stop) {
+	if !readyForReview(stop) && len(blocking) == 0 {
 		verdict := fmt.Sprintf("The review stopped early (stop reason: `%s`), so this is an incomplete review: "+
 			"its findings so far are advisory, nothing is labelled and no fix run starts.", stop)
-		if !sawSection {
-			verdict += " The reviewer wrote no findings section yet."
+		switch {
+		case len(findings) > 0 && !sawSection:
+			verdict += " The findings below were parsed from inline `[severity]` notes in the answer or the run record."
+		case len(findings) == 0:
+			verdict += " No findings section and no inline findings were found in the answer or the run record."
 		}
 		return "report-only", reviewReportBody(verdict, findings, result.Model, stop), 0, nil
 	}
-	blocking := blockingFindings(findings)
-	if len(blocking) > 0 {
-		var comments []issueComment
-		if err := gh.get(fmt.Sprintf("/issues/%d/comments?per_page=100", pr), &comments); err != nil {
-			return "", "", 0, err
+	if readyForReview(stop) && len(blocking) == 0 {
+		if hasUnrecognizedSeverity(findings) {
+			return "report-only", reviewReportBody(
+				"The review found nothing blocking, but the pass label is withheld because at least one severity "+
+					"was not recognized (high, medium or low are); a maintainer reads the findings below and decides.",
+				findings, result.Model, stop), 0, nil
 		}
-		used = continuationsUsed(countReports(comments))
-		if !continuationCapReached(used) {
-			return "fix", reviewFixBody(blocking, findings, used, result.Model, stop), used, nil
+		verdict := fmt.Sprintf("Nothing blocking was found: the %s label was added, so a person or a merge rule can merge with confidence.",
+			reviewPassedLabel)
+		if !hasLowFindings(findings) {
+			return "label", reviewReportBody(verdict, nil, result.Model, stop), 0, nil
 		}
-		return "report-only", reviewReportBody(fmt.Sprintf(
-			"The automatic fix budget of %d continuations per pull request is spent, so no fix run starts; "+
-				"a maintainer can continue by hand with a %s comment. The blocking findings above stay open for a person to act on.",
-			maxContinuations, command), findings, result.Model, stop), used, nil
+		return "label", reviewReportBody(verdict, findings, result.Model, stop), 0, nil
 	}
-	if hasUnrecognizedSeverity(findings) {
-		return "report-only", reviewReportBody(
-			"The review found nothing blocking, but the pass label is withheld because at least one severity "+
-				"was not recognized (high, medium or low are); a maintainer reads the findings below and decides.",
-			findings, result.Model, stop), 0, nil
+	// Blocking findings start a fix run, whether the review finished (issue
+	// #32) or stopped early (issue #49): an incomplete review with findings
+	// is a review with findings, not one with none.
+	var comments []issueComment
+	if err := gh.get(fmt.Sprintf("/issues/%d/comments?per_page=100", pr), &comments); err != nil {
+		return "", "", 0, err
 	}
-	verdict := fmt.Sprintf("Nothing blocking was found: the %s label was added, so a person or a merge rule can merge with confidence.",
-		reviewPassedLabel)
-	if !hasLowFindings(findings) {
-		return "label", reviewReportBody(verdict, nil, result.Model, stop), 0, nil
+	used = continuationsUsed(countReports(comments))
+	if !continuationCapReached(used) {
+		return "fix", reviewFixBody(blocking, findings, used, result.Model, stop), used, nil
 	}
-	return "label", reviewReportBody(verdict, findings, result.Model, stop), 0, nil
+	return "report-only", reviewReportBody(fmt.Sprintf(
+		"The automatic fix budget of %d continuations per pull request is spent, so no fix run starts; "+
+			"a maintainer can continue by hand with a %s comment. The blocking findings above stay open for a person to act on.",
+		maxContinuations, command), findings, result.Model, stop), used, nil
 }
 
 // reviewFixBody is the comment that starts a fix run: its first line is the
@@ -328,10 +430,15 @@ func reviewReportBody(verdict string, findings []Finding, model, stop string) st
 // reviewFixCommand is the first line of a fix comment: the /codeaf command
 // the workflow acts on. It is built only from sanitized severity words and
 // safe paths, so a hostile finding can neither inject shell nor break out of
-// the command line that the fix run parses again.
+// the command line. A finding with no location — the inline form (issue #49)
+// — carries its severity word alone.
 func reviewFixCommand(blocking []Finding) string {
 	parts := make([]string, 0, len(blocking))
 	for _, f := range blocking {
+		if f.Path == "" && f.Line == 0 {
+			parts = append(parts, asciiLower(f.Severity))
+			continue
+		}
 		parts = append(parts, asciiLower(f.Severity)+" "+safeReviewPath(f.Path)+":"+strconv.Itoa(f.Line))
 	}
 	plural := "s"
@@ -423,8 +530,11 @@ func reviewFooter(model, stop string) string {
 const reviewOutputContract = "# The output the harness parses\n\n" +
 	"End your answer with a section exactly titled `## Findings`, holding one bullet per finding, " +
 	"and write nothing after it:\n\n" +
-	"- [high] app/zip/queue.go:42 - the mutex is released twice under the error path, so a second request deadlocks\n\n" +
-	"Severity is high, medium or low. When the review is clean, write the section with no bullets under it."
+	"- [high] app/zip/queue.go:42 - the mutex is released twice under the error path, so a second request deadlocks\n" +
+	"- [low] the changelog does not mention the new flag\n\n" +
+	"Severity is high, medium or low. A finding without a file and line is still one bullet. " +
+	"When the review is clean, end with the section holding the single word `none` and nothing else:\n\n" +
+	"## Findings\n\nnone\n"
 
 // capDiff caps the diff embedded in the review brief without splitting a
 // UTF-8 rune, noting the truncation; the note counts against the cap.
@@ -557,6 +667,18 @@ func runReviewReport() error {
 		result, haveResult = r, true
 	}
 	findings, sawSection := parseFindings(result.Answer)
+	if len(findings) == 0 {
+		// The answer carried no findings (issue #49) — it may be empty, or
+		// the review may have written them inline where the envelope never
+		// looks. Fall back to the root task's final result in the run
+		// record, which the run job shipped beside this result and which is
+		// read as untrusted data.
+		if answer := readTrajectoryAnswer(trajectoryPath()); answer != "" {
+			if tf, tsec := parseFindings(answer); len(tf) > 0 {
+				findings, sawSection = tf, sawSection || tsec
+			}
+		}
+	}
 	action, body, used, err := reviewPlan(newGitHub(), pr, result, haveResult, findings, sawSection)
 	if err != nil {
 		return err
@@ -567,4 +689,108 @@ func runReviewReport() error {
 		return err
 	}
 	return os.WriteFile(path, []byte(body), 0o644)
+}
+
+// ---------------------------------------------------------------- the run record
+
+// maxTrajectoryBytes caps the root task's run record, both when the run job
+// ships it and when the report reads it: the record is written by the
+// untrusted run job, so it is data of bounded size, never instructions.
+const maxTrajectoryBytes = 2 << 20
+
+// trajectoryFileName is the harness's name for the copy of the root task's
+// run record that sits beside the result in the output artifact.
+const trajectoryFileName = "codeaf-trajectory.jsonl"
+
+// trajectoryPath names the run record the report falls back to (issue #49):
+// TRAJECTORY_PATH when set, else the copy the run job's summary made beside
+// the result.
+func trajectoryPath() string {
+	if p := os.Getenv("TRAJECTORY_PATH"); p != "" {
+		return p
+	}
+	return filepath.Join(filepath.Dir(os.Getenv("RESULT_PATH")), trajectoryFileName)
+}
+
+// readTrajectoryAnswer reads the root task's final result out of a run
+// record (issue #49): the last `end` line's result — the account the worker
+// gave when its loop ended, which is where a review's actual text lives when
+// the result envelope's answer is empty. The record comes from the untrusted
+// run job, so it is read as data: capped, one bounded struct per line,
+// malformed lines skipped, and only the result string is taken. A record
+// that cannot be read answers "".
+func readTrajectoryAnswer(path string) string {
+	file, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxTrajectoryBytes))
+	if err != nil {
+		return ""
+	}
+	answer := ""
+	for _, line := range strings.Split(string(data), "\n") {
+		// The line kinds and the end line's result are CodeAF's own record
+		// shape (internal/run/trajectory.go at the pin in codeaf-ref).
+		var record struct {
+			Kind   string `json:"kind"`
+			Result string `json:"result"`
+		}
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			continue // hostile or truncated line: skipped, never fatal
+		}
+		if record.Kind == "end" && record.Result != "" {
+			answer = record.Result // the last end line is the final result
+		}
+	}
+	return answer
+}
+
+// shipRunRecord copies the newest root task run record in CODEAF_HOME next to
+// the result (issue #49): the review report runs in the publish job, which
+// reads only this job's output artifact, so the record must ride it for the
+// fallback to reach the report. It runs in the run job, on files the agent
+// could have written: only regular files are taken, the copy is capped, and
+// the report reads the copy as data. Nothing here is fatal — the record is a
+// fallback — so trouble is logged and answered with "".
+func shipRunRecord() string {
+	home, out := os.Getenv("CODEAF_HOME"), filepath.Dir(os.Getenv("RESULT_PATH"))
+	if home == "" || out == "" {
+		return ""
+	}
+	records, err := filepath.Glob(filepath.Join(home, "runs", "*", "tasks", "root", "trajectory.jsonl"))
+	if err != nil || len(records) == 0 {
+		return ""
+	}
+	sort.Slice(records, func(a, b int) bool { // newest first: the run just finished
+		sa, era := os.Stat(records[a])
+		sb, erb := os.Stat(records[b])
+		if era != nil || erb != nil {
+			return era == nil
+		}
+		return sa.ModTime().After(sb.ModTime())
+	})
+	for _, record := range records {
+		if s, err := os.Lstat(record); err != nil || !s.Mode().IsRegular() {
+			continue // a planted symlink or directory is not a record
+		}
+		file, err := os.Open(record)
+		if err != nil {
+			log.Printf("warning: %s is unreadable: %v", record, err)
+			continue
+		}
+		data, err := io.ReadAll(io.LimitReader(file, maxTrajectoryBytes))
+		file.Close()
+		if err != nil {
+			log.Printf("warning: %s is unreadable: %v", record, err)
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(out, trajectoryFileName), data, 0o644); err != nil {
+			log.Printf("warning: the run record could not be shipped: %v", err)
+			return ""
+		}
+		return record
+	}
+	return ""
 }

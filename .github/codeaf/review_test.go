@@ -13,8 +13,9 @@ import (
 )
 
 // writeReviewResult points RESULT_PATH at a result file with the given stop
-// reason and answer, the two fields the review report reads.
-func writeReviewResult(t *testing.T, stop, answer string) {
+// reason and answer, the two fields the review report reads, and returns the
+// path so a test can put the run record beside it.
+func writeReviewResult(t *testing.T, stop, answer string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "result.json")
 	data, err := json.Marshal(map[string]any{"stop": stop, "model": "zai-org/glm-5.3-flash", "answer": answer})
@@ -25,6 +26,19 @@ func writeReviewResult(t *testing.T, stop, answer string) {
 		t.Fatal(err)
 	}
 	t.Setenv("RESULT_PATH", path)
+	return path
+}
+
+// writeTrajectory points TRAJECTORY_PATH at a run record holding the given
+// lines, the fallback source the review report reads when the result's
+// answer carries no findings.
+func writeTrajectory(t *testing.T, lines string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "trajectory.jsonl")
+	if err := os.WriteFile(path, []byte(lines), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TRAJECTORY_PATH", path)
 }
 
 // reviewLedger points LEDGER_PATH at a two-call ledger worth 0.25 USD; the
@@ -90,8 +104,11 @@ func TestParseFindings(t *testing.T) {
 	if !sawSection {
 		t.Fatal("sawSection = false, want true")
 	}
-	if len(findings) != 6 {
-		t.Fatalf("got %d findings, want 6: %+v", len(findings), findings)
+	// The section still holds its six bullets, and the bullets written
+	// outside it now parse as inline findings (issue #49) — in answer order,
+	// so the section findings sit between the ones before and after it.
+	if len(findings) != 9 {
+		t.Fatalf("got %d findings, want 9: %+v", len(findings), findings)
 	}
 	want := []struct {
 		severity   string
@@ -100,12 +117,15 @@ func TestParseFindings(t *testing.T) {
 		text       string
 		recognized bool
 	}{
+		{"high", "before.go", 1, "a bullet before the section must not parse", true},
+		{"high", "also-before.go", 2, "still before the section", true},
 		{"high", "app/x/main.go", 42, "the mutex is released twice on the error path", true},
 		{"Medium", "app/y/queue.go", 7, "the queue never drains when a send fails", true},
 		{"low", "docs/readme.md", 3, "typo in the flag name", true},
 		{"CRITICAL", "app/z/z.go", 1, "the universe ends", false},
 		{"high", "app/w/lock.go", 5, "| pipes | and <!-- html comments --> and `backticks`", true},
 		{"high", "app/w/nested.go", 9, "an indented bullet still parses", true},
+		{"high", "after.go", 1, "a bullet after the next header must not parse", true},
 	}
 	for i, w := range want {
 		f := findings[i]
@@ -114,46 +134,51 @@ func TestParseFindings(t *testing.T) {
 				i, f, w.severity, w.path, w.line, w.text, w.recognized)
 		}
 	}
-	// Bullets outside the section never parsed, and hostile text is kept
-	// verbatim, never truncated or rewritten.
-	for _, banned := range []string{"before.go", "after.go", "also-before.go"} {
-		for _, f := range findings {
-			if strings.Contains(f.Path, banned) {
-				t.Errorf("finding %q came from outside the findings section", f.Path)
-			}
-		}
+	// Hostile text is kept verbatim, never truncated or rewritten.
+	if findings[6].Text != "| pipes | and <!-- html comments --> and `backticks`" {
+		t.Errorf("hostile text was rewritten: %q", findings[6].Text)
 	}
 
 	// CRLF endings parse the same as LF.
 	findings, sawSection = parseFindings(strings.ReplaceAll(reviewFindingsAnswer, "\n", "\r\n"))
-	if !sawSection || len(findings) != 6 || findings[0].Text != want[0].text {
+	if !sawSection || len(findings) != 9 || findings[0].Text != want[0].text {
 		t.Errorf("CRLF parse = %d findings, sawSection %t, first text %q", len(findings), sawSection, findings[0].Text)
 	}
 
-	// No findings section at all.
+	// No findings section at all, and nothing inline either.
 	if findings, sawSection := parseFindings("Just an answer, no section, no header."); findings != nil || sawSection {
 		t.Errorf("missing section = (%v, %t), want (nil, false)", findings, sawSection)
 	}
 
 	// A header-like word that is not the section: "Findings" inside a
-	// sentence does not open it, and does not count as sawSection.
-	if findings, sawSection := parseFindings("## Notes on findings so far\n\n- [high] a.go:1 - x"); findings != nil || sawSection {
-		t.Errorf("prose header = (%v, %t), want (nil, false)", findings, sawSection)
+	// sentence does not open it, and does not count as sawSection — but the
+	// bullet under it is an inline finding now (issue #49).
+	findings, sawSection = parseFindings("## Notes on findings so far\n\n- [high] a.go:1 - x")
+	if sawSection {
+		t.Error("prose header counted as sawSection")
+	}
+	if len(findings) != 1 || findings[0].Path != "a.go" || findings[0].Line != 1 {
+		t.Errorf("prose header inline parse = %+v, want one a.go:1 finding", findings)
 	}
 
-	// Malformed bullets are ignored: none of these is a finding.
+	// Malformed bullets are ignored: none of these is a finding, under the
+	// section contract or the inline one. A token followed by text that
+	// opens like a path:line is dropped whole rather than read as a finding
+	// whose text is the half-written location.
 	malformed := []string{
 		"- high app/x.go:42 - no brackets",
 		"- [high app/x.go:42 - never closed",
 		"- [] app/x.go:42 - empty severity",
 		"- [high]app/x.go:42 - no space after the severity",
-		"- [high] app/x.go - no line number",
 		"- [high] app/x.go:42",
 		"- [high] app/x.go:42 no separator at all",
 		"- [high] :42 - no path",
-		"- [high] app/x.go:abc - line is not digits",
 		"plain prose in the section",
 		"- [high] app/x.go:42 - ",
+		"- [x] a task-list bullet is not a finding",
+		"- [ ] nor an empty one",
+		"see [the diff](https://example.com/a:b) and [TODO] fix later",
+		"[critical] an unknown severity with no location is prose, not a finding",
 	}
 	var b strings.Builder
 	b.WriteString("## Findings\n\n")
@@ -162,6 +187,79 @@ func TestParseFindings(t *testing.T) {
 	}
 	if findings, _ := parseFindings(b.String()); len(findings) != 0 {
 		t.Errorf("malformed bullets produced %d findings: %+v", len(findings), findings)
+	}
+
+	// The lenient inline forms (issue #49): a located finding anywhere in a
+	// line, with any separator and any case, and a finding with no location
+	// when the severity is one of the three known words.
+	inline := []struct {
+		line       string
+		severity   string
+		path       string
+		line_      int
+		text       string
+		recognized bool
+	}{
+		{"Findings: [high] app/x/main.go:42 - the mutex is released twice", "high", "app/x/main.go", 42, "the mutex is released twice", true},
+		{"- [HIGH] app/y/queue.go:7 — em dash, capital, no section", "HIGH", "app/y/queue.go", 7, "em dash, capital, no section", true},
+		{"[Medium] the queue never drains when a send fails", "Medium", "", 0, "the queue never drains when a send fails", true},
+		{"[low] docs: the flag is undocumented", "low", "", 0, "docs: the flag is undocumented", true},
+		{"[CRITICAL] app/z/z.go:1 - an unknown scale with a location still reports", "CRITICAL", "app/z/z.go", 1, "an unknown scale with a location still reports", false},
+	}
+	for _, w := range inline {
+		findings, sawSection := parseFindings("prose before\n\n" + w.line + "\n\nprose after")
+		if sawSection {
+			t.Errorf("%q: inline parse set sawSection", w.line)
+		}
+		if len(findings) != 1 {
+			t.Errorf("%q: got %d findings, want 1: %+v", w.line, len(findings), findings)
+			continue
+		}
+		f := findings[0]
+		if f.Severity != w.severity || f.Path != w.path || f.Line != w.line_ || f.Text != w.text || f.Recognized != w.recognized {
+			t.Errorf("%q: parsed %+v, want severity %q path %q line %d text %q recognized %t",
+				w.line, f, w.severity, w.path, w.line_, w.text, w.recognized)
+		}
+	}
+
+	// Two findings written on one line both parse.
+	findings, _ = parseFindings("[high] a.go:1 - first and [low] b.go:2 - second")
+	if len(findings) != 2 || findings[0].Path != "a.go" || findings[1].Path != "b.go" {
+		t.Errorf("two inline findings on one line = %+v, want a.go then b.go", findings)
+	}
+
+	// The same finding reached by both passes is kept once.
+	findings, _ = parseFindings("## Findings\n\n- [high] app/x/main.go:42 - the mutex is released twice\n" +
+		"[high] app/x/main.go:42 - the mutex is released twice\n")
+	if len(findings) != 1 {
+		t.Errorf("duplicate parse = %d findings, want 1: %+v", len(findings), findings)
+	}
+
+	// The cap counts section and inline findings together.
+	b.Reset()
+	b.WriteString("## Findings\n\n")
+	for i := 1; i <= 30; i++ {
+		fmt.Fprintf(&b, "- [low] app/cap.go:%d - section finding %d\n", i, i)
+	}
+	for i := 1; i <= 30; i++ {
+		fmt.Fprintf(&b, "[low] app/cap.go:%d - inline finding %d\n", i+100, i)
+	}
+	findings, _ = parseFindings(b.String())
+	if len(findings) != maxReviewFindings {
+		t.Fatalf("mixed cap: got %d findings, want %d", len(findings), maxReviewFindings)
+	}
+
+	// An empty answer is no findings and no section.
+	if findings, sawSection := parseFindings(""); findings != nil || sawSection {
+		t.Errorf("empty answer = (%v, %t), want (nil, false)", findings, sawSection)
+	}
+
+	// A hostile line of brackets is scanned once, not once per bracket: the
+	// one real finding buried in it still parses, and the scan stays linear.
+	hostile := strings.Repeat("[[]] ", 20000) + "[high] app/x/main.go:42 - the mutex is released twice" + strings.Repeat(" [ ]", 20000)
+	findings, _ = parseFindings(hostile)
+	if len(findings) != 1 || findings[0].Path != "app/x/main.go" || findings[0].Line != 42 {
+		t.Errorf("hostile bracket line = %+v, want the one real finding", findings)
 	}
 
 	// The cap: 60 valid bullets yield exactly maxReviewFindings.
@@ -298,24 +396,70 @@ func TestReviewPlan(t *testing.T) {
 		t.Errorf("pass with low findings: table or label missing: %q", body)
 	}
 
-	// An unfinished review: report-only, the stop reason named, the table
-	// marked incomplete, no label and no fix.
+	// An unfinished review with blocking findings starts a fix run (issue
+	// #49): findings parsed from either source act, whatever the stop reason.
 	server = commentsServer(t, reportComments(1), http.StatusOK)
 	ghEnv(t, server)
-	action, body, _, err = reviewPlan(newGitHub(), 7, Result{Stop: stopDeadline}, true, hostile, true)
+	action, body, used, err = reviewPlan(newGitHub(), 7, Result{Stop: stopDeadline}, true, hostile, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "fix" || used != 0 {
+		t.Fatalf("early stop with blocking findings: action = %q, used = %d", action, used)
+	}
+	if !strings.HasPrefix(body, command+" fix: 2 blocking findings") || !strings.Contains(body, "`deadline`") {
+		t.Errorf("early-stop fix body wrong: %q", body)
+	}
+	assertReviewBodyClean(t, body)
+
+	// The same, when the result envelope is missing entirely and the
+	// findings came from the run record: they still act.
+	server = commentsServer(t, reportComments(1), http.StatusOK)
+	ghEnv(t, server)
+	action, body, _, err = reviewPlan(newGitHub(), 7, Result{}, false, hostile, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "fix" {
+		t.Fatalf("no result with blocking findings: action = %q", action)
+	}
+	assertReviewBodyClean(t, body)
+
+	// An unfinished review whose findings are not blocking stays advisory:
+	// the stop reason named, the findings shown, no label and no fix.
+	server = commentsServer(t, reportComments(1), http.StatusOK)
+	ghEnv(t, server)
+	lowOnly := []Finding{{Severity: "low", Path: "docs/readme.md", Line: 3, Text: "typo", Recognized: true}}
+	action, body, _, err = reviewPlan(newGitHub(), 7, Result{Stop: stopDeadline}, true, lowOnly, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if action != "report-only" {
-		t.Fatalf("early stop: action = %q", action)
+		t.Fatalf("early stop with low findings: action = %q", action)
 	}
-	for _, want := range []string{"`deadline`", "incomplete review", "| severity | location | finding |"} {
+	for _, want := range []string{"`deadline`", "incomplete review", "inline `[severity]` notes", "| severity | location | finding |"} {
 		if !strings.Contains(body, want) {
-			t.Errorf("early-stop body missing %q: %q", want, body)
+			t.Errorf("advisory early-stop body missing %q: %q", want, body)
 		}
 	}
-	if strings.Contains(body, reviewPassedLabel) {
-		t.Errorf("an incomplete review must not name the pass label: %q", body)
+	if strings.Contains(body, reviewPassedLabel) || strings.HasPrefix(body, command+" fix:") {
+		t.Errorf("an advisory review must not label or fix: %q", body)
+	}
+	assertReviewBodyClean(t, body)
+
+	// An unfinished review with no findings anywhere: advisory, and the
+	// verdict says neither source carried findings.
+	server = commentsServer(t, reportComments(1), http.StatusOK)
+	ghEnv(t, server)
+	action, body, _, err = reviewPlan(newGitHub(), 7, Result{Stop: stopIncomplete}, true, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "report-only" {
+		t.Fatalf("early stop without findings: action = %q", action)
+	}
+	if !strings.Contains(body, "No findings section and no inline findings") {
+		t.Errorf("advisory body does not say where it looked: %q", body)
 	}
 	assertReviewBodyClean(t, body)
 
@@ -509,6 +653,7 @@ func TestRunReviewBrief(t *testing.T) {
 		"## The previous CodeAF report",                       // the previous report section
 		"# The output the harness parses",                     // the output contract
 		"app/zip/queue.go:42",                                 // the concrete example bullet
+		"single word `none`",                                  // the clean-review form
 	} {
 		if !strings.Contains(b, want) {
 			t.Errorf("brief missing %q", want)
@@ -653,7 +798,7 @@ func TestRunReviewReport(t *testing.T) {
 		}
 	})
 
-	t.Run("an early stop is report-only, findings counted", func(t *testing.T) {
+	t.Run("an early stop with blocking findings starts a fix run", func(t *testing.T) {
 		server := commentsServer(t, reportComments(1), http.StatusOK)
 		ghEnv(t, server)
 		setArgs("7")
@@ -664,7 +809,196 @@ func TestRunReviewReport(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if out != "action=report-only\nused=0\nblocking=2\n" {
+		if out != "action=fix\nused=0\nblocking=2\n" {
+			t.Errorf("stdout = %q", out)
+		}
+		data, err := os.ReadFile(comment)
+		if err != nil {
+			t.Fatalf("comment not written: %v", err)
+		}
+		if !strings.Contains(string(data), "`deadline`") {
+			t.Errorf("fix comment does not name the stop reason: %q", data)
+		}
+		assertReviewBodyClean(t, string(data))
+	})
+
+	t.Run("an early stop with only low findings is report-only", func(t *testing.T) {
+		server := commentsServer(t, reportComments(1), http.StatusOK)
+		ghEnv(t, server)
+		setArgs("7")
+		writeReviewResult(t, stopDeadline, "## Findings\n\n- [low] docs/readme.md:3 - typo in the flag name\n")
+		reviewLedger(t)
+		t.Setenv("REVIEW_COMMENT_PATH", comment)
+		out, err := captureStdout(t, runReviewReport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != "action=report-only\nused=0\nblocking=0\n" {
+			t.Errorf("stdout = %q", out)
+		}
+	})
+
+	t.Run("inline findings act on an incomplete review", func(t *testing.T) {
+		// Run 39010363221: the review wrote its findings inline, with no
+		// findings section, and was read as a review with none.
+		server := commentsServer(t, reportComments(1), http.StatusOK)
+		ghEnv(t, server)
+		setArgs("7")
+		writeReviewResult(t, stopIncomplete, "The review is finished. Findings: [high] app/x/main.go:42 - the mutex is released twice; and [medium] the queue never drains when a send fails.")
+		reviewLedger(t)
+		t.Setenv("REVIEW_COMMENT_PATH", comment)
+		out, err := captureStdout(t, runReviewReport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != "action=fix\nused=0\nblocking=2\n" {
+			t.Errorf("stdout = %q", out)
+		}
+		data, err := os.ReadFile(comment)
+		if err != nil {
+			t.Fatalf("comment not written: %v", err)
+		}
+		if !strings.Contains(string(data), "high app/x/main.go:42; medium\n\n") {
+			t.Errorf("inline findings missing from the command line: %q", data)
+		}
+		assertReviewBodyClean(t, string(data))
+	})
+
+	t.Run("the run record's final result is a fallback", func(t *testing.T) {
+		server := commentsServer(t, reportComments(1), http.StatusOK)
+		ghEnv(t, server)
+		setArgs("7")
+		// The envelope's answer is empty; the review's text lives in the
+		// root task's end record, as it did on run 39010363221.
+		writeReviewResult(t, stopIncomplete, "")
+		writeTrajectory(t, `{"kind":"step","step":1,"command":"go test ./...","observation":"ok"}
+{"kind":"end","step":0,"steps":1,"result":"The review found two problems.\n\n[high] app/x/main.go:42 - the mutex is released twice\n[low] docs/readme.md:3 - typo"}
+`)
+		reviewLedger(t)
+		t.Setenv("REVIEW_COMMENT_PATH", comment)
+		out, err := captureStdout(t, runReviewReport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != "action=fix\nused=0\nblocking=1\n" {
+			t.Errorf("stdout = %q", out)
+		}
+		data, err := os.ReadFile(comment)
+		if err != nil {
+			t.Fatalf("comment not written: %v", err)
+		}
+		if !strings.Contains(string(data), "| app/x/main.go:42 |") {
+			t.Errorf("run-record finding missing from the table: %q", data)
+		}
+		assertReviewBodyClean(t, string(data))
+	})
+
+	t.Run("the fallback also answers a section with no bullets", func(t *testing.T) {
+		server := commentsServer(t, reportComments(1), http.StatusOK)
+		ghEnv(t, server)
+		setArgs("7")
+		writeReviewResult(t, stopIncomplete, "## Findings\n\nnone\n")
+		writeTrajectory(t, `{"kind":"end","result":"[high] app/x/main.go:42 - the mutex is released twice\n"}
+`)
+		reviewLedger(t)
+		t.Setenv("REVIEW_COMMENT_PATH", comment)
+		out, err := captureStdout(t, runReviewReport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != "action=fix\nused=0\nblocking=1\n" {
+			t.Errorf("stdout = %q", out)
+		}
+	})
+
+	t.Run("the run record beside the result is found without TRAJECTORY_PATH", func(t *testing.T) {
+		server := commentsServer(t, reportComments(1), http.StatusOK)
+		ghEnv(t, server)
+		setArgs("7")
+		resultPath := writeReviewResult(t, stopIncomplete, "")
+		record := `{"kind":"end","result":"[high] app/x/main.go:42 - the mutex is released twice\n"}
+`
+		if err := os.WriteFile(filepath.Join(filepath.Dir(resultPath), trajectoryFileName), []byte(record), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		reviewLedger(t)
+		t.Setenv("REVIEW_COMMENT_PATH", comment)
+		out, err := captureStdout(t, runReviewReport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != "action=fix\nused=0\nblocking=1\n" {
+			t.Errorf("stdout = %q", out)
+		}
+	})
+
+	t.Run("a hostile run record is read as data", func(t *testing.T) {
+		server := commentsServer(t, reportComments(1), http.StatusOK)
+		ghEnv(t, server)
+		setArgs("7")
+		writeReviewResult(t, stopIncomplete, "")
+		writeTrajectory(t, `not json at all
+{"kind":"end"}
+{"kind":"end","result":42}
+["kind","end"]
+{"kind":"step","result":"[high] step.go:1 - not an ending"}
+{"kind":"begin","result":"[high] begin.go:1 - not an ending either"}
+{"kind":"end","result":"prose, then findings.\n\n- [high] app/x/main.go:42 - | pipes | and <!-- html comments --> and @alice\n"}
+{"kind":"end"}trailing garbage on the same line
+`)
+		reviewLedger(t)
+		t.Setenv("REVIEW_COMMENT_PATH", comment)
+		out, err := captureStdout(t, runReviewReport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Only the real end line's findings act; the step and begin lines
+		// never do, and the malformed lines are skipped, not fatal.
+		if out != "action=fix\nused=0\nblocking=1\n" {
+			t.Errorf("stdout = %q", out)
+		}
+		data, err := os.ReadFile(comment)
+		if err != nil {
+			t.Fatalf("comment not written: %v", err)
+		}
+		assertReviewBodyClean(t, string(data))
+	})
+
+	t.Run("an oversized run record is capped, not read whole", func(t *testing.T) {
+		server := commentsServer(t, reportComments(1), http.StatusOK)
+		ghEnv(t, server)
+		setArgs("7")
+		writeReviewResult(t, stopIncomplete, "")
+		// The findings sit past the cap, in an end record the reader must
+		// never reach: padding first, then the record.
+		padding := strings.Repeat("#", maxTrajectoryBytes) + "\n"
+		writeTrajectory(t, padding+`{"kind":"end","result":"[high] app/x/main.go:42 - beyond the cap\n"}
+`)
+		reviewLedger(t)
+		t.Setenv("REVIEW_COMMENT_PATH", comment)
+		out, err := captureStdout(t, runReviewReport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != "action=report-only\nused=0\nblocking=0\n" {
+			t.Errorf("stdout = %q", out)
+		}
+	})
+
+	t.Run("a run record with no findings stays advisory", func(t *testing.T) {
+		server := commentsServer(t, reportComments(1), http.StatusOK)
+		ghEnv(t, server)
+		setArgs("7")
+		writeReviewResult(t, stopIncomplete, "")
+		writeTrajectory(t, `{"kind":"end","result":"The review is clean."}
+`)
+		reviewLedger(t)
+		t.Setenv("REVIEW_COMMENT_PATH", comment)
+		out, err := captureStdout(t, runReviewReport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != "action=report-only\nused=0\nblocking=0\n" {
 			t.Errorf("stdout = %q", out)
 		}
 	})
