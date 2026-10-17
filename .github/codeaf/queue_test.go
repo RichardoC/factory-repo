@@ -69,7 +69,8 @@ func TestNextNothingQueued(t *testing.T) {
 }
 
 // TestNextParallelRuns covers `harness next` with N runs in progress: with
-// queue.max_parallel_runs 2 the issue starts while fewer than two CodeAF
+// this test's max_parallel_runs 2 (built on purpose below, never read from
+// models.json) the issue starts while fewer than two CodeAF
 // runs are queued or in progress, and is held at two. Queued counts like
 // in_progress; completed does not count. The candidate and the in-flight
 // issues carry different areas, so only the capacity can hold it.
