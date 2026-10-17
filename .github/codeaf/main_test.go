@@ -1821,3 +1821,235 @@ func TestBriefBudget(t *testing.T) {
 		t.Errorf("budget line is not first: %q", brief[:60])
 	}
 }
+
+// ---------------------------------------------------------------- tool-call repair (issue #50)
+
+// repairRequest is a compact chat request carrying valid, truncated, empty
+// and string-typed tool-call arguments across two assistant messages. It is
+// written without spaces, so untouched messages can be compared
+// byte-for-byte, and the valid arguments carry a u00e9 escape plus quoted
+// and backslash characters to pin their exact encoding.
+const repairRequest = `{"model":"zai-org/glm-5.3-flash","temperature":0.5,"messages":[` +
+	`{"role":"system","content":"be careful"},` +
+	`{"role":"user","content":"list the files"},` +
+	`{"role":"assistant","content":null,"tool_calls":[` +
+	`{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"note\":\"cafe\\u00e9\",\"path\":\"a\\\"quote\\\\slash\"}"}},` +
+	`{"id":"call_2","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"trunc"}}` +
+	`]},` +
+	`{"role":"tool","tool_call_id":"call_1","content":"ok"},` +
+	`{"role":"assistant","tool_calls":[` +
+	`{"id":"call_3","type":"function","function":{"name":"write_file","arguments":""}},` +
+	`{"id":"call_4","type":"function","function":{"name":"odd_tool","arguments":"\"just a string\""}}` +
+	`]}]}`
+
+func TestRepairToolArgs(t *testing.T) {
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(repairRequest), &body); err != nil {
+		t.Fatal(err)
+	}
+	var before []json.RawMessage
+	if err := json.Unmarshal(body["messages"], &before); err != nil {
+		t.Fatal(err)
+	}
+	if got := repairToolArgs(body); got != 2 {
+		t.Fatalf("repairToolArgs repaired %d arguments, want 2", got)
+	}
+	var after []json.RawMessage
+	if err := json.Unmarshal(body["messages"], &after); err != nil {
+		t.Fatal(err)
+	}
+	// Messages without a repair keep their original bytes.
+	for _, i := range []int{0, 1, 3} {
+		if string(after[i]) != string(before[i]) {
+			t.Errorf("message %d changed:\n before %s\n after  %s", i, before[i], after[i])
+		}
+	}
+	// The first assistant message: the valid arguments byte-for-byte (the
+	// escapes survive verbatim), the truncated one wrapped.
+	if !strings.Contains(string(after[2]), `cafe\\u00e9`) {
+		t.Errorf("valid arguments re-encoded, want the original escapes in %s", after[2])
+	}
+	var msg map[string]json.RawMessage
+	if err := json.Unmarshal(after[2], &msg); err != nil {
+		t.Fatal(err)
+	}
+	var first []struct {
+		ID       string `json:"id"`
+		Function struct {
+			Arguments string `json:"arguments"`
+		} `json:"function"`
+	}
+	if err := json.Unmarshal(msg["tool_calls"], &first); err != nil {
+		t.Fatal(err)
+	}
+	if first[0].Function.Arguments != `{"note":"cafe\u00e9","path":"a\"quote\\slash"}` {
+		t.Errorf("valid arguments = %q, want them unchanged", first[0].Function.Arguments)
+	}
+	if first[1].Function.Arguments != `{"_invalid_arguments":"{\"path\":\"trunc"}` {
+		t.Errorf("truncated arguments = %q", first[1].Function.Arguments)
+	}
+	// The second assistant message: the empty string wrapped, the JSON
+	// string (valid JSON, not an object) left alone.
+	if err := json.Unmarshal(after[4], &msg); err != nil {
+		t.Fatal(err)
+	}
+	var second []struct {
+		Function struct {
+			Arguments string `json:"arguments"`
+		} `json:"function"`
+	}
+	if err := json.Unmarshal(msg["tool_calls"], &second); err != nil {
+		t.Fatal(err)
+	}
+	if second[0].Function.Arguments != `{"_invalid_arguments":""}` {
+		t.Errorf("empty arguments = %q", second[0].Function.Arguments)
+	}
+	if second[1].Function.Arguments != `"just a string"` {
+		t.Errorf("JSON-string arguments = %q, want them unchanged", second[1].Function.Arguments)
+	}
+	// A second pass finds nothing left to repair and changes nothing.
+	repaired := append([]json.RawMessage(nil), after...)
+	if got := repairToolArgs(body); got != 0 {
+		t.Errorf("second pass repaired %d, want 0", got)
+	}
+	var again []json.RawMessage
+	if err := json.Unmarshal(body["messages"], &again); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(repaired, again) {
+		t.Error("second pass changed the messages")
+	}
+	// No messages, or messages that are not an array: nothing to do.
+	if got := repairToolArgs(map[string]json.RawMessage{}); got != 0 {
+		t.Errorf("no messages: repaired %d", got)
+	}
+	bad := map[string]json.RawMessage{"messages": json.RawMessage(`{"not":"an array"}`)}
+	if got := repairToolArgs(bad); got != 0 || string(bad["messages"]) != `{"not":"an array"}` {
+		t.Errorf("malformed messages: repaired %d, messages %s", got, bad["messages"])
+	}
+	// Requests over the size cap are skipped, not repaired.
+	huge := `{"messages":[{"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"bad"}}]},{"role":"user","content":"` + strings.Repeat("pad", maxRepairBytes) + `"}]}`
+	big := map[string]json.RawMessage{"messages": json.RawMessage(huge)}
+	if got := repairToolArgs(big); got != 0 {
+		t.Errorf("oversized request: repaired %d, want 0", got)
+	}
+	if !strings.Contains(string(big["messages"]), `"arguments":"bad"`) {
+		t.Error("oversized request was modified")
+	}
+}
+
+// The proxy forwards a repaired request upstream: invalid tool-call arguments
+// become valid JSON that keeps the original text, valid arguments and every
+// other field are unchanged, and the ledger counts the repairs (issue #50).
+func TestProxyRepairsInvalidToolArgs(t *testing.T) {
+	var upstreamBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamBody, _ = io.ReadAll(r.Body)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"hi"}}],"model":"x","usage":{"prompt_tokens":10,"completion_tokens":5}}`)
+	}))
+	defer upstream.Close()
+
+	p := &proxy{upstream: upstream.URL, apiKey: "k", ledger: filepath.Join(t.TempDir(), "ledger.jsonl"),
+		runCap: 5, dayCap: 20, models: testModels(t), client: upstream.Client()}
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json", strings.NewReader(repairRequest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", response.StatusCode)
+	}
+
+	var seen map[string]json.RawMessage
+	if err := json.Unmarshal(upstreamBody, &seen); err != nil {
+		t.Fatal(err)
+	}
+	if string(seen["model"]) != `"hf:zai-org/GLM-5.3-Flash"` {
+		t.Errorf("upstream saw model %s", seen["model"])
+	}
+	if string(seen["temperature"]) != "0.5" {
+		t.Errorf("upstream saw temperature %s, want it unchanged", seen["temperature"])
+	}
+	var sentReq map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(repairRequest), &sentReq); err != nil {
+		t.Fatal(err)
+	}
+	var sent []json.RawMessage
+	if err := json.Unmarshal(sentReq["messages"], &sent); err != nil {
+		t.Fatal(err)
+	}
+	var messages []json.RawMessage
+	if err := json.Unmarshal(seen["messages"], &messages); err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 5 {
+		t.Fatalf("upstream saw %d messages", len(messages))
+	}
+	for _, i := range []int{0, 1, 3} {
+		if string(messages[i]) != string(sent[i]) {
+			t.Errorf("message %d changed:\n sent  %s\n seen  %s", i, sent[i], messages[i])
+		}
+	}
+	if !strings.Contains(string(messages[2]), `cafe\\u00e9`) {
+		t.Errorf("valid arguments re-encoded: %s", messages[2])
+	}
+	var last map[string]json.RawMessage
+	if err := json.Unmarshal(messages[4], &last); err != nil {
+		t.Fatal(err)
+	}
+	var calls []map[string]json.RawMessage
+	if err := json.Unmarshal(last["tool_calls"], &calls); err != nil {
+		t.Fatal(err)
+	}
+	var fn struct {
+		Arguments string `json:"arguments"`
+	}
+	if err := json.Unmarshal(calls[0]["function"], &fn); err != nil {
+		t.Fatal(err)
+	}
+	if fn.Arguments != `{"_invalid_arguments":""}` {
+		t.Errorf("upstream saw arguments %q", fn.Arguments)
+	}
+	// A streamed call is repaired the same way, and its ledger line carries
+	// the count too.
+	response, err = http.Post(server.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"zai-org/glm-5.3","stream":true,"messages":[{"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"bad"}}]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("stream status %d", response.StatusCode)
+	}
+	lines, err := readLedger(p.ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != 2 || lines[0].RepairedToolArgs != 2 ||
+		!lines[1].Stream || lines[1].RepairedToolArgs != 1 {
+		t.Fatalf("ledger = %+v, want repaired_tool_args 2 then 1 on the streamed call", lines)
+	}
+}
+
+// The report shows the repaired-arguments figure when the ledger has repairs,
+// and not when it has none (issue #50).
+func TestReportRepairedToolArgs(t *testing.T) {
+	result := Result{Stop: "done"}
+	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
+	render := func(lines []LedgerLine) string {
+		return Report(result, true, lines, cfg, nil, ReportInputs{}, func(string) string { return "" })
+	}
+	report := render([]LedgerLine{
+		{Model: "zai-org/glm-5.3-flash", CostUSD: 0.0002, UsageSeen: true, RepairedToolArgs: 2},
+		{Model: "zai-org/glm-5.3", Stream: true, RepairedToolArgs: 3},
+	})
+	if want := "| tool-call arguments repaired | 5 |"; !strings.Contains(report, want) {
+		t.Errorf("report lacks %q:\n%s", want, report)
+	}
+	if strings.Contains(render(nil), "arguments repaired") {
+		t.Error("report shows a repair figure with nothing repaired")
+	}
+}
