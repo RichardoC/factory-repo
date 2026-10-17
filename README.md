@@ -113,6 +113,27 @@ Known failure modes:
 - a self-dependency or a dependency cycle blocks the issue until its body is
   edited.
 
+### Runs that stop early (issue #31)
+
+A run can stop before it is finished: CodeAF reports `stop: deadline` (it used
+its 100 minutes), `incomplete`, or a budget stop — the run or day cap in
+[`models.json`](.github/codeaf/models.json). The patch is still published, as a
+**draft** pull request whose body says the run stopped early, why, and that the
+work is unverified: after the push, `publish` asks the harness
+([`main.go`](.github/codeaf/main.go), `harness pr-mode`) how the run ended.
+
+For a stop a continuation can help (`deadline`, `incomplete` and the budget
+family; other stops, an `error` say, leave the draft to a person), the workflow
+then posts `/codeaf continue: <reason>` on that PR and dispatches
+[`codeaf.yml`](.github/workflows/codeaf.yml) with its new `pr` input, which
+starts a run on the PR's branch. The continuation's brief carries the previous
+run's report and what the issue the PR closes still requires. The chain is
+capped at **2 continuations per issue**, counted from the PR's own CodeAF
+report comments — the first report is the run that opened the PR, not a
+continuation. At the cap the PR gets a comment and stays a draft for a person
+(a maintainer can still continue it by hand with a `/codeaf` comment). A run
+that ends with `stop: done` marks the PR ready for review.
+
 ## Limits worth knowing
 
 - The agent has a shell on the runner, so treat it as having the same access as any
