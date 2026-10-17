@@ -125,37 +125,45 @@ jobs:
           gh run list --workflow=codeaf.yml --json databaseId,status,displayTitle --limit 100 \
             | jq --arg id "$FINISHED_RUN" '[.[] | select((.databaseId | tostring) != $id)]' > runs.json
 
-      - name: Pick the next queued issue
-        id: next
-        # A non-zero exit fails the job: fail closed, no label on unknown
-        # spend.
-        env:
-          CODEAF_WEEK_SPENT_USD: ${{ steps.shared.outputs.week_usd }}
-        run: |
-          # harness next prints GITHUB_OUTPUT lines (number=, lane=) on its
-          # stdout, empty while it holds the pick; its human log (runs in
-          # progress, lanes in use, why each candidate started or was held)
-          # goes to stderr.
-          "$HARNESS" next issues.json runs.json >> "$GITHUB_OUTPUT"
-
-      - name: Label the issue and start the run
-        if: steps.next.outputs.number != ''
+      - name: Start queued issues while there are free slots
+        # One tick fills every free slot: ticks come only when a run ends or
+        # an issue is queued (GitHub runs the schedule late or not at all), so
+        # starting one run per tick would rarely let runs overlap. After each
+        # start, the picked issue is relabelled in issues.json and the new run joins
+        # runs.json under the title codeaf.yml will give it, so the next pick
+        # sees its area and lane. harness next enforces max_parallel_runs, the
+        # area rules and the spend threshold on every pick; the loop's own
+        # bound is only a backstop. A non-zero exit fails the job: fail
+        # closed, no label on unknown spend.
         env:
           GH_TOKEN: ${{ github.token }}
+          CODEAF_WEEK_SPENT_USD: ${{ steps.shared.outputs.week_usd }}
           # Scheduled events carry no repository payload; they run on the
           # default branch, so its name is the run's own ref.
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch || github.ref_name }}
-          N: ${{ steps.next.outputs.number }}
-          LANE: ${{ steps.next.outputs.lane }}
         run: |
-          # The lane is untrusted tool output, re-validated here before it is
-          # dispatched; anything not digits-only means lane 0.
-          case "$LANE" in ""|*[!0-9]*) LANE=0 ;; esac
-          gh issue edit "$N" --add-label "$CODEAF_LABEL"
-          # Best effort: once the run has started, `codeaf-queued` has said
-          # all it can; a failure here only leaves a stale label.
-          gh issue edit "$N" --remove-label "$CODEAF_QUEUED_LABEL" || true
-          # GITHUB_TOKEN's events do not trigger workflows, so the label alone
-          # would not start codeaf.yml. workflow_dispatch is the one event
-          # GITHUB_TOKEN can start, so the queue dispatches it itself.
-          gh workflow run codeaf.yml --ref "$DEFAULT_BRANCH" -f "issue=$N" -f "lane=$LANE"
+          for _ in 1 2 3 4 5; do
+            # harness next prints GITHUB_OUTPUT-style lines (number=, lane=)
+            # on stdout, nothing while it holds the pick; its human log goes
+            # to stderr. Parsed, never sourced: digits only, or stop.
+            out=$("$HARNESS" next issues.json runs.json)
+            N=$(sed -n 's/^number=//p' <<<"$out" | head -1)
+            LANE=$(sed -n 's/^lane=//p' <<<"$out" | head -1)
+            [[ "$N" =~ ^[0-9]{1,10}$ ]] || break
+            [[ "$LANE" =~ ^[0-9]{1,4}$ ]] || LANE=0
+            echo "starting #$N on lane $LANE"
+            gh issue edit "$N" --add-label "$CODEAF_LABEL"
+            # Best effort: once the run has started, `codeaf-queued` has said
+            # all it can; a failure here only leaves a stale label.
+            gh issue edit "$N" --remove-label "$CODEAF_QUEUED_LABEL" || true
+            # GITHUB_TOKEN's events do not trigger workflows, so the label
+            # alone would not start codeaf.yml. workflow_dispatch is the one
+            # event GITHUB_TOKEN can start, so the queue dispatches it itself.
+            gh workflow run codeaf.yml --ref "$DEFAULT_BRANCH" -f "issue=$N" -f "lane=$LANE"
+            # Mirror the relabel: the issue stays (the in-flight run's area is
+            # read from it) but is no longer a candidate.
+            jq --argjson n "$N" --arg q "$CODEAF_QUEUED_LABEL" --arg c "$CODEAF_LABEL" \
+              'map(if .number == $n then .labels = ([.labels[] | select(.name != $q)] + [{"name": $c}]) else . end)' \
+              issues.json > issues.next && mv issues.next issues.json
+            jq --arg t "CodeAF #$N (lane $LANE)" '. + [{"databaseId": 0, "status": "queued", "displayTitle": $t}]' runs.json > runs.next && mv runs.next runs.json
+          done
