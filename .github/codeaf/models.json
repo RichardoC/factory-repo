@@ -17,7 +17,7 @@
       "context_length": 524288,
       "input_modalities": ["text", "image"],
       "efforts": ["high", "max"],
-      "efforts_note": "synthetic.new also lists 'low', but GLM at low returns an empty answer (all reasoning, no content; tested 2026-10-15 and again 2026-10-16), so low requests are sent as high"
+      "efforts_note": "low, minimal and medium requests are sent as high, because GLM returns empty answers at low. medium was measured (2026-10-17, a real multi-step Go edit-and-test task through the live proxy, 3 repeats per case) to save 19.3% median completion tokens and 17.8% median wall time at equal correctness, which is under the 20% threshold that measurement set for switching, so high is kept (results.md, issue #24)"
     },
     {
       "id": "deepseek-ai/deepseek-v4.1-flash",
@@ -43,8 +43,8 @@
       "cache_read": 0.26,
       "context_length": 524288,
       "input_modalities": ["text"],
-      "efforts": ["high", "max"],
-      "efforts_note": "as for GLM-5.3-Flash: 'low' returns empty answers, so it is not offered"
+      "efforts": ["medium", "high", "max"],
+      "efforts_note": "low, minimal and medium are all sent as medium: equal correctness (3/3 vs 3/3, 0 empty answers, 0 malformed tool calls) and a real saving (median completion 1332->854, i.e. 35.9% fewer; median wall 26.3->17.8 s, 32.1% less), so medium is sent raw to synthetic.new; low is still never sent raw because GLM returns an empty answer (tested 2026-10-15 and 2026-10-16; measured 2026-10-17, results.md, issue #24)"
     }
   ]
 }

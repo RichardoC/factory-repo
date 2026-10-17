@@ -160,8 +160,11 @@ Three workflow artifacts are uploaded, none of them encrypted:
   create and approve pull requests* (for `gh pr create` with `GITHUB_TOKEN`).
 - Configuration lives in files, not workflow variables:
   - [`models.json`](.github/codeaf/models.json): the spend caps (`limits`) and the
-    allowed models with their prices (USD per million tokens) and how many calls
-    each may have in flight (`max_concurrent`);
+    allowed models with their prices (USD per million tokens), how many calls
+    each may have in flight (`max_concurrent`), and the reasoning efforts each
+    model accepts (`efforts`; a request for an unlisted effort goes to the next
+    one the model lists, `enabled: false` to its lowest, so nothing is sent raw
+    that the model does not list — see *GLM reasoning effort* below);
   - [`panel.json`](.github/codeaf/panel.json): the escalation order (not used for
     now, see above);
   - [`codeaf-config.json`](.github/codeaf/codeaf-config.json): CodeAF's own settings
@@ -173,3 +176,19 @@ Three workflow artifacts are uploaded, none of them encrypted:
   worker model's `max_concurrent`. The only CodeAF setting left in
   the environment is the endpoint (`CODEAF_BASE_URL`), because CodeAF reads it from
   nowhere else. The panel path (`CODEAF_MODELS`) would be the second one.
+
+### GLM reasoning effort (issue #24)
+
+GLM returns empty answers at `low`, so a request for an unlisted effort goes to the next
+one the model lists; `low` is never sent to GLM. Measured 2026-10-17 on a real multi-step Go edit-and-test task through the
+live proxy, 3 repeats per case (results.md, issue #24): `medium` matched `high` on correctness
+for both models, saving ~19.3% median completion tokens and ~17.8% median wall s on
+glm-5.3-flash, ~35.9% and ~32.1% on glm-5.3. Only glm-5.3 clears the 20% switching threshold,
+so only it sends `low`/`minimal`/`medium` as `medium`; glm-5.3-flash keeps `high`.
+
+| model | effort | median completion tokens | median wall s | success |
+|---|---|---|---|---|
+| glm-5.3-flash | medium | 993 | 19.8 | 3/3 |
+| glm-5.3-flash | high | 1231 | 24.1 | 3/3 |
+| glm-5.3 | medium | 854 | 17.8 | 3/3 |
+| glm-5.3 | high | 1332 | 26.3 | 3/3 |

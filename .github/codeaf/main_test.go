@@ -63,6 +63,7 @@ func TestResolve(t *testing.T) {
 func TestEffortFor(t *testing.T) {
 	models := testModels(t)
 	flash := mustResolve(t, models, "zai-org/glm-5.3-flash")              // high, max
+	glm := mustResolve(t, models, "zai-org/glm-5.3")                      // medium, high, max
 	deepseek := mustResolve(t, models, "deepseek-ai/deepseek-v4.1-flash") // none … max
 	off := false
 	cases := []struct {
@@ -75,6 +76,11 @@ func TestEffortFor(t *testing.T) {
 		{flash, reasoningRequest{Effort: "low"}, "high"},
 		{flash, reasoningRequest{Effort: "minimal"}, "high"},
 		{flash, reasoningRequest{Enabled: &off}, "high"},
+		{glm, reasoningRequest{Effort: "high"}, "high"},
+		{glm, reasoningRequest{Effort: "medium"}, "medium"},
+		{glm, reasoningRequest{Effort: "low"}, "medium"},
+		{glm, reasoningRequest{Effort: "minimal"}, "medium"},
+		{glm, reasoningRequest{Enabled: &off}, "medium"},
 		{deepseek, reasoningRequest{Enabled: &off}, "none"},
 		{flash, reasoningRequest{}, ""},
 		{flash, reasoningRequest{Effort: "weird"}, "high"},
