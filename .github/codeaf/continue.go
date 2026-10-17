@@ -15,7 +15,8 @@ import (
 )
 
 // The stop words CodeAF can report, verified in Agent-Field/codeaf
-// envelope.go at the pinned CODEAF_REF (6e73ac7, main, 2026-10-15).
+// envelope.go at the pin recorded in .github/codeaf/codeaf-ref
+// (6e73ac7, main, 2026-10-15).
 const (
 	stopDone       = "done"
 	stopError      = "error"

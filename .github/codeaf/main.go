@@ -20,6 +20,9 @@
 //	                       the worker tier set to the reviewer model
 //	harness review-report  print the review's step outputs and write its
 //	                       comment body: fix run, pass label, or report only
+//	harness ref-check      decide what the weekly upstream-pin check does:
+//	                       create, update or close the one issue tracking
+//	                       commits past .github/codeaf/codeaf-ref (issue #35)
 //
 // Trust model: the `codeaf` label can only be added by people with triage access
 // or above, and /codeaf commands are obeyed only from OWNER/MEMBER/COLLABORATOR.
@@ -52,7 +55,7 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("harness: ")
 	if len(os.Args) < 2 {
-		log.Fatal("usage: harness proxy|gate|next|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report")
+		log.Fatal("usage: harness proxy|gate|next|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|ref-check")
 	}
 	commands := map[string]func() error{
 		"proxy":         runProxy,
@@ -69,6 +72,9 @@ func main() {
 		"review-brief":  runReviewBrief,
 		"review-config": runReviewConfig,
 		"review-report": runReviewReport,
+		// The weekly upstream-pin check (issue #35): what the scheduled job
+		// should do about commits past .github/codeaf/codeaf-ref.
+		"ref-check": runRefCheck,
 	}
 	command, ok := commands[os.Args[1]]
 	if !ok {
