@@ -4,9 +4,9 @@
   "models.tiers.mastermind": "deepseek-ai/deepseek-v4.1-flash",
   "models.tiers.high": "deepseek-ai/deepseek-v4.1-flash",
   "models.crew.task_cap": 5,
-  "models.crew.cap": 40,
+  "models.crew.cap": 20,
   "task.parallel": 2,
-  "daily_budget_usd": 40,
+  "daily_budget_usd": 20,
   "telemetry": false,
   "model_pool": "off"
 }

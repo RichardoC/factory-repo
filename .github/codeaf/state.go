@@ -2,7 +2,7 @@ package main
 
 // Shared CodeAF state: the files in $CODEAF_HOME that carry what one run
 // learned into the next (the memory db, the router's event log and model
-// ratings), plus the day's spend.
+// ratings), plus the rolling week's credit spend.
 //
 // One bundle is shared by every run. It lives in the Actions cache and only
 // the codeaf-state workflow writes it:
@@ -61,18 +61,20 @@ type Manifest struct {
 	Version    int                `json:"version"`
 	Generation int                `json:"generation"`
 	Merged     []string           `json:"merged"` // "<run id>-<attempt>", newest last
-	Spend      map[string]float64 `json:"spend"`  // UTC date -> USD
+	Spend      map[string]float64 `json:"spend"`  // UTC date -> credit USD
 	Updated    time.Time          `json:"updated"`
 }
 
 // RunMeta is a packed run's meta.json.
 type RunMeta struct {
-	Version        int     `json:"version"`
-	RunID          string  `json:"run_id"`
-	Attempt        string  `json:"attempt"`
-	BaseGeneration int     `json:"base_generation"`
-	Date           string  `json:"date"`
-	RunUSD         float64 `json:"run_usd"`
+	Version        int    `json:"version"`
+	RunID          string `json:"run_id"`
+	Attempt        string `json:"attempt"`
+	BaseGeneration int    `json:"base_generation"`
+	Date           string `json:"date"`
+	// RunUSD is what the run cost in credit dollars; the JSON key stays
+	// run_usd so packed artifacts from before the rework still merge.
+	RunUSD float64 `json:"run_usd"`
 }
 
 func (m RunMeta) key() string { return m.RunID + "-" + m.Attempt }
@@ -414,12 +416,24 @@ func SpendDate(recorded string, now time.Time) string {
 
 // RunSpend is what a packed run cost, as far as the merge believes it. The
 // number was written by the run job, so one that can't be right counts as the
-// whole per-run cap: a wrong guess must never loosen the daily cap.
+// whole per-run credit cap: a wrong guess must never loosen that cap.
 func RunSpend(recorded float64, runCap float64) float64 {
 	if math.IsNaN(recorded) || math.IsInf(recorded, 0) || recorded < 0 || recorded > 2*runCap+1 {
 		return runCap
 	}
 	return recorded
+}
+
+// weekSpend is the rolling week's credit spend: the sum over the last
+// spendDays UTC days, today included. The weekly credit regenerates
+// continuously, so a rolling 7-day sum of what runs recorded stands in for
+// the refill.
+func weekSpend(m Manifest, now time.Time) float64 {
+	total := 0.0
+	for i := 0; i < spendDays; i++ {
+		total += m.Spend[now.UTC().Add(-time.Duration(i)*24*time.Hour).Format(time.DateOnly)]
+	}
+	return total
 }
 
 func pruneSpend(spend map[string]float64, now time.Time) {
@@ -496,7 +510,7 @@ func runState() error {
 }
 
 // stateLoad installs the shared bundle into CodeAF's home and outputs its
-// generation and today's spend for the run job.
+// generation and today's and this week's credit spend for the run job.
 func stateLoad(bundle, home string, cfg Config, now time.Time) error {
 	m, found, err := readManifest(bundle)
 	if err != nil {
@@ -512,9 +526,12 @@ func stateLoad(bundle, home string, cfg Config, now time.Time) error {
 		return err
 	}
 	today := m.Spend[now.UTC().Format(time.DateOnly)]
-	log.Printf("loaded shared state generation %d (%d ratings, %d events, memory db %d bytes); spent today $%.4f",
-		m.Generation, len(files.Ledger.Entries), len(files.Events), len(files.DB), today)
-	return setOutput("generation", strconv.Itoa(m.Generation), "day_usd", strconv.FormatFloat(today, 'f', -1, 64))
+	week := weekSpend(m, now)
+	log.Printf("loaded shared state generation %d (%d ratings, %d events, memory db %d bytes); spent today $%.4f, this week $%.4f",
+		m.Generation, len(files.Ledger.Entries), len(files.Events), len(files.DB), today, week)
+	return setOutput("generation", strconv.Itoa(m.Generation),
+		"day_usd", strconv.FormatFloat(today, 'f', -1, 64),
+		"week_usd", strconv.FormatFloat(week, 'f', -1, 64))
 }
 
 // statePack packs what CodeAF left in its home, and what the run cost, for
@@ -540,7 +557,7 @@ func statePack(home, out string, cfg Config, now time.Time) error {
 		lines, err := readLedger(os.Getenv("LEDGER_PATH"))
 		if err != nil {
 			log.Printf("warning: ledger unreadable (%v); counting the whole run cap", err)
-			meta.RunUSD = cfg.Limits.RunUSD
+			meta.RunUSD = cfg.Limits.RunCreditUSD
 		} else {
 			meta.RunUSD = ledgerTotal(lines)
 		}
@@ -627,7 +644,7 @@ func stateMerge(bundle, out string, runDirs []string, cfg Config, now time.Time)
 	}
 	for _, r := range runs {
 		day := SpendDate(r.meta.Date, now)
-		usd := RunSpend(r.meta.RunUSD, cfg.Limits.RunUSD)
+		usd := RunSpend(r.meta.RunUSD, cfg.Limits.RunCreditUSD)
 		m.Spend[day] += usd
 		files, _ := readFiles(r.dir, cfg.Models, false)
 		var how string

@@ -82,19 +82,31 @@ maintainer's approval, like any other change under `.github/`.
   length of the job and sits between CodeAF and [synthetic.new](https://synthetic.new).
   It:
   - serves CodeAF an OpenRouter-style `/models` catalog containing only the models in
-    [`models.json`](.github/codeaf/models.json), at synthetic.new's usage-based prices,
-    so that CodeAF's estimates and model routing see real prices;
+    [`models.json`](.github/codeaf/models.json), at synthetic.new's **subscription
+    rates** — the prices that draw down the weekly credit, so CodeAF's estimates and
+    model routing see what usage really costs against the quota; the same file also
+    carries each model's API list rates (`api_*`), what overage past the quota costs
+    (both checked 2026-10-17, [synthetic.new/pricing](https://synthetic.new/pricing));
   - adds `usage.cost` to every response, which is where CodeAF's spend accounting
     reads cost from;
-  - refuses any other model, and returns HTTP 402 once the run reaches **$5** or the
-    UTC day reaches **$40**. The day's total comes from the shared state.
+  - refuses any other model, and returns HTTP 402 once the run reaches its per-run
+    credit cap (**$5**, `limits.run_credit_usd`) or the week's credit is gone
+    (`limits.weekly_credit_usd`, from the shared state); with `overage_usd` 0 (the
+    default) it stops there rather than pay API prices;
+  - asks synthetic.new for the subscription state once at proxy start
+    (`GET /v2/quotas` — the call does not count against the subscription's limits),
+    logs the raw response into the diagnostics with no key, shows its fields in the
+    report, and refuses a call early when the quota reports exhausted and overage is
+    0. The response's units are undocumented, so the parse is defensive and an
+    unfamiliar shape never fails a run;
 
   The synthetic.new key (`SYNTHETIC_API_KEY` secret) is held only by the proxy. It is
   passed in on stdin, not through the environment.
 - Model choice: the seats are spread across models, because the synthetic.new
   subscription allows only **2 calls to each model at once**:
-  - the worker runs on **GLM-5.3-Flash** ($0.15 in / $0.50 out per M tokens);
-  - the planner and checker run on **DeepSeek-V4.1-Flash** ($0.60 / $1.20).
+  - the worker runs on **GLM-5.3-Flash** ($0.10 in / $0.25 out per M tokens at
+    subscription rates);
+  - the planner and checker run on **DeepSeek-V4.1-Flash** ($0.06 / $0.30).
   - CodeAF runs at most 2 tasks at once (`task.parallel`), so the workers
     fit in GLM-5.3-Flash's 2 slots.
   - The proxy enforces the limit per model (`max_concurrent` in
@@ -103,12 +115,55 @@ maintainer's approval, like any other change under `.github/`.
     ledger, so the diagnostics show whether a run was held up by it.
   - Escalation is switched off for now. CodeAF's cascade
     ([`panel.json`](.github/codeaf/panel.json)) would escalate to
-    **DeepSeek-V4.1-Flash** ($0.60 / $1.20) and then **GLM-5.3** ($1.40 / $4.40),
+    **DeepSeek-V4.1-Flash** ($0.06 / $0.30) and then **GLM-5.3** ($0.40 / $2.20),
     but it has two bugs:
     - it treats a reply made only of tool calls as empty, and fails every run;
     - its pinned rungs all call the seat model, so it never escalates.
   - [`codeaf.yml`](.github/workflows/codeaf.yml) explains how to turn it back on
     once CodeAF is fixed.
+
+### Billing model (Big plan, issue #59)
+
+The synthetic.new account is on the **Big** plan ($90/mo). Usage draws down a
+**weekly credit** at the subscription rates, and the credit regenerates 2% of its
+total every 202 minutes (~3.4 h) — a full refill in about a week. Past the quota,
+usage is billed at the **API list prices**, up to `limits.overage_usd`; at 0 (the
+default) the factory stops rather than pay beyond the $90. The Big plan's weekly
+credit is not published, so `weekly_credit_usd` (40) is a conservative
+**assumption** — calibrate it from `GET /v2/quotas`'s `subscription.limit` once
+its units are known. `run_credit_usd` (5) caps one run; the weekly credit and the
+overage cap are shared by every run of the week through the shared state, and are
+sized so several overlapping runs (`task.parallel` 2) can share the week.
+
+What the harness does with it:
+- the catalog prices CodeAF sees are the subscription rates — the credit;
+  `api_input`/`api_cached`/`api_output` in the same file price the overage;
+- the shared state carries the rolling 7-day credit spend; `harness state load`
+  outputs the day's and the week's figure, and the queue starts a run only while the
+  rolling week is under 75% of the weekly credit (`CODEAF_WEEK_SPENT_USD` — an
+  unknown spend starts nothing);
+- the proxy refuses at the weekly credit unless `overage_usd` > 0, and prices
+  past-quota calls at the API rates against the overage cap;
+- at proxy start it calls `GET /v2/quotas` (the call does not count against the
+  subscription's limits), logs the raw body into the diagnostics with no key, shows
+  it in the report, and refuses when the quota reports exhausted and overage is 0;
+  the parse is defensive — unfamiliar fields never fail a run.
+
+CodeAF's own config maps onto this as closely as its settings allow: CodeAF has no
+weekly-budget key, and `daily_budget_usd`'s window is a single run's lifetime, so
+it is set to 20 (the weekly credit, the closest match) with `models.crew.cap` 20;
+`task_cap` 5 matches `run_credit_usd`.
+
+**Fast and Infinite modes (beta) — follow-up only, nothing enabled.** Fast mode is
+not enabled on the account and is not requested: the goal is more tickets, not
+faster ones. Infinite mode is a proposed follow-up: its requests never count against
+the rate limit, run outside the quota but much slower, and are DeepSeek-V4.1-Flash
+only — a way to add review/planner capacity without using the weekly credit. A
+request opts in per request: per the API docs (checked 2026-10-17,
+[dev.synthetic.new/docs/api/models](https://dev.synthetic.new/docs/api/models)), by
+sending the model as the `infinite:` alias (`infinite:small:vision` resolves to
+DeepSeek-V4.1-Flash), which requires `stream: true` and a Big plan. The `:flex`
+model suffix suggested in the issue is not documented anywhere reachable.
 
 ## The queue
 
@@ -120,8 +175,9 @@ demand, via *Run workflow*)
 
 - no CodeAF run is queued or in progress;
 - every issue named in a "Depends on #N" line in its body is closed;
-- the day's spend in the shared state is under 75% of `limits.day_usd` in
-  [`models.json`](.github/codeaf/models.json) — an unknown spend starts nothing;
+- the rolling week's credit spend in the shared state is under 75% of
+  `limits.weekly_credit_usd` in [`models.json`](.github/codeaf/models.json) — an
+  unknown spend starts nothing;
 - the issue is queued and not already active.
 
 A run is started by adding the **`codeaf`** label — the same trust gate as a
@@ -148,8 +204,9 @@ Known failure modes:
 ### Runs that stop early (issue #31)
 
 A run can stop before it is finished: CodeAF reports `stop: deadline` (it used
-its 100 minutes), `incomplete`, or a budget stop — the run or day cap in
-[`models.json`](.github/codeaf/models.json). The patch is still published, as a
+its 100 minutes), `incomplete`, or a budget stop — the per-run credit cap, or the
+weekly credit with `overage_usd` 0, in [`models.json`](.github/codeaf/models.json).
+The patch is still published, as a
 **draft** pull request whose body says the run stopped early, why, and that the
 work is unverified: after the push, `publish` asks the harness
 ([`main.go`](.github/codeaf/main.go), `harness pr-mode`) how the run ended.
@@ -239,7 +296,10 @@ maintainer's approval (the `codeaf-harness` environment, see
   with is executed with a write token.
 - **Shared state.** Every run starts from one shared bundle:
   - CodeAF's memory db, router events and model ratings;
-  - the day's spend.
+  - the rolling 7-day credit spend — credit at subscription rates, from the runs
+    merged so far. The weekly credit regenerates continuously (2% of the total every
+    ~202 minutes), and this rolling sum is what stands in for the refill; `state
+    load` outputs both the day's and the week's figure.
 
   [`codeaf-state.yml`](.github/workflows/codeaf-state.yml) is the only writer:
   - It merges each run's `codeaf-state-*` artifact into a new generation of
@@ -273,8 +333,11 @@ maintainer's approval (the `codeaf-harness` environment, see
 - Repository setting needed: *Settings → Actions → General → Allow GitHub Actions to
   create and approve pull requests* (for `gh pr create` with `GITHUB_TOKEN`).
 - Configuration lives in files, not workflow variables:
-  - [`models.json`](.github/codeaf/models.json): the spend caps (`limits`) and the
-    allowed models with their prices (USD per million tokens), how many calls
+  - [`models.json`](.github/codeaf/models.json): the spend caps (`limits`: the plan,
+    the weekly credit, the per-run credit and the overage cap) and the allowed models
+    with their prices (USD per million tokens: the `input`/`output`/`cache_read`
+    subscription rates draw down the weekly credit, `api_input`/`api_cached`/`api_output`
+    are the API list rates overage is billed at), how many calls
     each may have in flight (`max_concurrent`), and the reasoning efforts each
     model accepts (`efforts`; a request for an unlisted effort goes to the next
     one the model lists, `enabled: false` to its lowest, so nothing is sent raw

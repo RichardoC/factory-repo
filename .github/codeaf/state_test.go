@@ -265,13 +265,13 @@ func TestStateRoundTripWithOverlappingRuns(t *testing.T) {
 		t.Errorf("re-merge output = %q", output)
 	}
 
-	// The next run sees today's total and the merged files.
+	// The next run sees today's and the week's totals and the merged files.
 	home := t.TempDir()
 	t.Setenv("GITHUB_OUTPUT", filepath.Join(t.TempDir(), "output"))
 	if err := stateLoad(gen2, home, cfg, now); err != nil {
 		t.Fatal(err)
 	}
-	if output, _ := os.ReadFile(os.Getenv("GITHUB_OUTPUT")); string(output) != "generation=3\nday_usd=3.75\n" {
+	if output, _ := os.ReadFile(os.Getenv("GITHUB_OUTPUT")); string(output) != "generation=3\nday_usd=3.75\nweek_usd=3.75\n" {
 		t.Errorf("load output = %q", output)
 	}
 }
@@ -295,7 +295,7 @@ func TestStateMergeRefusesBadRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := readManifestT(t, out)
-	if m.Spend["2026-10-16"] != cfg.Limits.RunUSD {
+	if m.Spend["2026-10-16"] != cfg.Limits.RunCreditUSD {
 		t.Errorf("a negative spend should count as the run cap, got %v", m.Spend)
 	}
 	if _, err := os.Stat(filepath.Join(out, dbFile)); err == nil {
@@ -311,5 +311,64 @@ func TestReadManifestRefusesPoisonedSpend(t *testing.T) {
 	writeTestFile(t, filepath.Join(dir, manifestFile), []byte(`{"version":1,"generation":2,"merged":[],"spend":{"2026-10-16":-20}}`))
 	if _, _, err := readManifest(dir); err == nil {
 		t.Error("negative spend accepted")
+	}
+}
+func TestWeekSpend(t *testing.T) {
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	day := func(offset int) string {
+		return now.Add(time.Duration(offset) * 24 * time.Hour).Format(time.DateOnly)
+	}
+	if got := weekSpend(newManifest(), now); got != 0 {
+		t.Errorf("empty manifest: weekSpend = %v, want 0", got)
+	}
+	m := newManifest()
+	m.Spend[day(0)] = 1.5 // today
+	m.Spend[day(-1)] = 2  // yesterday
+	m.Spend[day(-6)] = 4  // the oldest day that still counts
+	if got := weekSpend(m, now); got != 7.5 {
+		t.Errorf("sparse days: weekSpend = %v, want 7.5", got)
+	}
+	m = newManifest()
+	m.Spend[day(0)] = 2.5
+	if got := weekSpend(m, now); got != 2.5 {
+		t.Errorf("today only: weekSpend = %v, want 2.5", got)
+	}
+	// Entries older than the rolling week do not count; pruneSpend drops
+	// them from the manifest.
+	m = newManifest()
+	m.Spend[day(0)] = 3
+	m.Spend[day(-7)] = 100 // at pruneSpend's edge: kept, but outside the sum
+	m.Spend[day(-8)] = 100 // gone after pruning
+	pruneSpend(m.Spend, now)
+	if _, ok := m.Spend[day(-8)]; ok {
+		t.Error("pruneSpend kept an entry from 8 days ago")
+	}
+	if got := weekSpend(m, now); got != 3 {
+		t.Errorf("old entries: weekSpend = %v, want 3", got)
+	}
+}
+
+func TestStateLoadOutputsWeekSpend(t *testing.T) {
+	cfg, err := loadConfig("models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	dir := t.TempDir()
+	m := newManifest()
+	m.Generation = 4
+	m.Spend["2026-10-16"] = 1.5 // today
+	m.Spend["2026-10-15"] = 2   // yesterday
+	m.Spend["2026-10-13"] = 4   // earlier in the week
+	m.Spend["2026-10-08"] = 100 // 8 days back: outside the rolling week
+	data, _ := json.MarshalIndent(m, "", "  ")
+	writeTestFile(t, filepath.Join(dir, manifestFile), append(data, '\n'))
+	t.Setenv("GITHUB_OUTPUT", filepath.Join(t.TempDir(), "output"))
+	if err := stateLoad(dir, t.TempDir(), cfg, now); err != nil {
+		t.Fatal(err)
+	}
+	output, _ := os.ReadFile(os.Getenv("GITHUB_OUTPUT"))
+	if string(output) != "generation=4\nday_usd=1.5\nweek_usd=7.5\n" {
+		t.Errorf("load output = %q, want day_usd 1.5 and week_usd 7.5", output)
 	}
 }

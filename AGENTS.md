@@ -71,7 +71,9 @@ whether through prompt injection or a compromised model.
   between runs. Build tools from pinned sources each run.
 - CodeAF's state is carried between runs in one shared bundle
   (`.github/codeaf/state.go`, `codeaf-state.yml`): the memory db
-  (`graph.db`), `router-events.jsonl`, the model ratings and the day's spend.
+  (`graph.db`), `router-events.jsonl`, the model ratings and the rolling 7-day
+  credit spend (spend is credit at subscription rates on a rolling 7-day week;
+  the account is on synthetic.new's Big plan).
   This was a deliberate decision. CodeAF puts saved memories from `graph.db`
   into every worker's prompt, so a poisoned memory would reach later runs.
   Hence the rules below:
@@ -93,15 +95,17 @@ whether through prompt injection or a compromised model.
 - Validate numbers from the bundle and from run artifacts before using them;
   never paste them into `$GITHUB_OUTPUT` or `$GITHUB_ENV` raw. A spend total in
   the bundle that is negative or not a number fails the run. A run's own spend
-  that can't be right counts as the whole per-run cap.
+  that can't be right counts as the whole per-run credit cap
+  (`limits.run_credit_usd`).
 - Record spend from the proxy's in-memory total, not from files the agent can
   edit. The harness falls back to the ledger file only if the proxy is gone.
   The proxy runs as the runner user and the agent as the `codeaf` user, so the
   agent can neither kill nor replace the proxy; before the user separation
   (issue #54) it could, which is why the rule stays. Runs that overlap
-  each start from the day total as it was, so together they can pass the daily
-  cap. So for a hard budget, also set a spending limit on the synthetic.new
-  account itself.
+  each start from the weekly total as it was, so together they can pass the
+  weekly credit. So for a hard budget, also set a spending limit on the
+  synthetic.new account itself (overage is capped by `limits.overage_usd`,
+  default 0).
 
 ### Privilege separation
 
