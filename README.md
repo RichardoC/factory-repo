@@ -473,8 +473,9 @@ GLM returns empty answers at `low`, so a request for an unlisted effort goes to 
 one the model lists; `low` is never sent to GLM. Measured 2026-10-17 on a real multi-step Go edit-and-test task through the
 live proxy, 3 repeats per case (results.md, issue #24): `medium` matched `high` on correctness
 for both models, saving ~19.3% median completion tokens and ~17.8% median wall s on
-glm-5.3-flash, ~35.9% and ~32.1% on glm-5.3. Only glm-5.3 clears the 20% switching threshold,
-so only it sends `low`/`minimal`/`medium` as `medium`; glm-5.3-flash keeps `high`.
+glm-5.3-flash, ~35.9% and ~32.1% on glm-5.3. Both now send `low`/`minimal`/`medium` as
+`medium`: glm-5.3 cleared the 20% threshold, and the owner chose `medium` for glm-5.3-flash
+too, since about 72% of its output is reasoning (the report's reasoning-share column).
 
 | model | effort | median completion tokens | median wall s | success |
 |---|---|---|---|---|
