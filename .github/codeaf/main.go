@@ -1065,13 +1065,15 @@ type Result struct {
 	Answer     string  `json:"answer"`
 }
 
-func readResult() (Result, error) {
+// readResult returns the result and its raw bytes; the raw bytes are parsed
+// again for the plan's tasks, whose shape is CodeAF's to change.
+func readResult() (Result, []byte, error) {
 	var result Result
 	data, err := os.ReadFile(os.Getenv("RESULT_PATH"))
 	if err != nil {
-		return result, err
+		return result, nil, err
 	}
-	return result, json.Unmarshal(data, &result)
+	return result, data, json.Unmarshal(data, &result)
 }
 
 func runSummary() error {
@@ -1326,9 +1328,412 @@ type modelTotals struct {
 	reasoningKnown                   bool // whether any call reported reasoning tokens
 }
 
+// ---------------------------------------------------------------- untrusted text
+
+// reportMaxAnswer caps CodeAF's answer in the report, in runes.
+const reportMaxAnswer = 6000
+
+// escapeMD makes untrusted text inert in GitHub-flavored markdown. Every
+// character that markdown or HTML gives structure to is escaped (backslash
+// for markdown punctuation, entities for < > &), and an @ that could start
+// a mention or an autolink is split with a zero-width space, so the rendered
+// comment shows the text itself and cannot carry headings, tables, code
+// spans, links, images, mentions or raw HTML. Control characters are dropped,
+// newlines are kept unless oneLine, and the text is capped at max runes with
+// an ellipsis. (. - + ( ) stay unescaped; see the default case below.)
+func escapeMD(s string, max int, oneLine bool) string {
+	var b strings.Builder
+	n := 0
+	for _, r := range s {
+		if n >= max {
+			b.WriteRune('…')
+			return b.String()
+		}
+		switch {
+		case r == '\n':
+			if oneLine {
+				r = ' '
+			} else {
+				b.WriteByte('\n')
+				n++
+				continue
+			}
+		case r == '\t':
+			r = ' '
+		case r < 0x20 || r == 0x7f:
+			continue
+		}
+		switch r {
+		case '&':
+			b.WriteString("&amp;")
+		case '<':
+			b.WriteString("&lt;")
+		case '>':
+			b.WriteString("&gt;")
+		case '@':
+			b.WriteString("@\u200b")
+		default:
+			// . - + ( ) are left alone: mid-line they are plain prose, and at
+			// a line start they make only lists and rules, which carry
+			// nothing and cannot inject.
+			if strings.ContainsRune("\\`*_{}[]#|~!", r) {
+				b.WriteByte('\\')
+			}
+			b.WriteRune(r)
+		}
+		n++
+	}
+	return b.String()
+}
+
+// plainToken reports whether s is the short lowercase word CodeAF's own stop,
+// verdict and task-state values are. Such a value renders as it is; anything
+// else is untrusted prose and renders escaped.
+func plainToken(s string) bool {
+	if s == "" || len(s) > 40 {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case i == 0:
+			if r < 'a' || r > 'z' {
+				return false
+			}
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// tokenCell renders a short untrusted word: known-shaped values in backticks,
+// anything else escaped and capped, an empty one as an em-dash.
+func tokenCell(s string, max int) string {
+	switch {
+	case s == "":
+		return "—"
+	case plainToken(s):
+		return "`" + s + "`"
+	default:
+		return escapeMD(s, max, true)
+	}
+}
+
+// ---------------------------------------------------------------- the plan's tasks
+
+// planTask is one task of the plan CodeAF's result may carry.
+type planTask struct {
+	Title string
+	State string
+}
+
+const (
+	maxPlanTasks      = 200 // parsed at most; a hostile result cannot grow the report
+	maxPlanTasksShown = 30  // rendered at most
+)
+
+// planTasks digs the plan's tasks and their states out of the raw result
+// JSON. The field is CodeAF's to shape, so the reader is permissive: a
+// top-level "tasks" array, or a "plan" object with one, of objects carrying
+// a title (or name) and a state (or status). Anything else — missing,
+// differently shaped, absurdly long — yields what it can, capped.
+func planTasks(raw []byte) []planTask {
+	if len(raw) == 0 {
+		return nil
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &top); err != nil {
+		return nil
+	}
+	arr, ok := top["tasks"]
+	if !ok {
+		var plan struct {
+			Tasks json.RawMessage `json:"tasks"`
+		}
+		if json.Unmarshal(top["plan"], &plan) != nil || plan.Tasks == nil {
+			return nil
+		}
+		arr = plan.Tasks
+	}
+	var items []map[string]json.RawMessage
+	if err := json.Unmarshal(arr, &items); err != nil {
+		return nil
+	}
+	if len(items) > maxPlanTasks {
+		items = items[:maxPlanTasks]
+	}
+	tasks := make([]planTask, 0, len(items))
+	for _, it := range items {
+		var t planTask
+		json.Unmarshal(it["title"], &t.Title) // best effort by design
+		if t.Title == "" {
+			json.Unmarshal(it["name"], &t.Title)
+		}
+		json.Unmarshal(it["state"], &t.State)
+		if t.State == "" {
+			json.Unmarshal(it["status"], &t.State)
+		}
+		t.Title, t.State = strings.TrimSpace(t.Title), strings.TrimSpace(t.State)
+		if len(t.Title) > 1024 {
+			t.Title = t.Title[:1024]
+		}
+		if len(t.State) > 256 {
+			t.State = t.State[:256]
+		}
+		if t.Title == "" && t.State == "" {
+			continue
+		}
+		tasks = append(tasks, t)
+	}
+	if len(tasks) == 0 {
+		return nil
+	}
+	return tasks
+}
+
+// ---------------------------------------------------------------- the patch's diffstat
+
+// fileDiff is one file's change, as the patch's diffstat reports it.
+type fileDiff struct {
+	Path   string
+	Add    int
+	Del    int
+	Binary bool
+}
+
+const (
+	maxDiffFiles = 200      // parsed at most; the rest is counted, not parsed
+	maxDiffShown = 50       // rendered at most
+	maxDiffPath  = 512      // one path, in runes
+	maxPatchRead = 64 << 20 // a patch over this is not summarised
+)
+
+// diffstat parses a git patch the way `git diff --stat` would: which files
+// changed, with lines added and removed. The patch is untrusted, so the
+// parser only reads it: quoted paths are unquoted, hunk lines that look like
+// headers ("--- x" as a removed line) stay hunk lines, binary sections are
+// skipped (their base85 lines can start with + or -), and a patch with more
+// than maxDiffFiles files stops early, with the rest counted in the second
+// return.
+func diffstat(patch []byte) (diffs []fileDiff, more int) {
+	sc := bufio.NewScanner(bytes.NewReader(patch))
+	sc.Buffer(make([]byte, 64*1024), 1<<22)
+	var (
+		cur                 *fileDiff
+		prePath             string // the section's a/ path; "" is /dev/null or unset
+		preGuess, postGuess string // the paths the diff --git header named
+		inHunk              bool
+	)
+	flush := func() {
+		if cur == nil {
+			return
+		}
+		path := cur.Path
+		switch {
+		case path == "":
+			path = prePath
+		case prePath != "" && prePath != path:
+			path = prePath + " → " + path
+		}
+		if path == "" {
+			// No ---/+++ lines named a path — a binary diff has none — so the
+			// header the section started with is all there is.
+			switch {
+			case preGuess != "" && postGuess != "" && preGuess != postGuess:
+				path = preGuess + " → " + postGuess
+			default:
+				path = postGuess
+				if path == "" {
+					path = preGuess
+				}
+			}
+		}
+		if path != "" {
+			if len(diffs) < maxDiffFiles {
+				diffs = append(diffs, fileDiff{Path: path, Add: cur.Add, Del: cur.Del, Binary: cur.Binary})
+			} else {
+				more++
+			}
+		}
+		cur, prePath, inHunk = nil, "", false
+	}
+	for sc.Scan() {
+		line := sc.Text()
+		switch {
+		case strings.HasPrefix(line, "diff --git "):
+			flush()
+			cur = &fileDiff{}
+			preGuess, postGuess = headerPaths(line[len("diff --git "):])
+		case cur == nil:
+			// before the first file section there is nothing to read
+		case strings.HasPrefix(line, "GIT binary patch"),
+			strings.HasPrefix(line, "Binary files ") && strings.HasSuffix(line, " differ"):
+			cur.Binary = true
+		case !inHunk && strings.HasPrefix(line, "@@"):
+			inHunk = true
+		case !inHunk && strings.HasPrefix(line, "--- "):
+			prePath = patchPath(line[4:], "a/")
+		case !inHunk && strings.HasPrefix(line, "+++ "):
+			if p := patchPath(line[4:], "b/"); p != "" {
+				cur.Path = p
+			}
+		case !inHunk && strings.HasPrefix(line, "rename from "):
+			prePath = patchPath(line[len("rename from "):], "")
+		case !inHunk && strings.HasPrefix(line, "rename to "):
+			cur.Path = patchPath(line[len("rename to "):], "")
+		case inHunk && !cur.Binary:
+			switch line[0] {
+			case '+':
+				cur.Add++
+			case '-':
+				cur.Del++
+			}
+		}
+	}
+	flush()
+	return diffs, more
+}
+
+// headerPaths reads the two paths out of a "diff --git a/X b/Y" line, which
+// git quotes when a path needs it. Best effort: a section without ---/+++
+// lines — a binary diff — is named from them.
+func headerPaths(rest string) (pre, post string) {
+	if strings.HasPrefix(rest, `"`) {
+		i := strings.Index(rest[1:], `"`)
+		if i < 0 {
+			return "", ""
+		}
+		pre = patchPath(rest[:i+2], "a/")
+		rest = strings.TrimSpace(rest[i+2:])
+		return pre, patchPath(rest, "b/")
+	}
+	i := strings.Index(rest, " b/")
+	if i < 0 {
+		return patchPath(rest, "a/"), ""
+	}
+	return patchPath(rest[:i], "a/"), patchPath(rest[i+1:], "b/")
+}
+
+// patchPath cleans one path out of a patch header: unquoted if git quoted it,
+// stripped of the a/ or b/ prefix, capped, and empty for /dev/null.
+func patchPath(arg, prefix string) string {
+	p := strings.TrimSpace(arg)
+	if p == "/dev/null" {
+		return ""
+	}
+	if strings.HasPrefix(p, `"`) {
+		if u, err := strconv.Unquote(p); err == nil {
+			p = u
+		} else {
+			p = strings.Trim(p, `"`)
+		}
+	}
+	p = strings.TrimPrefix(p, prefix)
+	if runes := []rune(p); len(runes) > maxDiffPath {
+		p = string(runes[:maxDiffPath]) + "…"
+	}
+	return p
+}
+
+// readPublishErrors reads the ::error:: lines the publish steps collected
+// into a file. Workflow output, but read as data all the same: capped here,
+// and escaped again at render.
+func readPublishErrors(path string) []string {
+	if path == "" {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, 1<<16))
+	if err != nil {
+		return nil
+	}
+	var lines []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "::error::"))
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) > 20 {
+		lines = lines[len(lines)-20:]
+	}
+	return lines
+}
+
+// patchDiffstat summarises the patch the run job handed over. A missing patch
+// is normal (nothing changed, or the run died before packaging); a patch too
+// big to read is reported in the note instead.
+func patchDiffstat(path string) (diffs []fileDiff, more int, note string) {
+	if path == "" {
+		return nil, 0, ""
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, 0, "" // missing or unreadable: no diffstat, no note
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, 0, ""
+	}
+	if info.Size() > maxPatchRead {
+		return nil, 0, "the patch is over 64 MB and was not summarised"
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, 0, ""
+	}
+	diffs, more = diffstat(data)
+	return diffs, more, ""
+}
+
+// diagnosticsArtifact looks up this run's diagnostics artifact through the
+// API, the way runWallTime does. Anything missing — no run id, no attempt, no
+// token, a failed call, no artifact — means no id, and the report links to
+// the run page, where the artifacts are listed, instead.
+func diagnosticsArtifact() string {
+	run, attempt := os.Getenv("GITHUB_RUN_ID"), os.Getenv("GITHUB_RUN_ATTEMPT")
+	gh := newGitHub()
+	if run == "" || attempt == "" || gh.repo == "" || gh.token == "" {
+		return ""
+	}
+	var listing struct {
+		Artifacts []struct {
+			ID int64 `json:"id"`
+		} `json:"artifacts"`
+	}
+	name := fmt.Sprintf("codeaf-diagnostics-%s-%s", run, attempt)
+	if err := gh.get(fmt.Sprintf("/actions/runs/%s/artifacts?name=%s&per_page=1", run, name), &listing); err != nil || len(listing.Artifacts) == 0 {
+		return ""
+	}
+	if id := listing.Artifacts[0].ID; id > 0 {
+		return strconv.FormatInt(id, 10)
+	}
+	return ""
+}
+
 // Report renders the run report. It is a pure function of its inputs so it can
 // be tested; runReport gathers them, including the run job's wall time.
-func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall *time.Duration, env func(string) string) string {
+//
+// ReportInputs carries the side files the report reads as data: everything in
+// them is untrusted output — of the run job (the patch, the result) and of the
+// publish steps (the collected ::error:: lines) — so every string rendered
+// from them is capped and escaped, and none of it is ever executed.
+type ReportInputs struct {
+	PublishErrors []string   // the ::error:: lines the publish steps collected, oldest first
+	PlanTasks     []planTask // the plan's tasks, if the result JSON has them
+	Diff          []fileDiff // the patch's diffstat
+	DiffMore      int        // files past the diffstat's parse cap
+	DiffNote      string     // why there is no diffstat, when there is none
+	DiagArtifact  string     // the diagnostics artifact's id, if the API had one
+}
+
+func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall *time.Duration, in ReportInputs, env func(string) string) string {
 	models := cfg.Models
 	// The ledger is written by the untrusted run job, so its strings are
 	// hostile: only model IDs the trusted config knows are rendered, and
@@ -1427,6 +1832,23 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 	if outcome == "" {
 		outcome = "finished"
 	}
+	// Where the diagnostics artifact lives. The artifact id comes from the
+	// API (diagnosticsArtifact), and only digits are believed here: it is
+	// rendered into a link, and a hostile id must not be able to break out
+	// of it. Without an id the link goes to the run page, which lists the
+	// artifacts.
+	server := env("GITHUB_SERVER_URL")
+	if server == "" {
+		server = "https://github.com"
+	}
+	run := env("GITHUB_RUN_ID")
+	diagURL := ""
+	if run != "" {
+		diagURL = fmt.Sprintf("%s/%s/actions/runs/%s", server, env("GITHUB_REPOSITORY"), run)
+		if digitsOnly(in.DiagArtifact) {
+			diagURL += "/artifacts/" + in.DiagArtifact
+		}
+	}
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s\n### CodeAF run — %s\n\n| | |\n|---|---|\n", reportMarker, outcome)
@@ -1435,27 +1857,102 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 		if result.OK != nil {
 			ok = strconv.FormatBool(*result.OK)
 		}
-		fmt.Fprintf(&b, "| stop / ok | `%s` / `%s` |\n", orUnknown(result.Stop), ok)
+		fmt.Fprintf(&b, "| stop / ok | %s / `%s` |\n", tokenCell(result.Stop, 40), ok)
 		if result.Verdict != "" {
-			fmt.Fprintf(&b, "| verdict | `%s` |\n", result.Verdict)
+			fmt.Fprintf(&b, "| verdict | %s |\n", tokenCell(result.Verdict, 200))
 		}
 		if result.Error != nil && result.Error != "" {
-			message := strings.ReplaceAll(fmt.Sprint(result.Error), "\n", " ")
-			fmt.Fprintf(&b, "| error | %.300s |\n", message)
+			fmt.Fprintf(&b, "| error | %s |\n", escapeMD(fmt.Sprint(result.Error), 300, true))
 		}
 	} else {
 		b.WriteString("| result | CodeAF produced no JSON result; see the workflow logs |\n")
+	}
+	// Seat models render only if the trusted config knows them, the same rule
+	// the ledger table applies; a crafted seat name cannot reach the comment.
+	seat := func(id string) string {
+		switch {
+		case id == "":
+			return "—"
+		case slices.ContainsFunc(models, func(m Model) bool { return m.ID == id }):
+			return "`" + id + "`"
+		default:
+			return "`(other)`"
+		}
 	}
 	allowed := make([]string, len(models))
 	for i, m := range models {
 		allowed[i] = "`" + m.ID + "`"
 	}
-	fmt.Fprintf(&b, "| seats | worker `%s`, planner `%s`, checker `%s` (allowed: %s; no escalation) |\n",
-		orUnknown(result.Model), orUnknown(result.PlanModel), orUnknown(result.CheckModel), strings.Join(allowed, ", "))
+	fmt.Fprintf(&b, "| seats | worker %s, planner %s, checker %s (allowed: %s; no escalation) |\n",
+		seat(result.Model), seat(result.PlanModel), seat(result.CheckModel), strings.Join(allowed, ", "))
 	fmt.Fprintf(&b, "| CodeAF's own spend figure | %s (plan estimate %s) |\n", money(result.SpendUSD), money(result.EstUSD))
 	fmt.Fprintf(&b, "| metered by proxy (from its ledger) | **%s** this run · %s today (cap $%s/run, $%s/day) |\n",
 		money(total), money(dayBefore+total), trimNumber(cfg.Limits.RunUSD), trimNumber(cfg.Limits.DayUSD))
-	fmt.Fprintf(&b, "| files changed | %s |\n\n", orUnknown(env("CHANGED")))
+	fmt.Fprintf(&b, "| files changed | %s |\n", orUnknown(env("CHANGED")))
+	// The ::error:: lines the publish steps collected: the two most recent are
+	// the cause of a failed publish. Read as data: the prefix is stripped and
+	// the line is escaped and capped, so a crafted error line stays a line.
+	if errs := in.PublishErrors; len(errs) > 0 {
+		if len(errs) > 2 {
+			errs = errs[len(errs)-2:]
+		}
+		for _, e := range errs {
+			e = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(e), "::error::"))
+			fmt.Fprintf(&b, "| publish error | %s |\n", escapeMD(e, 200, true))
+		}
+	}
+	b.WriteString("\n")
+	// When CodeAF stopped without an answer, its report is all the reviewer
+	// has: the stop reason, what the patch changed, the plan's tasks if the
+	// result carried them, and the warning that none of it is verified.
+	// A run CodeAF called ok is not unfinished, whatever its answer length.
+	if strings.TrimSpace(result.Answer) == "" && !(result.OK != nil && *result.OK) {
+		b.WriteString("### Unfinished work\n\n")
+		switch {
+		case !haveResult:
+			b.WriteString("CodeAF produced no result: **what it did here is unfinished and unverified.**")
+		case result.Stop == "":
+			b.WriteString("CodeAF stopped without an answer: **what it did here is unfinished and unverified.**")
+		default:
+			fmt.Fprintf(&b, "CodeAF stopped (%s) without an answer: **what it did here is unfinished and unverified.**",
+				tokenCell(result.Stop, 40))
+		}
+		if diagURL != "" {
+			fmt.Fprintf(&b, " Its [diagnostics](%s) show what it did do.", diagURL)
+		}
+		b.WriteString("\n\n")
+		if len(in.Diff) > 0 || in.DiffMore > 0 || in.DiffNote != "" {
+			b.WriteString("Files changed (from the patch's diffstat):\n\n| file | added | removed |\n|---|---:|---:|\n")
+			for i, d := range in.Diff {
+				if i == maxDiffShown {
+					break
+				}
+				if d.Binary {
+					fmt.Fprintf(&b, "| %s (binary) | — | — |\n", escapeMD(d.Path, 200, true))
+					continue
+				}
+				fmt.Fprintf(&b, "| %s | %d | %d |\n", escapeMD(d.Path, 200, true), d.Add, d.Del)
+			}
+			if rest := in.DiffMore + max(len(in.Diff)-maxDiffShown, 0); rest > 0 {
+				fmt.Fprintf(&b, "| … and %d more files | | |\n", rest)
+			}
+			if in.DiffNote != "" {
+				fmt.Fprintf(&b, "| %s | | |\n", escapeMD(in.DiffNote, 200, true))
+			}
+			b.WriteString("\n")
+		}
+		if len(in.PlanTasks) > 0 {
+			b.WriteString("The plan's tasks (from CodeAF's result, unverified):\n\n| task | state |\n|---|---|\n")
+			for i, t := range in.PlanTasks {
+				if i == maxPlanTasksShown {
+					fmt.Fprintf(&b, "| … and %d more tasks | | |\n", len(in.PlanTasks)-i)
+					break
+				}
+				fmt.Fprintf(&b, "| %s | %s |\n", escapeMD(t.Title, 200, true), tokenCell(t.State, 40))
+			}
+			b.WriteString("\n")
+		}
+	}
 
 	if len(totals) > 0 {
 		ids := make([]string, 0, len(totals))
@@ -1543,24 +2040,35 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 	fmt.Fprintf(&b, "| longest single call | %s |\n", longestRow)
 	fmt.Fprintf(&b, "| queued at the model limit | %s |\n", queuedRow)
 	b.WriteString("\n")
+	// The answer is untrusted too: escaped, so it cannot break out of this
+	// <details> block or any table above, and capped.
 	if result.Answer != "" {
-		answer := result.Answer
-		if len(answer) > 6000 {
-			answer = answer[:6000] + "…"
-		}
-		fmt.Fprintf(&b, "<details><summary>CodeAF's summary</summary>\n\n%s\n\n</details>\n\n", answer)
-	}
-	server := env("GITHUB_SERVER_URL")
-	if server == "" {
-		server = "https://github.com"
+		fmt.Fprintf(&b, "<details><summary>CodeAF's summary</summary>\n\n%s\n\n</details>\n\n", escapeMD(result.Answer, reportMaxAnswer, false))
 	}
 	labelName := env("CODEAF_LABEL")
 	if labelName == "" {
 		labelName = "codeaf"
 	}
-	fmt.Fprintf(&b, "[Workflow run](%s/%s/actions/runs/%s) · reply `%s <instructions>` on a `%s`-labelled issue/PR to run again.\n",
-		server, env("GITHUB_REPOSITORY"), env("GITHUB_RUN_ID"), command, labelName)
+	line := fmt.Sprintf("[Workflow run](%s/%s/actions/runs/%s)", server, env("GITHUB_REPOSITORY"), run)
+	if diagURL != "" {
+		line += " · [Diagnostics](" + diagURL + ")"
+	}
+	fmt.Fprintf(&b, "%s · reply `%s <instructions>` on a `%s`-labelled issue/PR to run again.\n", line, command, labelName)
 	return b.String()
+}
+
+// digitsOnly reports whether s is a plain decimal number, the only shape of
+// an artifact id the report believes.
+func digitsOnly(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // runWallTime asks the GitHub API how long this run's `run` job took, latest
@@ -1603,7 +2111,7 @@ func runWallTime() *time.Duration {
 }
 
 func runReport() error {
-	result, err := readResult()
+	result, raw, err := readResult()
 	haveResult := err == nil
 	if err != nil {
 		log.Printf("no CodeAF result: %v", err)
@@ -1616,6 +2124,13 @@ func runReport() error {
 	if err != nil {
 		return err
 	}
-	fmt.Print(Report(result, haveResult, lines, cfg, runWallTime(), os.Getenv))
+	var in ReportInputs
+	if haveResult {
+		in.PlanTasks = planTasks(raw)
+	}
+	in.PublishErrors = readPublishErrors(os.Getenv("PUBLISH_ERRORS_PATH"))
+	in.Diff, in.DiffMore, in.DiffNote = patchDiffstat(os.Getenv("PATCH_PATH"))
+	in.DiagArtifact = diagnosticsArtifact()
+	fmt.Print(Report(result, haveResult, lines, cfg, runWallTime(), in, os.Getenv))
 	return nil
 }

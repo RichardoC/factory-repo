@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -494,7 +496,7 @@ func TestReport(t *testing.T) {
 	env := map[string]string{"DAY_SPENT_BEFORE": "1.2", "CHANGED": "3",
 		"GITHUB_REPOSITORY": "RichardoC/factory-repo", "GITHUB_RUN_ID": "42"}
 	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
-	report := Report(result, true, lines, cfg, nil, func(k string) string { return env[k] })
+	report := Report(result, true, lines, cfg, nil, ReportInputs{}, func(k string) string { return env[k] })
 	for _, want := range []string{
 		reportMarker,
 		"| stop / ok | `done` / `true` |",
@@ -692,7 +694,7 @@ func TestReportTiming(t *testing.T) {
 			PromptTokens: 1000, CompletionTokens: 1000, CostUSD: 0.0044, UsageSeen: true},
 	}
 	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
-	report := Report(result, true, lines, cfg, &wall, func(string) string { return "" })
+	report := Report(result, true, lines, cfg, &wall, ReportInputs{}, func(string) string { return "" })
 	for _, want := range []string{
 		"| run job wall time | 1h28m0s |",
 		"| CodeAF session (proxy start → last call end) | 4m0s |",
@@ -718,7 +720,7 @@ func TestReportTiming(t *testing.T) {
 	// em-dashes, and a missing wall time does too.
 	old := []LedgerLine{{Model: "zai-org/glm-5.3-flash", Time: base, PromptTokens: 1000,
 		CompletionTokens: 200, CostUSD: 0.0001, UsageSeen: true}}
-	report = Report(result, true, old, cfg, nil, func(string) string { return "" })
+	report = Report(result, true, old, cfg, nil, ReportInputs{}, func(string) string { return "" })
 	for _, want := range []string{
 		"| run job wall time | — |",
 		"| CodeAF session (proxy start → last call end) | — |",
@@ -869,7 +871,7 @@ func TestReportGroupsUnknownModels(t *testing.T) {
 			PromptTokens: 1000, CompletionTokens: 200, CostUSD: 0.00228, UsageSeen: true},
 	}
 	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
-	report := Report(result, true, lines, cfg, nil, func(string) string { return "" })
+	report := Report(result, true, lines, cfg, nil, ReportInputs{}, func(string) string { return "" })
 	for _, banned := range []string{"INJECT", "@user", "http://e/x"} {
 		if strings.Contains(report, banned) {
 			t.Errorf("hostile model string leaked %q into the report:\n%s", banned, report)
@@ -912,7 +914,7 @@ func TestReportDropsAbsurdTiming(t *testing.T) {
 			SlotWaitS: 1e9, CostUSD: 0.01, UsageSeen: true},
 	}
 	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
-	report := Report(result, true, lines, cfg, nil, func(string) string { return "" })
+	report := Report(result, true, lines, cfg, nil, ReportInputs{}, func(string) string { return "" })
 	for _, banned := range []string{"2562047h", "4611686018427387904"} {
 		if strings.Contains(report, banned) {
 			t.Errorf("hostile timing reached the report (%q found):\n%s", banned, report)
@@ -943,5 +945,264 @@ func TestLedgerTotalCountsUnknownKinds(t *testing.T) {
 	}
 	if got := ledgerTotal(lines); math.Abs(got-5.001) > 1e-9 {
 		t.Errorf("ledgerTotal = %v, want 5.001", got)
+	}
+}
+
+// A failed publish: the report carries the ::error:: lines the publish steps
+// collected — the two most recent are the cause — with the prefix stripped,
+// and a link to the run's diagnostics artifact.
+func TestReportFailedPublish(t *testing.T) {
+	ok := false
+	result := Result{Stop: "done", OK: &ok}
+	in := ReportInputs{
+		PublishErrors: []string{
+			"::error::patch touches .github/ outside .github/codeaf/ without a maintainer's approval; refusing it",
+			"::error::GitHub refused the push of codeaf/issue-9-42",
+			"remote: GH006: Refused to update hidden path .github/workflows/ci.yml",
+		},
+		DiagArtifact: "12345",
+	}
+	env := map[string]string{"GITHUB_REPOSITORY": "RichardoC/factory-repo", "GITHUB_RUN_ID": "42",
+		"OUTCOME": "publishing failed"}
+	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
+	report := Report(result, true, nil, cfg, nil, in, func(k string) string { return env[k] })
+	for _, want := range []string{
+		"### CodeAF run — publishing failed",
+		"| publish error | GitHub refused the push of codeaf/issue-9-42 |",
+		"| publish error | remote: GH006: Refused to update hidden path .github/workflows/ci.yml |",
+		"[Diagnostics](https://github.com/RichardoC/factory-repo/actions/runs/42/artifacts/12345)",
+	} {
+		if !strings.Contains(report, want) {
+			t.Errorf("report lacks %q:\n%s", want, report)
+		}
+	}
+	for _, banned := range []string{
+		"::error::",                       // the prefix is not shown
+		"without a maintainer's approval", // only the two most recent lines show
+	} {
+		if strings.Contains(report, banned) {
+			t.Errorf("report leaks %q:\n%s", banned, report)
+		}
+	}
+}
+
+// CodeAF stopped without an answer (the deadline case): the report says why,
+// summarises the patch and the plan's tasks, and says plainly that the work
+// is unfinished and unverified.
+func TestReportEmptyAnswerFallback(t *testing.T) {
+	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
+	env := map[string]string{"GITHUB_REPOSITORY": "RichardoC/factory-repo", "GITHUB_RUN_ID": "42"}
+	envf := func(k string) string { return env[k] }
+	in := ReportInputs{
+		PlanTasks: []planTask{{"write the parser", "done"}, {"wire the report", "open"}},
+		Diff:      []fileDiff{{Path: "app/x.go", Add: 12, Del: 3}, {Path: "img/logo.png", Binary: true}},
+		DiffMore:  7,
+	}
+	ok := false
+	report := Report(Result{Stop: "deadline", OK: &ok}, true, nil, cfg, nil, in, envf)
+	for _, want := range []string{
+		"### Unfinished work",
+		"CodeAF stopped (`deadline`) without an answer: **what it did here is unfinished and unverified.**",
+		"[diagnostics](https://github.com/RichardoC/factory-repo/actions/runs/42)",
+		"| app/x.go | 12 | 3 |",
+		"| img/logo.png (binary) | — | — |",
+		"… and 7 more files",
+		"| write the parser | `done` |",
+		"| wire the report | `open` |",
+	} {
+		if !strings.Contains(report, want) {
+			t.Errorf("report lacks %q:\n%s", want, report)
+		}
+	}
+	if strings.Contains(report, "CodeAF's summary") {
+		t.Errorf("an empty answer must not render a summary block:\n%s", report)
+	}
+	// The fallback is for runs CodeAF did not call ok: a run it called ok, or
+	// one that answered, is not unfinished.
+	ok = true
+	if report = Report(Result{Stop: "done", OK: &ok}, true, nil, cfg, nil, in, envf); strings.Contains(report, "Unfinished work") {
+		t.Errorf("a run CodeAF called ok is not unfinished:\n%s", report)
+	}
+	if report = Report(Result{Stop: "done", Answer: "Did it."}, true, nil, cfg, nil, in, envf); strings.Contains(report, "Unfinished work") {
+		t.Errorf("a run with an answer is not unfinished:\n%s", report)
+	}
+	// No result at all: the fallback still says what the patch changed.
+	report = Report(Result{}, false, nil, cfg, nil, in, envf)
+	for _, want := range []string{"Unfinished work", "produced no result", "| app/x.go | 12 | 3 |"} {
+		if !strings.Contains(report, want) {
+			t.Errorf("no-result report lacks %q:\n%s", want, report)
+		}
+	}
+}
+
+// The strings of the result file are hostile: stop, error, the seat models and
+// the answer render inert — no raw HTML, no mentions, no images, no headings,
+// no tables, no breakout of the details block — and a non-numeric artifact id
+// is not believed.
+func TestReportHostileResult(t *testing.T) {
+	result := Result{
+		Stop:  "done`\n\n# INJECTED HEADING @user",
+		Error: "<script>alert(1)</script> ![pwn](http://e/i) @admin | break |",
+		Model: "zai-org/glm-5.3\n\n# INJECT",
+		Answer: "wrote code</details><img src=x onerror=alert(1)> ![pwn](http://e/i) @admin" +
+			"\n\n# INJECTED\n\n| x | y |\n|---|---|\n\n" + strings.Repeat("a", 8000),
+	}
+	in := ReportInputs{
+		DiagArtifact: `42"><script>`,
+		PlanTasks:    []planTask{{Title: "`title` @admin", State: "done\n\n# X"}},
+	}
+	env := map[string]string{"GITHUB_REPOSITORY": "RichardoC/factory-repo", "GITHUB_RUN_ID": "42"}
+	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
+	report := Report(result, true, nil, cfg, nil, in, func(k string) string { return env[k] })
+	for _, banned := range []string{
+		"<script", "<img", // raw HTML cannot survive
+		"@admin", "@user", // mentions cannot survive
+		"![pwn]",                     // images cannot survive
+		"\n# INJECT", "\n# INJECTED", // headings cannot survive
+		"| x | y |",         // tables cannot survive
+		"/artifacts/",       // a non-numeric artifact id is ignored
+		"zai-org/glm-5.3\n", // a hostile seat name renders as (other)
+	} {
+		if strings.Contains(report, banned) {
+			t.Errorf("hostile result leaked %q into the report:\n%s", banned, report)
+		}
+	}
+	if n := strings.Count(report, "</details>"); n != 1 {
+		t.Errorf("the answer broke out of the details block (%d closers):\n%s", n, report)
+	}
+	if strings.Contains(report, strings.Repeat("a", 6100)) {
+		t.Error("the answer was not capped")
+	}
+}
+
+// diffstat reads a patch the way `git diff --stat` would: hunk lines that look
+// like headers stay hunk lines, binary sections are not counted, quoted paths
+// are unquoted, renames show both ends, and a deleted file keeps its old path.
+func TestDiffstat(t *testing.T) {
+	patch := []byte(`diff --git a/app/new.go b/app/new.go
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/app/new.go
+@@ -0,0 +1,3 @@
++one
++two
++three
+diff --git a/app/mod.go b/app/mod.go
+index 1111111..2222222 100644
+--- a/app/mod.go
++++ b/app/mod.go
+@@ -1,3 +1,3 @@
+ context
+--- a/fake header
++++ b/fake header
+-old line
++new line
+diff --git a/app/gone.go b/app/gone.go
+deleted file mode 100644
+index 2222222..0000000
+--- a/app/gone.go
++++ /dev/null
+@@ -1 +0,0 @@
+-bye
+diff --git a/renamed.go b/moved.go
+similarity index 100%
+rename from renamed.go
+rename to moved.go
+diff --git a/bin.dat b/bin.dat
+index 3333333..4444444 100644
+GIT binary patch
+literal 8
+McZ{+-;=1)2|3?
+
+diff --git a/we ird.go b/we ird.go
+index 5555555..6666666 100644
+--- "a/we ird.go"
++++ "b/we ird.go"
+@@ -1 +1 @@
+-a
++b
+`)
+	diffs, more := diffstat(patch)
+	if more != 0 {
+		t.Fatalf("more = %d, want 0", more)
+	}
+	want := []fileDiff{
+		{Path: "app/new.go", Add: 3},
+		{Path: "app/mod.go", Add: 2, Del: 2}, // the fake header lines are hunk lines
+		{Path: "app/gone.go", Del: 1},
+		{Path: "renamed.go → moved.go"},
+		{Path: "bin.dat", Binary: true},
+		{Path: "we ird.go", Add: 1, Del: 1},
+	}
+	if !reflect.DeepEqual(diffs, want) {
+		t.Fatalf("diffstat = %+v, want %+v", diffs, want)
+	}
+}
+
+// A huge diffstat cannot grow the report: the parser keeps at most
+// maxDiffFiles files, the report renders at most maxDiffShown of them, and
+// one path renders capped.
+func TestReportCapsHugeDiffstat(t *testing.T) {
+	var patch strings.Builder
+	for i := 0; i < 300; i++ {
+		fmt.Fprintf(&patch, "diff --git a/f/%03d.go b/f/%03d.go\n--- a/f/%03d.go\n+++ b/f/%03d.go\n@@ -1 +1 @@\n-a\n+b\n", i, i, i, i)
+	}
+	diffs, more := diffstat([]byte(patch.String()))
+	if len(diffs) != maxDiffFiles || more != 100 {
+		t.Fatalf("diffstat kept %d files (more %d), want %d and 100", len(diffs), more, maxDiffFiles)
+	}
+	diffs = append(diffs, fileDiff{Path: strings.Repeat("p", 100000), Add: 1})
+	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
+	report := Report(Result{}, false, nil, cfg, nil, ReportInputs{Diff: diffs, DiffMore: more}, func(string) string { return "" })
+	// 50 shown of 201 kept, plus the 100 the parser did not keep.
+	if !strings.Contains(report, "… and 251 more files") {
+		t.Errorf("report lacks the more-files row:\n%s", report)
+	}
+	if strings.Contains(report, strings.Repeat("p", 300)) {
+		t.Error("a hostile path was not capped")
+	}
+	if n := strings.Count(report, "\n| f/"); n != maxDiffShown {
+		t.Errorf("rendered %d file rows, want %d", n, maxDiffShown)
+	}
+}
+
+// The plan's tasks come out of whatever shape the result JSON carries, capped,
+// and a result without them yields nothing.
+func TestPlanTasks(t *testing.T) {
+	got := planTasks([]byte(`{"stop":"done","tasks":[{"title":"a","state":"done"},{"name":"b","status":"open"},{"title":""},{"state":"bare"}]}`))
+	if want := []planTask{{"a", "done"}, {"b", "open"}, {"", "bare"}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("planTasks = %+v, want %+v", got, want)
+	}
+	if got = planTasks([]byte(`{"plan":{"tasks":[{"title":"t","state":"open"}]}}`)); !reflect.DeepEqual(got, []planTask{{"t", "open"}}) {
+		t.Fatalf("planTasks(plan.tasks) = %+v", got)
+	}
+	for _, raw := range []string{`{"stop":"done"}`, `not json`, `{"tasks":"no"}`, `{"tasks":[1,2]}`, `{"tasks":[{"title":42}]}`, `{"plan":{"tasks":7}}`, ""} {
+		if got := planTasks([]byte(raw)); got != nil {
+			t.Errorf("planTasks(%q) = %+v, want nil", raw, got)
+		}
+	}
+	var many []string
+	for i := 0; i < 500; i++ {
+		many = append(many, fmt.Sprintf(`{"title":"t%d"}`, i))
+	}
+	if got := planTasks([]byte(`{"tasks":[` + strings.Join(many, ",") + `]}`)); len(got) != maxPlanTasks {
+		t.Fatalf("planTasks kept %d tasks, want %d", len(got), maxPlanTasks)
+	}
+}
+
+// The collected ::error:: file is read capped: the oldest lines drop, the
+// prefix strips, and a missing file is no error.
+func TestReadPublishErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "errors.log")
+	if err := os.WriteFile(path, []byte(strings.Repeat("::error::x\n", 25)+"::error::the last one\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := readPublishErrors(path)
+	if len(got) != 20 || got[0] != "x" || got[len(got)-1] != "the last one" {
+		t.Fatalf("readPublishErrors = %q", got)
+	}
+	if readPublishErrors(filepath.Join(t.TempDir(), "absent")) != nil {
+		t.Error("a missing file is not an error")
 	}
 }

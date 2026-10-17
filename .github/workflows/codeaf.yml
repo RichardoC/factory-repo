@@ -345,6 +345,10 @@ jobs:
             echo "IN=$RUNNER_TEMP/in"
             echo "RESULT_PATH=$RUNNER_TEMP/in/codeaf-result.json"
             echo "LEDGER_PATH=$RUNNER_TEMP/in/codeaf-ledger.jsonl"
+            # The report reads the patch and the publish steps' ::error::
+            # lines as data: capped and escaped, never executed.
+            echo "PATCH_PATH=$RUNNER_TEMP/in/changes.patch"
+            echo "PUBLISH_ERRORS_PATH=$RUNNER_TEMP/publish-errors.log"
             echo "HARNESS=$RUNNER_TEMP/harness/harness"
           } >> "$GITHUB_ENV"
 
@@ -393,7 +397,7 @@ jobs:
               exit 0
             fi
           done
-          echo "::error::the patch changes .github/ outside .github/codeaf/ but no maintainer approved the codeaf-harness deployment; set required reviewers on that environment"
+          echo "::error::the patch changes .github/ outside .github/codeaf/ but no maintainer approved the codeaf-harness deployment; set required reviewers on that environment" | tee -a "$PUBLISH_ERRORS_PATH"
           exit 1
 
       - name: Apply the patch
@@ -432,7 +436,7 @@ jobs:
             # (checked above, in this job). --no-renames, so a file moved out
             # of .github/workflows/ shows up under its old path too.
             if [ "$(stat -c %s "$patch")" -gt 52428800 ]; then
-              echo "::error::patch is over 50 MB; refusing it"; exit 1
+              echo "::error::patch is over 50 MB; refusing it" | tee -a "$PUBLISH_ERRORS_PATH"; exit 1
             fi
             if [ "$moved" = true ]; then
               # Merged onto the current default branch. A branch started from
@@ -449,19 +453,19 @@ jobs:
               fi
             else
               if [ "$(cat "$IN/base-commit" 2>/dev/null)" != "$(git rev-parse HEAD)" ]; then
-                echo "::error::the branch moved while CodeAF ran; refusing to apply a stale patch"; exit 1
+                echo "::error::the branch moved while CodeAF ran; refusing to apply a stale patch" | tee -a "$PUBLISH_ERRORS_PATH"; exit 1
               fi
               git apply --index --binary "$patch"
             fi
             if git diff --cached --name-only | grep -qE '(^|/)\.git(/|$)'; then
-              echo "::error::patch touches a .git path; refusing it"; exit 1
+              echo "::error::patch touches a .git path; refusing it" | tee -a "$PUBLISH_ERRORS_PATH"; exit 1
             fi
             # Collected first, not piped to `grep -q`: an early exit there could
             # kill git with SIGPIPE, and under pipefail the test would read false.
             outside=$(git diff --cached --no-renames --name-only | grep '^\.github/' | grep -v '^\.github/codeaf/' || true)
             if [ -n "$outside" ] && [ "$HARNESS_APPROVED" != true ]; then
               printf '%s\n' "$outside" # every line starts with .github/, so none is a workflow command
-              echo "::error::patch touches .github/ outside .github/codeaf/ without a maintainer's approval; refusing it"; exit 1
+              echo "::error::patch touches .github/ outside .github/codeaf/ without a maintainer's approval; refusing it" | tee -a "$PUBLISH_ERRORS_PATH"; exit 1
             fi
             changed=$(git diff --cached --name-only | wc -l)
           fi
@@ -500,9 +504,9 @@ jobs:
             status=$(api "https://api.github.com/repos/$GITHUB_REPOSITORY/installation")
             if [ "$status" != 200 ]; then
               case "$status" in
-                404) echo "::error::the CodeAF harness app is not installed on $GITHUB_REPOSITORY (GET /repos/…/installation: 404). Install it on this repository (app settings → Install App)." ;;
-                401) echo "::error::GitHub refused the app's JWT (401): check CODEAF_APP_ID and CODEAF_APP_PRIVATE_KEY on the codeaf-harness environment." ;;
-                *) echo "::error::looking up the app's installation failed: HTTP $status $(jq -r '.message // empty' "$RUNNER_TEMP/app-api.json")" ;;
+                404) echo "::error::the CodeAF harness app is not installed on $GITHUB_REPOSITORY (GET /repos/…/installation: 404). Install it on this repository (app settings → Install App)." | tee -a "$PUBLISH_ERRORS_PATH" ;;
+                401) echo "::error::GitHub refused the app's JWT (401): check CODEAF_APP_ID and CODEAF_APP_PRIVATE_KEY on the codeaf-harness environment." | tee -a "$PUBLISH_ERRORS_PATH" ;;
+                *) echo "::error::looking up the app's installation failed: HTTP $status $(jq -r '.message // empty' "$RUNNER_TEMP/app-api.json")" | tee -a "$PUBLISH_ERRORS_PATH" ;;
               esac
               exit 1
             fi
@@ -512,7 +516,7 @@ jobs:
             push_token=$(jq -r '.token // empty' "$RUNNER_TEMP/app-api.json")
             rm -f "$RUNNER_TEMP/app-api.json"
             if [ "$status" != 201 ] || [ -z "$push_token" ]; then
-              echo "::error::the app could not get an installation token (HTTP $status): it needs Contents and Workflows read and write on $GITHUB_REPOSITORY"
+              echo "::error::the app could not get an installation token (HTTP $status): it needs Contents and Workflows read and write on $GITHUB_REPOSITORY" | tee -a "$PUBLISH_ERRORS_PATH"
               exit 1
             fi
             echo "::add-mask::$push_token"
@@ -520,14 +524,24 @@ jobs:
           elif [ "$APPROVED" = true ]; then
             echo "::warning::CODEAF_APP_ID / CODEAF_APP_PRIVATE_KEY are not set on the codeaf-harness environment; pushing with GITHUB_TOKEN, which can't push changes to .github/workflows/"
           fi
-          git push "https://x-access-token:${push_token}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/$BRANCH"
+          # The #9 case: a push GitHub refuses used to die into "publishing
+          # failed" with the cause only in the log. Collect it for the report,
+          # redacting anything token-shaped (the URL carries a credential).
+          if ! out=$(git push "https://x-access-token:${push_token}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/$BRANCH" 2>&1); then
+            printf '%s\n' "$out" | sed -E 's/x-access-token:[^@[:space:]]+@/x-access-token:[redacted]@/g; s/(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,})/[redacted]/g' | tail -n 4 | tee -a "$PUBLISH_ERRORS_PATH"
+            echo "::error::GitHub refused the push of $BRANCH; the cause is above and in this job's log" | tee -a "$PUBLISH_ERRORS_PATH"
+            exit 1
+          fi
           pr=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')
           if [ -z "$pr" ]; then
             title=$(gh issue view "$NUMBER" --json title --jq .title)
-            pr_url=$(gh pr create --base "$BASE" --head "$BRANCH" --title "$title" \
+            if ! pr_url=$(gh pr create --base "$BASE" --head "$BRANCH" --title "$title" \
               --body "Closes #$NUMBER
 
-          Opened by the [CodeAF workflow]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID). Comment \`/codeaf <instructions>\` (or request changes in a review) to have CodeAF continue on this branch.")
+          Opened by the [CodeAF workflow]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID). Comment \`/codeaf <instructions>\` (or request changes in a review) to have CodeAF continue on this branch."); then
+              echo "::error::could not open the pull request for $BRANCH" | tee -a "$PUBLISH_ERRORS_PATH"
+              exit 1
+            fi
             pr=${pr_url##*/}
             gh pr edit "$pr" --add-label "$CODEAF_LABEL"
           fi
