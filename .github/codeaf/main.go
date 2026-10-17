@@ -96,6 +96,9 @@ func main() {
 		// Web search through the proxy (issue #58): the CLI posts to the
 		// proxy on 127.0.0.1; the key never leaves the proxy.
 		"search": runSearch,
+		// The deterministic gate on a workflow change published without a
+		// maintainer's approval (workflowpolicy.go).
+		"workflow-policy": runWorkflowPolicy,
 	}
 	command, ok := commands[os.Args[1]]
 	if !ok {

@@ -22,6 +22,24 @@ Review the embedded diff against the issue the pull request closes:
   request claims (`go test -bench`) and compare with the claimed numbers.
   AGENTS.md requires before and after numbers for a performance claim; a
   claim without them is a finding.
+- **Workflow security** — when the diff touches `.github/workflows/`, it was
+  published without a maintainer, on the deterministic workflow policy
+  alone, and your review is what stands between it and the default branch.
+  Read every changed workflow line against AGENTS.md's security rules. Each
+  of these is a **high** finding:
+  - a secret, token or credential that could reach a log, an artifact, a
+    file, a network call, or a step or job that runs CodeAF;
+  - a weakened check in `publish`: the patch checks, the `.github/` and
+    workflow-policy gates, approval, conflict markers, the sandbox probes;
+  - untrusted data (issue or PR text, anything the `run` job produced)
+    executed, `source`d, `eval`ed, or put into `${{ }}` inside `run:`;
+  - a job given more than it needs, or harness code built from anything but
+    the default branch in a job that holds a secret or a write token;
+  - anything that lets CodeAF's agent reach the runner, the proxy, the key
+    or the push token.
+
+  If you can't tell whether a workflow change is safe, that is a high
+  finding too: the change then waits for a maintainer.
 
 Severity:
 

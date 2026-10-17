@@ -568,8 +568,12 @@ jobs:
               exit 0
             fi
           done
-          echo "::error::the patch changes .github/ outside .github/codeaf/ but no maintainer approved the codeaf-harness deployment; set required reviewers on that environment" | tee -a "$PUBLISH_ERRORS_PATH"
-          exit 1
+          # No maintainer approved. That is not a refusal by itself: a patch
+          # whose only .github/ changes are workflow files that pass the
+          # deterministic workflow policy is published without one (see
+          # "Apply the patch"); anything else is refused there.
+          echo "::notice::no maintainer approval; the patch publishes only if its workflow changes pass the workflow policy"
+          echo "approved=false" >> "$GITHUB_OUTPUT"
 
       - name: Apply the patch
         id: apply
@@ -582,6 +586,11 @@ jobs:
         run: |
           git config user.name  "codeaf[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # The default branch's workflows, as checked out above, before any
+          # branch is fetched: what the workflow policy compares against.
+          rm -rf "$RUNNER_TEMP/wf-default"
+          cp -r .github/workflows "$RUNNER_TEMP/wf-default"
+          policy_approved=false
           moved=false
           merge_state=none
           if git fetch --depth=1 origin "refs/heads/$BRANCH" 2>/dev/null; then
@@ -665,11 +674,42 @@ jobs:
             outside=$(git diff --cached --no-renames --name-only | grep '^\.github/' | grep -v '^\.github/codeaf/' || true)
             if [ -n "$outside" ] && [ "$HARNESS_APPROVED" != true ]; then
               printf '%s\n' "$outside" # every line starts with .github/, so none is a workflow command
-              echo "::error::patch touches .github/ outside .github/codeaf/ without a maintainer's approval; refusing it" | tee -a "$PUBLISH_ERRORS_PATH"; exit 1
+              # Without a maintainer, only top-level workflow files may change,
+              # and only within the deterministic workflow policy
+              # (.github/codeaf/workflowpolicy.go): no new triggers,
+              # permissions, secrets, secret-bearing step edits, actions or
+              # github.event interpolation. The independent review run then
+              # checks the PR before anyone merges it.
+              other=$(printf '%s\n' "$outside" | grep -vE '^\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml$' || true)
+              if [ -n "$other" ]; then
+                echo "::error::patch touches .github/ outside .github/codeaf/ and top-level workflow files without a maintainer's approval; refusing it" | tee -a "$PUBLISH_ERRORS_PATH"; exit 1
+              fi
+              before="$RUNNER_TEMP/wf-before"; after="$RUNNER_TEMP/wf-after"
+              rm -rf "$before" "$after"; mkdir -p "$before" "$after"
+              # mikefarah yq (preinstalled on GitHub's Ubuntu runners) turns
+              # each workflow into JSON; any failure refuses the patch.
+              for f in "$RUNNER_TEMP"/wf-default/*.yml "$RUNNER_TEMP"/wf-default/*.yaml; do
+                [ -f "$f" ] || continue
+                yq -o=json '.' "$f" > "$before/$(basename "$f").json"
+              done
+              while IFS= read -r -d '' f; do
+                case "$f" in .github/workflows/*/*) continue ;; esac
+                case "$f" in *.yml|*.yaml) ;; *) continue ;; esac
+                git show ":$f" | yq -o=json '.' > "$after/$(basename "$f").json"
+              done < <(git ls-files -z -- .github/workflows/)
+              if "$HARNESS" workflow-policy "$before" "$after" > "$RUNNER_TEMP/workflow-policy.log" 2>&1; then
+                cat "$RUNNER_TEMP/workflow-policy.log"
+                policy_approved=true
+              else
+                cat "$RUNNER_TEMP/workflow-policy.log"
+                head -c 2000 "$RUNNER_TEMP/workflow-policy.log" | sed 's/^/workflow policy: /' >> "$PUBLISH_ERRORS_PATH"
+                echo "::error::the workflow change breaks the workflow policy (above) and no maintainer approved it; refusing it" | tee -a "$PUBLISH_ERRORS_PATH"; exit 1
+              fi
             fi
             changed=$(git diff --cached --name-only | wc -l)
           fi
           echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "policy_approved=$policy_approved" >> "$GITHUB_OUTPUT"
           # Issue #57: a conflicted merge must be fully resolved - whatever
           # the patch did, even nothing, publish refuses while a conflict
           # marker remains in any file the merge conflicted.
@@ -696,13 +736,15 @@ jobs:
           # GITHUB_TOKEN can never push changes to .github/workflows/, so an
           # approved harness patch is pushed as the CodeAF harness GitHub App
           # instead, not as a person. Its id and private key are secrets of the
-          # codeaf-harness environment, read only once the approval check
-          # passed. The key only signs a request for an installation token
-          # that lasts an hour, limited to this repository and to contents
-          # and workflows. The PR is still opened as github-actions[bot].
-          APP_ID: ${{ steps.approval.outputs.approved == 'true' && secrets.CODEAF_APP_ID || '' }}
-          APP_KEY: ${{ steps.approval.outputs.approved == 'true' && secrets.CODEAF_APP_PRIVATE_KEY || '' }}
-          APPROVED: ${{ steps.approval.outputs.approved }}
+          # codeaf-harness environment, read only once a maintainer approved
+          # or the deterministic workflow policy passed ("Apply the patch").
+          # The key only signs a request for an installation token that lasts
+          # an hour, limited to this repository and to contents and
+          # workflows. The PR is still opened as github-actions[bot].
+          APP_ID: ${{ (steps.approval.outputs.approved == 'true' || steps.apply.outputs.policy_approved == 'true') && secrets.CODEAF_APP_ID || '' }}
+          APP_KEY: ${{ (steps.approval.outputs.approved == 'true' || steps.apply.outputs.policy_approved == 'true') && secrets.CODEAF_APP_PRIVATE_KEY || '' }}
+          APPROVED: ${{ (steps.approval.outputs.approved == 'true' || steps.apply.outputs.policy_approved == 'true') && 'true' || '' }}
+          POLICY_APPROVED: ${{ steps.apply.outputs.policy_approved }}
         run: |
           push_token=$GH_TOKEN
           if [ -n "$APP_ID" ] && [ -n "$APP_KEY" ]; then
@@ -791,6 +833,13 @@ jobs:
             elif [ "$ready" = true ]; then
               gh pr ready "$pr" || true
             fi
+          fi
+          # A workflow change published on the policy alone, with no
+          # maintainer: marked so it is merged only after the independent
+          # review run passes it (codeaf-review-passed).
+          if [ "$POLICY_APPROVED" = true ]; then
+            gh label create codeaf-workflow-change --color B60205 --description "Workflow change published on the workflow policy; merge only after the independent review passes" 2>/dev/null || true
+            gh pr edit "$pr" --add-label codeaf-workflow-change || echo "::warning::could not label #$pr codeaf-workflow-change"
           fi
           echo "number=$pr" >> "$GITHUB_OUTPUT"
           gh workflow run ci.yml --ref "$BRANCH" || echo "::warning::could not dispatch CI"
