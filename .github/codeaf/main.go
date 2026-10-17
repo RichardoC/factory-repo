@@ -42,6 +42,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -817,6 +818,10 @@ func quotasURL(upstream string) string {
 // any network or HTTP failure. The Authorization header carries the key and
 // is never logged or written; the raw body never contains it. This call does
 // not count against the subscription's limits.
+// quotaNumberString matches a number written as a string, optionally with a
+// leading dollar sign: the shape of synthetic.new's credit figures.
+var quotaNumberString = regexp.MustCompile(`^\$?-?[0-9]{1,15}(\.[0-9]{1,12})?$`)
+
 // redactQuotasBody keeps a /v2/quotas body's keys, numbers, booleans, nulls
 // and RFC 3339 timestamps, and replaces every other string with
 // "[redacted]". A body that is not JSON is reduced to its length.
@@ -840,6 +845,11 @@ func redactQuotasBody(raw string) string {
 			return t
 		case string:
 			if _, err := time.Parse(time.RFC3339Nano, t); err == nil {
+				return t
+			}
+			// Credit figures arrive as strings ("12.34", "$12.34"); a number
+			// is not personal data, and it is what calibrates the limits.
+			if quotaNumberString.MatchString(t) {
 				return t
 			}
 			return "[redacted]"
