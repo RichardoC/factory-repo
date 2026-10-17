@@ -378,7 +378,25 @@ maintainer's approval (the `codeaf-harness` environment, see
     **`codeaf-harness`** environment and waits for a maintainer
   to approve it in the run's page (GitHub emails the reviewers) before anything
   is pushed. It also checks the approval through the API, so a misconfigured
-  environment refuses the patch rather than publishing it. One-off setup:
+  environment refuses the patch rather than publishing it.
+  - **Workflow changes without a maintainer.** A patch whose only such
+    changes are top-level workflow files is published anyway if it passes
+    the deterministic workflow policy (`harness workflow-policy`). The
+    policy lets the patched workflows do nothing the default branch's
+    can't:
+    - no new triggers, permissions or environments;
+    - no new or edited steps that reference secrets;
+    - no new or unpinned actions;
+    - no new `github.event` interpolation;
+    - no new or deleted workflow files.
+
+    The PR is labelled `codeaf-workflow-change`. The independent review run,
+    on another model with a workflow-security checklist, must pass it before
+    it is merged, and it is never merged automatically. Anything the policy
+    refuses, such as an edit to a step that holds a secret, still waits for a
+    maintainer.
+
+  One-off setup:
   - *Settings → Environments → New environment* `codeaf-harness`:
     - **Required reviewers**: yourself. Leave *Prevent self-review* off, since
       the run is started by you.

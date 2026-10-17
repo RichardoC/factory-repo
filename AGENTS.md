@@ -173,7 +173,8 @@ whether through prompt injection or a compromised model.
   the base tip first and applying the patch on top of it. It applies it with
   `git apply`, which runs nothing and refuses `.git` paths, then refuses the
   result if any staged path (rename detection off) is under `.github/` but
-  outside `.github/codeaf/`, unless a maintainer approved it. Keep it that
+  outside `.github/codeaf/`, unless a maintainer approved it or (top-level
+  workflow files only) the workflow policy passes, below. Keep it that
   way: never run, `source` or `eval` anything that came from `run`.
 - `.github/codeaf/` may be published without approval only because every job
   that holds a secret or a write token builds the harness from the default
@@ -189,6 +190,28 @@ whether through prompt injection or a compromised model.
   creates a missing environment with no reviewers. Only then is it applied and
   pushed. The `run` job's `touches_harness` output only routes the job; never
   treat its absence as proof that a patch leaves `.github/` alone.
+- Without a maintainer's approval (the owner's decision, 2026-10-17), a patch
+  whose only changes under `.github/` outside `.github/codeaf/` are
+  top-level workflow files may still be published, if it passes the
+  deterministic workflow policy (`harness workflow-policy`,
+  `.github/codeaf/workflowpolicy.go`). The policy compares the patched
+  workflows with the default branch's, and refuses:
+  - new or deleted workflow files;
+  - changed triggers (a `workflow_dispatch` may only gain inputs);
+  - changed permissions or environments;
+  - a new or edited step, job env or `with` that references secrets;
+  - new jobs that aren't read-only;
+  - new or unpinned actions;
+  - new `github.event` interpolation in `run:`.
+
+  Its reason: an app-token push can trigger the branch's own workflows with
+  the repository's secrets, so the patched workflows must not be able to do
+  anything the default branch's cannot. The PR is labelled
+  `codeaf-workflow-change`. It is merged only after the independent review
+  run (on another model, with a workflow-security checklist) passes it, and
+  only by a person or Claude acting for the owner. Never widen the policy
+  to allow secret-bearing steps, triggers or permissions to change without
+  a maintainer, and never auto-merge a `codeaf-workflow-change` PR.
 - `codeaf-state.yml` runs no agent and handles no secret. It reads other runs'
   artifacts as untrusted data and holds only `actions: write`, for the
   artifacts and the cache.
@@ -229,5 +252,6 @@ whether through prompt injection or a compromised model.
   text to tools as data (files, environment variables), never into `${{ }}`
   expressions inside `run:` scripts.
 - Pin every action to a full commit SHA. CodeAF's changes to `.github/`
-  outside `.github/codeaf/` are published only after a maintainer's approval;
-  never add a path that publishes them without one.
+  outside `.github/codeaf/` are published only after a maintainer's approval,
+  or for top-level workflow files within the workflow policy above; never
+  add another path that publishes them without one.
