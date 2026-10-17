@@ -23,10 +23,11 @@ Nothing else triggers it. Only people with triage access can add labels, and `/c
 commands are obeyed only from repository owners, members and collaborators, so
 outside contributors cannot spend the API budget. PRs from forks are ignored.
 
-Every run posts a report comment with CodeAF's outcome and a per-model cost table.
+Every run posts a report comment with CodeAF's outcome, a per-model cost table and
+the run's timing figures (wall time, time with a call in flight, tokens/s, longest call).
 Three workflow artifacts are uploaded, none of them encrypted:
 - `codeaf-output-*` (14 days): the patch, its base commit, CodeAF's JSON result
-  and the call ledger;
+  and the call ledger (each call's start and duration, slot wait and reasoning tokens);
 - `codeaf-diagnostics-*` (30 days): the brief, CodeAF's stderr, its run records
   (prompts, replies, tool output), call log and usage, and the proxy log;
 - `codeaf-state-*` (14 days): what the run left in CodeAF's home, and what it
@@ -66,8 +67,8 @@ Three workflow artifacts are uploaded, none of them encrypted:
     fit in GLM-5.3-Flash's 2 slots.
   - The proxy enforces the limit per model (`max_concurrent` in
     `models.json`): a call past it waits for a slot instead of reaching
-    synthetic.new. Each wait is written to the proxy log, so the
-    diagnostics show whether a run was held up by it.
+    synthetic.new. Each wait is written to the proxy log and the call
+    ledger, so the diagnostics show whether a run was held up by it.
   - Escalation is switched off for now. CodeAF's cascade
     ([`panel.json`](.github/codeaf/panel.json)) would escalate to
     **DeepSeek-V4.1-Flash** ($0.60 / $1.20) and then **GLM-5.3** ($1.40 / $4.40),
