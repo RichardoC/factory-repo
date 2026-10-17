@@ -24,6 +24,8 @@ Instructions for any coding agent working in this repository, including CodeAF
   envtest/kind behind a build tag that CI opts into explicitly.
 - Back a performance claim with a benchmark (`go test -bench`), and give before and
   after numbers.
+- A test that needs a config value reads it from the config file or builds its own
+  config; it never hard-codes a value from `models.json`.
 
 ## Models and concurrency
 
