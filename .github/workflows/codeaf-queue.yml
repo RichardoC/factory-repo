@@ -25,9 +25,17 @@
 name: CodeAF queue
 
 on:
+  # GitHub runs schedules late or not at all when busy, so the queue also
+  # ticks when a CodeAF run finishes and when someone queues an issue. The
+  # schedule is the fallback.
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
+  workflow_run:
+    workflows: [CodeAF]
+    types: [completed]
+  issues:
+    types: [labeled]
 
 # Two queue ticks never overlap: the second waits for the first to finish.
 concurrency:
@@ -45,6 +53,8 @@ env:
 
 jobs:
   queue:
+    # Most issue label events are other labels; only codeaf-queued matters.
+    if: github.event_name != 'issues' || github.event.label.name == 'codeaf-queued'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
