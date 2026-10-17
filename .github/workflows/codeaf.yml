@@ -106,7 +106,7 @@ jobs:
       issues: read
       pull-requests: read
     outputs:
-      day_before: ${{ steps.shared.outputs.day_usd }}
+      week_before: ${{ steps.shared.outputs.week_usd }}
       # Only routes publish to the approval-gated environment. publish checks
       # the patch itself and never trusts this to mean "no .github/ changes".
       touches_harness: ${{ steps.package.outputs.touches_harness }}
@@ -205,7 +205,7 @@ jobs:
       - name: Start pricing proxy
         env:
           SYNTHETIC_API_KEY: ${{ secrets.SYNTHETIC_API_KEY }}
-          PROXY_DAY_SPENT_USD: ${{ steps.shared.outputs.day_usd }}
+          PROXY_WEEK_SPENT_USD: ${{ steps.shared.outputs.week_usd }}
           PROXY_LEDGER: ${{ env.LEDGER_PATH }}
         run: |
           # The key goes in on stdin so it is not in the proxy's environment,
@@ -809,7 +809,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GH_TOKEN: ${{ github.token }}
-          DAY_SPENT_BEFORE: ${{ needs.run.outputs.day_before }}
+          WEEK_SPENT_BEFORE: ${{ needs.run.outputs.week_before }}
           CHANGED: ${{ steps.apply.outputs.changed }}
           OUTCOME: ${{ needs.run.result != 'success' && 'run job failed' || (job.status != 'success' && 'publishing failed' || (steps.apply.outputs.changed != '0' && 'changes pushed' || 'no changes')) }}
         run: |

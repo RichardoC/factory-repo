@@ -10,14 +10,14 @@ import (
 	"testing"
 )
 
-// nextOpts is the queue the tests decide in: a $10 day cap and the three
-// default labels.
+// nextOpts is the queue the tests decide in: a $10 weekly credit and the
+// three default labels.
 func nextOpts() queueOptions {
 	return queueOptions{
 		Label:         "codeaf",
 		QueuedLabel:   "codeaf-queued",
 		PriorityLabel: "codeaf-priority",
-		DayCap:        10,
+		WeekCap:       10,
 	}
 }
 
@@ -69,30 +69,30 @@ func TestNextBlocksOnARun(t *testing.T) {
 
 func TestNextSpendThreshold(t *testing.T) {
 	issues := []item{queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued")}
-	o := nextOpts()  // day cap $10
-	o.DaySpent = 7.5 // exactly 0.75 of the cap
+	o := nextOpts()   // weekly credit $10
+	o.WeekSpent = 7.5 // exactly 0.75 of the credit
 	if n, reason := Next(issues, nil, o); n != 0 || reason != "spend threshold reached" {
 		t.Fatalf("at the threshold Next = %d, %q", n, reason)
 	}
-	o.DaySpent = 7.4999
+	o.WeekSpent = 7.4999
 	if n, _ := Next(issues, nil, o); n != 3 {
 		t.Fatalf("just under the threshold Next = %d", n)
 	}
 }
 
 // The spend total comes from the shared state, which is untrusted, so
-// spentToday must refuse whatever does not parse as a finite total at least
+// spentWeek must refuse whatever does not parse as a finite total at least
 // zero.
 func TestNextSpentEnv(t *testing.T) {
 	for _, bad := range []string{"abc", "-1", "NaN", "Inf", "-Inf", "1e400", "5 USD"} {
-		t.Setenv("CODEAF_DAY_SPENT_USD", bad)
-		if _, err := spentToday("CODEAF_DAY_SPENT_USD"); err == nil {
-			t.Errorf("spentToday accepted %q", bad)
+		t.Setenv("CODEAF_WEEK_SPENT_USD", bad)
+		if _, err := spentWeek("CODEAF_WEEK_SPENT_USD"); err == nil {
+			t.Errorf("spentWeek accepted %q", bad)
 		}
 	}
-	t.Setenv("CODEAF_DAY_SPENT_USD", "1.25")
-	if spent, err := spentToday("CODEAF_DAY_SPENT_USD"); err != nil || spent != 1.25 {
-		t.Fatalf("spentToday(1.25) = %v, %v", spent, err)
+	t.Setenv("CODEAF_WEEK_SPENT_USD", "1.25")
+	if spent, err := spentWeek("CODEAF_WEEK_SPENT_USD"); err != nil || spent != 1.25 {
+		t.Fatalf("spentWeek(1.25) = %v, %v", spent, err)
 	}
 }
 
@@ -278,7 +278,7 @@ func TestRunNext(t *testing.T) {
 	write(runsPath, `[{"status":"completed"}]`)
 
 	// A queued issue is picked, and nothing but its number is printed.
-	t.Setenv("CODEAF_DAY_SPENT_USD", "1")
+	t.Setenv("CODEAF_WEEK_SPENT_USD", "1")
 	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "3\n" {
 		t.Fatalf("runNext printed %q, %v", out, err)
 	}
@@ -296,22 +296,22 @@ func TestRunNext(t *testing.T) {
 		t.Fatalf("runNext printed %q, %v; wanted nothing", out, err)
 	}
 
-	// The threshold is taken against the config's day cap.
-	t.Setenv("CODEAF_DAY_SPENT_USD", fmt.Sprintf("%v", cfg.Limits.DayUSD*0.75))
+	// The threshold is taken against the config's weekly credit.
+	t.Setenv("CODEAF_WEEK_SPENT_USD", fmt.Sprintf("%v", cfg.Limits.WeeklyCreditUSD*0.75))
 	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "" {
 		t.Fatalf("runNext at the threshold printed %q, %v; wanted nothing", out, err)
 	}
 
 	// Bad and missing spend totals fail the command.
 	for _, spent := range []string{"-3", "tomorrow", ""} {
-		t.Setenv("CODEAF_DAY_SPENT_USD", spent)
+		t.Setenv("CODEAF_WEEK_SPENT_USD", spent)
 		if _, err := runNextStdout(t, issuesPath, runsPath); err == nil {
-			t.Fatalf("runNext accepted CODEAF_DAY_SPENT_USD=%q", spent)
+			t.Fatalf("runNext accepted CODEAF_WEEK_SPENT_USD=%q", spent)
 		}
 	}
 
 	// Malformed input fails the command.
-	t.Setenv("CODEAF_DAY_SPENT_USD", "1")
+	t.Setenv("CODEAF_WEEK_SPENT_USD", "1")
 	write(issuesPath, `{}`)
 	if _, err := runNextStdout(t, issuesPath, runsPath); err == nil {
 		t.Fatal("runNext accepted malformed issues JSON")

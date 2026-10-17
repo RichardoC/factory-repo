@@ -23,14 +23,15 @@ type queueOptions struct {
 	Label         string  // active label: an issue carrying it is already running
 	QueuedLabel   string  // backlog label: only issues carrying it are candidates
 	PriorityLabel string  // jumps the queue
-	DayCap        float64 // limits.day_usd from models.json
-	DaySpent      float64 // today's spend, from the shared state
+	WeekCap       float64 // limits.weekly_credit_usd from models.json
+	WeekSpent     float64 // the rolling week's credit spend, from the shared state
 }
 
-// queueSpendFraction is the largest share of the day cap at which the queue
-// still starts a run: at 75% of day_usd spent, the rest of the day's budget
-// is left for the run it is about to start.
-const queueSpendFraction = 0.75 // 75% of day_usd
+// queueSpendFraction is the largest share of the weekly credit at which the
+// queue still starts a run: at 75% of weekly_credit_usd spent in the rolling
+// week, the rest of the week's budget is left for the run it is about to
+// start.
+const queueSpendFraction = 0.75 // 75% of the weekly credit
 
 // maxBodyScan caps how much of a candidate's body is scanned for "Depends on"
 // lines. Issue bodies are untrusted text of unbounded size, so only a bounded
@@ -39,8 +40,9 @@ const maxBodyScan = 1 << 16 // 64KiB
 
 // Next picks the issue CodeAF should work next. It returns the issue's number
 // and a reason, or 0 and a reason when nothing should run: no CodeAF run may
-// be in progress or waiting, today's spend must be under the threshold, and
-// the pick is the oldest queued issue (priority-labelled ones first) whose
+// be in progress or waiting, the rolling week's credit spend must be under
+// the threshold, and the pick is the oldest queued issue (priority-labelled
+// ones first) whose
 // "Depends on" references are all closed. The reason is for humans, on
 // stderr; stdout carries only the number.
 func Next(issues []item, runs []runStatus, o queueOptions) (int, string) {
@@ -49,7 +51,7 @@ func Next(issues []item, runs []runStatus, o queueOptions) (int, string) {
 			return 0, "a CodeAF run is in progress or waiting"
 		}
 	}
-	if o.DaySpent >= queueSpendFraction*o.DayCap {
+	if o.WeekSpent >= queueSpendFraction*o.WeekCap {
 		return 0, "spend threshold reached"
 	}
 	// open holds every open entry by number, PRs included: a "Depends on"
@@ -193,13 +195,13 @@ func runNext() error {
 	if err != nil {
 		return err
 	}
-	// CODEAF_DAY_SPENT_USD is the day_usd figure `harness state load`
+	// CODEAF_WEEK_SPENT_USD is the week_usd figure `harness state load`
 	// printed. It is required: treating a missing total as $0 would start
-	// runs with the day's spend unknown.
-	if os.Getenv("CODEAF_DAY_SPENT_USD") == "" {
-		return errors.New("CODEAF_DAY_SPENT_USD is empty; run `harness state load` first")
+	// runs with the week's spend unknown.
+	if os.Getenv("CODEAF_WEEK_SPENT_USD") == "" {
+		return errors.New("CODEAF_WEEK_SPENT_USD is empty; run `harness state load` first")
 	}
-	spent, err := spentToday("CODEAF_DAY_SPENT_USD")
+	spent, err := spentWeek("CODEAF_WEEK_SPENT_USD")
 	if err != nil {
 		return err
 	}
@@ -211,8 +213,8 @@ func runNext() error {
 		Label:         envOr("CODEAF_LABEL", "codeaf"),
 		QueuedLabel:   envOr("CODEAF_QUEUED_LABEL", "codeaf-queued"),
 		PriorityLabel: envOr("CODEAF_PRIORITY_LABEL", "codeaf-priority"),
-		DayCap:        cfg.Limits.DayUSD,
-		DaySpent:      spent,
+		WeekCap:       cfg.Limits.WeeklyCreditUSD,
+		WeekSpent:     spent,
 	})
 	if number == 0 {
 		log.Print(reason)

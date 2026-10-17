@@ -88,6 +88,10 @@ func main() {
 // ---------------------------------------------------------------- models
 
 // Model is one row of models.json. Prices are USD per million tokens.
+// Input/Output/CacheRead are the synthetic.new SUBSCRIPTION rates: they price
+// the credit a call draws down the weekly quota. The API* fields are the API
+// list rates: what the same call costs once the quota is gone and overage
+// begins.
 type Model struct {
 	ID              string   `json:"id"`       // what CodeAF sees
 	Upstream        string   `json:"upstream"` // the synthetic.new model id
@@ -96,6 +100,9 @@ type Model struct {
 	Input           float64  `json:"input"`
 	Output          float64  `json:"output"`
 	CacheRead       float64  `json:"cache_read"`
+	APIInput        float64  `json:"api_input"`
+	APICached       float64  `json:"api_cached"`
+	APIOutput       float64  `json:"api_output"`
 	ContextLength   int      `json:"context_length"`
 	InputModalities []string `json:"input_modalities"`
 	Efforts         []string `json:"efforts"`
@@ -105,10 +112,16 @@ type Model struct {
 	MaxConcurrent int `json:"max_concurrent"`
 }
 
-// Limits are the spend caps the proxy enforces, in USD.
+// Limits are the Big-plan spend caps the proxy enforces, in USD of credit
+// (subscription-rate dollars) unless said otherwise. The weekly credit is
+// shared by every run of the week and arrives per run through the shared
+// state; OverageUSD prices extra usage past it at the API list rates.
 type Limits struct {
-	RunUSD float64 `json:"run_usd"` // per workflow run
-	DayUSD float64 `json:"day_usd"` // per UTC day, across runs
+	Plan            string  `json:"plan"`              // the synthetic.new plan the caps assume
+	PlanNote        string  `json:"plan_note"`         // where the numbers came from
+	WeeklyCreditUSD float64 `json:"weekly_credit_usd"` // per rolling week, across runs
+	RunCreditUSD    float64 `json:"run_credit_usd"`    // per workflow run
+	OverageUSD      float64 `json:"overage_usd"`       // API-price USD past the weekly credit; 0 = stop
 }
 
 // Config is models.json: the spend caps and the models CodeAF may use.
@@ -126,8 +139,14 @@ func loadConfig(path string) (Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return cfg, fmt.Errorf("%s: %w", path, err)
 	}
-	if cfg.Limits.RunUSD <= 0 || cfg.Limits.DayUSD <= 0 {
-		return cfg, fmt.Errorf("%s: limits.run_usd and limits.day_usd must be positive", path)
+	if cfg.Limits.Plan == "" {
+		return cfg, fmt.Errorf("%s: limits.plan must be set", path)
+	}
+	if cfg.Limits.RunCreditUSD <= 0 || cfg.Limits.WeeklyCreditUSD <= 0 {
+		return cfg, fmt.Errorf("%s: limits.run_credit_usd and limits.weekly_credit_usd must be positive", path)
+	}
+	if cfg.Limits.OverageUSD < 0 {
+		return cfg, fmt.Errorf("%s: limits.overage_usd must not be negative", path)
 	}
 	if len(cfg.Models) == 0 {
 		return cfg, fmt.Errorf("%s: no models", path)
@@ -194,27 +213,41 @@ func (u Usage) reasoningTokens() (int, bool) {
 }
 
 // CostOf prices one call: uncached input, cached input and output (which
-// includes reasoning tokens) at the model's per-million rates.
+// includes reasoning tokens) at the model's per-million SUBSCRIPTION rates.
+// This is the credit the call draws down the weekly quota, and the cost the
+// ledger and the report carry.
 func CostOf(m Model, u Usage) float64 {
 	cached := u.cached()
 	return (float64(u.PromptTokens-cached)*m.Input + float64(cached)*m.CacheRead + float64(u.CompletionTokens)*m.Output) / 1e6
 }
 
+// ApiCostOf prices the same call at the model's API list rates (api_*): what
+// it costs once the weekly credit is exhausted and overage begins. Same
+// cached-token split as CostOf.
+func ApiCostOf(m Model, u Usage) float64 {
+	cached := u.cached()
+	return (float64(u.PromptTokens-cached)*m.APIInput + float64(cached)*m.APICached + float64(u.CompletionTokens)*m.APIOutput) / 1e6
+}
+
 // ---------------------------------------------------------------- proxy
 
 type proxy struct {
-	upstream string
-	apiKey   string
-	ledger   string
-	runCap   float64
-	dayCap   float64
-	daySpent float64
-	models   []Model
-	client   *http.Client
-	slots    map[string]chan struct{} // per upstream model, for max_concurrent
+	upstream   string
+	apiKey     string
+	ledger     string
+	runCap     float64 // per-run credit cap (limits.run_credit_usd)
+	weekCap    float64 // weekly credit cap, shared across runs (limits.weekly_credit_usd)
+	weekSpent  float64 // credit spent earlier in the week, from the shared state
+	overageCap float64 // API-price USD allowed past the weekly credit (limits.overage_usd)
+	models     []Model
+	client     *http.Client
+	slots      map[string]chan struct{} // per upstream model, for max_concurrent
 
-	mu       sync.Mutex
-	runSpent float64
+	mu         sync.Mutex
+	runSpent   float64 // credit spent by this run
+	overage    bool    // the weekly credit is exhausted; new calls are billed at API prices
+	overageApi float64 // API-price USD recorded past the weekly credit
+	quota      quota   // GET /v2/quotas at startup; an unknown quota never blocks
 }
 
 func envFloat(name string, fallback float64) (float64, error) {
@@ -247,9 +280,12 @@ func runProxy() error {
 	if err != nil {
 		return err
 	}
-	p.models, p.runCap, p.dayCap = cfg.Models, cfg.Limits.RunUSD, cfg.Limits.DayUSD
+	p.models = cfg.Models
+	p.runCap = cfg.Limits.RunCreditUSD
+	p.weekCap = cfg.Limits.WeeklyCreditUSD
+	p.overageCap = cfg.Limits.OverageUSD
 	p.slots = newSlots(p.models)
-	if p.daySpent, err = spentToday("PROXY_DAY_SPENT_USD"); err != nil {
+	if p.weekSpent, err = spentWeek("PROXY_WEEK_SPENT_USD"); err != nil {
 		return err
 	}
 	// Preferred: the key arrives on stdin, so it is not in /proc/<pid>/environ
@@ -262,10 +298,16 @@ func runProxy() error {
 		return errors.New("no SYNTHETIC_API_KEY in the environment or on stdin")
 	}
 	addr := "127.0.0.1:" + envOr("PROXY_PORT", "8787")
-	log.Printf("proxy on %s -> %s (run cap $%.2f, day cap $%.2f, day spent $%.4f)", addr, p.upstream, p.runCap, p.dayCap, p.daySpent)
+	log.Printf("proxy on %s -> %s (run credit cap $%.2f, weekly credit cap $%.2f, week spent $%.4f, overage cap $%.2f)", addr, p.upstream, p.runCap, p.weekCap, p.weekSpent, p.overageCap)
 	// One marker line at the top of the ledger; the report times the CodeAF
 	// session from it to the last call's end.
 	p.recordMarker("proxy_start")
+	// Ask synthetic.new for the subscription state once (issue #59 step 3).
+	// Best-effort and startup-only: it must not break the run, and it is
+	// never re-fetched mid-run — one run is short and the quota regenerates
+	// 2% of the weekly credit every ~202 minutes, so a refresh would not
+	// change any decision this run makes.
+	p.fetchQuotasStartup()
 	return http.ListenAndServe(addr, p)
 }
 
@@ -277,9 +319,12 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, catalog(p.models))
 	case r.Method == http.MethodGet && strings.HasSuffix(path, "/healthz"):
 		p.mu.Lock()
-		spent := p.runSpent
+		spent, week, over := p.runSpent, p.weekSpent+p.runSpent, p.overageApi
 		p.mu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "run_spent_usd": spent})
+		// run_spent_usd keeps its name (meteredRunSpend reads it) and now
+		// carries credit: subscription-rate dollars.
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "run_spent_usd": spent,
+			"week_spent_credit_usd": week, "overage_api_usd": over})
 	case r.Method == http.MethodPost && strings.HasSuffix(path, "/chat/completions"):
 		p.chat(w, r)
 	default:
@@ -610,14 +655,22 @@ type LedgerLine struct {
 	// keeps the original text (issue #50); 0 on the usual call.
 	RepairedToolArgs int     `json:"repaired_tool_args,omitempty"`
 	CostUSD          float64 `json:"cost_usd"`
-	Stream           bool    `json:"stream"`
-	UsageSeen        bool    `json:"usage_seen"`
+	// APICostUSD is the same call priced at the model's API list rates: what
+	// it costs once the weekly credit is exhausted and overage begins. A line
+	// written before the field existed parses back as 0 (json.Unmarshal of a
+	// missing field), and omitempty keeps the common zero off the wire.
+	APICostUSD float64 `json:"api_cost_usd,omitempty"`
+	Stream     bool    `json:"stream"`
+	UsageSeen  bool    `json:"usage_seen"`
 	// Start is when the upstream request was issued, after any wait for a
 	// slot; ts is when the call ended. SlotWaitS is how long the call queued
 	// for a model slot. Old ledgers carry neither.
 	Start     time.Time `json:"start,omitzero"`
 	SlotWaitS float64   `json:"slot_wait_s,omitempty"`
 	Kind      string    `json:"kind,omitempty"`
+	// Quotas carries the raw GET /v2/quotas response body on the "quotas"
+	// marker line, capped (recordQuotas); the report re-parses it from here.
+	Quotas string `json:"quotas,omitempty"`
 }
 
 func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slotWait time.Duration, chars charCounts, repaired int) {
@@ -628,6 +681,7 @@ func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slot
 		line.UsageSeen = true
 		line.PromptTokens, line.CachedTokens, line.CompletionTokens = usage.PromptTokens, usage.cached(), usage.CompletionTokens
 		line.CostUSD = usage.Cost
+		line.APICostUSD = ApiCostOf(m, *usage)
 		if n, ok := usage.reasoningTokens(); ok {
 			line.ReasoningTokens = &n
 		}
@@ -636,7 +690,20 @@ func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slot
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// Overage accounting: a call that started once the weekly credit was
+	// already exhausted is billed at API prices, and its whole API cost
+	// counts against the overage cap — usage is not split mid-call. The
+	// approximation: a call still in flight when the credit runs out is
+	// recorded as credit, and a call recorded just after another call
+	// crossed the line counts as overage in full, even if it started
+	// seconds earlier. One run is short; that error is small.
+	if p.overage {
+		p.overageApi += line.APICostUSD
+	}
 	p.runSpent += line.CostUSD
+	if p.weekSpent+p.runSpent >= p.weekCap {
+		p.overage = true
+	}
 	p.appendLedger(line)
 }
 
@@ -669,14 +736,232 @@ func (p *proxy) appendLedger(line any) {
 	_, _ = f.Write(append(data, '\n'))
 }
 
+// ------------------------------------------------------------- quotas
+
+const (
+	// quotasMarkerCap caps the raw /v2/quotas body kept in the ledger marker
+	// and in the proxy log: diagnostics, not data to serve calls from.
+	quotasMarkerCap = 4 << 10
+	// quotasReadCap bounds how much of the response body is read at all, so
+	// a broken or hostile upstream cannot balloon the proxy's memory.
+	quotasReadCap = 64 << 10
+	// quotasTimeout bounds the startup fetch; the run must not wait on it.
+	quotasTimeout = 15 * time.Second
+)
+
+// quota is the subscription state GET /v2/quotas reports. The response's
+// units are undocumented (issue #59), so the parse is defensive: the numbers
+// are believed only when both arrive as JSON numbers and are sane, and
+// anything else — a body that does not parse, a missing subscription, quoted
+// numbers, a negative or zero limit — leaves Known false. Nothing here may
+// fail a run only because the fields are unfamiliar.
+type quota struct {
+	Limit    float64 // subscription.limit
+	Requests float64 // subscription.requests
+	RenewsAt string  // subscription.renewsAt, as the API sent it
+	Known    bool    // both numbers parsed and passed the sanity checks
+}
+
+// parseQuotas parses a /v2/quotas body defensively. It returns no error, only
+// Known false when the shape is not the expected one.
+func parseQuotas(body []byte) quota {
+	var doc struct {
+		Subscription *struct {
+			Limit    json.RawMessage `json:"limit"`
+			Requests json.RawMessage `json:"requests"`
+			RenewsAt json.RawMessage `json:"renewsAt"`
+		} `json:"subscription"`
+	}
+	var q quota
+	if err := json.Unmarshal(body, &doc); err != nil || doc.Subscription == nil {
+		return q
+	}
+	limit, okLimit := jsonNumber(doc.Subscription.Limit)
+	requests, okRequests := jsonNumber(doc.Subscription.Requests)
+	if !okLimit || !okRequests || limit <= 0 || requests < 0 {
+		return q
+	}
+	q.Limit, q.Requests, q.Known = limit, requests, true
+	if doc.Subscription.RenewsAt != nil {
+		_ = json.Unmarshal(doc.Subscription.RenewsAt, &q.RenewsAt)
+	}
+	return q
+}
+
+// jsonNumber accepts exactly a JSON number; a quoted value is unfamiliar, not
+// coerced, and out-of-range numbers are refused like any other.
+func jsonNumber(raw json.RawMessage) (float64, bool) {
+	if len(raw) == 0 {
+		return 0, false
+	}
+	var value float64
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return 0, false
+	}
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, false
+	}
+	return value, true
+}
+
+// quotasURL derives the /v2/quotas endpoint from the chat upstream: the chat
+// base is https://api.synthetic.new/openai/v1, and the quota endpoint lives
+// at the API root, not under /openai/v1.
+func quotasURL(upstream string) string {
+	base := strings.TrimSuffix(strings.TrimRight(upstream, "/"), "/openai/v1")
+	return base + "/v2/quotas"
+}
+
+// fetchQuotas GETs the subscription state. It returns the parsed quota and
+// the raw response body (for the log and the ledger marker), and an error on
+// any network or HTTP failure. The Authorization header carries the key and
+// is never logged or written; the raw body never contains it. This call does
+// not count against the subscription's limits.
+// redactQuotasBody keeps a /v2/quotas body's keys, numbers, booleans, nulls
+// and RFC 3339 timestamps, and replaces every other string with
+// "[redacted]". A body that is not JSON is reduced to its length.
+func redactQuotasBody(raw string) string {
+	var v any
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		return fmt.Sprintf("[non-JSON body, %d bytes]", len(raw))
+	}
+	var walk func(any) any
+	walk = func(x any) any {
+		switch t := x.(type) {
+		case map[string]any:
+			for k, val := range t {
+				t[k] = walk(val)
+			}
+			return t
+		case []any:
+			for i, val := range t {
+				t[i] = walk(val)
+			}
+			return t
+		case string:
+			if _, err := time.Parse(time.RFC3339Nano, t); err == nil {
+				return t
+			}
+			return "[redacted]"
+		default:
+			return t
+		}
+	}
+	out, err := json.Marshal(walk(v))
+	if err != nil {
+		return "[unrenderable body]"
+	}
+	return string(out)
+}
+
+func fetchQuotas(ctx context.Context, client *http.Client, url, key string) (quota, string, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return quota{}, "", err
+	}
+	request.Header.Set("Authorization", "Bearer "+key)
+	response, err := client.Do(request)
+	if err != nil {
+		return quota{}, "", err
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, quotasReadCap))
+	if err != nil {
+		return quota{}, string(body), err
+	}
+	if response.StatusCode != http.StatusOK {
+		return quota{}, string(body), fmt.Errorf("status %d", response.StatusCode)
+	}
+	return parseQuotas(body), string(body), nil
+}
+
+// fetchQuotasStartup asks synthetic.new for the subscription state once, at
+// proxy start, and keeps the parsed result for overCap. Best-effort by
+// contract: any failure is logged and leaves the quota unknown, so startup
+// never breaks and an unfamiliar shape never blocks a call. The raw body is
+// logged (capped, no key) and appended to the ledger as the "quotas" marker
+// the report reads.
+func (p *proxy) fetchQuotasStartup() {
+	ctx, cancel := context.WithTimeout(context.Background(), quotasTimeout)
+	defer cancel()
+	client := &http.Client{Timeout: quotasTimeout}
+	url := quotasURL(p.upstream)
+	q, raw, err := fetchQuotas(ctx, client, url, p.apiKey)
+	switch {
+	case err != nil:
+		log.Printf("quotas: GET %s failed (%v); continuing with the quota unknown", url, err)
+	case !q.Known:
+		log.Printf("quotas: unfamiliar shape; continuing with the quota unknown")
+	}
+	if raw != "" {
+		// The diagnostics and the ledger are public artifacts, so only the
+		// body's shape, numbers, booleans and timestamps are kept: any other
+		// string an account endpoint might return is redacted.
+		redacted := redactQuotasBody(raw)
+		log.Printf("quotas: body (redacted, capped): %s", capString(redacted, quotasMarkerCap))
+		p.recordQuotas(redacted)
+	}
+	p.mu.Lock()
+	p.quota = q
+	p.mu.Unlock()
+}
+
+// recordQuotas appends the quotas marker: kind, ts and the raw response body,
+// capped. The report re-parses the body from the ledger.
+func (p *proxy) recordQuotas(raw string) {
+	line := struct {
+		Kind   string    `json:"kind"`
+		Time   time.Time `json:"ts"`
+		Quotas string    `json:"quotas"`
+	}{Kind: "quotas", Time: time.Now().UTC(), Quotas: capString(raw, quotasMarkerCap)}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.appendLedger(line)
+}
+
+// capString cuts s to at most max bytes, back to a UTF-8 rune boundary.
+func capString(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := s[:max]
+	for len(cut) > 0 {
+		r, size := utf8.DecodeLastRuneInString(cut)
+		if r != utf8.RuneError || size != 1 {
+			break
+		}
+		cut = cut[:len(cut)-1]
+	}
+	return cut
+}
+
 func (p *proxy) overCap() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.runSpent >= p.runCap {
-		return fmt.Sprintf("per-run spend cap $%.2f reached ($%.4f spent)", p.runCap, p.runSpent)
+		return fmt.Sprintf("per-run credit cap $%.2f reached ($%.4f spent)", p.runCap, p.runSpent)
 	}
-	if p.daySpent+p.runSpent >= p.dayCap {
-		return fmt.Sprintf("daily spend cap $%.2f reached ($%.4f spent today)", p.dayCap, p.daySpent+p.runSpent)
+	// The subscription quota reported exhausted at startup (GET /v2/quotas)
+	// and overage is disabled: refuse before a call is billed at API prices
+	// the factory chose not to pay (issue #59 step 3). An unknown quota —
+	// fetch failed or unfamiliar shape — never blocks.
+	if p.quota.Known && p.quota.Limit > 0 && p.quota.Requests >= p.quota.Limit && p.overageCap <= 0 {
+		return fmt.Sprintf("the subscription quota reports exhausted and overage is disabled (limit %s, used %s at proxy start)",
+			trimNumber(p.quota.Limit), trimNumber(p.quota.Requests))
+	}
+	if p.weekSpent+p.runSpent < p.weekCap {
+		return ""
+	}
+	// The weekly credit is gone. Past it usage is billed at API prices, up
+	// to the overage cap; at 0 (the default) the factory stops rather than
+	// pay. The flag marks every later call as overage, so record() prices it
+	// against the cap.
+	p.overage = true
+	if p.overageCap <= 0 {
+		return fmt.Sprintf("weekly credit cap $%.2f reached ($%.4f spent this week); overage disabled, refusing", p.weekCap, p.weekSpent+p.runSpent)
+	}
+	if p.overageApi >= p.overageCap {
+		return fmt.Sprintf("API overage cap $%.2f reached ($%.4f of API-priced usage past the weekly credit)", p.overageCap, p.overageApi)
 	}
 	return ""
 }
@@ -1295,10 +1580,10 @@ func (g github) thread(number int) (string, error) {
 
 // budgetLine opens the brief with the run's budget. CODEAF_BUDGET_MINUTES is
 // digits only and validated here; missing or invalid falls back to 100,
-// which matches the workflow job's timeout-minutes. The spend cap comes from
-// models.json (limits.run_usd, which the proxy enforces); when that config
-// cannot be loaded the line says the cap is unknown instead of failing, so a
-// broken installation still produces a brief.
+// which matches the workflow job's timeout-minutes. The cap comes from
+// models.json (limits.run_credit_usd, which the proxy enforces); when that
+// config cannot be loaded the line says the credit cap is unknown instead of
+// failing, so a broken installation still produces a brief.
 func budgetLine() string {
 	minutes := 100
 	if v := os.Getenv("CODEAF_BUDGET_MINUTES"); digitsOnly(v) {
@@ -1308,9 +1593,9 @@ func budgetLine() string {
 	}
 	cfg, err := loadConfig(configPath())
 	if err != nil {
-		return fmt.Sprintf("You have %d minutes (spend cap unknown). Stop and write your final answer at least 10 minutes before the deadline.", minutes)
+		return fmt.Sprintf("You have %d minutes (credit cap unknown). Stop and write your final answer at least 10 minutes before the deadline.", minutes)
 	}
-	return fmt.Sprintf("You have %d minutes and $%s. Stop and write your final answer at least 10 minutes before the deadline.", minutes, trimNumber(cfg.Limits.RunUSD))
+	return fmt.Sprintf("You have %d minutes and $%s of credit. Stop and write your final answer at least 10 minutes before the deadline.", minutes, trimNumber(cfg.Limits.RunCreditUSD))
 }
 
 // maxBriefBytes bounds the whole brief: every section is capped on its own,
@@ -1984,11 +2269,13 @@ func ledgerTotal(lines []LedgerLine) float64 {
 	return total
 }
 
-// spentToday reads the day's earlier spend, which comes from the shared state
-// bundle. That total is built from numbers run jobs reported, so it is treated
-// as untrusted: a negative, infinite or unparseable total would loosen the
-// daily cap, and is refused rather than repaired.
-func spentToday(name string) (float64, error) {
+// spentWeek reads a week's credit spend from the shared state bundle — for the
+// proxy, the credit spent earlier in the week (PROXY_WEEK_SPENT_USD); the
+// queue reuses it for its own weekly total. That total is built from numbers
+// run jobs reported, so it is treated as untrusted: a negative, infinite or
+// unparseable total would loosen the cap, and is refused rather than repaired
+// (the AGENTS.md rule for spend totals).
+func spentWeek(name string) (float64, error) {
 	value, err := envFloat(name, 0)
 	if err != nil {
 		return 0, err
@@ -2624,6 +2911,43 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 		return "(other)"
 	}
 	repairedArgs := 0 // assistant tool-call arguments rewritten to valid JSON (issue #50)
+	// Credit spent earlier in the rolling week, from the shared state
+	// (WEEK_SPENT_BEFORE — the week total this run started from, the same
+	// pattern the old DAY_SPENT_BEFORE had). Missing, empty or invalid
+	// renders "?" rather than pretending zero was spent.
+	weekBefore := 0.0
+	weekKnown := false
+	if raw := strings.TrimSpace(env("WEEK_SPENT_BEFORE")); raw != "" {
+		if v, err := strconv.ParseFloat(raw, 64); err == nil && v >= 0 && !math.IsInf(v, 0) && !math.IsNaN(v) {
+			weekBefore, weekKnown = v, true
+		}
+	}
+	// apiCost is what this run would have cost at the API list rates;
+	// overage is the part of it spent past the weekly credit. apiPrice uses
+	// the ledger's APICostUSD when the line carries one (the source this
+	// proxy wrote); lines written before the field existed carry only
+	// tokens, and are re-priced from them at the config's api_* rates.
+	// Overage replays record()'s rule over the ledger in file order: once
+	// the week's credit (before this run + credit so far) is exhausted,
+	// later calls are billed at API prices and count against the overage
+	// cap. An unknown WEEK_SPENT_BEFORE replays from 0, which under-counts;
+	// the proxy's own overage figure (/healthz) is what the caps enforced.
+	week, over := weekBefore, false
+	apiPrice := func(id string, l LedgerLine) float64 {
+		if l.APICostUSD > 0 {
+			return l.APICostUSD
+		}
+		m, known := prices[id]
+		if !known || !l.UsageSeen {
+			return 0
+		}
+		usage := Usage{PromptTokens: l.PromptTokens, CompletionTokens: l.CompletionTokens}
+		usage.PromptTokensDetails = &struct {
+			CachedTokens int `json:"cached_tokens"`
+		}{CachedTokens: l.CachedTokens}
+		return ApiCostOf(m, usage)
+	}
+	var apiCost, overage float64
 	totals := map[string]*modelTotals{}
 	for _, l := range lines {
 		if l.Kind != "" {
@@ -2649,6 +2973,15 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 		repairedArgs += clampTokens(l.RepairedToolArgs)
 		if !l.UsageSeen {
 			t.unpriced++
+		}
+		api := apiPrice(id, l)
+		apiCost += api
+		if over {
+			overage += api
+		}
+		week += l.CostUSD
+		if week >= cfg.Limits.WeeklyCreditUSD {
+			over = true
 		}
 	}
 	// Timing figures. The proxy_start marker and each call's start..ts span
@@ -2698,7 +3031,6 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 		spans = kept
 	}
 	total := ledgerTotal(lines)
-	dayBefore, _ := strconv.ParseFloat(env("DAY_SPENT_BEFORE"), 64)
 	orUnknown := func(s string) string {
 		if s == "" {
 			return "?"
@@ -2763,8 +3095,34 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 	fmt.Fprintf(&b, "| seats | worker %s, planner %s, checker %s (allowed: %s; no escalation) |\n",
 		seat(result.Model), seat(result.PlanModel), seat(result.CheckModel), strings.Join(allowed, ", "))
 	fmt.Fprintf(&b, "| CodeAF's own spend figure | %s (plan estimate %s) |\n", money(result.SpendUSD), money(result.EstUSD))
-	fmt.Fprintf(&b, "| metered by proxy (from its ledger) | **%s** this run · %s today (cap $%s/run, $%s/day) |\n",
-		money(total), money(dayBefore+total), trimNumber(cfg.Limits.RunUSD), trimNumber(cfg.Limits.DayUSD))
+	// The Big-plan metered row (issue #59): what the proxy records is credit
+	// — subscription-rate dollars — plus the same calls at API list prices
+	// and the overage past the weekly credit. previousReportSection looks
+	// this exact label up for continuations, so the label must not change.
+	weekCell := "?"
+	if weekKnown {
+		weekCell = money(weekBefore + total)
+	}
+	fmt.Fprintf(&b, "| metered by proxy (from its ledger) | **%s** credit this run · %s this week (cap $%s/run, $%s/week) · %s at API prices · %s overage |\n",
+		money(total), weekCell, trimNumber(cfg.Limits.RunCreditUSD), trimNumber(cfg.Limits.WeeklyCreditUSD), money(apiCost), money(overage))
+	// The quota state synthetic.new reported at proxy start, re-parsed from
+	// the ledger's "quotas" marker. Omitted when the marker is absent or
+	// its body does not parse; the units are undocumented, so the row says
+	// so. Values pass escapeMD: the marker body is untrusted input.
+	for _, l := range lines {
+		if l.Kind != "quotas" {
+			continue
+		}
+		if q := parseQuotas([]byte(l.Quotas)); q.Known {
+			renews := "—"
+			if s := escapeMD(q.RenewsAt, 80, true); s != "" {
+				renews = s
+			}
+			fmt.Fprintf(&b, "| synthetic.new quota | limit %s, used %s, renewsAt %s (units undocumented) |\n",
+				trimNumber(q.Limit), trimNumber(q.Requests), renews)
+		}
+		break
+	}
 	if repairedArgs > 0 {
 		fmt.Fprintf(&b, "| tool-call arguments repaired | %d |\n", repairedArgs)
 	}

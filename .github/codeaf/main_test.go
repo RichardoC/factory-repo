@@ -40,14 +40,42 @@ func mustResolve(t *testing.T, models []Model, id string) Model {
 }
 
 func TestCostOf(t *testing.T) {
-	flash := mustResolve(t, testModels(t), "zai-org/glm-5.3-flash")
 	usage := Usage{PromptTokens: 1000, CompletionTokens: 200}
 	usage.PromptTokensDetails = &struct {
 		CachedTokens int `json:"cached_tokens"`
 	}{CachedTokens: 400}
-	// 600 uncached × $0.15 + 400 cached × $0.04 + 200 out × $0.50, per million.
-	if got, want := CostOf(flash, usage), 0.000206; math.Abs(got-want) > 1e-12 {
-		t.Fatalf("CostOf = %v, want %v", got, want)
+	// Per model, 600 uncached input + 400 cached input + 200 output tokens:
+	// CostOf prices the credit the call draws down the weekly credit, at the
+	// subscription rates; ApiCostOf prices the same call at the API list
+	// rates, what it costs as overage once the credit is gone.
+	for _, tc := range []struct {
+		id         string
+		creditCost float64
+		apiCost    float64
+	}{
+		// flash: 600×0.10 + 400×0.02 + 200×0.25 vs 600×0.15 + 400×0.04 + 200×0.50
+		{"zai-org/glm-5.3-flash", 0.000118, 0.000206},
+		// GLM-5.3: 600×0.40 + 400×0.07 + 200×2.20 vs 600×1.40 + 400×0.26 + 200×4.40
+		{"zai-org/glm-5.3", 0.000708, 0.001824},
+		// DeepSeek: 600×0.06 + 400×0.003 + 200×0.30 vs 600×0.60 + 400×0.03 + 200×1.20
+		{"deepseek-ai/deepseek-v4.1-flash", 0.0000972, 0.000612},
+	} {
+		m := mustResolve(t, testModels(t), tc.id)
+		if got, want := CostOf(m, usage), tc.creditCost; math.Abs(got-want) > 1e-12 {
+			t.Errorf("%s: CostOf = %v, want %v", tc.id, got, want)
+		}
+		if got, want := ApiCostOf(m, usage), tc.apiCost; math.Abs(got-want) > 1e-12 {
+			t.Errorf("%s: ApiCostOf = %v, want %v", tc.id, got, want)
+		}
+	}
+	// With no cache, the whole prompt is uncached, for both pricings.
+	plain := Usage{PromptTokens: 1000, CompletionTokens: 200}
+	flash := mustResolve(t, testModels(t), "zai-org/glm-5.3-flash")
+	if got, want := CostOf(flash, plain), 0.00015; math.Abs(got-want) > 1e-12 {
+		t.Errorf("uncached CostOf = %v, want %v", got, want)
+	}
+	if got, want := ApiCostOf(flash, plain), 0.00025; math.Abs(got-want) > 1e-12 {
+		t.Errorf("uncached ApiCostOf = %v, want %v", got, want)
 	}
 }
 
@@ -131,7 +159,7 @@ func TestCatalogIsParseableByCodeAF(t *testing.T) {
 		t.Fatalf("got %d rows", len(rows))
 	}
 	// CodeAF's parsePrice is strconv.ParseFloat on these strings: no "$".
-	if got := rows[0].Pricing.Completion; got != "0.000000500000" {
+	if got := rows[0].Pricing.Completion; got != "0.000000250000" {
 		t.Errorf("completion price = %q", got)
 	}
 }
@@ -161,7 +189,7 @@ func TestProxyEndToEnd(t *testing.T) {
 	defer upstream.Close()
 
 	ledger := filepath.Join(t.TempDir(), "ledger.jsonl")
-	p := &proxy{upstream: upstream.URL, apiKey: "secret", ledger: ledger, runCap: 0.0005, dayCap: 20,
+	p := &proxy{upstream: upstream.URL, apiKey: "secret", ledger: ledger, runCap: 0.0005, weekCap: 20,
 		models: testModels(t), client: upstream.Client()}
 	server := httptest.NewServer(p)
 	defer server.Close()
@@ -178,19 +206,19 @@ func TestProxyEndToEnd(t *testing.T) {
 	}
 
 	response, body := post(`{"model":"zai-org/glm-5.3-flash","messages":[]}`)
-	if response.StatusCode != 200 || !strings.Contains(body, `"cost":0.000206`) || !strings.Contains(body, `"model":"zai-org/glm-5.3-flash"`) {
+	if response.StatusCode != 200 || !strings.Contains(body, `"cost":0.000118`) || !strings.Contains(body, `"model":"zai-org/glm-5.3-flash"`) {
 		t.Fatalf("JSON call: %d %s", response.StatusCode, body)
 	}
 
 	response, body = post(`{"model":"zai-org/glm-5.3","stream":true,"messages":[]}`)
-	if response.StatusCode != 200 || !strings.Contains(body, `"cost":0.001824`) || !strings.Contains(body, "data: [DONE]") {
+	if response.StatusCode != 200 || !strings.Contains(body, `"cost":0.000708`) || !strings.Contains(body, "data: [DONE]") {
 		t.Fatalf("stream call: %d %s", response.StatusCode, body)
 	}
 	if seen[1]["model"] != "hf:zai-org/GLM-5.3" {
 		t.Errorf("upstream saw model %v", seen[1]["model"])
 	}
 
-	// $0.00203 spent > the $0.0005 run cap: the next call is refused.
+	// $0.000826 spent > the $0.0005 run credit cap: the next call is refused.
 	if response, body = post(`{"model":"zai-org/glm-5.3-flash","messages":[]}`); response.StatusCode != http.StatusPaymentRequired {
 		t.Fatalf("over cap: %d %s", response.StatusCode, body)
 	}
@@ -202,7 +230,7 @@ func TestProxyEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(lines) != 2 || math.Abs(ledgerTotal(lines)-0.00203) > 1e-12 || !lines[1].Stream || !lines[1].UsageSeen {
+	if len(lines) != 2 || math.Abs(ledgerTotal(lines)-0.000826) > 1e-12 || !lines[1].Stream || !lines[1].UsageSeen {
 		t.Fatalf("ledger = %+v", lines)
 	}
 	models, err := http.Get(server.URL + "/v1/models")
@@ -274,7 +302,7 @@ func TestProxyLimitsCallsPerModel(t *testing.T) {
 	}))
 	defer upstream.Close()
 	models := testModels(t)
-	p := &proxy{upstream: upstream.URL, apiKey: "k", ledger: filepath.Join(t.TempDir(), "l.jsonl"), runCap: 5, dayCap: 20,
+	p := &proxy{upstream: upstream.URL, apiKey: "k", ledger: filepath.Join(t.TempDir(), "l.jsonl"), runCap: 5, weekCap: 20,
 		models: models, client: upstream.Client(), slots: newSlots(models)}
 	server := httptest.NewServer(p)
 	defer server.Close()
@@ -540,20 +568,22 @@ func TestReport(t *testing.T) {
 	ok := true
 	result := Result{Stop: "done", OK: &ok, Model: "zai-org/glm-5.3-flash", SpendUSD: 0.0008, Answer: "Did it."}
 	lines := []LedgerLine{
-		{Model: "zai-org/glm-5.3-flash", PromptTokens: 1000, CachedTokens: 400, CompletionTokens: 200, CostUSD: 0.000206, UsageSeen: true},
+		// APICostUSD set: the report takes it as-is (the source this proxy
+		// writes). The next line leaves it 0 and is re-priced from tokens.
+		{Model: "zai-org/glm-5.3-flash", PromptTokens: 1000, CachedTokens: 400, CompletionTokens: 200, CostUSD: 0.000206, APICostUSD: 0.000206, UsageSeen: true},
 		{Model: "zai-org/glm-5.3", PromptTokens: 1000, CompletionTokens: 200, CostUSD: 0.00228, UsageSeen: true},
 		{Model: "zai-org/glm-5.3", Stream: true},
 	}
-	env := map[string]string{"DAY_SPENT_BEFORE": "1.2", "CHANGED": "3",
+	env := map[string]string{"WEEK_SPENT_BEFORE": "1.2", "CHANGED": "3",
 		"GITHUB_REPOSITORY": "RichardoC/factory-repo", "GITHUB_RUN_ID": "42"}
-	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
+	cfg := Config{Limits: Limits{Plan: "big", WeeklyCreditUSD: 20, RunCreditUSD: 5, OverageUSD: 0}, Models: testModels(t)}
 	report := Report(result, true, lines, cfg, nil, ReportInputs{}, func(k string) string { return env[k] })
 	for _, want := range []string{
 		reportMarker,
 		"| stop / ok | `done` / `true` |",
-		"**$0.0025** this run · $1.2025 today (cap $5/run, $20/day)",
-		"| `zai-org/glm-5.3` | 1.4 · 0.26 · 4.4 | 2 | 1000 | 0 | 200 | — | — | $0.0023 (+1 unpriced) |",
-		"| `zai-org/glm-5.3-flash` | 0.15 · 0.04 · 0.5 | 1 | 1000 | 400 | 200 | — | — | $0.0002 |",
+		"**$0.0025** credit this run · $1.2025 this week (cap $5/run, $20/week) · $0.0025 at API prices · $0.0000 overage",
+		"| `zai-org/glm-5.3` | 0.4 · 0.07 · 2.2 | 2 | 1000 | 0 | 200 | — | — | $0.0023 (+1 unpriced) |",
+		"| `zai-org/glm-5.3-flash` | 0.1 · 0.02 · 0.25 | 1 | 1000 | 400 | 200 | — | — | $0.0002 |",
 		// Old-format ledger lines: the timing figures degrade to em-dashes.
 		"| run job wall time | — |",
 		"| time with a call in flight | — |",
@@ -601,7 +631,7 @@ func TestProxyRecordsReasoningTokens(t *testing.T) {
 	defer upstream.Close()
 
 	ledger := filepath.Join(t.TempDir(), "ledger.jsonl")
-	p := &proxy{upstream: upstream.URL, apiKey: "k", ledger: ledger, runCap: 5, dayCap: 20,
+	p := &proxy{upstream: upstream.URL, apiKey: "k", ledger: ledger, runCap: 5, weekCap: 20,
 		models: testModels(t), client: upstream.Client()}
 	server := httptest.NewServer(p)
 	defer server.Close()
@@ -733,7 +763,7 @@ func TestProxyCountsReasoningChars(t *testing.T) {
 	defer upstream.Close()
 
 	ledger := filepath.Join(t.TempDir(), "ledger.jsonl")
-	p := &proxy{upstream: upstream.URL, apiKey: "k", ledger: ledger, runCap: 5, dayCap: 20,
+	p := &proxy{upstream: upstream.URL, apiKey: "k", ledger: ledger, runCap: 5, weekCap: 20,
 		models: testModels(t), client: upstream.Client()}
 	server := httptest.NewServer(p)
 	defer server.Close()
@@ -805,11 +835,11 @@ func TestReportReasoningShare(t *testing.T) {
 			ReasoningChars: 10, OutputChars: 10, CostUSD: 0.0023, UsageSeen: true},
 		{Model: "zai-org/glm-5.3", Stream: true},
 	}
-	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
+	cfg := Config{Limits: Limits{Plan: "big", WeeklyCreditUSD: 20, RunCreditUSD: 5, OverageUSD: 0}, Models: testModels(t)}
 	report := Report(result, true, lines, cfg, nil, ReportInputs{}, func(string) string { return "" })
 	for _, want := range []string{
-		"| `zai-org/glm-5.3-flash` | 0.15 · 0.04 · 0.5 | 1 | 0 | 0 | 0 | — | ~60% (chars) | $0.0002 |",
-		"| `zai-org/glm-5.3` | 1.4 · 0.26 · 4.4 | 2 | 100 | 0 | 200 | 50 | 25% | $0.0023 (+1 unpriced) |",
+		"| `zai-org/glm-5.3-flash` | 0.1 · 0.02 · 0.25 | 1 | 0 | 0 | 0 | — | ~60% (chars) | $0.0002 |",
+		"| `zai-org/glm-5.3` | 0.4 · 0.07 · 2.2 | 2 | 100 | 0 | 200 | 50 | 25% | $0.0023 (+1 unpriced) |",
 		"(chars) is an estimate",
 	} {
 		if !strings.Contains(report, want) {
@@ -858,7 +888,7 @@ func TestReportTiming(t *testing.T) {
 		{Model: "zai-org/glm-5.3", Time: base.Add(4 * time.Minute), Start: base.Add(90 * time.Second),
 			PromptTokens: 1000, CompletionTokens: 1000, CostUSD: 0.0044, UsageSeen: true},
 	}
-	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
+	cfg := Config{Limits: Limits{Plan: "big", WeeklyCreditUSD: 20, RunCreditUSD: 5, OverageUSD: 0}, Models: testModels(t)}
 	report := Report(result, true, lines, cfg, &wall, ReportInputs{}, func(string) string { return "" })
 	for _, want := range []string{
 		"| run job wall time | 1h28m0s |",
@@ -869,9 +899,9 @@ func TestReportTiming(t *testing.T) {
 		"255.6 tok/s", // (45003+1000) output tokens over the 3m in flight
 		"| longest single call | 2m30s · 1000 tok · `zai-org/glm-5.3` |",
 		"| queued at the model limit | 1m30s |",
-		"| `zai-org/glm-5.3-flash` | 0.15 · 0.04 · 0.5 | 1 | 1000 | 0 | 45003 | 321 | 0.7% | $0.0225 |",
-		"| `zai-org/glm-5.3` | 1.4 · 0.26 · 4.4 | 1 | 1000 | 0 | 1000 | — | — | $0.0044 |",
-		"**$0.0269** this run", // marker line adds nothing to the metered total
+		"| `zai-org/glm-5.3-flash` | 0.1 · 0.02 · 0.25 | 1 | 1000 | 0 | 45003 | 321 | 0.7% | $0.0225 |",
+		"| `zai-org/glm-5.3` | 0.4 · 0.07 · 2.2 | 1 | 1000 | 0 | 1000 | — | — | $0.0044 |",
+		"**$0.0269** credit this run", // marker line adds nothing to the metered total
 	} {
 		if !strings.Contains(report, want) {
 			t.Errorf("report lacks %q:\n%s", want, report)
@@ -895,7 +925,7 @@ func TestReportTiming(t *testing.T) {
 		"| output tok/s while in flight | — |",
 		"| longest single call | — |",
 		"| queued at the model limit | — |",
-		"| `zai-org/glm-5.3-flash` | 0.15 · 0.04 · 0.5 | 1 | 1000 | 0 | 200 | — | — | $0.0001 |",
+		"| `zai-org/glm-5.3-flash` | 0.1 · 0.02 · 0.25 | 1 | 1000 | 0 | 200 | — | — | $0.0001 |",
 	} {
 		if !strings.Contains(report, want) {
 			t.Errorf("old-format report lacks %q:\n%s", want, report)
@@ -1003,20 +1033,20 @@ func TestSanitizeLedger(t *testing.T) {
 	}
 }
 
-func TestSpentTodayRefusesPoisonedTotals(t *testing.T) {
+func TestSpentWeekRefusesPoisonedTotals(t *testing.T) {
 	for _, bad := range []string{"-5", "NaN", "Inf", "-Inf", "lots"} {
-		t.Setenv("DAY_SPENT", bad)
-		if _, err := spentToday("DAY_SPENT"); err == nil {
-			t.Errorf("spentToday accepted %q", bad)
+		t.Setenv("WEEK_SPENT", bad)
+		if _, err := spentWeek("WEEK_SPENT"); err == nil {
+			t.Errorf("spentWeek accepted %q", bad)
 		}
 	}
-	t.Setenv("DAY_SPENT", "1.25")
-	if got, err := spentToday("DAY_SPENT"); err != nil || got != 1.25 {
-		t.Errorf("spentToday(1.25) = %v, %v", got, err)
+	t.Setenv("WEEK_SPENT", "1.25")
+	if got, err := spentWeek("WEEK_SPENT"); err != nil || got != 1.25 {
+		t.Errorf("spentWeek(1.25) = %v, %v", got, err)
 	}
-	t.Setenv("DAY_SPENT", "")
-	if got, err := spentToday("DAY_SPENT"); err != nil || got != 0 {
-		t.Errorf("spentToday(empty) = %v, %v", got, err)
+	t.Setenv("WEEK_SPENT", "")
+	if got, err := spentWeek("WEEK_SPENT"); err != nil || got != 0 {
+		t.Errorf("spentWeek(empty) = %v, %v", got, err)
 	}
 }
 
@@ -1035,7 +1065,7 @@ func TestReportGroupsUnknownModels(t *testing.T) {
 		{Model: "zai-org/glm-5.3", Time: base.Add(30 * time.Second), Start: base,
 			PromptTokens: 1000, CompletionTokens: 200, CostUSD: 0.00228, UsageSeen: true},
 	}
-	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
+	cfg := Config{Limits: Limits{Plan: "big", WeeklyCreditUSD: 20, RunCreditUSD: 5, OverageUSD: 0}, Models: testModels(t)}
 	report := Report(result, true, lines, cfg, nil, ReportInputs{}, func(string) string { return "" })
 	for _, banned := range []string{"INJECT", "@user", "http://e/x"} {
 		if strings.Contains(report, banned) {
@@ -1044,7 +1074,7 @@ func TestReportGroupsUnknownModels(t *testing.T) {
 	}
 	for _, want := range []string{
 		"| `(other)` | — · — · — | 2 | 200 | 0 | 500 | — | — | $0.7500 |",
-		"| `zai-org/glm-5.3` | 1.4 · 0.26 · 4.4 | 1 | 1000 | 0 | 200 | — | — | $0.0023 |",
+		"| `zai-org/glm-5.3` | 0.4 · 0.07 · 2.2 | 1 | 1000 | 0 | 200 | — | — | $0.0023 |",
 		"| longest single call | 2m0s · 500 tok · `(other)` |",
 	} {
 		if !strings.Contains(report, want) {
@@ -1078,7 +1108,7 @@ func TestReportDropsAbsurdTiming(t *testing.T) {
 			PromptTokens: huge, CompletionTokens: huge, ReasoningTokens: &huge,
 			SlotWaitS: 1e9, CostUSD: 0.01, UsageSeen: true},
 	}
-	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
+	cfg := Config{Limits: Limits{Plan: "big", WeeklyCreditUSD: 20, RunCreditUSD: 5, OverageUSD: 0}, Models: testModels(t)}
 	report := Report(result, true, lines, cfg, nil, ReportInputs{}, func(string) string { return "" })
 	for _, banned := range []string{"2562047h", "4611686018427387904"} {
 		if strings.Contains(report, banned) {
@@ -1090,7 +1120,7 @@ func TestReportDropsAbsurdTiming(t *testing.T) {
 		"| CodeAF session (proxy start → last call end) | 31m0s |",
 		"| longest single call | 1m0s · 10000000 tok · `zai-org/glm-5.3` |",
 		"| queued at the model limit | 24h0m0s |",
-		"| `zai-org/glm-5.3` | 1.4 · 0.26 · 4.4 | 4 | 10000000 | 0 | 10000000 | 10000000 | 100% | $0.0100 (+3 unpriced) |",
+		"| `zai-org/glm-5.3` | 0.4 · 0.07 · 2.2 | 4 | 10000000 | 0 | 10000000 | 10000000 | 100% | $0.0100 (+3 unpriced) |",
 	} {
 		if !strings.Contains(report, want) {
 			t.Errorf("report lacks %q:\n%s", want, report)
@@ -1129,7 +1159,7 @@ func TestReportFailedPublish(t *testing.T) {
 	}
 	env := map[string]string{"GITHUB_REPOSITORY": "RichardoC/factory-repo", "GITHUB_RUN_ID": "42",
 		"OUTCOME": "publishing failed"}
-	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
+	cfg := Config{Limits: Limits{Plan: "big", WeeklyCreditUSD: 20, RunCreditUSD: 5, OverageUSD: 0}, Models: testModels(t)}
 	report := Report(result, true, nil, cfg, nil, in, func(k string) string { return env[k] })
 	for _, want := range []string{
 		"### CodeAF run — publishing failed",
@@ -1155,7 +1185,7 @@ func TestReportFailedPublish(t *testing.T) {
 // summarises the patch and the plan's tasks, and says plainly that the work
 // is unfinished and unverified.
 func TestReportEmptyAnswerFallback(t *testing.T) {
-	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
+	cfg := Config{Limits: Limits{Plan: "big", WeeklyCreditUSD: 20, RunCreditUSD: 5, OverageUSD: 0}, Models: testModels(t)}
 	env := map[string]string{"GITHUB_REPOSITORY": "RichardoC/factory-repo", "GITHUB_RUN_ID": "42"}
 	envf := func(k string) string { return env[k] }
 	in := ReportInputs{
@@ -1217,7 +1247,7 @@ func TestReportHostileResult(t *testing.T) {
 		PlanTasks:    []planTask{{Title: "`title` @admin", State: "done\n\n# X"}},
 	}
 	env := map[string]string{"GITHUB_REPOSITORY": "RichardoC/factory-repo", "GITHUB_RUN_ID": "42"}
-	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
+	cfg := Config{Limits: Limits{Plan: "big", WeeklyCreditUSD: 20, RunCreditUSD: 5, OverageUSD: 0}, Models: testModels(t)}
 	report := Report(result, true, nil, cfg, nil, in, func(k string) string { return env[k] })
 	for _, banned := range []string{
 		"<script", "<img", // raw HTML cannot survive
@@ -1318,7 +1348,7 @@ func TestReportCapsHugeDiffstat(t *testing.T) {
 		t.Fatalf("diffstat kept %d files (more %d), want %d and 100", len(diffs), more, maxDiffFiles)
 	}
 	diffs = append(diffs, fileDiff{Path: strings.Repeat("p", 100000), Add: 1})
-	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
+	cfg := Config{Limits: Limits{Plan: "big", WeeklyCreditUSD: 20, RunCreditUSD: 5, OverageUSD: 0}, Models: testModels(t)}
 	report := Report(Result{}, false, nil, cfg, nil, ReportInputs{Diff: diffs, DiffMore: more}, func(string) string { return "" })
 	// 50 shown of 201 kept, plus the 100 the parser did not keep.
 	if !strings.Contains(report, "… and 251 more files") {
@@ -1788,30 +1818,30 @@ func TestBriefBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	spendCap := trimNumber(cfg.Limits.RunUSD)
+	spendCap := trimNumber(cfg.Limits.RunCreditUSD)
 	want := func(minutes int, middle string) string {
 		return fmt.Sprintf("You have %d minutes %s. Stop and write your final answer at least 10 minutes before the deadline.", minutes, middle)
 	}
 	t.Setenv("CODEAF_BUDGET_MINUTES", "45")
-	if got := budgetLine(); got != want(45, "and $"+spendCap) {
+	if got := budgetLine(); got != want(45, "and $"+spendCap+" of credit") {
 		t.Errorf("valid minutes: got %q", got)
 	}
 	for _, bad := range []string{"", "abc", "12x", "-5", "1.5", "0", "99999999999999999999"} {
 		t.Setenv("CODEAF_BUDGET_MINUTES", bad)
-		if got := budgetLine(); got != want(100, "and $"+spendCap) {
+		if got := budgetLine(); got != want(100, "and $"+spendCap+" of credit") {
 			t.Errorf("CODEAF_BUDGET_MINUTES %q: got %q, want the 100-minute fallback", bad, got)
 		}
 	}
 	// A missing variable (not merely empty) behaves the same.
 	t.Setenv("CODEAF_BUDGET_MINUTES", "45")
 	os.Unsetenv("CODEAF_BUDGET_MINUTES")
-	if got := budgetLine(); got != want(100, "and $"+spendCap) {
+	if got := budgetLine(); got != want(100, "and $"+spendCap+" of credit") {
 		t.Errorf("missing CODEAF_BUDGET_MINUTES: got %q", got)
 	}
 	// A config that fails to load says the cap is unknown instead.
 	t.Setenv("CODEAF_BUDGET_MINUTES", "45")
 	t.Setenv("PROXY_MODELS", filepath.Join(t.TempDir(), "missing.json"))
-	if got := budgetLine(); got != want(45, "(spend cap unknown)") {
+	if got := budgetLine(); got != want(45, "(credit cap unknown)") {
 		t.Errorf("broken config: got %q", got)
 	}
 	// And the budget line is the first thing in the brief, loaded from the
@@ -2046,7 +2076,7 @@ func TestProxyRepairsInvalidToolArgs(t *testing.T) {
 	defer upstream.Close()
 
 	p := &proxy{upstream: upstream.URL, apiKey: "k", ledger: filepath.Join(t.TempDir(), "ledger.jsonl"),
-		runCap: 5, dayCap: 20, models: testModels(t), client: upstream.Client()}
+		runCap: 5, weekCap: 20, models: testModels(t), client: upstream.Client()}
 	server := httptest.NewServer(p)
 	defer server.Close()
 
@@ -2134,7 +2164,7 @@ func TestProxyRepairsInvalidToolArgs(t *testing.T) {
 // and not when it has none (issue #50).
 func TestReportRepairedToolArgs(t *testing.T) {
 	result := Result{Stop: "done"}
-	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
+	cfg := Config{Limits: Limits{Plan: "big", WeeklyCreditUSD: 20, RunCreditUSD: 5, OverageUSD: 0}, Models: testModels(t)}
 	render := func(lines []LedgerLine) string {
 		return Report(result, true, lines, cfg, nil, ReportInputs{}, func(string) string { return "" })
 	}
@@ -2147,5 +2177,251 @@ func TestReportRepairedToolArgs(t *testing.T) {
 	}
 	if strings.Contains(render(nil), "arguments repaired") {
 		t.Error("report shows a repair figure with nothing repaired")
+	}
+}
+
+// ---------------------------------------------------------------- quotas
+
+// The /v2/quotas parse is defensive (issue #59): the units are undocumented,
+// so only the expected shape with both numbers present yields a known quota,
+// and nothing is allowed to panic or fail on an unfamiliar body.
+func TestParseQuotas(t *testing.T) {
+	q := parseQuotas([]byte(`{"subscription":{"limit":135,"requests":0,"renewsAt":"2026-10-24T00:00:00Z"}}`))
+	if !q.Known || q.Limit != 135 || q.Requests != 0 || q.RenewsAt != "2026-10-24T00:00:00Z" {
+		t.Fatalf("documented example: %+v", q)
+	}
+	// Unknown extra fields, top-level and inside subscription, do not break it.
+	q = parseQuotas([]byte(`{"plan":"big","source":"v2","subscription":{"limit":135,"requests":7,"renewsAt":"r","note":"x"}}`))
+	if !q.Known || q.Limit != 135 || q.Requests != 7 || q.RenewsAt != "r" {
+		t.Fatalf("extra fields: %+v", q)
+	}
+	for name, body := range map[string]string{
+		"strings instead of numbers": `{"subscription":{"limit":"135","requests":"0"}}`,
+		"missing subscription":       `{"subscription":null}`,
+		"empty object":               `{}`,
+		"missing limit":              `{"subscription":{"requests":0}}`,
+		"missing requests":           `{"subscription":{"limit":135}}`,
+		"zero limit":                 `{"subscription":{"limit":0,"requests":0}}`,
+		"negative limit":             `{"subscription":{"limit":-1,"requests":0}}`,
+		"negative requests":          `{"subscription":{"limit":135,"requests":-1}}`,
+		"wrong types":                `{"subscription":{"limit":{},"requests":[]}}`,
+		"out-of-range number":        `{"subscription":{"limit":1e999,"requests":0}}`,
+		"garbage body":               `<html>rate limited</html>`,
+		"empty body":                 ``,
+	} {
+		if got := parseQuotas([]byte(body)); got.Known {
+			t.Errorf("%s: parsed as known: %q", name, body)
+		}
+	}
+}
+
+// The quota endpoint lives at the API root, not under the chat base's
+// /openai/v1.
+func TestQuotasURL(t *testing.T) {
+	for upstream, want := range map[string]string{
+		"https://api.synthetic.new/openai/v1":  "https://api.synthetic.new/v2/quotas",
+		"https://api.synthetic.new/openai/v1/": "https://api.synthetic.new/v2/quotas",
+		"http://127.0.0.1:9999/openai/v1":      "http://127.0.0.1:9999/v2/quotas",
+	} {
+		if got := quotasURL(upstream); got != want {
+			t.Errorf("quotasURL(%q) = %q, want %q", upstream, got, want)
+		}
+	}
+}
+
+func TestFetchQuotas(t *testing.T) {
+	body := `{"subscription":{"limit":135,"requests":40,"renewsAt":"2026-10-24T00:00:00Z"}}`
+	auth := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth <- r.Header.Get("Authorization")
+		fmt.Fprint(w, body)
+	}))
+	defer server.Close()
+	q, raw, err := fetchQuotas(context.Background(), server.Client(), server.URL, "secret-key")
+	if err != nil || !q.Known || q.Limit != 135 || q.Requests != 40 || raw != body {
+		t.Fatalf("fetch = %+v, %q, %v", q, raw, err)
+	}
+	if got := <-auth; got != "Bearer secret-key" {
+		t.Errorf("Authorization = %q", got)
+	}
+	// A server error is an error, and the raw body still comes back for the
+	// diagnostics marker.
+	server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, body)
+	})
+	if _, raw, err := fetchQuotas(context.Background(), server.Client(), server.URL, "k"); err == nil || raw != body {
+		t.Errorf("status 503: raw = %q, err = %v, want the body and an error", raw, err)
+	}
+	// A network failure leaves nothing to mark: quota unknown, no raw body.
+	server.Close()
+	if _, raw, err := fetchQuotas(context.Background(), server.Client(), server.URL, "k"); err == nil || raw != "" {
+		t.Errorf("network error: raw = %q, err = %v, want no body and an error", raw, err)
+	}
+}
+
+// The quotas marker carries the raw body, capped at 4KiB; a body truncated
+// by the cap no longer parses, which the report treats as no quota row.
+func TestRecordQuotasMarker(t *testing.T) {
+	ledger := filepath.Join(t.TempDir(), "l.jsonl")
+	p := &proxy{ledger: ledger}
+	small := `{"subscription":{"limit":135,"requests":0,"renewsAt":"r"}}`
+	huge := `{"note":"` + strings.Repeat("x", 6000) + `"}`
+	p.recordQuotas(small)
+	p.recordQuotas(huge)
+	lines, err := readLedger(ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != 2 || lines[0].Kind != "quotas" || lines[0].Time.IsZero() || lines[1].Kind != "quotas" {
+		t.Fatalf("markers = %+v", lines)
+	}
+	if lines[0].Quotas != small || !parseQuotas([]byte(lines[0].Quotas)).Known {
+		t.Errorf("small marker = %q", lines[0].Quotas)
+	}
+	if len(lines[1].Quotas) > 4<<10 {
+		t.Errorf("huge marker not capped: %d bytes", len(lines[1].Quotas))
+	}
+	if parseQuotas([]byte(lines[1].Quotas)).Known {
+		t.Error("a body truncated by the cap parsed as known")
+	}
+	// Like every marker, it carries no tokens or cost.
+	if text, err := os.ReadFile(ledger); err != nil || strings.Contains(string(text), "cost") || strings.Contains(string(text), "tokens") {
+		t.Errorf("marker line = %s (%v)", text, err)
+	}
+}
+
+// A quota reported exhausted at startup refuses chat calls only while
+// overage is disabled; an unknown quota never blocks.
+func TestOverCapQuotaExhausted(t *testing.T) {
+	exhausted := quota{Known: true, Limit: 135, Requests: 135}
+	p := &proxy{runCap: 5, weekCap: 20, overageCap: 0, quota: exhausted}
+	want := "the subscription quota reports exhausted and overage is disabled"
+	if got := p.overCap(); !strings.Contains(got, want) {
+		t.Errorf("overCap = %q, want it to contain %q", got, want)
+	}
+	// With overage allowed the quota does not refuse by itself.
+	p.overageCap = 0.01
+	if got := p.overCap(); got != "" {
+		t.Errorf("overCap = %q, want \"\" with overage allowed", got)
+	}
+	// An unknown quota — fetch failed, unfamiliar shape — never blocks.
+	p.quota = quota{}
+	if got := p.overCap(); got != "" {
+		t.Errorf("overCap = %q, want \"\" for an unknown quota", got)
+	}
+	// Reported but not exhausted: no refusal.
+	p.quota = quota{Known: true, Limit: 135, Requests: 3}
+	if got := p.overCap(); got != "" {
+		t.Errorf("overCap = %q, want \"\" below the quota", got)
+	}
+}
+
+// The quota row: rendered from the ledger's quotas marker, omitted when the
+// marker is absent or its body does not parse.
+func TestReportQuotaRow(t *testing.T) {
+	result := Result{Stop: "done"}
+	cfg := Config{Limits: Limits{Plan: "big", WeeklyCreditUSD: 20, RunCreditUSD: 5, OverageUSD: 0}, Models: testModels(t)}
+	render := func(lines []LedgerLine) string {
+		return Report(result, true, lines, cfg, nil, ReportInputs{}, func(string) string { return "" })
+	}
+	with := render([]LedgerLine{
+		{Kind: "proxy_start", Time: time.Now().Add(-time.Hour)},
+		{Kind: "quotas", Time: time.Now(), Quotas: `{"subscription":{"limit":135,"requests":40,"renewsAt":"2026-10-24T00:00:00Z"}}`},
+	})
+	if want := "| synthetic.new quota | limit 135, used 40, renewsAt 2026-10-24T00:00:00Z (units undocumented) |"; !strings.Contains(with, want) {
+		t.Errorf("report lacks the quota row %q:\n%s", want, with)
+	}
+	// An unparseable marker body renders no row.
+	unparseable := render([]LedgerLine{{Kind: "quotas", Time: time.Now(), Quotas: `{"subscription":{"limit":"x"}}`}})
+	if strings.Contains(unparseable, "synthetic.new quota") {
+		t.Errorf("unparseable marker rendered a row:\n%s", unparseable)
+	}
+	// No marker at all: no row.
+	absent := render(nil)
+	if strings.Contains(absent, "synthetic.new quota") {
+		t.Errorf("no marker but a row rendered:\n%s", absent)
+	}
+}
+
+// The metered row's weekly and overage figures: WEEK_SPENT_BEFORE unknown
+// renders "?", and overage replays record()'s rule — calls written after the
+// week's credit was exhausted are the API-priced spend past the quota.
+func TestReportWeekAndOverage(t *testing.T) {
+	result := Result{Stop: "done"}
+	cfg := Config{Limits: Limits{Plan: "big", WeeklyCreditUSD: 0.001, RunCreditUSD: 5, OverageUSD: 0}, Models: testModels(t)}
+	// Each line: credit 0.00084, API price 0.00228. The week's 0.001 credit
+	// runs out during the second call, so the third is overage; the last
+	// line is a model the config does not know, which prices at 0.
+	lines := []LedgerLine{
+		{Model: "zai-org/glm-5.3", PromptTokens: 1000, CompletionTokens: 1000, CostUSD: 0.00084, APICostUSD: 0.00228, UsageSeen: true},
+		{Model: "zai-org/glm-5.3", PromptTokens: 1000, CompletionTokens: 1000, CostUSD: 0.00084, APICostUSD: 0.00228, UsageSeen: true},
+		{Model: "zai-org/glm-5.3", PromptTokens: 1000, CompletionTokens: 1000, CostUSD: 0.00084, APICostUSD: 0.00228, UsageSeen: true},
+		{Model: "rogue/model", PromptTokens: 1000, CompletionTokens: 1000, CostUSD: 0.00001, UsageSeen: true},
+	}
+	// WEEK_SPENT_BEFORE empty: the week figure is "?" and the replay starts
+	// from 0, so only the third call counts as overage.
+	report := Report(result, true, lines, cfg, nil, ReportInputs{}, func(string) string { return "" })
+	want := "| metered by proxy (from its ledger) | **$0.0025** credit this run · ? this week (cap $5/run, $0.001/week) · $0.0068 at API prices · $0.0023 overage |"
+	if !strings.Contains(report, want) {
+		t.Errorf("report lacks %q:\n%s", want, report)
+	}
+	// The week already over the cap when the run began: a known week figure
+	// renders, and the overage is the API-priced spend the proxy itself
+	// counted. record() sets its overage flag after a call is recorded, so
+	// the first call past an exhausted week lands as credit and only the
+	// later two count — the replay reproduces exactly that, which keeps the
+	// report consistent with the caps the proxy enforced (/healthz).
+	env := map[string]string{"WEEK_SPENT_BEFORE": "0.5"}
+	report = Report(result, true, lines, cfg, nil, ReportInputs{}, func(k string) string { return env[k] })
+	want = "| metered by proxy (from its ledger) | **$0.0025** credit this run · $0.5025 this week (cap $5/run, $0.001/week) · $0.0068 at API prices · $0.0046 overage |"
+	if !strings.Contains(report, want) {
+		t.Errorf("report lacks %q:\n%s", want, report)
+	}
+	// An invalid WEEK_SPENT_BEFORE is as good as a missing one.
+	env["WEEK_SPENT_BEFORE"] = "not-a-number"
+	report = Report(result, true, lines, cfg, nil, ReportInputs{}, func(k string) string { return env[k] })
+	if !strings.Contains(report, "? this week") {
+		t.Errorf("invalid WEEK_SPENT_BEFORE did not render \"?\":\n%s", report)
+	}
+}
+
+// The run at API prices is summed from the ledger's APICostUSD; lines written
+// before the field existed are re-priced from their tokens at the config's
+// api_* rates.
+func TestReportAPICostSources(t *testing.T) {
+	result := Result{Stop: "done"}
+	cfg := Config{Limits: Limits{Plan: "big", WeeklyCreditUSD: 20, RunCreditUSD: 5, OverageUSD: 0}, Models: testModels(t)}
+	// Recorded: 0.00228. Re-priced from tokens (1000 in, 0 cached, 1000 out
+	// at glm-5.3's api rates 1.40/0.26/4.40): (1400 + 0 + 4400)/1e6 = 0.0058.
+	lines := []LedgerLine{
+		{Model: "zai-org/glm-5.3", PromptTokens: 1000, CompletionTokens: 1000, CostUSD: 0.00084, APICostUSD: 0.00228, UsageSeen: true},
+		{Model: "zai-org/glm-5.3", PromptTokens: 1000, CompletionTokens: 1000, CostUSD: 0.00084, UsageSeen: true},
+	}
+	report := Report(result, true, lines, cfg, nil, ReportInputs{}, func(string) string { return "" })
+	want := "$0.0081 at API prices · $0.0000 overage" // 0.00228 + 0.0058
+	if !strings.Contains(report, want) {
+		t.Errorf("report lacks %q:\n%s", want, report)
+	}
+}
+
+// The /v2/quotas body lands in public artifacts, so only its shape, numbers,
+// booleans and timestamps survive.
+func TestRedactQuotasBody(t *testing.T) {
+	raw := `{"subscription":{"limit":135,"requests":0,"renewsAt":"2025-09-21T14:36:14.288Z","email":"someone@example.com","active":true,"plans":["big"]}}`
+	got := redactQuotasBody(raw)
+	for _, want := range []string{`"limit":135`, `"requests":0`, `"renewsAt":"2025-09-21T14:36:14.288Z"`, `"active":true`, `"email":"[redacted]"`, `["[redacted]"]`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("redacted body lacks %s: %s", want, got)
+		}
+	}
+	if strings.Contains(got, "someone@example.com") || strings.Contains(got, `"big"`) {
+		t.Errorf("a string survived redaction: %s", got)
+	}
+	if q := parseQuotas([]byte(got)); q != parseQuotas([]byte(raw)) {
+		t.Errorf("redaction changed the parsed quota: %+v vs %+v", q, parseQuotas([]byte(raw)))
+	}
+	if got := redactQuotasBody("<html>secret</html>"); got != "[non-JSON body, 19 bytes]" {
+		t.Errorf("non-JSON body: %q", got)
 	}
 }

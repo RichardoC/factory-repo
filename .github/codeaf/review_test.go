@@ -602,7 +602,7 @@ func TestRunReviewConfig(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(single, "codeaf-config.json"), []byte(worker), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(single, "single-models.json"), []byte(`{"limits":{"run_usd":5,"day_usd":40},"models":[{"id":"only/model","role":"mid","upstream":"u","efforts":["high"]}]}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(single, "single-models.json"), []byte(`{"limits":{"plan":"big","weekly_credit_usd":20,"run_credit_usd":5,"overage_usd":0},"models":[{"id":"only/model","role":"mid","upstream":"u","efforts":["high"]}]}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("HARNESS_DIR", single)

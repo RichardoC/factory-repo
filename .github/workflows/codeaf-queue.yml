@@ -8,8 +8,9 @@
 #     carry the `codeaf-priority` label;
 #   * an issue may start a run only when no CodeAF run is queued or in
 #     progress, every issue named in a "Depends on #N" line in its body is
-#     closed, and the day's spend in the shared state is under the threshold
-#     (75% of limits.day_usd in .github/codeaf/models.json).
+#     closed, and the rolling week's credit spend in the shared state is
+#     under the threshold (75% of limits.weekly_credit_usd in
+#     .github/codeaf/models.json).
 # It marks the chosen issue with the `codeaf` label — the same trust gate a
 # person uses (codeaf.yml's gate refuses any run whose issue lacks it) — and
 # then dispatches codeaf.yml. The dispatch step exists because events raised
@@ -124,7 +125,7 @@ jobs:
         # A non-zero exit fails the job: fail closed, no label on unknown
         # spend.
         env:
-          CODEAF_DAY_SPENT_USD: ${{ steps.shared.outputs.day_usd }}
+          CODEAF_WEEK_SPENT_USD: ${{ steps.shared.outputs.week_usd }}
         run: |
           n=$("$HARNESS" next issues.json runs.json)
           echo "n=$n" >> "$GITHUB_OUTPUT"
