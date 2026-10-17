@@ -2437,3 +2437,35 @@ func TestRedactQuotasBodyKeepsNumberStrings(t *testing.T) {
 		}
 	}
 }
+
+// The weekly credit synthetic.new reports is what runs out on the Big plan:
+// below the floor, with overage 0, the proxy refuses; above it, or with
+// overage allowed, or unknown, it never blocks.
+func TestOverCapWeeklyCreditPercent(t *testing.T) {
+	q := parseQuotas([]byte(`{"subscription":{"limit":500,"requests":0},"weeklyTokenLimit":{"percentRemaining":7.5,"maxCredits":"$20"}}`))
+	if !q.PercentKnown || q.PercentRemaining != 7.5 {
+		t.Fatalf("percentRemaining not parsed: %+v", q)
+	}
+	for _, bad := range []string{`{"weeklyTokenLimit":{"percentRemaining":"7"}}`, `{"weeklyTokenLimit":{"percentRemaining":150}}`, `{"weeklyTokenLimit":{"percentRemaining":-1}}`, `{}`} {
+		if q := parseQuotas([]byte(bad)); q.PercentKnown {
+			t.Errorf("%s parsed as known: %+v", bad, q)
+		}
+	}
+	p := &proxy{runCap: 5, weekCap: 22, minCreditPct: 10, quota: q}
+	if reason := p.overCap(); !strings.Contains(reason, "7.5%") {
+		t.Errorf("below the floor with overage 0: %q", reason)
+	}
+	p.overageCap = 1
+	if reason := p.overCap(); reason != "" {
+		t.Errorf("overage allowed must not refuse on the floor: %q", reason)
+	}
+	p.overageCap = 0
+	p.quota = quota{PercentRemaining: 50, PercentKnown: true}
+	if reason := p.overCap(); reason != "" {
+		t.Errorf("above the floor: %q", reason)
+	}
+	p.quota = quota{}
+	if reason := p.overCap(); reason != "" {
+		t.Errorf("unknown quota must never block: %q", reason)
+	}
+}
