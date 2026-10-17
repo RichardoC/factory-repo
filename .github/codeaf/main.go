@@ -442,6 +442,94 @@ func RewriteRequest(body map[string]json.RawMessage, m Model) (stream bool, err 
 	return stream, nil
 }
 
+// maxRepairBytes bounds the size of the messages array repairToolArgs will
+// walk, so the repair cannot become a CPU sink on a very large request. It
+// is several times the largest context these models accept.
+const maxRepairBytes = 4 << 20
+
+// repairToolArgs walks a chat request's messages and repairs assistant
+// tool calls whose function.arguments is not valid JSON, replacing each with
+// {"_invalid_arguments": "<original text>"}. synthetic.new validates the
+// whole history and refuses a request that carries a malformed call, so one
+// bad call would end every later request of the run (issue #50); wrapped
+// this way the model still sees what it sent. Valid arguments are left
+// byte-for-byte unchanged, and messages with nothing to repair keep their
+// original bytes. It returns how many arguments were repaired. Requests
+// whose messages are over maxRepairBytes are skipped. A repaired message is
+// re-encoded, so its object keys come out sorted; the values are untouched.
+func repairToolArgs(body map[string]json.RawMessage) int {
+	raw, ok := body["messages"]
+	if !ok || len(raw) > maxRepairBytes {
+		return 0
+	}
+	var messages []json.RawMessage
+	if json.Unmarshal(raw, &messages) != nil {
+		return 0
+	}
+	repaired := 0
+	for i, rawMsg := range messages {
+		var msg map[string]json.RawMessage
+		if json.Unmarshal(rawMsg, &msg) != nil {
+			continue
+		}
+		var role string
+		if json.Unmarshal(msg["role"], &role) != nil || role != "assistant" {
+			continue
+		}
+		var calls []json.RawMessage
+		if json.Unmarshal(msg["tool_calls"], &calls) != nil {
+			continue
+		}
+		changed, fixed := false, 0
+		for j, rawCall := range calls {
+			var call map[string]json.RawMessage
+			if json.Unmarshal(rawCall, &call) != nil {
+				continue
+			}
+			var fn map[string]json.RawMessage
+			if json.Unmarshal(call["function"], &fn) != nil {
+				continue
+			}
+			// Unmarshalling a JSON null leaves args empty and reports no
+			// error; empty text is not valid JSON either, so an empty (or
+			// null) argument is repaired and keeps its original, empty text.
+			var args string
+			if json.Unmarshal(fn["arguments"], &args) != nil || json.Valid([]byte(args)) {
+				continue
+			}
+			wrapped, err := json.Marshal(map[string]string{"_invalid_arguments": args})
+			if err != nil {
+				continue
+			}
+			// Back as a JSON string, the shape the field already had.
+			if fn["arguments"], err = json.Marshal(string(wrapped)); err != nil {
+				continue
+			}
+			if call["function"], err = json.Marshal(fn); err != nil {
+				continue
+			}
+			if calls[j], err = json.Marshal(call); err != nil {
+				continue
+			}
+			changed, fixed = true, fixed+1
+		}
+		if !changed {
+			continue
+		}
+		msg["tool_calls"], _ = json.Marshal(calls)
+		repairedMsg, err := json.Marshal(msg)
+		if err != nil {
+			continue // the original message is kept
+		}
+		messages[i] = repairedMsg
+		repaired += fixed
+	}
+	if repaired > 0 {
+		body["messages"], _ = json.Marshal(messages)
+	}
+	return repaired
+}
+
 // charCounts tallies the characters one call produced, split into the
 // reasoning text and the visible output. GLM streams its reasoning as
 // reasoning_content and reports no reasoning_tokens (issue #20), so the
@@ -515,11 +603,15 @@ type LedgerLine struct {
 	// and of the visible content plus tool-call arguments. GLM sends no
 	// reasoning_tokens (issue #20), so the report estimates its reasoning
 	// share from these counts. Both stay 0 when the call produced no text.
-	ReasoningChars int     `json:"reasoning_chars,omitempty"`
-	OutputChars    int     `json:"output_chars,omitempty"`
-	CostUSD        float64 `json:"cost_usd"`
-	Stream         bool    `json:"stream"`
-	UsageSeen      bool    `json:"usage_seen"`
+	ReasoningChars int `json:"reasoning_chars,omitempty"`
+	OutputChars    int `json:"output_chars,omitempty"`
+	// RepairedToolArgs is how many of this request's assistant tool-call
+	// arguments were not valid JSON and were replaced with valid JSON that
+	// keeps the original text (issue #50); 0 on the usual call.
+	RepairedToolArgs int     `json:"repaired_tool_args,omitempty"`
+	CostUSD          float64 `json:"cost_usd"`
+	Stream           bool    `json:"stream"`
+	UsageSeen        bool    `json:"usage_seen"`
 	// Start is when the upstream request was issued, after any wait for a
 	// slot; ts is when the call ended. SlotWaitS is how long the call queued
 	// for a model slot. Old ledgers carry neither.
@@ -528,10 +620,10 @@ type LedgerLine struct {
 	Kind      string    `json:"kind,omitempty"`
 }
 
-func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slotWait time.Duration, chars charCounts) {
+func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slotWait time.Duration, chars charCounts, repaired int) {
 	line := LedgerLine{Time: time.Now().UTC(), Model: m.ID, Upstream: m.Upstream, Stream: stream,
 		Start: start.UTC(), SlotWaitS: slotWait.Seconds(),
-		ReasoningChars: chars.reasoning, OutputChars: chars.output}
+		ReasoningChars: chars.reasoning, OutputChars: chars.output, RepairedToolArgs: repaired}
 	if usage != nil {
 		line.UsageSeen = true
 		line.PromptTokens, line.CachedTokens, line.CompletionTokens = usage.PromptTokens, usage.cached(), usage.CompletionTokens
@@ -616,6 +708,12 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusPaymentRequired, reason)
 		return
 	}
+	// One malformed tool call left in the history makes upstream refuse every
+	// later request (issue #50), so repair the arguments before forwarding.
+	repaired := repairToolArgs(body)
+	if repaired > 0 {
+		log.Printf("repaired %d invalid tool-call argument(s) for %s", repaired, m.Upstream)
+	}
 	stream, err := RewriteRequest(body, m)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -651,10 +749,10 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !stream {
-		p.relayJSON(w, response.Body, m, started, slotWait)
+		p.relayJSON(w, response.Body, m, started, slotWait, repaired)
 		return
 	}
-	p.relayStream(w, response.Body, m, started, slotWait)
+	p.relayStream(w, response.Body, m, started, slotWait, repaired)
 }
 
 // newSlots makes one semaphore per upstream model that has a max_concurrent.
@@ -696,7 +794,7 @@ func (p *proxy) acquire(ctx context.Context, m Model) (func(), time.Duration, er
 	}
 }
 
-func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, started time.Time, slotWait time.Duration) {
+func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, started time.Time, slotWait time.Duration, repaired int) {
 	var payload map[string]json.RawMessage
 	if err := json.NewDecoder(upstream).Decode(&payload); err != nil {
 		writeError(w, http.StatusBadGateway, "upstream body: "+err.Error())
@@ -720,7 +818,7 @@ func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, st
 		chars.addChoices(choices, "message")
 	}
 	payload["model"], _ = json.Marshal(m.ID)
-	p.record(m, usage, false, started, slotWait, chars)
+	p.record(m, usage, false, started, slotWait, chars, repaired)
 	writeJSON(w, http.StatusOK, payload)
 }
 
@@ -758,7 +856,7 @@ func RewriteChunk(data []byte, m Model, chars *charCounts) ([]byte, *Usage) {
 	return out, usage
 }
 
-func (p *proxy) relayStream(w http.ResponseWriter, upstream io.Reader, m Model, started time.Time, slotWait time.Duration) {
+func (p *proxy) relayStream(w http.ResponseWriter, upstream io.Reader, m Model, started time.Time, slotWait time.Duration, repaired int) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
@@ -792,7 +890,7 @@ func (p *proxy) relayStream(w http.ResponseWriter, upstream io.Reader, m Model, 
 			break
 		}
 	}
-	p.record(m, usage, true, started, slotWait, chars)
+	p.record(m, usage, true, started, slotWait, chars, repaired)
 }
 
 // ---------------------------------------------------------------- GitHub
@@ -2525,6 +2623,7 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 		}
 		return "(other)"
 	}
+	repairedArgs := 0 // assistant tool-call arguments rewritten to valid JSON (issue #50)
 	totals := map[string]*modelTotals{}
 	for _, l := range lines {
 		if l.Kind != "" {
@@ -2547,6 +2646,7 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 		}
 		t.reasoningChars += clampTokens(l.ReasoningChars)
 		t.outputChars += clampTokens(l.OutputChars)
+		repairedArgs += clampTokens(l.RepairedToolArgs)
 		if !l.UsageSeen {
 			t.unpriced++
 		}
@@ -2665,6 +2765,9 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 	fmt.Fprintf(&b, "| CodeAF's own spend figure | %s (plan estimate %s) |\n", money(result.SpendUSD), money(result.EstUSD))
 	fmt.Fprintf(&b, "| metered by proxy (from its ledger) | **%s** this run · %s today (cap $%s/run, $%s/day) |\n",
 		money(total), money(dayBefore+total), trimNumber(cfg.Limits.RunUSD), trimNumber(cfg.Limits.DayUSD))
+	if repairedArgs > 0 {
+		fmt.Fprintf(&b, "| tool-call arguments repaired | %d |\n", repairedArgs)
+	}
 	fmt.Fprintf(&b, "| files changed | %s |\n", orUnknown(env("CHANGED")))
 	// The ::error:: lines the publish steps collected: the two most recent are
 	// the cause of a failed publish. Read as data: the prefix is stripped and

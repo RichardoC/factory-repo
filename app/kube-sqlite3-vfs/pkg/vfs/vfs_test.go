@@ -1393,9 +1393,16 @@ func TestLeaseLossDetected(t *testing.T) {
 	}
 	time.Sleep(2 * lease) // the lease lapses with no lock-path call
 
+	// Issue #51: the exact error, checked with errors.Is in both
+	// directions. A lost lease is deliberately not a conflict — BusyError
+	// (SQLITE_BUSY) would send sqlite's busy handler into retrying the
+	// same request, whose holder state is already gone.
 	err := fa.Lock(sqlite3vfs.LockShared)
 	if !errors.Is(err, errLockLeaseLost) {
 		t.Fatalf("Lock after lapsed lease = %v, want errLockLeaseLost", err)
+	}
+	if errors.Is(err, sqlite3vfs.BusyError) {
+		t.Fatalf("Lock after lapsed lease = %v, want a distinct error and not sqlite3vfs.BusyError: BUSY would make sqlite retry a request whose holder state is gone", err)
 	}
 	if fa.lockLevel != sqlite3vfs.LockNone || !fa.lockKnown {
 		t.Errorf("after lease loss local state = (level %v, known %v), want (NONE, true)", fa.lockLevel, fa.lockKnown)
@@ -1787,9 +1794,10 @@ func TestSectorReadPathMakesNoLockCalls(t *testing.T) {
 // lock go; B, seeing none of the state A warmed, rewrites the file larger
 // and then truncates it; A re-locks and must see B's bytes and B's size,
 // revalidated by FileSize's LIST rather than anything cached under A's
-// previous lock. (The lock ConfigMap provides no real mutual exclusion —
-// see the README — so B takes no lock here; that does not matter for the
-// data and size visibility this test pins.)
+// previous lock. (B takes no lock here: this test pins data and size
+// visibility across a lock handoff, not lock arbitration — the lock
+// ConfigMap's compare-and-swap mutual exclusion has its own tests, see
+// TestTwoProcessesMutualExclusion and the README.)
 func TestTwoVFSInstancesSeeEachOthersWritesAndTruncate(t *testing.T) {
 	_, fcs := newTestVFS(t)
 	va := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3)
