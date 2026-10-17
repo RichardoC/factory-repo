@@ -99,6 +99,9 @@ jobs:
       MODE: ${{ needs.gate.outputs.mode }}
       NUMBER: ${{ needs.gate.outputs.number }}
       BRANCH: ${{ needs.gate.outputs.branch }}
+      # The time budget the brief states, and the same limit `codeaf do` gets:
+      # one literal value, passed as data, never through an expression.
+      CODEAF_BUDGET_MINUTES: "100"
     steps:
       - name: Paths
         run: |
@@ -206,7 +209,7 @@ jobs:
         run: |
           cp "$RUNNER_TEMP/harness/codeaf-config.json" "$CODEAF_HOME/config.json"
           set +e
-          "$TOOLS/codeaf" do "$(cat "$BRIEF_PATH")" --dir . --json --yes-spend --timeout 100m \
+          "$TOOLS/codeaf" do "$(cat "$BRIEF_PATH")" --dir . --json --yes-spend --timeout "${CODEAF_BUDGET_MINUTES:-100}m" \
             > "$RESULT_PATH" 2> "$RUNNER_TEMP/codeaf.stderr"
           echo "codeaf exit code: $?"
           tail -n 80 "$RUNNER_TEMP/codeaf.stderr"

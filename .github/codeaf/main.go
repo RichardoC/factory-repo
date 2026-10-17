@@ -37,6 +37,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 func main() {
@@ -734,6 +735,8 @@ func (i item) labelled(name string) bool {
 
 // comment is an issue comment or a pull request review.
 type comment struct {
+	ID                int64  `json:"id"`
+	SubmittedAt       string `json:"submitted_at"`
 	Body              string `json:"body"`
 	AuthorAssociation string `json:"author_association"`
 	User              user   `json:"user"`
@@ -932,17 +935,22 @@ func runGate() error {
 }
 
 type issueComment struct {
+	ID                int64  `json:"id"`
+	CreatedAt         string `json:"created_at"`
 	Body              string `json:"body"`
 	AuthorAssociation string `json:"author_association"`
 	User              user   `json:"user"`
 }
 
 type reviewComment struct {
-	Path         string `json:"path"`
-	Line         *int   `json:"line"`
-	OriginalLine *int   `json:"original_line"`
-	Body         string `json:"body"`
-	User         user   `json:"user"`
+	ID                int64  `json:"id"`
+	CreatedAt         string `json:"created_at"`
+	Path              string `json:"path"`
+	Line              *int   `json:"line"`
+	AuthorAssociation string `json:"author_association"`
+	OriginalLine      *int   `json:"original_line"`
+	Body              string `json:"body"`
+	User              user   `json:"user"`
 }
 
 const reportMarker = "<!-- codeaf-report -->"
@@ -973,6 +981,515 @@ func (g github) thread(number int) (string, error) {
 	return b.String(), nil
 }
 
+// ---------------------------------------------------------------- the brief's context sections
+
+// budgetLine opens the brief with the run's budget. CODEAF_BUDGET_MINUTES is
+// digits only and validated here; missing or invalid falls back to 100,
+// which matches the workflow job's timeout-minutes. The spend cap comes from
+// models.json (limits.run_usd, which the proxy enforces); when that config
+// cannot be loaded the line says the cap is unknown instead of failing, so a
+// broken installation still produces a brief.
+func budgetLine() string {
+	minutes := 100
+	if v := os.Getenv("CODEAF_BUDGET_MINUTES"); digitsOnly(v) {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			minutes = n
+		}
+	}
+	cfg, err := loadConfig(configPath())
+	if err != nil {
+		return fmt.Sprintf("You have %d minutes (spend cap unknown). Stop and write your final answer at least 10 minutes before the deadline.", minutes)
+	}
+	return fmt.Sprintf("You have %d minutes and $%s. Stop and write your final answer at least 10 minutes before the deadline.", minutes, trimNumber(cfg.Limits.RunUSD))
+}
+
+// maxBriefBytes bounds the whole brief: every section is capped on its own,
+// but a crafted target body, thread or dependency list still adds up.
+const maxBriefBytes = 100000
+
+// capBrief truncates s at max bytes without splitting a UTF-8 rune and
+// appends a note line; the note counts against the cap.
+func capBrief(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	note := fmt.Sprintf("\n\n(brief truncated at %d bytes)\n", max)
+	cut := max - len(note)
+	if cut < 0 {
+		cut = 0
+	}
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + note
+}
+
+// actionsBotEmail is the identity the publish job pushes as; the newest
+// commit authored or committed by it marks the last CodeAF push.
+const actionsBotEmail = "41898282+github-actions[bot]@users.noreply.github.com"
+
+// reportSummaryOpen opens the summary block of a run report.
+const reportSummaryOpen = "<details><summary>CodeAF's summary</summary>"
+
+const (
+	maxDeps     = 10 // "depends on" items rendered at most
+	maxDepFiles = 20 // changed paths shown per merged pull request
+	maxFindings = 20 // review findings rendered at most, newest last
+)
+
+// pull is the part of a pull request the dependencies section reads.
+type pull struct {
+	Number   int    `json:"number"`
+	Title    string `json:"title"`
+	MergedAt string `json:"merged_at"`
+}
+
+// prFile is one changed path of a pull request.
+type prFile struct {
+	Filename string `json:"filename"`
+}
+
+// gitPerson is the author or committer block of a commit.
+type gitPerson struct {
+	Name  string `json:"name"`
+	Email string `json:"email"`
+	Date  string `json:"date"`
+}
+
+// prCommit is one commit of a pull request; only who made it and when is
+// read.
+type prCommit struct {
+	Commit struct {
+		Author    gitPerson `json:"author"`
+		Committer gitPerson `json:"committer"`
+	} `json:"commit"`
+}
+
+// timelineEvent is one event of an issue's timeline; only cross-references
+// whose source is a pull request in this repository are read.
+type timelineEvent struct {
+	Event  string `json:"event"`
+	Source *struct {
+		Issue *struct {
+			Number      int             `json:"number"`
+			PullRequest json.RawMessage `json:"pull_request"` // present when the source is a pull request
+			Repository  *struct {
+				FullName string `json:"full_name"`
+			} `json:"repository"`
+		} `json:"issue"`
+	} `json:"source"`
+}
+
+// parseAPITime parses a GitHub timestamp; a malformed or forged one yields
+// false and the item is dropped, not guessed about.
+func parseAPITime(s string) (time.Time, bool) {
+	t, err := time.Parse(time.RFC3339, s)
+	return t, err == nil
+}
+
+// lastReportComment returns the newest comment on the target that carries
+// the run-report marker, or nil.
+func lastReportComment(comments []issueComment) *issueComment {
+	for i := len(comments) - 1; i >= 0; i-- {
+		if strings.Contains(comments[i].Body, reportMarker) {
+			return &comments[i]
+		}
+	}
+	return nil
+}
+
+// reportTableRow returns the cell of the report table's row labelled label:
+// the text between the label and the row's closing pipe. A report body is
+// plain text here, so it parses as such, not as data.
+func reportTableRow(report, label string) (string, bool) {
+	prefix := "| " + label + " |"
+	for _, line := range strings.Split(report, "\n") {
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		cell := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		return strings.TrimSpace(strings.TrimSuffix(cell, "|")), true
+	}
+	return "", false
+}
+
+// reportSummary returns the text inside a report's summary <details> block.
+func reportSummary(report string) (string, bool) {
+	i := strings.Index(report, reportSummaryOpen)
+	if i < 0 {
+		return "", false
+	}
+	inner := report[i+len(reportSummaryOpen):]
+	if j := strings.Index(inner, "</details>"); j >= 0 {
+		inner = inner[:j]
+	}
+	return strings.TrimSpace(inner), true
+}
+
+// previousReportSection re-reads the last CodeAF run report on this issue or
+// PR: its stop reason, its metered spend and CodeAF's summary. Everything
+// extracted from a report is untrusted text, so the section renders it
+// inside a quoted data block, escaped, every line prefixed with "> " — a
+// report forged to read like instructions stays inert data.
+func previousReportSection(gh github, number int) string {
+	var b strings.Builder
+	b.WriteString("## The previous CodeAF report\n")
+	var comments []issueComment
+	if err := gh.get(fmt.Sprintf("/issues/%d/comments?per_page=100", number), &comments); err != nil {
+		fmt.Fprintf(&b, "\n(previous CodeAF report unavailable: %s)\n", escapeMD(err.Error(), 200, true))
+		return b.String()
+	}
+	report := lastReportComment(comments)
+	if report == nil {
+		b.WriteString("\n(no previous CodeAF report found on this issue or PR)\n")
+		return b.String()
+	}
+	b.WriteString("\n")
+	if stop, ok := reportTableRow(report.Body, "stop / ok"); ok {
+		fmt.Fprintf(&b, "> stop: %s\n", escapeMD(stop, 200, true))
+	} else {
+		b.WriteString("> stop: (not found in the previous report)\n")
+	}
+	if spend, ok := reportTableRow(report.Body, "metered by proxy (from its ledger)"); ok {
+		fmt.Fprintf(&b, "> spend: %s\n", escapeMD(spend, 200, true))
+	} else {
+		b.WriteString("> spend: (not found in the previous report)\n")
+	}
+	if summary, ok := reportSummary(report.Body); ok {
+		b.WriteString("> summary:\n")
+		for _, line := range strings.Split(escapeMD(summary, 1500, false), "\n") {
+			if line == "" {
+				b.WriteString(">\n")
+			} else {
+				b.WriteString("> " + line + "\n")
+			}
+		}
+	} else {
+		b.WriteString("> summary: (not found in the previous report)\n")
+	}
+	return b.String()
+}
+
+// finding is one item of the review findings: an issue comment, a review or
+// an inline review comment newer than the last CodeAF push.
+type finding struct {
+	when  time.Time
+	login string
+	assoc string
+	state string // reviews only
+	path  string // inline review comments only
+	line  int    // inline review comments only; 0 when the API sent no line
+	body  string
+}
+
+// prBotCutoff returns when the publish job last pushed to the pull request:
+// the newest commit authored or committed by the Actions bot. With no such
+// commit it returns the zero time, which includes every finding.
+func (g github) prBotCutoff(number int) (time.Time, error) {
+	var commits []prCommit
+	if err := g.get(fmt.Sprintf("/pulls/%d/commits?per_page=100", number), &commits); err != nil {
+		return time.Time{}, err
+	}
+	cutoff := time.Time{}
+	for _, c := range commits {
+		if c.Commit.Author.Email != actionsBotEmail && c.Commit.Committer.Email != actionsBotEmail {
+			continue
+		}
+		t, ok := parseAPITime(c.Commit.Committer.Date)
+		if !ok {
+			t, ok = parseAPITime(c.Commit.Author.Date)
+		}
+		if ok && t.After(cutoff) {
+			cutoff = t
+		}
+	}
+	return cutoff, nil
+}
+
+// reviewFindings collects what reviewers said after cutoff, without the
+// bots' entries and without the comment or review that triggered this run.
+// A source the API cannot answer degrades to a note; it must not fail the
+// brief.
+func (g github) reviewFindings(number int, cutoff time.Time, triggerCommentID, triggerReviewID int64) (items []finding, notes []string) {
+	var comments []issueComment
+	if err := g.get(fmt.Sprintf("/issues/%d/comments?per_page=100", number), &comments); err != nil {
+		notes = append(notes, err.Error())
+	}
+	for _, c := range comments {
+		if c.User.Type == "Bot" || (triggerCommentID != 0 && c.ID == triggerCommentID) {
+			continue
+		}
+		when, ok := parseAPITime(c.CreatedAt)
+		if !ok || !when.After(cutoff) {
+			continue
+		}
+		items = append(items, finding{when: when, login: c.User.Login, assoc: c.AuthorAssociation, body: c.Body})
+	}
+
+	var reviews []comment
+	if err := g.get(fmt.Sprintf("/pulls/%d/reviews?per_page=100", number), &reviews); err != nil {
+		notes = append(notes, err.Error())
+	}
+	for _, r := range reviews {
+		if r.User.Type == "Bot" || (triggerReviewID != 0 && r.ID == triggerReviewID) {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(r.State), "approved") || strings.TrimSpace(r.Body) == "" {
+			continue
+		}
+		when, ok := parseAPITime(r.SubmittedAt)
+		if !ok || !when.After(cutoff) {
+			continue
+		}
+		items = append(items, finding{when: when, login: r.User.Login, assoc: r.AuthorAssociation, state: r.State, body: r.Body})
+	}
+
+	var inline []reviewComment
+	if err := g.get(fmt.Sprintf("/pulls/%d/comments?per_page=100", number), &inline); err != nil {
+		notes = append(notes, err.Error())
+	}
+	for _, c := range inline {
+		if c.User.Type == "Bot" {
+			continue
+		}
+		when, ok := parseAPITime(c.CreatedAt)
+		if !ok || !when.After(cutoff) {
+			continue
+		}
+		f := finding{when: when, login: c.User.Login, assoc: c.AuthorAssociation, path: c.Path, body: c.Body}
+		switch {
+		case c.Line != nil:
+			f.line = *c.Line
+		case c.OriginalLine != nil:
+			f.line = *c.OriginalLine
+		}
+		items = append(items, f)
+	}
+
+	sort.SliceStable(items, func(i, j int) bool { return items[i].when.Before(items[j].when) })
+	return lastN(items, maxFindings), notes
+}
+
+// reviewFindingsSection renders what reviewers said after the last CodeAF
+// push, newest last. Logins, associations, states, paths and bodies are
+// untrusted text and render escaped, one line each; none of it renders raw.
+func reviewFindingsSection(gh github, number int, ev event) string {
+	var b strings.Builder
+	b.WriteString("## Open review findings (after the last CodeAF push)\n")
+	cutoff, err := gh.prBotCutoff(number)
+	if err != nil {
+		fmt.Fprintf(&b, "\n(review findings unavailable: %s)\n", escapeMD(err.Error(), 200, true))
+		return b.String()
+	}
+	var triggerCommentID, triggerReviewID int64
+	if ev.Comment != nil {
+		triggerCommentID = ev.Comment.ID
+	}
+	if ev.Review != nil {
+		triggerReviewID = ev.Review.ID
+	}
+	items, notes := gh.reviewFindings(number, cutoff, triggerCommentID, triggerReviewID)
+	if len(items) == 0 && len(notes) == 0 {
+		b.WriteString("\n(no review findings since the last CodeAF push)\n")
+		return b.String()
+	}
+	b.WriteString("\n")
+	for _, f := range items {
+		fmt.Fprintf(&b, "- %s %s", f.when.UTC().Format("2006-01-02"), escapeMD("@"+f.login, 80, true))
+		detail := f.assoc
+		if f.state != "" {
+			if detail != "" {
+				detail += ", "
+			}
+			detail += f.state
+		}
+		if detail != "" {
+			fmt.Fprintf(&b, " (%s)", escapeMD(detail, 200, true))
+		}
+		if f.path != "" {
+			if f.line != 0 {
+				fmt.Fprintf(&b, " %s line %d:", escapeMD(f.path, 200, true), f.line)
+			} else {
+				fmt.Fprintf(&b, " %s:", escapeMD(f.path, 200, true))
+			}
+		} else {
+			b.WriteString(":")
+		}
+		fmt.Fprintf(&b, " %s\n", escapeMD(f.body, 300, true))
+	}
+	for _, note := range notes {
+		fmt.Fprintf(&b, "(some findings unavailable: %s)\n", escapeMD(note, 200, true))
+	}
+	return b.String()
+}
+
+// asciiLower folds ASCII letters only, byte for byte, so indexes into the
+// result index the original string; multi-byte sequences pass through.
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
+}
+
+// isRefByte reports whether c can be part of a word around a "#N" reference:
+// "foo#12" and "#12ab" are not references.
+func isRefByte(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_'
+}
+
+// hashRefs returns every #N reference in s: a '#' outside a word, digits,
+// and a word boundary after.
+func hashRefs(s string) []int {
+	var out []int
+	for i := 0; i < len(s); i++ {
+		if s[i] != '#' || (i > 0 && isRefByte(s[i-1])) {
+			continue
+		}
+		j := i + 1
+		for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+			j++
+		}
+		if j == i+1 || (j < len(s) && isRefByte(s[j])) {
+			continue
+		}
+		if n, err := strconv.Atoi(s[i+1 : j]); err == nil && n > 0 {
+			out = append(out, n)
+		}
+		i = j - 1
+	}
+	return out
+}
+
+// depsFromBody collects the issue references that follow a "depends on"
+// phrase on the same line ("Depends on #12, #13"), deduplicated and sorted,
+// at most maxDeps of them.
+func depsFromBody(body string) []int {
+	seen := map[int]bool{}
+	var out []int
+	for _, line := range strings.Split(body, "\n") {
+		lower := asciiLower(line)
+		for i := 0; ; {
+			j := strings.Index(lower[i:], "depends on")
+			if j < 0 {
+				break
+			}
+			i += j + len("depends on")
+			for _, n := range hashRefs(line[i:]) {
+				if !seen[n] {
+					seen[n] = true
+					out = append(out, n)
+				}
+			}
+		}
+	}
+	sort.Ints(out)
+	if len(out) > maxDeps {
+		out = out[:maxDeps]
+	}
+	return out
+}
+
+// mergedPRForIssue returns the merged pull request that closed issue n: the
+// timeline's cross-referenced events whose source is a pull request in this
+// repository, of which the one merged most recently wins. m is 0 when none
+// merged. A candidate the API cannot answer is skipped; when none can be
+// answered the first error comes back.
+func (g github) mergedPRForIssue(n int) (int, pull, error) {
+	var events []timelineEvent
+	if err := g.get(fmt.Sprintf("/issues/%d/timeline?per_page=100", n), &events); err != nil {
+		return 0, pull{}, err
+	}
+	best, bestAt, firstErr := 0, time.Time{}, error(nil)
+	var bestPR pull
+	for _, ev := range events {
+		if ev.Event != "cross-referenced" || ev.Source == nil || ev.Source.Issue == nil || ev.Source.Issue.PullRequest == nil {
+			continue
+		}
+		if repo := ev.Source.Issue.Repository; repo != nil && repo.FullName != "" && repo.FullName != g.repo {
+			continue // another repository's pull request
+		}
+		var candidate pull
+		if err := g.get(fmt.Sprintf("/pulls/%d", ev.Source.Issue.Number), &candidate); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		merged, ok := parseAPITime(candidate.MergedAt)
+		if !ok {
+			continue // references the issue but never merged
+		}
+		if best == 0 || merged.After(bestAt) {
+			best, bestPR, bestAt = ev.Source.Issue.Number, candidate, merged
+		}
+	}
+	if best == 0 && firstErr != nil {
+		return 0, pull{}, firstErr
+	}
+	return best, bestPR, nil
+}
+
+// dependencyBullet renders one "depends on" item: number, state and title,
+// and for a closed one the merged pull request that closed it with its
+// changed paths. An API failure degrades that item to a note; it must not
+// fail the brief.
+func dependencyBullet(gh github, n int) string {
+	unavailable := func(reason string) string {
+		return fmt.Sprintf("- #%d (unavailable: %s)\n", n, escapeMD(reason, 200, true))
+	}
+	var it item
+	if err := gh.get(fmt.Sprintf("/issues/%d", n), &it); err != nil {
+		return unavailable(err.Error())
+	}
+	line := fmt.Sprintf("- #%d (%s) %s", n, escapeMD(it.State, 40, true), escapeMD(it.Title, 200, true))
+	m, pr, err := gh.mergedPRForIssue(n)
+	if err != nil {
+		return line + " (unavailable: " + escapeMD(err.Error(), 200, true) + ")\n"
+	}
+	if m == 0 {
+		return line + "\n"
+	}
+	line += fmt.Sprintf(" — merged as PR #%d %s", m, escapeMD(pr.Title, 200, true))
+	var files []prFile
+	if err := gh.get(fmt.Sprintf("/pulls/%d/files?per_page=100", m), &files); err != nil {
+		return line + " (unavailable: " + escapeMD(err.Error(), 200, true) + ")\n"
+	}
+	var b strings.Builder
+	b.WriteString(line + "\n")
+	shown := files
+	if len(shown) > maxDepFiles {
+		shown = shown[:maxDepFiles]
+	}
+	for _, f := range shown {
+		b.WriteString("  - " + escapeMD(f.Filename, 200, true) + "\n")
+	}
+	if rest := len(files) - len(shown); rest > 0 {
+		fmt.Fprintf(&b, "  - … and %d more files\n", rest)
+	}
+	return b.String()
+}
+
+// dependenciesSection renders the issues the target body says it depends on:
+// title and state, and the merged pull request that closed each one.
+func dependenciesSection(gh github, body string) string {
+	var b strings.Builder
+	b.WriteString("## Dependencies (\"depends on\" items)\n")
+	deps := depsFromBody(body)
+	if len(deps) == 0 {
+		b.WriteString("\n(no \"depends on\" items in the body)\n")
+		return b.String()
+	}
+	b.WriteString("\n")
+	for _, n := range deps {
+		b.WriteString(dependencyBullet(gh, n))
+	}
+	return b.String()
+}
+
 func runBrief() error {
 	number, err := strconv.Atoi(os.Getenv("NUMBER"))
 	if err != nil {
@@ -987,13 +1504,15 @@ func runBrief() error {
 	if err != nil {
 		return err
 	}
-	parts := []string{string(standing)}
+	parts := []string{budgetLine(), string(standing)}
+	var targetBody string
 
 	if os.Getenv("MODE") == "issue" {
 		var issue item
 		if err := gh.get(fmt.Sprintf("/issues/%d", number), &issue); err != nil {
 			return err
 		}
+		targetBody = issue.Body
 		parts = append(parts, fmt.Sprintf("# Task: issue #%d — %s\n\n%s", number, issue.Title, issue.Body))
 		if issue.Comments > 0 {
 			thread, err := gh.thread(number)
@@ -1007,6 +1526,7 @@ func runBrief() error {
 		if err := gh.get(fmt.Sprintf("/pulls/%d", number), &pr); err != nil {
 			return err
 		}
+		targetBody = pr.Body
 		parts = append(parts, fmt.Sprintf("# Follow-up on pull request #%d — %s\n\nYou are continuing work on an open pull request. "+
 			"The working tree is its head branch `%s`. Address the request below; do not redo work that is already on the branch.\n\n"+
 			"## PR description\n\n%s", number, pr.Title, pr.Head.Ref, pr.Body))
@@ -1037,6 +1557,12 @@ func runBrief() error {
 		parts = append(parts, "## Conversation\n\n"+thread)
 	}
 
+	parts = append(parts, previousReportSection(gh, number))
+	if os.Getenv("MODE") == "pr" {
+		parts = append(parts, reviewFindingsSection(gh, number, ev))
+	}
+	parts = append(parts, dependenciesSection(gh, targetBody))
+
 	if trigger := ev.trigger(); trigger != nil {
 		text := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(trigger.Body), command))
 		if text == "" {
@@ -1045,6 +1571,7 @@ func runBrief() error {
 		parts = append(parts, fmt.Sprintf("## The request you are acting on now (from @%s)\n\n%s", trigger.User.Login, text))
 	}
 	brief := strings.Join(parts, "\n\n") + "\n"
+	brief = capBrief(brief, maxBriefBytes)
 	fmt.Print(brief)
 	return os.WriteFile(os.Getenv("BRIEF_PATH"), []byte(brief), 0o644)
 }
