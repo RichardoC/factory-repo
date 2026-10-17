@@ -23,6 +23,13 @@
 //	harness ref-check      decide what the weekly upstream-pin check does:
 //	                       create, update or close the one issue tracking
 //	                       commits past .github/codeaf/codeaf-ref (issue #35)
+//	harness merge-default  bring a PR base branch in (issue #57): the run job
+//	                       merges it into the branch before CodeAF works (a
+//	                       conflict is committed with markers and named in
+//	                       the brief); publish recreates that merge from the
+//	                       same two parents, checked by tree hash, and
+//	                       refuses a result that still carries conflict
+//	                       markers
 //
 // Trust model: the `codeaf` label can only be added by people with triage access
 // or above, and /codeaf commands are obeyed only from OWNER/MEMBER/COLLABORATOR.
@@ -56,7 +63,7 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("harness: ")
 	if len(os.Args) < 2 {
-		log.Fatal("usage: harness proxy|gate|next|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|ref-check")
+		log.Fatal("usage: harness proxy|gate|next|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|ref-check|merge-default")
 	}
 	commands := map[string]func() error{
 		"proxy":         runProxy,
@@ -76,6 +83,12 @@ func main() {
 		// The weekly upstream-pin check (issue #35): what the scheduled job
 		// should do about commits past .github/codeaf/codeaf-ref.
 		"ref-check": runRefCheck,
+		// Bringing a PR base branch in (issue #57): the run job merges it
+		// into the PR branch before CodeAF works (a conflict is committed
+		// with markers and named in the brief); publish recreates that merge
+		// from the same two parents, checked by tree hash, and refuses a
+		// result that still carries conflict markers (merge.go).
+		"merge-default": runMergeDefault,
 	}
 	command, ok := commands[os.Args[1]]
 	if !ok {
@@ -2135,6 +2148,17 @@ func runBrief() error {
 		parts = append(parts, fmt.Sprintf("# Follow-up on pull request #%d — %s\n\nYou are continuing work on an open pull request. "+
 			"The working tree is its head branch `%s`. Address the request below; do not redo work that is already on the branch.\n\n"+
 			"## PR description\n\n%s", number, pr.Title, pr.Head.Ref, pr.Body))
+		// Issue #57: the checkout may have merged the base branch tip in
+		// already — cleanly, or with conflict markers the run must resolve.
+		// A conflicted merge that cannot be read fails the brief: CodeAF
+		// would otherwise work on marked files it was never told about.
+		section, err := mergeBriefSection(envOr("MERGE_INFO_FILE", ""))
+		if err != nil {
+			return err
+		}
+		if section != "" {
+			parts = append(parts, section)
+		}
 		// A continuation must say what the issue still requires
 		// (issue #31): when the PR body names the issue it closes,
 		// fetch it and add its task text. An API failure degrades to

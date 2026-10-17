@@ -145,7 +145,19 @@ whether through prompt injection or a compromised model.
   checks the patch's size and that its base commit matches. For a new
   branch whose base the API confirms the default branch contains, it
   instead merges the patch onto the default branch with `git apply --3way`,
-  starting from the base only on a conflict. It applies it with
+  starting from the base only on a conflict. In PR mode the run job may
+  first merge the tip of the PR's base branch into the PR head: an ordinary
+  merge commit when clean, or the same merge committed with conflict
+  markers left in the files when it conflicts, in which case the run's base
+  commit becomes that merge commit and the brief names the conflicted
+  files. publish recreates that merge itself from the same two parents,
+  trusting `merge-info.json` only as bounded, validated fields (40-hex SHAs
+  and a kind of `clean` or `conflicted`): it refuses unless the tree hash
+  it recomputes matches the recorded tree, and refuses the publish if any
+  previously conflicted file still contains a conflict marker. The
+  run-side merge commit is data verified by recomputation, never fetched or
+  trusted; with no `merge-info.json` present, publish falls back to merging
+  the base tip first and applying the patch on top of it. It applies it with
   `git apply`, which runs nothing and refuses `.git` paths, then refuses the
   result if any staged path (rename detection off) is under `.github/` but
   outside `.github/codeaf/`, unless a maintainer approved it. Keep it that

@@ -223,6 +223,41 @@ continuation. At the cap the PR gets a comment and stays a draft for a person
 (a maintainer can still continue it by hand with a `/codeaf` comment). A run
 that ends with `stop: done` marks the PR ready for review.
 
+### Bringing the base branch in (issue #57)
+
+A pull request that conflicts with the default branch used to stay dirty
+forever. The run job hands `publish` a patch against the PR branch's head,
+`publish` applies it and pushes a plain commit, and nothing ever made a
+merge commit -- so the branch never contained `main`, and a person had to
+resolve the conflict by hand. In PR mode the run job now merges the PR base
+branch's tip into the PR head **before** CodeAF works. A clean merge is
+committed as an ordinary merge commit. A conflicting merge is committed
+too, with the conflict markers left in the files: the run's base commit
+becomes that merge commit, and the brief names the conflicted files and
+tells CodeAF to remove every conflict marker (the lines starting with
+`<<<<<<<`, `=======` and `>>>>>>>`). The merge commit exists only in the
+run job's checkout -- the run has no write token and never pushes.
+
+`publish`, which treats everything from `run` as untrusted data, recreates
+the merge commit itself from the same two parents (the PR head and the
+base tip) and refuses unless the tree hash it computes matches the tree
+recorded in the run's `merge-info.json` artifact (its fields: a kind of
+`clean` or `conflicted`, commit, base, onto, tree, files). It then applies
+the patch -- the patch is what removes the markers -- and refuses the
+whole publish if any conflict marker is left in the previously conflicted
+files. When there is no `merge-info.json` (the run died before merging,
+say), `publish` keeps a fallback: it merges the base tip first, then
+applies the patch. The invariants do not move: `git apply` is still the
+only thing applied from `run`, the `.github/` approval check still applies
+to the staged patch diff only, and every new commit still descends from
+the PR head -- no force-push.
+
+One limit: if the base branch changed anything under `.github/workflows/`
+since the PR branched, the base is **not** brought in, by the run job or by
+`publish`. GitHub refuses a `GITHUB_TOKEN` push that carries workflow
+changes, so the patch is pushed alone, as before, and the PR stays behind
+its base until a maintainer updates the branch.
+
 ### Keeping CodeAF current (issue #35)
 
 The CodeAF version is pinned by a full commit SHA in
