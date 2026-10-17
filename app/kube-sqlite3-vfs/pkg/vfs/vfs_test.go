@@ -20,12 +20,15 @@ package vfs
 import (
 	"bytes"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/psanford/sqlite3vfs"
@@ -175,6 +178,35 @@ func lockState(tb testing.TB, fcs *fake.Clientset, f *file) string {
 	return getLockfileConfigMap(tb, fcs, f).Data["lock"]
 }
 
+// sharedHoldersIn parses the lockfile ConfigMap's shared-holders JSON:
+// holder id -> lease expiry.
+func sharedHoldersIn(tb testing.TB, fcs *fake.Clientset, f *file) map[string]time.Time {
+	tb.Helper()
+	raw := getLockfileConfigMap(tb, fcs, f).Data["shared-holders"]
+	if strings.TrimSpace(raw) == "" {
+		return map[string]time.Time{}
+	}
+	holders := map[string]time.Time{}
+	if err := json.Unmarshal([]byte(raw), &holders); err != nil {
+		tb.Fatalf("parse shared-holders %q: %v", raw, err)
+	}
+	return holders
+}
+
+// writerIn parses the lockfile ConfigMap's writer JSON; nil when empty.
+func writerIn(tb testing.TB, fcs *fake.Clientset, f *file) *writerEntry {
+	tb.Helper()
+	raw := getLockfileConfigMap(tb, fcs, f).Data["writer"]
+	if raw == "" {
+		return nil
+	}
+	w := &writerEntry{}
+	if err := json.Unmarshal([]byte(raw), w); err != nil {
+		tb.Fatalf("parse writer %q: %v", raw, err)
+	}
+	return w
+}
+
 func mustWriteAt(tb testing.TB, f *file, p []byte, off int64) int {
 	tb.Helper()
 	n, err := f.WriteAt(p, off)
@@ -208,6 +240,15 @@ func TestOpenFreshFileCreatesLockfileAndEmptySector(t *testing.T) {
 	}
 	if got := lf.Data["relevant-file"]; got != string(f.b32ByteFromString("fresh.db")) {
 		t.Errorf("lockfile relevant-file = %q, want the base32 file label", got)
+	}
+	if got := lf.Data["shared-holders"]; got != "{}" {
+		t.Errorf("fresh lockfile shared-holders = %q, want %q (an opened file holds nothing)", got, "{}")
+	}
+	if got := lf.Data["writer"]; got != "" {
+		t.Errorf("fresh lockfile writer = %q, want empty (an opened file holds nothing)", got)
+	}
+	if got := lf.Labels["data"]; got != "lockfile" {
+		t.Errorf("fresh lockfile data label = %q, want lockfile", got)
 	}
 
 	sectors := listSectorConfigMaps(t, fcs, f)
@@ -698,6 +739,13 @@ func TestDeleteRemovesSectorsAndLockfile(t *testing.T) {
 // The lock levels the sqlite3vfs shim passes through are None=0, Shared=1,
 // Reserved=2, Pending=3, Exclusive=4. SQLite never requests Pending
 // explicitly (it is implicit in the OS backend), and this VFS rejects it.
+//
+// Since issue #47 the lock ConfigMap records WHO holds what: a
+// shared-holders map (holder id -> lease expiry) plus one writer entry, so
+// two files — two processes — can hold SHARED at once, RESERVED excludes
+// other writers only, and CheckReservedLock answers "is any writer held",
+// not "is any lock held". The aggregate "lock" key keeps its old meaning
+// (the highest level held) for readers of the old format.
 
 func TestLockTransitionsValid(t *testing.T) {
 	v, fcs := newTestVFS(t)
@@ -712,6 +760,14 @@ func TestLockTransitionsValid(t *testing.T) {
 	if got := lockState(t, fcs, f); got != sqlite3vfs.LockShared.String() {
 		t.Errorf("lock after Lock(Shared) = %q, want %q", got, sqlite3vfs.LockShared.String())
 	}
+	if holders := sharedHoldersIn(t, fcs, f); len(holders) != 1 {
+		t.Errorf("shared-holders after Lock(Shared) = %v, want exactly this file's entry", holders)
+	} else if _, ok := holders[f.holderID]; !ok {
+		t.Errorf("shared-holders %v lacks this file's holder id", holders)
+	}
+	if w := writerIn(t, fcs, f); w != nil {
+		t.Errorf("writer after Lock(Shared) = %v, want none", w)
+	}
 
 	if err := f.Lock(sqlite3vfs.LockReserved); err != nil {
 		t.Fatalf("Lock(Reserved) from Shared = %v, want nil", err)
@@ -721,6 +777,14 @@ func TestLockTransitionsValid(t *testing.T) {
 	}
 	if got := lockState(t, fcs, f); got != sqlite3vfs.LockExclusive.String() {
 		t.Errorf("lock after Lock(Exclusive) = %q, want %q", got, sqlite3vfs.LockExclusive.String())
+	}
+	// The EXCLUSIVE write subsumes this file's shared entry: the writer is
+	// the only record of the lock now.
+	if holders := sharedHoldersIn(t, fcs, f); len(holders) != 0 {
+		t.Errorf("shared-holders after Lock(Exclusive) = %v, want empty (subsumed by the writer)", holders)
+	}
+	if w := writerIn(t, fcs, f); w == nil || w.ID != f.holderID || w.Level != sqlite3vfs.LockExclusive.String() {
+		t.Errorf("writer after Lock(Exclusive) = %v, want this file at LockExclusive", w)
 	}
 
 	// Requesting a level already held or lower is a silent no-op.
@@ -748,6 +812,9 @@ func TestLockTransitionsInvalid(t *testing.T) {
 	if got := lockState(t, fcs, f); got != sqlite3vfs.LockNone.String() {
 		t.Errorf("failed lock requests changed the stored lock to %q, want %q", got, sqlite3vfs.LockNone.String())
 	}
+	if w := writerIn(t, fcs, f); w != nil {
+		t.Errorf("failed lock requests wrote a writer entry %v, want none", w)
+	}
 }
 
 func TestUnlockTransitions(t *testing.T) {
@@ -766,6 +833,9 @@ func TestUnlockTransitions(t *testing.T) {
 	}
 	if got := lockState(t, fcs, f); got != sqlite3vfs.LockNone.String() {
 		t.Errorf("lock after Unlock(None) = %q, want %q", got, sqlite3vfs.LockNone.String())
+	}
+	if holders := sharedHoldersIn(t, fcs, f); len(holders) != 0 {
+		t.Errorf("shared-holders after Unlock(None) = %v, want empty (this file's entry released)", holders)
 	}
 
 	// Reserved drops straight back to Shared, then to None.
@@ -811,7 +881,10 @@ func TestUnlockRejectsInvalidRequests(t *testing.T) {
 
 // TestCheckReservedLockSecondProcess simulates a second process by holding a
 // second file object over the same (fake) API server: the lock ConfigMap is
-// the shared state between them.
+// the shared state between them. Since the holder-aware format
+// (issue #47), CheckReservedLock reports whether any WRITER (RESERVED or
+// above) is held: shared holders are readers, and another process's plain
+// SHARED lock must not read as "someone has reserved the database".
 func TestCheckReservedLockSecondProcess(t *testing.T) {
 	v, _ := newTestVFS(t)
 	f1 := openTestFile(t, v, "twoproc.db")
@@ -824,8 +897,25 @@ func TestCheckReservedLockSecondProcess(t *testing.T) {
 	if err := f1.Lock(sqlite3vfs.LockShared); err != nil {
 		t.Fatalf("Lock(Shared): %v", err)
 	}
+	// A SHARED holder is a reader, not a reserved-lock holder.
+	if reserved, err := f2.CheckReservedLock(); err != nil || reserved {
+		t.Errorf("CheckReservedLock while another process holds Shared = (%v, %v), want (false, nil)", reserved, err)
+	}
+
+	if err := f1.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatalf("Lock(Reserved): %v", err)
+	}
 	if reserved, err := f2.CheckReservedLock(); err != nil || !reserved {
-		t.Errorf("CheckReservedLock while another process holds Shared = (%v, %v), want (true, nil)", reserved, err)
+		t.Errorf("CheckReservedLock while another process holds Reserved = (%v, %v), want (true, nil)", reserved, err)
+	}
+
+	// Downgrading the writer back to SHARED clears the writer entry, and
+	// the second process observes that too.
+	if err := f1.Unlock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("Unlock(Shared): %v", err)
+	}
+	if reserved, err := f2.CheckReservedLock(); err != nil || reserved {
+		t.Errorf("CheckReservedLock after the writer downgraded = (%v, %v), want (false, nil)", reserved, err)
 	}
 
 	if err := f1.Unlock(sqlite3vfs.LockNone); err != nil {
@@ -835,8 +925,8 @@ func TestCheckReservedLockSecondProcess(t *testing.T) {
 		t.Errorf("CheckReservedLock after the other process unlocked = (%v, %v), want (false, nil)", reserved, err)
 	}
 
-	// The second process observes the released state, so the transition
-	// Shared -> Reserved is legal for it now.
+	// The second process observes the released state, so the transitions
+	// None -> Shared -> Reserved are legal for it now.
 	if err := f2.Lock(sqlite3vfs.LockShared); err != nil {
 		t.Fatalf("second process Lock(Shared): %v", err)
 	}
@@ -986,6 +1076,433 @@ func TestOpenDoesNotAdoptAnotherProcessLock(t *testing.T) {
 	}
 	if got := lockState(t, fcs, fa); got != sqlite3vfs.LockExclusive.String() {
 		t.Errorf("rejected lock requests changed the stored lock to %q, want exclusive", got)
+	}
+}
+
+// TestTwoProcessesMutualExclusion is the core issue #47 test: two vfs
+// instances — two processes — over ONE fake clientset, each file with its
+// own holder id. Both may hold SHARED; only one may hold RESERVED; the
+// other's attempt reports sqlite3vfs.BusyError; EXCLUSIVE waits (BUSY)
+// while any other holder remains and succeeds once it releases.
+func TestTwoProcessesMutualExclusion(t *testing.T) {
+	fcs := fake.NewSimpleClientset()
+	va := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3)
+	vb := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3)
+
+	fa := openTestFile(t, va, "mutual.db")
+	fb := openTestFile(t, vb, "mutual.db")
+	if fa.holderID == "" || fa.holderID == fb.holderID {
+		t.Fatalf("holder ids must be distinct and non-empty, got %q twice", fa.holderID)
+	}
+
+	// Both take SHARED: any number of shared holders may coexist.
+	if err := fa.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("A Lock(Shared): %v", err)
+	}
+	if err := fb.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("B Lock(Shared) while A holds Shared: %v, want nil (readers coexist)", err)
+	}
+	holders := sharedHoldersIn(t, fcs, fa)
+	if len(holders) != 2 {
+		t.Fatalf("shared-holders = %v, want entries for both holders", holders)
+	}
+	for _, f := range []*file{fa, fb} {
+		if _, ok := holders[f.holderID]; !ok {
+			t.Errorf("shared-holders %v lacks %s's entry", holders, f.holderID)
+		}
+	}
+	if got := lockState(t, fcs, fa); got != sqlite3vfs.LockShared.String() {
+		t.Errorf("aggregate lock with two shared holders = %q, want %q", got, sqlite3vfs.LockShared.String())
+	}
+
+	// Only one writer: A takes RESERVED, B is refused with BusyError.
+	if err := fa.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatalf("A Lock(Reserved): %v", err)
+	}
+	if err := fb.Lock(sqlite3vfs.LockReserved); !errors.Is(err, sqlite3vfs.BusyError) {
+		t.Fatalf("B Lock(Reserved) while A holds it = %v, want sqlite3vfs.BusyError", err)
+	}
+	if w := writerIn(t, fcs, fa); w == nil || w.ID != fa.holderID || w.Level != sqlite3vfs.LockReserved.String() {
+		t.Fatalf("writer after A takes Reserved = %v, want A at LockReserved", w)
+	}
+	// B keeps its SHARED through the refused attempt, and the aggregate
+	// still names the highest held level.
+	if holders := sharedHoldersIn(t, fcs, fb); len(holders) != 2 {
+		t.Errorf("shared-holders after B's refused Reserved = %v, want both entries intact", holders)
+	}
+	if got := lockState(t, fcs, fb); got != sqlite3vfs.LockReserved.String() {
+		t.Errorf("aggregate with A Reserved + both Shared = %q, want %q", got, sqlite3vfs.LockReserved.String())
+	}
+
+	// A downgrades to SHARED; B can take RESERVED now.
+	if err := fa.Unlock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("A Unlock(Shared): %v", err)
+	}
+	if w := writerIn(t, fcs, fa); w != nil {
+		t.Errorf("writer after A downgraded = %v, want none", w)
+	}
+	if err := fb.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatalf("B Lock(Reserved) after A downgraded: %v, want nil", err)
+	}
+
+	// EXCLUSIVE waits (BusyError) while another holder still holds SHARED.
+	if err := fb.Lock(sqlite3vfs.LockExclusive); !errors.Is(err, sqlite3vfs.BusyError) {
+		t.Fatalf("B Lock(Exclusive) while A holds Shared = %v, want sqlite3vfs.BusyError", err)
+	}
+	// The refused attempt leaves B holding PENDING, which blocks new
+	// readers from now on.
+	if w := writerIn(t, fcs, fb); w == nil || w.ID != fb.holderID || w.Level != sqlite3vfs.LockPending.String() {
+		t.Fatalf("writer after B's refused Exclusive = %v, want B at LockPending", w)
+	}
+	if got := lockState(t, fcs, fb); got != sqlite3vfs.LockPending.String() {
+		t.Errorf("aggregate with B Pending = %q, want %q", got, sqlite3vfs.LockPending.String())
+	}
+	fc := openTestFile(t, va, "mutual.db")
+	if err := fc.Lock(sqlite3vfs.LockShared); !errors.Is(err, sqlite3vfs.BusyError) {
+		t.Fatalf("C Lock(Shared) while B holds Pending = %v, want sqlite3vfs.BusyError (pending blocks readers)", err)
+	}
+
+	// A releases; B's EXCLUSIVE now succeeds and subsumes B's own entry.
+	if err := fa.Unlock(sqlite3vfs.LockNone); err != nil {
+		t.Fatalf("A Unlock(None): %v", err)
+	}
+	if err := fb.Lock(sqlite3vfs.LockExclusive); err != nil {
+		t.Fatalf("B Lock(Exclusive) after A released: %v, want nil", err)
+	}
+	if holders := sharedHoldersIn(t, fcs, fb); len(holders) != 0 {
+		t.Errorf("shared-holders after B Exclusive = %v, want empty (B's own entry subsumed)", holders)
+	}
+	if w := writerIn(t, fcs, fb); w == nil || w.Level != sqlite3vfs.LockExclusive.String() {
+		t.Errorf("writer after B Exclusive = %v, want LockExclusive", w)
+	}
+	if got := lockState(t, fcs, fb); got != sqlite3vfs.LockExclusive.String() {
+		t.Errorf("aggregate after B Exclusive = %q, want %q", got, sqlite3vfs.LockExclusive.String())
+	}
+}
+
+// TestCASRetriesOnConflict pins the compare-and-swap: one injected 409 on
+// the lock ConfigMap Update is retried — the CAS re-reads the state
+// (including the other holder's entry) and re-decides, converging without a
+// lost update.
+func TestCASRetriesOnConflict(t *testing.T) {
+	v, fcs := newTestVFS(t)
+	fa := openTestFile(t, v, "conflict.db")
+	fb := openTestFile(t, v, "conflict.db")
+
+	if err := fb.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("B Lock(Shared): %v", err)
+	}
+	if err := fa.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("A Lock(Shared): %v", err)
+	}
+
+	// The next lock ConfigMap Update fails once with a real 409.
+	var attempts, injected int32
+	fcs.PrependReactor("update", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		ua, ok := action.(k8stesting.UpdateAction)
+		if !ok {
+			return false, nil, nil
+		}
+		cm, ok := ua.GetObject().(*v1.ConfigMap)
+		if !ok || cm.Name != fa.LockFileName() {
+			return false, nil, nil
+		}
+		if atomic.AddInt32(&attempts, 1) > 1 {
+			return false, nil, nil
+		}
+		atomic.AddInt32(&injected, 1)
+		return true, nil, kerrors.NewConflict(v1.Resource("configmaps"), fa.LockFileName(), errors.New("injected 409"))
+	})
+	// Count only the updates of the transition under test.
+	fcs.ClearActions()
+
+	if err := fa.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatalf("A Lock(Reserved) under an injected 409 = %v, want nil (the CAS retries)", err)
+	}
+	if injected != 1 {
+		t.Errorf("injected conflict count = %d, want exactly 1", injected)
+	}
+	if attempts != 2 {
+		t.Errorf("lock update attempts seen by the reactor = %d, want 2 (one 409 + one retry)", attempts)
+	}
+
+	// The converged state carries BOTH B's shared entry (not lost by the
+	// retry) and A's writer.
+	holders := sharedHoldersIn(t, fcs, fa)
+	if _, ok := holders[fb.holderID]; !ok {
+		t.Errorf("shared-holders %v lost B's entry: the retry overwrote instead of re-deciding", holders)
+	}
+	if _, ok := holders[fa.holderID]; !ok {
+		t.Errorf("shared-holders %v lost A's entry", holders)
+	}
+	if w := writerIn(t, fcs, fa); w == nil || w.ID != fa.holderID || w.Level != sqlite3vfs.LockReserved.String() {
+		t.Errorf("writer after retried Reserved = %v, want A at LockReserved", w)
+	}
+
+	// Exactly two Update attempts were made against the lock ConfigMap:
+	// the conflicted one and the successful retry.
+	updates := 0
+	for _, a := range fcs.Actions() {
+		if a.GetVerb() == "update" && a.GetResource().Resource == "configmaps" {
+			updates++
+		}
+	}
+	if updates != 2 {
+		t.Errorf("lock ConfigMap updates = %d, want 2 (one 409 + one retry)", updates)
+	}
+}
+
+// TestStaleHolderPruned pins lease expiry: a holder that stops renewing —
+// a crashed process — is pruned by the next CAS of another process, so its
+// shared entry and writer stop blocking RESERVED and EXCLUSIVE even though
+// it never unlocked.
+func TestStaleHolderPruned(t *testing.T) {
+	fcs := fake.NewSimpleClientset()
+	lease := 80 * time.Millisecond
+	va := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3, WithLockLease(lease))
+	vb := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3) // default 30s lease
+
+	fa := openTestFile(t, va, "stale-holder.db")
+	if err := fa.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("A Lock(Shared): %v", err)
+	}
+	if err := fa.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatalf("A Lock(Reserved): %v", err)
+	}
+
+	// B (with its long default lease) joins as a reader; A's writer blocks
+	// B's RESERVED.
+	fb := openTestFile(t, vb, "stale-holder.db")
+	if err := fb.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("B Lock(Shared): %v", err)
+	}
+	if err := fb.Lock(sqlite3vfs.LockReserved); !errors.Is(err, sqlite3vfs.BusyError) {
+		t.Fatalf("B Lock(Reserved) while A (live) holds it = %v, want sqlite3vfs.BusyError", err)
+	}
+
+	// A dies: no more renewals. Sleep past its lease.
+	time.Sleep(lease + 80*time.Millisecond)
+
+	// B's next CAS prunes A's expired entries: the RESERVED is free again
+	// even though A never unlocked, and B can climb to EXCLUSIVE.
+	if err := fb.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatalf("B Lock(Reserved) after A's lease expired: %v, want nil (stale holder pruned)", err)
+	}
+	if err := fb.Lock(sqlite3vfs.LockExclusive); err != nil {
+		t.Fatalf("B Lock(Exclusive) after A's lease expired: %v, want nil", err)
+	}
+	holders := sharedHoldersIn(t, fcs, fb)
+	if _, ok := holders[fa.holderID]; ok {
+		t.Errorf("A's expired entry survived B's CAS: %v", holders)
+	}
+	if w := writerIn(t, fcs, fb); w == nil || w.ID != fb.holderID || w.Level != sqlite3vfs.LockExclusive.String() {
+		t.Errorf("writer after B Exclusive = %v, want B at LockExclusive (A's stale writer pruned)", w)
+	}
+	if got := lockState(t, fcs, fb); got != sqlite3vfs.LockExclusive.String() {
+		t.Errorf("aggregate after B Exclusive = %q, want %q", got, sqlite3vfs.LockExclusive.String())
+	}
+}
+
+// TestLeaseRenewedOnLockPathOps pins renewal: a no-op Lock on the level
+// already held renews a lease that is under half spent, and the renewed
+// entry is still live — unpruned by another process's CAS — after the
+// original expiry has passed. The renewal never touches the sector read
+// path, which is separately pinned by TestSectorReadPathMakesNoLockCalls.
+func TestLeaseRenewedOnLockPathOps(t *testing.T) {
+	fcs := fake.NewSimpleClientset()
+	lease := 120 * time.Millisecond
+	va := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3, WithLockLease(lease))
+	vb := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3)
+
+	fa := openTestFile(t, va, "renewal.db")
+	if err := fa.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("A Lock(Shared): %v", err)
+	}
+	first := sharedHoldersIn(t, fcs, fa)[fa.holderID]
+
+	// Past half the lease, still before expiry: the no-op Lock renews.
+	time.Sleep(lease/2 + 20*time.Millisecond)
+	if err := fa.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("A no-op Lock(Shared) (should renew): %v", err)
+	}
+	second := sharedHoldersIn(t, fcs, fa)[fa.holderID]
+	if !second.After(first) {
+		t.Fatalf("renewal did not move the lease forward: %v -> %v", first, second)
+	}
+
+	// The original expiry is now past. Another process's CAS must find A's
+	// renewed entry live and leave it alone.
+	time.Sleep(lease/2 + 20*time.Millisecond)
+	fb := openTestFile(t, vb, "renewal.db")
+	if err := fb.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("B Lock(Shared): %v", err)
+	}
+	if err := fb.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatalf("B Lock(Reserved): %v", err)
+	}
+	holders := sharedHoldersIn(t, fcs, fa)
+	if _, ok := holders[fa.holderID]; !ok {
+		t.Error("A's renewed entry was pruned although it never lapsed")
+	}
+}
+
+// TestLeaseLossDetected pins the losing side of a lapsed lease: a file that
+// made no lock-path call past its own lease discovers, on its next no-op
+// lock operation, that its entries are gone — the local belief is reset and
+// the loss is reported instead of writing under a false belief.
+func TestLeaseLossDetected(t *testing.T) {
+	fcs := fake.NewSimpleClientset()
+	lease := 40 * time.Millisecond
+	v := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3, WithLockLease(lease))
+
+	fa := openTestFile(t, v, "lost.db")
+	if err := fa.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("A Lock(Shared): %v", err)
+	}
+	time.Sleep(2 * lease) // the lease lapses with no lock-path call
+
+	err := fa.Lock(sqlite3vfs.LockShared)
+	if !errors.Is(err, errLockLeaseLost) {
+		t.Fatalf("Lock after lapsed lease = %v, want errLockLeaseLost", err)
+	}
+	if fa.lockLevel != sqlite3vfs.LockNone || !fa.lockKnown {
+		t.Errorf("after lease loss local state = (level %v, known %v), want (NONE, true)", fa.lockLevel, fa.lockKnown)
+	}
+
+	// The file re-acquires cleanly, as a fresh holder.
+	if err := fa.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("re-Lock(Shared) after the loss: %v", err)
+	}
+	if holders := sharedHoldersIn(t, fcs, fa); len(holders) != 1 {
+		t.Errorf("shared-holders after re-acquire = %v, want exactly one entry", holders)
+	}
+}
+
+// TestCloseReleasesHolder pins Close (= Unlock(NONE)): the closing file's
+// shared entry and writer are removed and every other holder's entries
+// survive.
+func TestCloseReleasesHolder(t *testing.T) {
+	v, fcs := newTestVFS(t)
+	fa := openTestFile(t, v, "closing.db")
+	fb := openTestFile(t, v, "closing.db")
+
+	if err := fa.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("A Lock(Shared): %v", err)
+	}
+	if err := fb.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("B Lock(Shared): %v", err)
+	}
+	if err := fa.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatalf("A Lock(Reserved): %v", err)
+	}
+
+	if err := fa.Close(); err != nil {
+		t.Fatalf("A Close: %v", err)
+	}
+	holders := sharedHoldersIn(t, fcs, fa)
+	if len(holders) != 1 {
+		t.Fatalf("shared-holders after A Close = %v, want only B's entry", holders)
+	}
+	if _, ok := holders[fb.holderID]; !ok {
+		t.Errorf("B's entry did not survive A's Close: %v", holders)
+	}
+	if w := writerIn(t, fcs, fa); w != nil {
+		t.Errorf("writer after A Close = %v, want none", w)
+	}
+	if got := lockState(t, fcs, fa); got != sqlite3vfs.LockShared.String() {
+		t.Errorf("aggregate after A Close = %q, want %q (B still holds Shared)", got, sqlite3vfs.LockShared.String())
+	}
+
+	// Closing an already-closed file is a no-op.
+	if err := fa.Close(); err != nil {
+		t.Errorf("second Close = %v, want nil", err)
+	}
+	if got := lockState(t, fcs, fa); got != sqlite3vfs.LockShared.String() {
+		t.Errorf("second Close changed the aggregate to %q, want %q", got, sqlite3vfs.LockShared.String())
+	}
+}
+
+// TestAggregateLockKeyStaysMaxHeldLevel walks mixed states over two holders
+// and asserts the aggregate "lock" key — the only key readers of the old
+// format see — always names the highest level actually held.
+func TestAggregateLockKeyStaysMaxHeldLevel(t *testing.T) {
+	v, fcs := newTestVFS(t)
+	fa := openTestFile(t, v, "aggregate.db")
+	fb := openTestFile(t, v, "aggregate.db")
+
+	assertAggregate := func(want sqlite3vfs.LockType, label string) {
+		t.Helper()
+		if got := lockState(t, fcs, fa); got != want.String() {
+			t.Errorf("%s: aggregate = %q, want %q", label, got, want.String())
+		}
+	}
+
+	if err := fa.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("A Lock(Shared): %v", err)
+	}
+	if err := fb.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("B Lock(Shared): %v", err)
+	}
+	assertAggregate(sqlite3vfs.LockShared, "two shared holders")
+
+	if err := fa.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatalf("A Lock(Reserved): %v", err)
+	}
+	assertAggregate(sqlite3vfs.LockReserved, "A reserved over two shared")
+
+	if err := fa.Unlock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("A Unlock(Shared): %v", err)
+	}
+	assertAggregate(sqlite3vfs.LockShared, "A back to shared")
+
+	if err := fa.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatalf("A Lock(Reserved) again: %v", err)
+	}
+	if err := fa.Lock(sqlite3vfs.LockExclusive); !errors.Is(err, sqlite3vfs.BusyError) {
+		t.Fatalf("A Lock(Exclusive) while B holds Shared = %v, want sqlite3vfs.BusyError", err)
+	}
+	assertAggregate(sqlite3vfs.LockPending, "A stuck in Pending")
+
+	if err := fb.Unlock(sqlite3vfs.LockNone); err != nil {
+		t.Fatalf("B Unlock(None): %v", err)
+	}
+	assertAggregate(sqlite3vfs.LockPending, "B released, A still Pending")
+
+	if err := fa.Lock(sqlite3vfs.LockExclusive); err != nil {
+		t.Fatalf("A Lock(Exclusive) after B released: %v", err)
+	}
+	assertAggregate(sqlite3vfs.LockExclusive, "A exclusive")
+
+	if err := fa.Unlock(sqlite3vfs.LockNone); err != nil {
+		t.Fatalf("A Unlock(None): %v", err)
+	}
+	assertAggregate(sqlite3vfs.LockNone, "all released")
+}
+
+// TestSectorReadPathMakesNoLockCalls pins the zero-API-call rule for the
+// hot sector-read path: once the cache is warm under a held lock, reads
+// make no Kubernetes calls at all — the lease machinery must never sneak a
+// renewal into ReadAt.
+func TestSectorReadPathMakesNoLockCalls(t *testing.T) {
+	v, fcs := newTestVFS(t)
+	f := openTestFile(t, v, "hotread.db")
+
+	data := make([]byte, 128)
+	fillPattern(data)
+	mustWriteAt(t, f, data, 0)
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("Lock(Shared): %v", err)
+	}
+	if _, err := f.FileSize(); err != nil {
+		t.Fatalf("FileSize: %v", err)
+	}
+
+	fcs.ClearActions()
+	if n := mustReadAt(t, f, make([]byte, 128), 0); n != 128 {
+		t.Fatalf("read %d bytes, want 128", n)
+	}
+	for _, a := range fcs.Actions() {
+		t.Errorf("read under a held SHARED lock made a %s %s call, want none (the hot read path must be cache-only)", a.GetVerb(), a.GetResource().Resource)
 	}
 }
 

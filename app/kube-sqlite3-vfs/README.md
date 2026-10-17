@@ -35,7 +35,12 @@ rather than single numbers.
 
 Creates a set of configmaps per file requested, which is named a base32 encoding of the filename
 the namespace contains
-a configmap called "lockfile" which contains the lock information
+a configmap called `<base32 filename>-lockfile` which holds the locking state
+(issue #47): the `lock` data key still carries the highest lock level any live
+holder has — the aggregate old readers saw; a `shared-holders` data key maps every
+SHARED holder's id (a UUID generated per `Open`) to its lease expiry; a `writer`
+data key carries the one writer's id, level and lease expiry, or is empty when no
+writer holds
 a series of configmaps named which contain up to 64kB of data each
 
 namespaces all labelled with "kube-sqlite3-vfs": "used" to ease cleanup
@@ -64,20 +69,28 @@ panics on an ordinary error.
 
 Using an in-memory journal (`_journal=MEMORY`, as `main.go` and the cmd tools do) still means a crash in the middle of a transaction cannot be rolled back, so it is very likely to corrupt your data. That warning stands.
 
-**Concurrent writers from several processes are not safe.** The lock ConfigMap gives no real mutual exclusion: it stores one bare lock level, has no owner, and every transition is an unconditional Update with no resourceVersion. Nothing refuses a transition to a level another process already holds — a second process's `Lock` simply overwrites the level the first one wrote — and sector writes are never checked against the lock, so a writer's EXCLUSIVE lock does not actually stop another process from writing (or from serving reads from its own cache while that write happens). Use one writer at a time. This is true of the code as imported too; fixing it would need owner tracking plus compare-and-swap (resourceVersion) updates on the lock ConfigMap and is deliberately out of scope here.
+**Concurrent access between processes is now guarded by real mutual exclusion (issue #47) — under the limits listed below.** The lock ConfigMap no longer stores one bare level written blindly. Every transition is a compare-and-swap: the holder state is read, the new state is decided from what was read, and the Update carries the `resourceVersion` just read, so two processes can never overwrite each other's holdings; on a 409 Conflict the state is re-read and the decision re-made, never forced. A missing lockfile is created with Create, and `AlreadyExists` from that Create is treated as "re-read". Each file — generated once per `Open`, and per `NewFile` — carries a holder id (a UUID) and every lock operation acts as that holder, so a process can tell its own locks from another process's; `Close` releases them. The stored state expresses sqlite's model: any number of SHARED holders, at most one writer at a time (RESERVED, PENDING or EXCLUSIVE), and EXCLUSIVE only once no other holder remains. A transition another process has made impossible — a second RESERVED, EXCLUSIVE while other SHARED holders remain — returns SQLITE_BUSY (`sqlite3vfs.BusyError`) instead of blocking; sqlite retries on its own schedule. The aggregate `lock` key still holds the highest level any live holder has, so a reader of the old single-level format still sees a meaningful value. The #19 cache rules are unchanged: caches are dropped before any downgrade is written, and a file never adopts the ConfigMap's stored state as its own lock.
 
-The VFS is no longer "really very slow" at the Kubernetes API, though: reads and writes no longer LIST every sector ConfigMap of the file, `FileSize` is O(1) from memory while a SHARED-or-better lock is held (and otherwise costs one LIST, which also revalidates and warms the sector cache), each changed sector is written exactly once per write (UPDATE or CREATE chosen from what is known), reads never create missing sectors, and the lock level is tracked locally instead of GETting the lock ConfigMap before every transition. See the benchmarks below.
+The guarantees hold only under these limits:
+
+* **Roughly synchronised clocks.** Leases compare client-generated UTC timestamps (default 30 s, configurable with `WithLockLease`): every holder entry carries an expiry, entries past their expiry are pruned before any lock decision, and a successful CAS re-stamps the holder's own entries.
+* **A paused process can lose its lock.** A process paused or suspended for longer than its lease — a laptop asleep, a VM frozen, a SIGSTOP — has its entries pruned by the next holder's CAS and its lock can be taken by another process. On resuming, its next lock-path operation reports the loss and resets its local state instead of writing under a false belief.
+* **Every process must run this version.** A process still running the pre-#47 code updates the lock ConfigMap unconditionally, carrying no resourceVersion, and overwrites whatever holders are stored there. The guarantee holds only while every process touching the database runs the new code.
+* **Renewal happens on the lock path only.** `Lock`, `Unlock`, `Close` and `CheckReservedLock` re-stamp the lease when less than half of it remains; the sector read/write path gains no renewal calls at all. A single transaction that runs far longer than the lease without any VFS lock call — one long statement on one connection — therefore relies on renewal at its next lock-path operation: in the meantime the lease can lapse and the lock can be pruned and taken, and the loss is reported only at that next lock-path call.
+* **Sector writes are not gated by the lock.** The exclusion is enforced on the lock transitions sqlite performs; the VFS still does not refuse a `WriteAt` from a file that holds no lock. Correct sqlite clients only write sectors while holding EXCLUSIVE, but the cmd tools (which drive `NewFile` directly) bypass locking entirely, as before.
+
+The VFS is no longer "really very slow" at the Kubernetes API, though: reads and writes no longer LIST every sector ConfigMap of the file, `FileSize` is O(1) from memory while a SHARED-or-better lock is held (and otherwise costs one LIST, which also revalidates and warms the sector cache), each changed sector is written exactly once per write (UPDATE or CREATE chosen from what is known), reads never create missing sectors, and a lock transition for a level already held still makes no lock API call at all. See the benchmarks below.
 
 ## TODO
 
 * ~~have filesize be O(1) rather than O(n)~~ — done: `FileSize` is O(1) while a SHARED-or-better lock is held, and otherwise costs one LIST that revalidates and warms the sector cache.
 
-## On-cluster data layout (unchanged)
+## On-cluster data layout (issue #47 added lockfile keys; nothing else moved)
 
-The optimisation did not change the on-cluster data layout, so databases written by the old code remain readable by the new code and vice versa:
+The on-cluster data layout is backward and forward compatible — databases written by the old code remain readable by the new code and vice versa — but issue #47 did add two data keys to the lockfile ConfigMap (see the bullet below):
 
 * sector ConfigMaps are still named `<base32 filename>-<index>`, labelled `data: sector` and `relevant-file: <base32 filename>`, and hold the sector bytes in the `sector` binary key plus the `filename` data key;
-* the lockfile ConfigMap is still named `<base32 filename>-lockfile`, labelled `data: lockfile` and `relevant-file`, and holds the lock level in the `lock` data key;
+* the lockfile ConfigMap is still named `<base32 filename>-lockfile`, labelled `data: lockfile` and `relevant-file`, and holds the locking state: the lock level — the highest level any live holder has — in the `lock` data key as before, plus the issue #47 keys `shared-holders` (holder id → lease expiry) and `writer` (the one writer's id, level and lease); a lockfile written by the old code carries only `lock`, which the new code reads as "nobody holds anything" until its next CAS rewrites it in the new format;
 * namespaces are still labelled `kube-sqlite3-vfs: used`.
 
 ## Benchmarks (issue #8: fewer API calls per operation)
@@ -98,6 +111,23 @@ What changed per operation: an unlocked read used to pay a LIST + a GET of the l
 BenchmarkSequentialReadLocked is new: it measures the under-lock steady state directly. After one warm-up read pays the revalidating LIST, a read under a held SHARED lock costs zero API calls — `FileSize` is served from memory and every sector comes from the cache.
 
 The insert benchmark now runs at 64 KiB pages (the `main.go`/cmd-tools configuration: one VFS sector per page) with ~200-byte rows, so its transaction spans seven 64 KiB sectors and exercises the multi-sector write path. Its previous one-sector numbers are kept above for the record. There is no before number for the multi-sector workload: the pre-optimisation code panicked the moment a database outgrew its first sector, so it cannot run this workload at all.
+
+## Locking (issue #47): mutual exclusion and what it costs
+
+The WARNINGS section above describes the new locking guarantees: compare-and-swap on the lock ConfigMap via `resourceVersion`, holder ids, leases. This table records what that costs at the Kubernetes API, measured as in the issue #8 table above — fake clientset, `go test ./pkg/vfs -run ZZZ -bench . -benchtime 10x -count 2`; BEFORE was recorded on the pre-#47 tree with the same flags, AFTER on this tree. `BenchmarkLockUnlockShared` was additionally run with `-count 5` for a stable median. ns/op varies between runs; api-calls/op is exact and is the number that matters.
+
+| Benchmark                                                                | api-calls/op before | api-calls/op after | ns/op after (run 1 / run 2) |
+| ------------------------------------------------------------------------ | ------------------- | ------------------ | --------------------------- |
+| BenchmarkSequentialRead                                                  | 2.000               | 2.000              | 197822 / 212903             |
+| BenchmarkSequentialReadLocked (held SHARED lock)                         | 0                   | 0                  | 80374 / 87765               |
+| BenchmarkRandomPageRead                                                  | 2.000               | 2.000              | 468399 / 535553             |
+| BenchmarkSequentialWrite                                                 | 2.000               | 2.000              | 200935 / 216833             |
+| BenchmarkSQLiteInsert1000Rows (64 KiB pages, transaction spans 7 sectors) | 17.00               | 24.00              | 2456432 / 2197694           |
+| BenchmarkLockUnlockShared                                                | 2.000               | 4.000              | 24686 / 19554               |
+| BenchmarkLockUnlockExclusive (new)                                       | —                   | 6.000              | 30912 / 31336               |
+
+The read and write paths are untouched — their api-calls/op is identical, because the sector path still makes no lock calls at all (`BenchmarkSequentialReadLocked` stays at 0). Everything that moved is the CAS itself: a transition that writes now GETs the lock ConfigMap first, where the old code wrote blindly. `BenchmarkLockUnlockShared`'s acquire + release cycle goes 2 → 4 (one GET + one UPDATE per transition). The insert transaction performs five lock transitions — SHARED, RESERVED, EXCLUSIVE, back to SHARED, NONE — costing +5 GETs, and its EXCLUSIVE climb is now two CAS steps (claim PENDING, then acquire EXCLUSIVE once no other holder remains) where the old code wrote EXCLUSIVE in a single blind UPDATE, another +1 GET +1 UPDATE: 17 → 24. `BenchmarkLockUnlockExclusive` is new and has no before number; its three transitions (PENDING claim, EXCLUSIVE acquire, downgrade to SHARED) cost 6. The extra GET and the JSON round-trip of the holder state also show in CPU terms: `BenchmarkLockUnlockShared` went from ~12.9k–14.7k ns/op and 127 allocs/op before to ~20k–41k ns/op across seven runs (median of the five `-count 5` runs ~30k) and 170 allocs/op. What did not change: `CheckReservedLock` costs the same as before (zero calls while this file holds RESERVED or better locally, one GET otherwise), and a lock transition for a level already held still makes no lock API call.
+
 ## Go 1.27 and dependencies (issue #9)
 
 The module moved from `go 1.19` to `go 1.27` and its dependencies from their

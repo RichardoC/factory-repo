@@ -216,3 +216,61 @@ func BenchmarkSQLiteInsert1000Rows(b *testing.B) {
 	}
 	b.ReportMetric(float64(calls)/float64(b.N), "api-calls/op")
 }
+
+// BenchmarkLockUnlockShared measures the lock path itself: one
+// Lock(Shared) transition and one Unlock(None) per iteration, with the
+// api-calls/op metric counting the Kubernetes calls each full acquire +
+// release cycle costs. Issue #47 replaces the lock ConfigMap's single
+// unconditional write with a read-modify-write CAS (resourceVersion) that
+// also carries holders and leases, so the lock path costs more calls per
+// transition than it did; this benchmark is the before/after measure. Its
+// issue #47 baseline (before the CAS change, run with -benchtime 10x) is
+// tabulated in the module README.
+func BenchmarkLockUnlockShared(b *testing.B) {
+	v, fcs := newTestVFS(b)
+	f := openTestFile(b, v, "bench-lock-unlock.db")
+
+	var calls int64
+	b.ReportAllocs()
+	for range b.N {
+		fcs.ClearActions()
+		if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+			b.Fatal(err)
+		}
+		if err := f.Unlock(sqlite3vfs.LockNone); err != nil {
+			b.Fatal(err)
+		}
+		calls += int64(len(fcs.Actions()))
+	}
+	b.ReportMetric(float64(calls)/float64(b.N), "api-calls/op")
+}
+
+// BenchmarkLockUnlockExclusive measures the write side of the lock path:
+// one climb from a held SHARED lock to EXCLUSIVE — sqlite's SHARED ->
+// (PENDING) -> EXCLUSIVE route, which issue #47 implements as two CAS
+// steps against the lock ConfigMap — and one downgrade back to SHARED
+// (Unlock below the held level), per iteration. Holding SHARED between
+// iterations mirrors a sqlite writer between transactions. Each iteration
+// is therefore three CAS transitions: two for the climb, one for the
+// downgrade. Its issue #47 baseline is tabulated in the module README.
+func BenchmarkLockUnlockExclusive(b *testing.B) {
+	v, fcs := newTestVFS(b)
+	f := openTestFile(b, v, "bench-lock-unlock-exclusive.db")
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		b.Fatal(err)
+	}
+
+	var calls int64
+	b.ReportAllocs()
+	for range b.N {
+		fcs.ClearActions()
+		if err := f.Lock(sqlite3vfs.LockExclusive); err != nil {
+			b.Fatal(err)
+		}
+		if err := f.Unlock(sqlite3vfs.LockShared); err != nil {
+			b.Fatal(err)
+		}
+		calls += int64(len(fcs.Actions()))
+	}
+	b.ReportMetric(float64(calls)/float64(b.N), "api-calls/op")
+}

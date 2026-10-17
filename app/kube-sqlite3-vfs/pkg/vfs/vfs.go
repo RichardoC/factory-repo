@@ -19,13 +19,16 @@ package vfs
 import (
 	"context"
 	"encoding/base32"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"maps"
 	"strings"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/psanford/sqlite3vfs"
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
@@ -41,6 +44,31 @@ const (
 	// SectorSize is the size of one stored sector: 64 KiB, the largest page
 	// size SQLite supports. Each sector is stored as one ConfigMap.
 	SectorSize = 64 * 1024 // Max pagesize supported by SQLITE3
+
+	// defaultLockLease is how long a lock holder's lease lasts unless
+	// WithLockLease says otherwise.
+	defaultLockLease = 30 * time.Second
+
+	// maxLockCASAttempts bounds the compare-and-swap retries on the lock
+	// ConfigMap. Every attempt re-reads the state and re-decides from what
+	// it read, so the bound only matters under sustained contention.
+	maxLockCASAttempts = 10
+)
+
+// The lock ConfigMap's Data holds the lock state under these keys:
+//
+//   - lockLevelDataKey ("lock"): the aggregate lock level over all live
+//     holders, spelled exactly as the single-writer format spelled it
+//     (LockNone…LockExclusive), so a reader of the old format still sees a
+//     meaningful level;
+//   - sharedHoldersDataKey ("shared-holders"): a JSON object mapping holder
+//     id to lease expiry (RFC3339Nano, UTC) — any number of SHARED holders;
+//   - writerDataKey ("writer"): a JSON object {"id","level","lease"} for
+//     the single RESERVED/PENDING/EXCLUSIVE holder, or empty when none.
+const (
+	lockLevelDataKey     = "lock"
+	sharedHoldersDataKey = "shared-holders"
+	writerDataKey        = "writer"
 )
 
 // CommonSectorLabel and LockfileLabel are the base labels every sector and
@@ -57,17 +85,42 @@ type vfs struct {
 	retries   int
 	namespace string
 
+	// lockLease is how long one holder's lock entries stay valid without
+	// renewal. A holder that stops renewing — a crashed process — is
+	// pruned by the next CAS of any other process, so a dead holder can
+	// never block the database forever.
+	lockLease time.Duration
+
 	// ctx backs every Kubernetes call this VFS makes. It is fixed at
 	// construction because SQLite enters the VFS through cgo, where there
 	// is no caller context to propagate.
 	ctx context.Context
 }
 
+// Option configures a vfs at construction time.
+type Option func(*vfs)
+
+// WithLockLease sets how long a lock holder's entries stay valid without
+// renewal. The default is defaultLockLease (30s); a holder renews on every
+// successful lock CAS and whenever a lock-path operation finds less than
+// half the lease remaining.
+func WithLockLease(d time.Duration) Option {
+	return func(v *vfs) {
+		if d > 0 {
+			v.lockLease = d
+		}
+	}
+}
+
 // NewVFS returns a VFS that stores database files as ConfigMaps in
 // namespace. Every Kubernetes call the VFS makes uses ctx. retries is the
 // number of attempts Open makes against races between concurrent clients.
-func NewVFS(ctx context.Context, kc kubernetes.Interface, namespace string, logger *slog.Logger, retries int) *vfs {
-	return &vfs{kc: kc, logger: logger, retries: retries, namespace: namespace, ctx: ctx}
+func NewVFS(ctx context.Context, kc kubernetes.Interface, namespace string, logger *slog.Logger, retries int, opts ...Option) *vfs {
+	v := &vfs{kc: kc, logger: logger, retries: retries, namespace: namespace, lockLease: defaultLockLease, ctx: ctx}
+	for _, opt := range opts {
+		opt(v)
+	}
+	return v
 }
 
 func (f *file) b32ByteFromString(s string) []byte {
@@ -77,10 +130,11 @@ func (f *file) b32ByteFromString(s string) []byte {
 	return dst
 }
 
-// Close implements sqlite3vfs.File: it releases the file's lock by writing
-// LockNone to the lock ConfigMap.
+// Close implements sqlite3vfs.File: it releases the file's holdings —
+// exactly Unlock(NONE), removing this file's shared-holder entry and writer
+// (if any) and leaving every other process's entries alone.
 func (f *file) Close() error {
-	return f.setLock(sqlite3vfs.LockNone)
+	return f.Unlock(sqlite3vfs.LockNone)
 }
 
 // Truncate implements sqlite3vfs.File: it shortens the file to size bytes,
@@ -235,6 +289,20 @@ type file struct {
 	size      int64
 	valid     bool
 	sectors   map[int64][]byte
+
+	// holderID identifies this file's entries in the lock ConfigMap: the
+	// shared-holders key maps it to a lease expiry and the writer key
+	// carries it, so a file can tell its own lock from another process's.
+	// It is generated once, here, and every lock operation of this file
+	// acts as this holder.
+	holderID string
+
+	// leaseExpires is when this file's own lease runs out locally — the
+	// moment its entries were last written with an expiry, plus the VFS's
+	// lease length. It is a local approximation used only to decide WHEN a
+	// renewal CAS is worth an API call; the ConfigMap's expiries are the
+	// truth other processes prune against.
+	leaseExpires time.Time
 }
 
 // ReadAt implements sqlite3vfs.File. A read that starts at or past the end
@@ -382,7 +450,7 @@ func (f *file) Sync(flag sqlite3vfs.SyncType) error {
 	return nil
 }
 
-// lockLevelFromString maps the lock ConfigMap's "lock" value to a
+// lockLevelFromString maps a stored lock level string to a
 // sqlite3vfs.LockType, reporting false for an unknown value.
 func lockLevelFromString(currentLockString string) (sqlite3vfs.LockType, bool) {
 	switch currentLockString {
@@ -400,41 +468,294 @@ func lockLevelFromString(currentLockString string) (sqlite3vfs.LockType, bool) {
 	return sqlite3vfs.LockNone, false
 }
 
-func (f *file) getCurrentLock() (sqlite3vfs.LockType, error) {
-	f.vfs.logger.Debug("getCurrentLock")
-
-	cm, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Get(f.vfs.ctx, f.LockFileName(), metav1.GetOptions{})
-	if err != nil {
-		return sqlite3vfs.LockNone, fmt.Errorf("get lock configmap: %w", err)
-	}
-	lockToReturn, ok := lockLevelFromString(cm.Data["lock"])
-	if !ok {
-		return sqlite3vfs.LockNone, fmt.Errorf("lock type unknown: file %v, configmap lock value %q", f, cm.Data["lock"])
-	}
-	f.vfs.logger.Debug("getCurrentLock", "found current lock", lockToReturn)
-
-	return lockToReturn, nil
+// writerEntry is the JSON stored under the lock ConfigMap's "writer" key:
+// the one holder climbing past SHARED, its level and its lease. Level is
+// stored spelled as sqlite3vfs.LockType.String() ("LockReserved" and so on)
+// so the entry is legible in kubectl output.
+type writerEntry struct {
+	ID    string    `json:"id"`
+	Level string    `json:"level"`
+	Lease time.Time `json:"lease"`
 }
 
-// currentLockLevel returns the lock level to judge a transition against.
-// While this file's state is known locally — every file opened through the
-// VFS starts at NONE and records its own transitions — no API call is made:
-// re-GETting the ConfigMap before every Lock/Unlock, as the imported code
-// did, is one of the per-operation API calls this optimisation removes. A
-// file object created with NewFile (the cmd tools) has no local state and
-// consults the ConfigMap here, as before.
-//
-// The fetched level is deliberately NOT recorded as this file's own: it may
-// be another process's lock, and believing it ours is what let a newly
-// opened file skip its own transitions and clobber the cluster's level
-// under them. Local state is only ever written by adoptLockState, after
-// this process's own setLock succeeded.
-func (f *file) currentLockLevel() (sqlite3vfs.LockType, error) {
-	f.vfs.logger.Debug("currentLockLevel")
-	if f.lockKnown {
-		return f.lockLevel, nil
+// lockType parses the writer's stored level.
+func (w *writerEntry) lockType() (sqlite3vfs.LockType, bool) {
+	return lockLevelFromString(w.Level)
+}
+
+// lockView is a parsed view of the lock ConfigMap's holder state. All
+// expiries are UTC; a state is always pruned of expired entries before any
+// decision is made from it, so a holder whose lease has passed counts as
+// absent — on reads it is simply not there, and a successful CAS drops it
+// from the stored state.
+type lockView struct {
+	sharedHolders map[string]time.Time
+	writer        *writerEntry
+}
+
+func emptyLockView() lockView {
+	return lockView{sharedHolders: map[string]time.Time{}}
+}
+
+// parseLockState reads the holder/writer keys out of a lock ConfigMap's
+// Data. Missing keys mean an empty holder state — a lockfile written by an
+// older version of this module carries only the aggregate "lock" key. Keys
+// that are present but not valid JSON are an error rather than silently
+// ignored state: guessing could break the mutual exclusion the keys exist
+// to provide.
+func parseLockState(cm *corev1.ConfigMap) (lockView, error) {
+	st := emptyLockView()
+	if raw := cm.Data[sharedHoldersDataKey]; strings.TrimSpace(raw) != "" {
+		if err := json.Unmarshal([]byte(raw), &st.sharedHolders); err != nil {
+			return st, fmt.Errorf("parse %s of %q: %w", sharedHoldersDataKey, cm.Name, err)
+		}
 	}
-	return f.getCurrentLock()
+	if st.sharedHolders == nil {
+		st.sharedHolders = map[string]time.Time{}
+	}
+	if raw := cm.Data[writerDataKey]; strings.TrimSpace(raw) != "" {
+		w := &writerEntry{}
+		if err := json.Unmarshal([]byte(raw), w); err != nil {
+			return st, fmt.Errorf("parse %s of %q: %w", writerDataKey, cm.Name, err)
+		}
+		st.writer = w
+	}
+	return st, nil
+}
+
+// pruneExpired drops every entry — shared holders and the writer — whose
+// lease has passed. A holder that died mid-lock must never block the
+// database: this runs before any decision on any read of the state, and a
+// successful CAS writes the pruned state back.
+func (st *lockView) pruneExpired(now time.Time) {
+	for id, lease := range st.sharedHolders {
+		if lease.Before(now) {
+			delete(st.sharedHolders, id)
+		}
+	}
+	if st.writer != nil && st.writer.Lease.Before(now) {
+		st.writer = nil
+	}
+}
+
+// levelOf returns the level holder holds in this state: SHARED while it has
+// a shared-holders entry, raised to its writer level when it is also the
+// writer.
+func (st *lockView) levelOf(holderID string) sqlite3vfs.LockType {
+	level := sqlite3vfs.LockNone
+	if _, ok := st.sharedHolders[holderID]; ok {
+		level = sqlite3vfs.LockShared
+	}
+	if st.writer != nil && st.writer.ID == holderID {
+		if wl, ok := st.writer.lockType(); ok && wl > level {
+			level = wl
+		}
+	}
+	return level
+}
+
+// hasOtherHolders reports whether any holder other than except still holds
+// a shared lock.
+func (st *lockView) hasOtherHolders(except string) bool {
+	for id := range st.sharedHolders {
+		if id != except {
+			return true
+		}
+	}
+	return false
+}
+
+// aggregate returns the highest level any live holder holds — the value
+// kept under the "lock" key so a reader of the old single-writer format
+// still sees a meaningful level.
+func (st *lockView) aggregate() sqlite3vfs.LockType {
+	level := sqlite3vfs.LockNone
+	if len(st.sharedHolders) > 0 {
+		level = sqlite3vfs.LockShared
+	}
+	if st.writer != nil {
+		if wl, ok := st.writer.lockType(); ok && wl > level {
+			level = wl
+		}
+	}
+	return level
+}
+
+// serializeLockState renders st for the ConfigMap's Data keys: the aggregate
+// level string, the shared-holder lease map as JSON (always present, "{}"
+// when empty) and the writer entry as JSON ("" when none).
+func serializeLockState(st *lockView) (lockLevel, holdersJSON, writerJSON string) {
+	holders, err := json.Marshal(st.sharedHolders)
+	if err != nil {
+		// map[string]time.Time marshalling cannot fail; nothing below it
+		// can either. Panic rather than write a half-serialised state.
+		panic(fmt.Sprintf("serialize shared-holders: %v", err))
+	}
+	writerJSON = ""
+	if st.writer != nil {
+		b, err := json.Marshal(st.writer)
+		if err != nil {
+			panic(fmt.Sprintf("serialize writer: %v", err))
+		}
+		writerJSON = string(b)
+	}
+	return st.aggregate().String(), string(holders), writerJSON
+}
+
+// newLockConfigMap builds the lock ConfigMap with the same labels and
+// "lock"/"relevant-file" keys the single-writer setLock always wrote, plus
+// the holder keys.
+func (f *file) newLockConfigMap(lockLevel, holdersJSON, writerJSON string) *corev1.ConfigMap {
+	fileNameLabel := string(f.b32ByteFromString(f.RawName))
+	lockfileLabels := make(map[string]string, len(LockfileLabel)+1)
+	maps.Copy(lockfileLabels, LockfileLabel)
+	lockfileLabels["relevant-file"] = fileNameLabel
+
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: f.LockFileName(), Labels: lockfileLabels},
+		Data: map[string]string{
+			lockLevelDataKey:     lockLevel,
+			"relevant-file":      fileNameLabel,
+			sharedHoldersDataKey: holdersJSON,
+			writerDataKey:        writerJSON,
+		},
+	}
+}
+
+// stampOwnLease refreshes the lease on every entry this file holds in st.
+// casLock runs it after every successful mutation, which is what keeps a
+// live holder's lease fresh: any CAS a file performs — transition, renewal
+// or no-op that turned out to need a write — re-stamps its own entries.
+func (f *file) stampOwnLease(st *lockView) {
+	lease := time.Now().UTC().Add(f.vfs.lockLease)
+	if _, ok := st.sharedHolders[f.holderID]; ok {
+		st.sharedHolders[f.holderID] = lease
+	}
+	if st.writer != nil && st.writer.ID == f.holderID {
+		st.writer.Lease = lease
+	}
+}
+
+// casLock applies mutate to the lock ConfigMap's state with real mutual
+// exclusion (issue #47): the state is read, the new state computed from
+// what was read, and the Update carries the ResourceVersion just read — so
+// two processes can never overwrite each other's holders. On a 409 Conflict
+// the state is re-read and re-decided, never overwritten; a missing
+// ConfigMap is Created, with AlreadyExists from the Create treated as
+// "re-read". The loop is bounded by maxLockCASAttempts.
+//
+// mutate reports sqlite3vfs.BusyError when another process holds a
+// conflicting lock and a plain error for an invalid request; both are
+// returned unwrapped, because the sqlite3vfs shim maps errors to SQLite
+// codes with a bare type assertion and a wrapped BusyError would degrade to
+// a generic error instead of SQLITE_BUSY.
+//
+// On every attempt that ends in a write, the leases of this file's
+// surviving entries are refreshed first (stampOwnLease); a mutation that
+// leaves the stored keys byte-identical writes nothing at all.
+func (f *file) casLock(mutate func(*lockView) error) error {
+	configMaps := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace)
+	for range maxLockCASAttempts {
+		cm, err := configMaps.Get(f.vfs.ctx, f.LockFileName(), metav1.GetOptions{})
+		var st lockView
+		exists := true
+		switch {
+		case kerrors.IsNotFound(err):
+			exists = false
+			st = emptyLockView()
+		case err != nil:
+			return fmt.Errorf("get lock configmap: %w", err)
+		default:
+			st, err = parseLockState(cm)
+			if err != nil {
+				return err
+			}
+			st.pruneExpired(time.Now().UTC())
+		}
+
+		if err := mutate(&st); err != nil {
+			return err
+		}
+		f.stampOwnLease(&st)
+
+		lockLevel, holdersJSON, writerJSON := serializeLockState(&st)
+		if exists {
+			if cm.Data[lockLevelDataKey] == lockLevel &&
+				cm.Data[sharedHoldersDataKey] == holdersJSON &&
+				cm.Data[writerDataKey] == writerJSON {
+				// Nothing changed: no write, and no API call beyond the Get.
+				return nil
+			}
+			cm.Data[lockLevelDataKey] = lockLevel
+			cm.Data[sharedHoldersDataKey] = holdersJSON
+			cm.Data[writerDataKey] = writerJSON
+			// cm still carries the ResourceVersion from the Get above: if
+			// another process wrote in between, this Update is a 409 and
+			// the loop re-reads instead of clobbering its holders.
+			_, err = configMaps.Update(f.vfs.ctx, cm, metav1.UpdateOptions{})
+			if kerrors.IsConflict(err) || kerrors.IsNotFound(err) {
+				// Lost the race, or the ConfigMap was deleted under us:
+				// re-read and re-decide.
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("update lock configmap: %w", err)
+			}
+		} else {
+			cm = f.newLockConfigMap(lockLevel, holdersJSON, writerJSON)
+			_, err = configMaps.Create(f.vfs.ctx, cm, metav1.CreateOptions{})
+			if kerrors.IsAlreadyExists(err) {
+				// Another process created it first: re-read.
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("create lock configmap: %w", err)
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("lock configmap %q did not settle after %d attempts", f.LockFileName(), maxLockCASAttempts)
+}
+
+// errLockLeaseLost reports that this file's own lease expired and its
+// entries were pruned by another process: whatever the local state
+// believed, the cluster no longer holds this file's lock.
+var errLockLeaseLost = errors.New("lock lease expired and was pruned by another process")
+
+// noteLeaseLost rewrites a lease-loss into the local state it implies —
+// this file holds nothing, and everything cached under the lost lock may
+// have been rewritten by whoever took over — and returns the error as-is.
+func (f *file) noteLeaseLost(err error) error {
+	if errors.Is(err, errLockLeaseLost) {
+		f.lockLevel = sqlite3vfs.LockNone
+		f.lockKnown = true
+		f.dropCaches()
+	}
+	return err
+}
+
+// maybeRenew renews this file's lease when less than half of it remains. It
+// runs only from the lock-path operations (Lock, Unlock, Close and
+// CheckReservedLock) — never from the sector read/write path, which must
+// gain zero API calls. The renewal CAS is a no-op mutation: stampOwnLease
+// makes the fresh expiry the only change, so a still-valid lease costs
+// nothing and a due one costs one Get plus one Update. A renewal whose CAS
+// finds this file's entries gone means the lease lapsed and another process
+// pruned us; noteLeaseLost resets the local state and the loss is reported
+// rather than pretending the lock still holds.
+func (f *file) maybeRenew() error {
+	if !f.lockKnown || f.lockLevel == sqlite3vfs.LockNone {
+		return nil // this file holds nothing, so there is no lease to renew
+	}
+	if time.Until(f.leaseExpires) >= f.vfs.lockLease/2 {
+		return nil
+	}
+	return f.noteLeaseLost(f.casLock(func(st *lockView) error {
+		if st.levelOf(f.holderID) == sqlite3vfs.LockNone {
+			return errLockLeaseLost
+		}
+		return nil
+	}))
 }
 
 // LockFileName returns the name of the ConfigMap holding this file's SQLite
@@ -450,47 +771,6 @@ func (f *file) generateSectorsLabels() {
 	f.SectorLabels = make(map[string]string, len(CommonSectorLabel)+1)
 	maps.Copy(f.SectorLabels, CommonSectorLabel)
 	f.SectorLabels["relevant-file"] = fileNameLabel
-}
-
-// setLock writes the requested lock level to the lock ConfigMap, creating
-// the ConfigMap if it does not exist yet, and records the transition
-// locally (adoptLockState) only once the write succeeded.
-func (f *file) setLock(lock sqlite3vfs.LockType) error {
-	f.vfs.logger.Debug("setLock", "lock", lock)
-
-	// Any downgrade — Unlock and Close land here — invalidates the local
-	// view BEFORE the write is attempted, whatever the write returns. If
-	// the ConfigMap write fails transiently, sqlite largely ignores the
-	// unlock error and carries on, so the caches must already be gone by
-	// then: with the lock state unknown, the next Lock/Unlock/
-	// CheckReservedLock re-GETs the ConfigMap and the next FileSize pays
-	// its revalidating LIST, so writes another process made between our
-	// locks can never be masked by stale cached sectors. On success,
-	// adoptLockState below records the new level (dropping the caches
-	// again for sub-SHARED levels, a no-op by then).
-	if f.lockKnown && lock < f.lockLevel {
-		f.dropCaches()
-		f.lockKnown = false
-	}
-
-	fileNameLabel := string(f.b32ByteFromString(f.RawName))
-	lockfileLabels := make(map[string]string, len(LockfileLabel)+1)
-	maps.Copy(lockfileLabels, LockfileLabel)
-	lockfileLabels["relevant-file"] = fileNameLabel
-
-	lf := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: f.LockFileName(), Labels: lockfileLabels}, Data: map[string]string{"lock": lock.String(), "relevant-file": fileNameLabel}}
-
-	_, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Update(f.vfs.ctx, lf, metav1.UpdateOptions{})
-	f.vfs.logger.Debug("setLock", "lock", lock, "err", err)
-	if kerrors.IsNotFound(err) {
-		_, err = f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Create(f.vfs.ctx, lf, metav1.CreateOptions{})
-		f.vfs.logger.Debug("setLock has been created", "lock", lock, "err", err)
-	}
-	if err == nil {
-		f.adoptLockState(lock)
-	}
-
-	return err
 }
 
 // dropCaches discards the cached file size and sector contents. Everything
@@ -511,22 +791,30 @@ func (f *file) dropCaches() {
 func (f *file) adoptLockState(lock sqlite3vfs.LockType) {
 	f.lockLevel = lock
 	f.lockKnown = true
+	// The entries this successful write left on the cluster expire at
+	// now+lease; keep the local approximation in step so maybeRenew fires
+	// at the right time.
+	f.leaseExpires = time.Now().UTC().Add(f.vfs.lockLease)
 	if lock < sqlite3vfs.LockShared {
 		f.dropCaches()
 	}
 }
 
-// Lock implements sqlite3vfs.File: it acquires or upgrades the file's lock
-// through the lock ConfigMap. Only the transitions of the sqlite locking
-// chart below are legal; sqlite never requests PENDING explicitly, and a
-// file holding no lock cannot climb past SHARED in one step.
+// Lock implements sqlite3vfs.File: it acquires or upgrades this file's lock
+// through the lock ConfigMap, acting as this file's holder id. Only the
+// transitions of the sqlite locking chart below are legal; sqlite never
+// requests PENDING explicitly, and a file holding no lock cannot climb past
+// SHARED in one step. A transition another process makes impossible — a
+// conflicting writer, or other live holders for EXCLUSIVE — is reported as
+// sqlite3vfs.BusyError (SQLITE_BUSY), never waited out.
+//
+// Every decision that writes is made inside the CAS against the state just
+// read (see casLock and the mutate* builders below); the local lockLevel
+// only short-circuits no-ops and invalid requests that cannot require an
+// API call. A file whose lease was pruned mid-transaction is therefore
+// judged by the cluster, not by its stale local belief.
 func (f *file) Lock(elock sqlite3vfs.LockType) error {
 	f.vfs.logger.Debug("Lock", "elock", elock)
-	currentLock, err := f.currentLockLevel()
-	if err != nil {
-		f.vfs.logger.Error("Lock", "err", err)
-		return err
-	}
 
 	//    UNLOCKED -> SHARED
 	//    SHARED -> RESERVED
@@ -534,57 +822,206 @@ func (f *file) Lock(elock sqlite3vfs.LockType) error {
 	//    RESERVED -> (PENDING) -> EXCLUSIVE
 	//    PENDING -> EXCLUSIVE
 
-	if elock <= currentLock {
+	if f.lockKnown {
+		// A request for the level held, or below it, is a silent no-op —
+		// judged against this file's own level, which records only the
+		// transitions this file performed itself.
+		if elock <= f.lockLevel {
+			return f.maybeRenew()
+		}
+		//  (1) We never move from unlocked to anything higher than shared lock.
+		if f.lockLevel == sqlite3vfs.LockNone && elock > sqlite3vfs.LockShared {
+			return errors.New("invalid lock transition requested")
+		}
+		//  (2) SQLite never explicitly requests a pending lock.
+		if elock == sqlite3vfs.LockPending {
+			return errors.New("invalid Lock() request for state pending")
+		}
+		//  (3) A shared lock is always held when a reserve lock is requested.
+		if elock == sqlite3vfs.LockReserved && f.lockLevel != sqlite3vfs.LockShared {
+			return errors.New("can only transition to Reserved lock from Shared lock")
+		}
+	}
+
+	if elock == sqlite3vfs.LockExclusive {
+		// Two CAS steps, exactly the chart's SHARED/RESERVED -> (PENDING) ->
+		// EXCLUSIVE path: first claim (or promote) this file's writer entry
+		// to PENDING — which alone blocks new SHARED acquisitions — then,
+		// once no other live holder remains, subsume this file's shared
+		// entry into the EXCLUSIVE write. While other holders remain the
+		// file stays in PENDING and BusyError is reported; sqlite retries,
+		// and each retry re-claims (renewing the lease as a side effect).
+		if err := f.noteLeaseLost(f.casLock(f.mutateLockExclusiveClaim)); err != nil {
+			return err
+		}
+		f.adoptLockState(sqlite3vfs.LockPending)
+		if err := f.noteLeaseLost(f.casLock(f.mutateLockExclusiveAcquire)); err != nil {
+			return err
+		}
+		f.adoptLockState(sqlite3vfs.LockExclusive)
 		return nil
 	}
 
-	//  (1) We never move from unlocked to anything higher than shared lock.
-	if currentLock == sqlite3vfs.LockNone && elock > sqlite3vfs.LockShared {
-		return errors.New("invalid lock transition requested")
-	}
-	//  (2) SQLite never explicitly requests a pending lock.
-	if elock == sqlite3vfs.LockPending {
-		return errors.New("invalid Lock() request for state pending")
-	}
-	//  (3) A shared lock is always held when a reserve lock is requested.
-	if elock == sqlite3vfs.LockReserved && currentLock != sqlite3vfs.LockShared {
-		return errors.New("can only transition to Reserved lock from Shared lock")
-	}
-
-	return f.setLock(elock)
-}
-
-// Unlock implements sqlite3vfs.File: it drops or downgrades the file's lock
-// through the lock ConfigMap. An unlock above SHARED (sqlite never unlocks
-// upward) or to a level above the one currently held is an error, not a
-// panic: the sqlite3vfs interface lets Unlock report an error, and a panic
-// here crashed the whole process through cgo.
-func (f *file) Unlock(elock sqlite3vfs.LockType) error {
-	f.vfs.logger.Debug("Unlock", "elock", elock)
-
-	currentLock, err := f.currentLockLevel()
-	if err != nil {
-		f.vfs.logger.Error("Unlock", "err", err)
+	if err := f.noteLeaseLost(f.casLock(f.mutateLock(elock))); err != nil {
 		return err
 	}
+	f.adoptLockState(elock)
+	return nil
+}
+
+// mutateLock returns the CAS mutation for a single-step Lock transition
+// (NONE->SHARED or SHARED->RESERVED). The decision is made from the state
+// just read, so it holds even when this file's local belief is stale; the
+// invalid-request errors match the ones Lock rejects locally.
+func (f *file) mutateLock(elock sqlite3vfs.LockType) func(*lockView) error {
+	return func(st *lockView) error {
+		own := st.levelOf(f.holderID)
+		if elock <= own {
+			return nil // already held at or above elock: a renewal CAS at most
+		}
+		switch elock {
+		case sqlite3vfs.LockPending:
+			return errors.New("invalid Lock() request for state pending")
+		case sqlite3vfs.LockShared:
+			// NONE -> SHARED. Readers are allowed while a writer holds
+			// RESERVED; PENDING and EXCLUSIVE block new readers.
+			if st.writer != nil {
+				if wl, ok := st.writer.lockType(); ok && wl >= sqlite3vfs.LockPending {
+					return sqlite3vfs.BusyError
+				}
+			}
+			st.sharedHolders[f.holderID] = time.Time{} // stamped by casLock
+			return nil
+		case sqlite3vfs.LockReserved:
+			// SHARED -> RESERVED. At most one writer of any kind may exist.
+			if own != sqlite3vfs.LockShared {
+				return errors.New("can only transition to Reserved lock from Shared lock")
+			}
+			if st.writer != nil {
+				return sqlite3vfs.BusyError
+			}
+			st.writer = &writerEntry{ID: f.holderID, Level: sqlite3vfs.LockReserved.String()}
+			return nil
+		default:
+			return errors.New("invalid lock transition requested")
+		}
+	}
+}
+
+// mutateLockExclusiveClaim is the first CAS step of Lock(EXCLUSIVE): claim
+// the writer slot for this file at PENDING, promoting its own RESERVED
+// writer in place. A writer held by another file is a conflict; this file
+// already holding PENDING is a no-op (a retry after BusyError).
+func (f *file) mutateLockExclusiveClaim(st *lockView) error {
+	own := st.levelOf(f.holderID)
+	if sqlite3vfs.LockExclusive <= own {
+		return nil // already exclusive: nothing to claim
+	}
+	if own == sqlite3vfs.LockNone {
+		return errors.New("invalid lock transition requested")
+	}
+	if st.writer == nil {
+		st.writer = &writerEntry{ID: f.holderID, Level: sqlite3vfs.LockPending.String()}
+		return nil
+	}
+	if st.writer.ID != f.holderID {
+		return sqlite3vfs.BusyError
+	}
+	if wl, ok := st.writer.lockType(); ok && wl == sqlite3vfs.LockReserved {
+		st.writer.Level = sqlite3vfs.LockPending.String()
+	}
+	return nil // ours and already PENDING
+}
+
+// mutateLockExclusiveAcquire is the second CAS step of Lock(EXCLUSIVE):
+// from this file's own PENDING writer, take EXCLUSIVE once no other live
+// holder remains; this file's shared entry is removed, subsumed by the
+// EXCLUSIVE write. While another holder's entry exists the file stays in
+// PENDING and BusyError is reported. A missing own writer means this
+// file's PENDING claim was pruned (its lease lapsed): errLockLeaseLost
+// makes Lock reset the local state instead of writing under a false belief.
+func (f *file) mutateLockExclusiveAcquire(st *lockView) error {
+	if st.writer == nil || st.writer.ID != f.holderID {
+		return errLockLeaseLost
+	}
+	if st.hasOtherHolders(f.holderID) {
+		return sqlite3vfs.BusyError // stay in PENDING
+	}
+	delete(st.sharedHolders, f.holderID)
+	st.writer.Level = sqlite3vfs.LockExclusive.String()
+	return nil
+}
+
+// Unlock implements sqlite3vfs.File: it drops or downgrades this file's
+// lock through the lock ConfigMap, touching only this file's own entries.
+// An unlock above SHARED (sqlite never unlocks upward) or to a level above
+// the one currently held is an error, not a panic: the sqlite3vfs interface
+// lets Unlock report an error, and a panic here crashed the whole process
+// through cgo. Unlocking when this file holds nothing is a no-op downgrade
+// — never an error, and never a write, so a file that holds nothing cannot
+// clobber another process's holders.
+func (f *file) Unlock(elock sqlite3vfs.LockType) error {
+	f.vfs.logger.Debug("Unlock", "elock", elock)
 
 	if elock > sqlite3vfs.LockShared {
 		return fmt.Errorf("invalid unlock request to level %s", elock)
 	}
 
-	if currentLock < elock {
-		return fmt.Errorf("cannot unlock to a level %s above the current lock level %s", elock, currentLock)
+	if f.lockKnown {
+		if f.lockLevel < elock {
+			return fmt.Errorf("cannot unlock to a level %s above the current lock level %s", elock, f.lockLevel)
+		}
+		if f.lockLevel == elock {
+			return f.maybeRenew()
+		}
+		// Any downgrade invalidates the local view BEFORE the write is
+		// attempted, whatever the write returns (issue #19). If the CAS
+		// fails transiently, sqlite largely ignores the unlock error and
+		// carries on, so the caches must already be gone by then: with the
+		// lock state unknown, the next FileSize pays its revalidating LIST,
+		// so writes another process made between our locks can never be
+		// masked by stale cached sectors.
+		f.dropCaches()
+		f.lockKnown = false
 	}
 
-	if elock == currentLock {
+	if err := f.noteLeaseLost(f.casLock(f.mutateUnlock(elock))); err != nil {
+		return err
+	}
+	f.adoptLockState(elock)
+	return nil
+}
+
+// mutateUnlock returns the CAS mutation dropping this file's holdings to
+// elock, judged against the holder-aware state just read: a missing own
+// entry makes the request a no-op, whatever other processes hold.
+func (f *file) mutateUnlock(elock sqlite3vfs.LockType) func(*lockView) error {
+	return func(st *lockView) error {
+		own := st.levelOf(f.holderID)
+		if own < elock {
+			return fmt.Errorf("cannot unlock to a level %s above the current lock level %s", elock, own)
+		}
+		if own == elock {
+			return nil // nothing held above elock: a renewal CAS at most
+		}
+		if elock == sqlite3vfs.LockShared {
+			// Drop this file's writer, keep (or restore) its shared entry:
+			// EXCLUSIVE had subsumed it, RESERVED and PENDING keep it.
+			if st.writer != nil && st.writer.ID == f.holderID {
+				st.writer = nil
+			}
+			if _, ok := st.sharedHolders[f.holderID]; !ok {
+				st.sharedHolders[f.holderID] = time.Time{} // stamped by casLock
+			}
+			return nil
+		}
+		// To NONE: everything of this file's goes.
+		delete(st.sharedHolders, f.holderID)
+		if st.writer != nil && st.writer.ID == f.holderID {
+			st.writer = nil
+		}
 		return nil
 	}
-
-	if elock == sqlite3vfs.LockShared {
-		return f.setLock(sqlite3vfs.LockShared)
-	}
-
-	return f.setLock(sqlite3vfs.LockNone)
 }
 
 // SectorSize implements sqlite3vfs.File: it reports the size of one stored
@@ -601,11 +1038,14 @@ func (f *file) DeviceCharacteristics() sqlite3vfs.DeviceCharacteristic {
 
 // NewFile returns a file object for name backed by v. The cmd tools use it
 // to read and write a database stored in the cluster without going through
-// a sqlite connection.
+// a sqlite connection. The file's holder id is generated here: every lock
+// operation of this file acts as this holder, so two files — two processes
+// — over the same database always hold distinguishable entries in the lock
+// ConfigMap.
 func NewFile(name string, v *vfs) *file {
 	o := base32.NewEncoding("abcdefghijklmnopqrstuv0123456789")
 	e := o.WithPadding('x')
-	f := &file{RawName: name, vfs: v, encoding: e}
+	f := &file{RawName: name, vfs: v, encoding: e, holderID: uuid.NewString()}
 	f.generateSectorsLabels()
 	return f
 }
@@ -636,7 +1076,11 @@ func (v *vfs) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sql
 		_, err := v.kc.CoreV1().ConfigMaps(v.namespace).Get(v.ctx, f.LockFileName(), metav1.GetOptions{})
 		switch {
 		case kerrors.IsNotFound(err):
-			if err := f.setLock(sqlite3vfs.LockNone); err != nil {
+			// Fresh lockfile: create it through the CAS so a lost race
+			// against another opener's Create is re-read, not an error.
+			// The no-op mutation leaves the state empty — this file starts
+			// at NONE, holding nothing.
+			if err := f.casLock(func(*lockView) error { return nil }); err != nil {
 				v.logger.Error("Open: set initial lock state", "err", err)
 				lastErr = err
 				continue
@@ -756,24 +1200,34 @@ func (v *vfs) FullPathname(name string) string {
 	return name
 }
 
-// CheckReservedLock implements sqlite3vfs.File. When this process itself
-// holds a lock the answer is known locally and costs no API call; otherwise
-// another process may hold one, so the lock ConfigMap is consulted as
-// before.
+// CheckReservedLock implements sqlite3vfs.File: it reports whether anyone
+// — this file included — holds RESERVED or above. When this file itself
+// holds a writer-level lock the answer is known locally and costs no API
+// call (beyond a due lease renewal); otherwise the lock ConfigMap is
+// consulted and the answer reports whether the writer entry is non-empty
+// after pruning: expired entries count as absent on this read and are not
+// rewritten.
 func (f *file) CheckReservedLock() (bool, error) {
-	if f.lockKnown && f.lockLevel > sqlite3vfs.LockNone {
-		// we hold a lock
+	if f.lockKnown && f.lockLevel >= sqlite3vfs.LockReserved {
+		if err := f.maybeRenew(); err != nil {
+			return false, err
+		}
 		return true, nil
 	}
 
-	currentLock, err := f.getCurrentLock()
+	cm, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Get(f.vfs.ctx, f.LockFileName(), metav1.GetOptions{})
+	if kerrors.IsNotFound(err) {
+		// No lockfile: nobody holds anything.
+		return false, nil
+	}
 	if err != nil {
 		f.vfs.logger.Error("CheckReservedLock", "err", err)
+		return false, fmt.Errorf("get lock configmap: %w", err)
+	}
+	st, err := parseLockState(cm)
+	if err != nil {
 		return false, err
 	}
-	if currentLock > sqlite3vfs.LockNone {
-		// we hold a lock
-		return true, nil
-	}
-	return false, nil
+	st.pruneExpired(time.Now().UTC())
+	return st.writer != nil, nil
 }
