@@ -19,6 +19,7 @@ package vfs
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -37,7 +38,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	k8stesting "k8s.io/client-go/testing"
 )
 
@@ -885,28 +888,40 @@ func TestUnlockRejectsInvalidRequests(t *testing.T) {
 // (issue #47), CheckReservedLock reports whether any WRITER (RESERVED or
 // above) is held: shared holders are readers, and another process's plain
 // SHARED lock must not read as "someone has reserved the database".
+// TestCheckReservedLockSecondProcess pins the Go-level answer of
+// CheckReservedLock across two files — WITH THE KNOWN INVERSION the upstream
+// dependency forces on it. CheckReservedLock returns the NEGATION of "a
+// reserved-or-greater lock is held" (false means held), because upstream
+// github.com/psanford/sqlite3vfs writes *pResOut = 0 for a true answer and 1
+// for false — see the comment on file.CheckReservedLock and the README's
+// "Known upstream bug" section. The value SQLite finally sees is pinned end
+// to end, across the cgo boundary, by
+// TestCheckReservedLockCrossesCGOBoundary in vfs_concurrent_test.go.
 func TestCheckReservedLockSecondProcess(t *testing.T) {
 	v, _ := newTestVFS(t)
 	f1 := openTestFile(t, v, "twoproc.db")
 	f2 := NewFile("twoproc.db", v) // "second process", same backing store
 
-	if reserved, err := f2.CheckReservedLock(); err != nil || reserved {
-		t.Errorf("CheckReservedLock on unlocked file = (%v, %v), want (false, nil)", reserved, err)
+	// Nobody holds anything: the true answer is "not held", inverted to true.
+	if reserved, err := f2.CheckReservedLock(); err != nil || !reserved {
+		t.Errorf("CheckReservedLock on unlocked file = (%v, %v), want (true, nil)", reserved, err)
 	}
 
 	if err := f1.Lock(sqlite3vfs.LockShared); err != nil {
 		t.Fatalf("Lock(Shared): %v", err)
 	}
 	// A SHARED holder is a reader, not a reserved-lock holder.
-	if reserved, err := f2.CheckReservedLock(); err != nil || reserved {
-		t.Errorf("CheckReservedLock while another process holds Shared = (%v, %v), want (false, nil)", reserved, err)
+	if reserved, err := f2.CheckReservedLock(); err != nil || !reserved {
+		t.Errorf("CheckReservedLock while another process holds Shared = (%v, %v), want (true, nil)", reserved, err)
 	}
 
 	if err := f1.Lock(sqlite3vfs.LockReserved); err != nil {
 		t.Fatalf("Lock(Reserved): %v", err)
 	}
-	if reserved, err := f2.CheckReservedLock(); err != nil || !reserved {
-		t.Errorf("CheckReservedLock while another process holds Reserved = (%v, %v), want (true, nil)", reserved, err)
+	// A reserved lock IS held: the inverted answer is false, which upstream
+	// turns into *pResOut = 1 — "locked" — for SQLite.
+	if reserved, err := f2.CheckReservedLock(); err != nil || reserved {
+		t.Errorf("CheckReservedLock while another process holds Reserved = (%v, %v), want (false, nil)", reserved, err)
 	}
 
 	// Downgrading the writer back to SHARED clears the writer entry, and
@@ -914,15 +929,15 @@ func TestCheckReservedLockSecondProcess(t *testing.T) {
 	if err := f1.Unlock(sqlite3vfs.LockShared); err != nil {
 		t.Fatalf("Unlock(Shared): %v", err)
 	}
-	if reserved, err := f2.CheckReservedLock(); err != nil || reserved {
-		t.Errorf("CheckReservedLock after the writer downgraded = (%v, %v), want (false, nil)", reserved, err)
+	if reserved, err := f2.CheckReservedLock(); err != nil || !reserved {
+		t.Errorf("CheckReservedLock after the writer downgraded = (%v, %v), want (true, nil)", reserved, err)
 	}
 
 	if err := f1.Unlock(sqlite3vfs.LockNone); err != nil {
 		t.Fatalf("Unlock(None): %v", err)
 	}
-	if reserved, err := f2.CheckReservedLock(); err != nil || reserved {
-		t.Errorf("CheckReservedLock after the other process unlocked = (%v, %v), want (false, nil)", reserved, err)
+	if reserved, err := f2.CheckReservedLock(); err != nil || !reserved {
+		t.Errorf("CheckReservedLock after the other process unlocked = (%v, %v), want (true, nil)", reserved, err)
 	}
 
 	// The second process observes the released state, so the transitions
@@ -1184,6 +1199,17 @@ func TestTwoProcessesMutualExclusion(t *testing.T) {
 // the lock ConfigMap Update is retried — the CAS re-reads the state
 // (including the other holder's entry) and re-decides, converging without a
 // lost update.
+//
+// The 409 has to be injected by a hand-written reactor because the bare fake
+// clientset cannot arbitrate it natively: its tracker (k8s.io/client-go/
+// testing, fixture.go tracker.add) replaces the stored object on every
+// Update without ever comparing the submitted resourceVersion against the
+// stored one, and it keeps resourceVersions per GVR rather than per object,
+// so no stale write is ever refused. newArbitratingFakeClientset in
+// vfs_concurrent_test.go restores the real per-object
+// resourceVersion/409/AlreadyExists semantics with reactors for the
+// end-to-end two-instance tests; there is no configuration of the plain fake
+// that produces a Conflict on its own.
 func TestCASRetriesOnConflict(t *testing.T) {
 	v, fcs := newTestVFS(t)
 	fa := openTestFile(t, v, "conflict.db")
@@ -1375,6 +1401,236 @@ func TestLeaseLossDetected(t *testing.T) {
 	}
 	if holders := sharedHoldersIn(t, fcs, fa); len(holders) != 1 {
 		t.Errorf("shared-holders after re-acquire = %v, want exactly one entry", holders)
+	}
+}
+
+// fakeClock is the injectable clock the lease tests drive: the test advances
+// it instead of sleeping, and the VFS's whole lock path stamps, prunes and
+// renews against it through vfs.clock. It is called from the test goroutine
+// only.
+type fakeClock struct{ now time.Time }
+
+func (c *fakeClock) Now() time.Time          { return c.now }
+func (c *fakeClock) Advance(d time.Duration) { c.now = c.now.Add(d) }
+
+// TestLeaseRenewedFromIOPathWhenNearExpiry pins lease renewal from the
+// sector read/write path: a read or write stretch longer than half the lease
+// must not outrun renewal, or the lease lapses while WriteAt keeps writing
+// (the review finding on the #47 locking). The injected clock moves time
+// without sleeps; the API-call counts pin that a live lease still costs the
+// read/write path nothing at all and a due renewal exactly one CAS.
+func TestLeaseRenewedFromIOPathWhenNearExpiry(t *testing.T) {
+	fcs := fake.NewSimpleClientset()
+	const lease = time.Minute
+	clock := &fakeClock{now: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}
+	v := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3, WithLockLease(lease))
+	v.clock = clock.Now
+
+	f := openTestFile(t, v, "io-renewal.db")
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("Lock(Shared): %v", err)
+	}
+	first := sharedHoldersIn(t, fcs, f)[f.holderID]
+	buf := make([]byte, 64)
+	fillPattern(buf)
+
+	// A write well inside the lease renews nothing: exactly one API call
+	// (the sector write), and the stored lease does not move.
+	clock.Advance(lease / 4) // 15s in: 45s of the 60s lease remain
+	before := len(fcs.Actions())
+	if n, err := f.WriteAt(buf, 0); err != nil || n != len(buf) {
+		t.Fatalf("WriteAt at quarter lease = (%d, %v), want (%d, nil)", n, err, len(buf))
+	}
+	if got := len(fcs.Actions()) - before; got != 1 {
+		t.Errorf("write at quarter lease caused %d API calls, want exactly 1 (the sector write; no lock calls)", got)
+	}
+	if got := sharedHoldersIn(t, fcs, f)[f.holderID]; !got.Equal(first) {
+		t.Errorf("stored lease moved at quarter lease: %v -> %v, want unchanged", first, got)
+	}
+
+	// Past half the lease the same write renews first: the renewal CAS is
+	// one Get plus one Update on top of the sector write, and the stored
+	// expiry is now+lease as of the renewal.
+	clock.Advance(lease / 3) // 35s in: 25s remain, under half
+	before = len(fcs.Actions())
+	if n, err := f.WriteAt(buf, 128); err != nil || n != len(buf) {
+		t.Fatalf("WriteAt past half lease = (%d, %v), want (%d, nil)", n, err, len(buf))
+	}
+	second := sharedHoldersIn(t, fcs, f)[f.holderID]
+	if want := first.Add(35 * time.Second); !second.Equal(want) {
+		t.Errorf("stored lease after write past half = %v, want %v (renewed to now+lease at the renewal)", second, want)
+	}
+	if got := len(fcs.Actions()) - before; got != 3 {
+		t.Errorf("write past half the lease caused %d API calls, want 3 (renewal Get + Update, then the sector write)", got)
+	}
+
+	// The read path renews too, on the same half-spent rule.
+	clock.Advance(lease/2 + time.Second) // 66s after the renewal: 29s remain
+	if _, err := f.ReadAt(make([]byte, 8), 0); err != nil {
+		t.Fatalf("ReadAt past half lease: %v", err)
+	}
+	third := sharedHoldersIn(t, fcs, f)[f.holderID]
+	if want := second.Add(31 * time.Second); !third.Equal(want) {
+		t.Errorf("stored lease after read past half = %v, want %v", third, want)
+	}
+}
+
+// TestLeaseLossFailsSectorIOUntilRelock pins the losing side of the gate:
+// once the lease has lapsed, WriteAt is refused instead of writing without
+// the lock, the loss sticks so ReadAt is refused too (instead of serving
+// sectors cached under the lost lock), and a successful Lock clears it —
+// after which the file reads exactly the bytes committed before the loss,
+// proving the refused write never landed.
+func TestLeaseLossFailsSectorIOUntilRelock(t *testing.T) {
+	fcs := fake.NewSimpleClientset()
+	const lease = time.Minute
+	clock := &fakeClock{now: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}
+	v := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3, WithLockLease(lease))
+	v.clock = clock.Now
+
+	f := openTestFile(t, v, "io-loss.db")
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("Lock(Shared): %v", err)
+	}
+	kept := make([]byte, 64)
+	fillPattern(kept)
+	if n, err := f.WriteAt(kept, 0); err != nil || n != len(kept) {
+		t.Fatalf("WriteAt while live = (%d, %v), want (%d, nil)", n, err, len(kept))
+	}
+
+	clock.Advance(2 * lease) // the lease lapses with no renewal
+	if _, err := f.WriteAt(make([]byte, 64), 0); !errors.Is(err, sqlite3vfs.BusyError) {
+		t.Fatalf("WriteAt with a lapsed lease = %v, want sqlite3vfs.BusyError", err)
+	}
+	if f.lockLevel != sqlite3vfs.LockNone || !f.lockKnown || !f.leaseLost {
+		t.Errorf("after lease loss local state = (level %v, known %v, lost %v), want (NONE, true, true)", f.lockLevel, f.lockKnown, f.leaseLost)
+	}
+
+	if _, err := f.ReadAt(make([]byte, 64), 0); !errors.Is(err, sqlite3vfs.BusyError) {
+		t.Fatalf("ReadAt with a lost lease = %v, want sqlite3vfs.BusyError (sticky)", err)
+	}
+
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("re-Lock(Shared) after the loss: %v", err)
+	}
+	if f.leaseLost {
+		t.Error("leaseLost survived a successful Lock; the read/write path would stay gated forever")
+	}
+	got := make([]byte, len(kept))
+	n, err := f.ReadAt(got, 0)
+	if err != nil && err != io.EOF {
+		t.Fatalf("ReadAt after re-lock: %v", err)
+	}
+	if n != len(kept) || !bytes.Equal(got, kept) {
+		t.Errorf("bytes after re-lock = (%d, %v), want the pre-loss %d bytes (the refused write must not have landed)", n, got, len(kept))
+	}
+}
+
+// ctxSensitiveProbe wraps a kubernetes.Interface and fails every ConfigMap
+// Get/Update/Create whose CALL context is already done, the way a real
+// clientset honours per-call context cancellation. The bare fake ignores the
+// context entirely — its methods never look at ctx — so without this probe a
+// test cannot tell which context a lock-path call was made with, and a
+// cancelled-context bug would pass unnoticed.
+type ctxSensitiveProbe struct {
+	kubernetes.Interface
+}
+
+func (p *ctxSensitiveProbe) CoreV1() corev1client.CoreV1Interface {
+	return &ctxSensitiveCoreV1{CoreV1Interface: p.Interface.CoreV1()}
+}
+
+type ctxSensitiveCoreV1 struct {
+	corev1client.CoreV1Interface
+}
+
+func (c *ctxSensitiveCoreV1) ConfigMaps(namespace string) corev1client.ConfigMapInterface {
+	return &ctxSensitiveConfigMaps{ConfigMapInterface: c.CoreV1Interface.ConfigMaps(namespace)}
+}
+
+type ctxSensitiveConfigMaps struct {
+	corev1client.ConfigMapInterface
+}
+
+func requireLiveCtx(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("call made with a done context: %w", err)
+	}
+	return nil
+}
+
+func (m *ctxSensitiveConfigMaps) Get(ctx context.Context, name string, opts metav1.GetOptions) (*v1.ConfigMap, error) {
+	if err := requireLiveCtx(ctx); err != nil {
+		return nil, err
+	}
+	return m.ConfigMapInterface.Get(ctx, name, opts)
+}
+
+func (m *ctxSensitiveConfigMaps) Update(ctx context.Context, cm *v1.ConfigMap, opts metav1.UpdateOptions) (*v1.ConfigMap, error) {
+	if err := requireLiveCtx(ctx); err != nil {
+		return nil, err
+	}
+	return m.ConfigMapInterface.Update(ctx, cm, opts)
+}
+
+func (m *ctxSensitiveConfigMaps) Create(ctx context.Context, cm *v1.ConfigMap, opts metav1.CreateOptions) (*v1.ConfigMap, error) {
+	if err := requireLiveCtx(ctx); err != nil {
+		return nil, err
+	}
+	return m.ConfigMapInterface.Create(ctx, cm, opts)
+}
+
+// TestLockPathSurvivesCancelledContext pins the context finding on the #47
+// locking: the construction context belongs to the caller's registration
+// scope, and cancelling it after Open must not break a single lock-path
+// call. Every lock ConfigMap compare-and-swap — and the CheckReservedLock
+// read — runs on a cancellation-detached context (context.WithoutCancel)
+// with its own timeout, so the whole locking protocol still works here even
+// though every call made with the registration context itself would fail.
+// The probe above makes the fake reject done contexts like a real clientset,
+// and the negative control at the end proves it would have caught a leaked
+// cancelled context.
+func TestLockPathSurvivesCancelledContext(t *testing.T) {
+	fcs := fake.NewSimpleClientset()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	probe := &ctxSensitiveProbe{Interface: fcs}
+	v := NewVFS(ctx, probe, testNamespace, slog.New(slog.DiscardHandler), 3)
+
+	fa := openTestFile(t, v, "cancel-ctx.db") // opened while the ctx is live
+	fb := openTestFile(t, v, "cancel-ctx.db")
+
+	cancel() // the registration context dies; the lock path must not care
+
+	if err := fa.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("Lock(Shared) after the registration context was cancelled: %v", err)
+	}
+	if err := fb.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("second holder Lock(Shared) after cancellation: %v", err)
+	}
+	if reserved, err := fa.CheckReservedLock(); err != nil || !reserved {
+		t.Fatalf("CheckReservedLock after cancellation = (%v, %v), want (true, nil)", reserved, err)
+	}
+	if err := fa.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatalf("Lock(Reserved) after cancellation: %v", err)
+	}
+	if err := fa.Unlock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("Unlock(Shared) after cancellation: %v", err)
+	}
+	if err := fa.Unlock(sqlite3vfs.LockNone); err != nil {
+		t.Fatalf("Unlock(None) after cancellation: %v", err)
+	}
+	if err := fb.Unlock(sqlite3vfs.LockNone); err != nil {
+		t.Fatalf("second holder Unlock(None) after cancellation: %v", err)
+	}
+	if holders := sharedHoldersIn(t, fcs, fa); len(holders) != 0 {
+		t.Errorf("shared-holders after all unlocks = %v, want empty (every CAS landed)", holders)
+	}
+
+	// Negative control: the probe really does reject a call made with the
+	// cancelled context, so the passes above mean the lock path avoided it.
+	if _, err := probe.CoreV1().ConfigMaps(testNamespace).Get(ctx, fa.LockFileName(), metav1.GetOptions{}); err == nil {
+		t.Fatal("probe accepted a call made with the cancelled context; this test proves nothing")
 	}
 }
 

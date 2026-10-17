@@ -12,8 +12,14 @@
 //
 // The VFS talks to any kubernetes.Interface: pass a real clientset in
 // production and client-go's fake clientset in tests. The context given to
-// NewVFS is used for every Kubernetes call the VFS makes; SQLite calls into
-// the VFS through cgo, so there is no per-call context to accept.
+// NewVFS is used for the sector read/write calls; SQLite calls into the VFS
+// through cgo, so there is no per-call context to accept. The lock-path
+// calls (the lock ConfigMap compare-and-swap and the CheckReservedLock
+// read) instead run on a context derived from the construction one with
+// context.WithoutCancel, each bounded by its own timeout: a caller
+// cancelling its context after Open must not be able to cancel a
+// compare-and-swap half-way, because the atomicity of that call is what
+// issue #47's mutual exclusion is built on.
 package vfs
 
 import (
@@ -53,6 +59,12 @@ const (
 	// ConfigMap. Every attempt re-reads the state and re-decides from what
 	// it read, so the bound only matters under sustained contention.
 	maxLockCASAttempts = 10
+
+	// lockCallTimeout bounds one lock-path Kubernetes call (the Get, Update
+	// or Create of a lock compare-and-swap, and the CheckReservedLock read).
+	// Those calls run on lockCtx, which no caller can cancel; this timeout
+	// is what keeps a hung API server from hanging SQLite instead.
+	lockCallTimeout = 30 * time.Second
 )
 
 // The lock ConfigMap's Data holds the lock state under these keys:
@@ -91,10 +103,26 @@ type vfs struct {
 	// never block the database forever.
 	lockLease time.Duration
 
-	// ctx backs every Kubernetes call this VFS makes. It is fixed at
-	// construction because SQLite enters the VFS through cgo, where there
-	// is no caller context to propagate.
+	// ctx backs the sector read/write Kubernetes calls this VFS makes. It
+	// is fixed at construction because SQLite enters the VFS through cgo,
+	// where there is no caller context to propagate.
 	ctx context.Context
+
+	// lockCtx backs every LOCK-PATH Kubernetes call: the lock ConfigMap
+	// compare-and-swap and the CheckReservedLock read. It is the
+	// construction context with cancellation removed
+	// (context.WithoutCancel): that context usually belongs to the
+	// caller's registration scope (a command run, a request handler), and
+	// once it is cancelled every remaining compare-and-swap would fail
+	// mid-flight — precisely the calls whose read-decide-write atomicity
+	// issue #47's mutual exclusion stands on. Each call adds its own
+	// lockCallTimeout.
+	lockCtx context.Context
+
+	// clock returns the current time for the whole lock path (lease
+	// stamping, expiry pruning, renewal decisions). It is time.Now except
+	// in tests, which advance an injected clock instead of sleeping.
+	clock func() time.Time
 }
 
 // Option configures a vfs at construction time.
@@ -102,8 +130,12 @@ type Option func(*vfs)
 
 // WithLockLease sets how long a lock holder's entries stay valid without
 // renewal. The default is defaultLockLease (30s); a holder renews on every
-// successful lock CAS and whenever a lock-path operation finds less than
-// half the lease remaining.
+// successful lock CAS and whenever any operation on the file — lock path or
+// sector read/write — finds less than half the lease remaining.
+//
+// A non-positive value is ignored and keeps the default: Option cannot
+// return an error, so an out-of-range value is documented behaviour (the
+// default stands) rather than a silently broken lease.
 func WithLockLease(d time.Duration) Option {
 	return func(v *vfs) {
 		if d > 0 {
@@ -116,7 +148,7 @@ func WithLockLease(d time.Duration) Option {
 // namespace. Every Kubernetes call the VFS makes uses ctx. retries is the
 // number of attempts Open makes against races between concurrent clients.
 func NewVFS(ctx context.Context, kc kubernetes.Interface, namespace string, logger *slog.Logger, retries int, opts ...Option) *vfs {
-	v := &vfs{kc: kc, logger: logger, retries: retries, namespace: namespace, lockLease: defaultLockLease, ctx: ctx}
+	v := &vfs{kc: kc, logger: logger, retries: retries, namespace: namespace, lockLease: defaultLockLease, ctx: ctx, lockCtx: context.WithoutCancel(ctx), clock: time.Now}
 	for _, opt := range opts {
 		opt(v)
 	}
@@ -303,6 +335,14 @@ type file struct {
 	// renewal CAS is worth an API call; the ConfigMap's expiries are the
 	// truth other processes prune against.
 	leaseExpires time.Time
+
+	// leaseLost sticks once a renewal finds this file's entries pruned from
+	// the lock ConfigMap: every sector read/write then fails with
+	// sqlite3vfs.BusyError until the next successful Lock re-establishes
+	// the holder, so a file whose lease was taken over never serves or
+	// writes sectors in that state. The lock path needs no flag — its next
+	// call re-reads the cluster state anyway.
+	leaseLost bool
 }
 
 // ReadAt implements sqlite3vfs.File. A read that starts at or past the end
@@ -311,6 +351,14 @@ type file struct {
 // SQLITE_IOERR_SHORT_READ.
 func (f *file) ReadAt(p []byte, off int64) (int, error) {
 	f.vfs.logger.Debug("ReadAt", "f", f, "off", off, "len(buffer)", len(p))
+
+	// Renew a due lease before serving: a lease that lapsed mid-read means
+	// another process may hold the lock and be rewriting the database, and
+	// this file must not serve — least of all from caches taken under the
+	// lost lock — until sqlite has re-locked and revalidated.
+	if err := f.renewForIO(); err != nil {
+		return 0, ioFailure(err)
+	}
 
 	firstSector := f.sectorForPos(off)
 
@@ -384,6 +432,14 @@ func (f *file) WriteAt(p []byte, off int64) (int, error) {
 
 	if len(p) == 0 {
 		return 0, nil
+	}
+
+	// Renew a due lease, and refuse to write at all once it is lost: the
+	// write path used to run with no reference to the lock state, so a
+	// write stretch longer than the lease kept writing sectors after
+	// another process had pruned this holder and taken the lock.
+	if err := f.renewForIO(); err != nil {
+		return 0, ioFailure(err)
 	}
 
 	firstSector := f.sectorForPos(off)
@@ -627,7 +683,11 @@ func (f *file) newLockConfigMap(lockLevel, holdersJSON, writerJSON string) *core
 // live holder's lease fresh: any CAS a file performs — transition, renewal
 // or no-op that turned out to need a write — re-stamps its own entries.
 func (f *file) stampOwnLease(st *lockView) {
-	lease := time.Now().UTC().Add(f.vfs.lockLease)
+	lease := f.vfs.clock().UTC().Add(f.vfs.lockLease)
+	// Keep the local renewal timer in step with the expiry just written, so
+	// the next renewal decision measures against the fresh lease instead of
+	// firing again on every subsequent call.
+	f.leaseExpires = lease
 	if _, ok := st.sharedHolders[f.holderID]; ok {
 		st.sharedHolders[f.holderID] = lease
 	}
@@ -656,7 +716,9 @@ func (f *file) stampOwnLease(st *lockView) {
 func (f *file) casLock(mutate func(*lockView) error) error {
 	configMaps := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace)
 	for range maxLockCASAttempts {
-		cm, err := configMaps.Get(f.vfs.ctx, f.LockFileName(), metav1.GetOptions{})
+		ctx, cancel := f.vfs.lockCallCtx()
+		cm, err := configMaps.Get(ctx, f.LockFileName(), metav1.GetOptions{})
+		cancel()
 		var st lockView
 		exists := true
 		switch {
@@ -670,7 +732,7 @@ func (f *file) casLock(mutate func(*lockView) error) error {
 			if err != nil {
 				return err
 			}
-			st.pruneExpired(time.Now().UTC())
+			st.pruneExpired(f.vfs.clock().UTC())
 		}
 
 		if err := mutate(&st); err != nil {
@@ -691,8 +753,12 @@ func (f *file) casLock(mutate func(*lockView) error) error {
 			cm.Data[writerDataKey] = writerJSON
 			// cm still carries the ResourceVersion from the Get above: if
 			// another process wrote in between, this Update is a 409 and
-			// the loop re-reads instead of clobbering its holders.
-			_, err = configMaps.Update(f.vfs.ctx, cm, metav1.UpdateOptions{})
+			// the loop re-reads instead of clobbering its holders. The
+			// Update must not carry a caller-cancellable context either:
+			// half a compare-and-swap is worse than none.
+			ctx, cancel := f.vfs.lockCallCtx()
+			_, err = configMaps.Update(ctx, cm, metav1.UpdateOptions{})
+			cancel()
 			if kerrors.IsConflict(err) || kerrors.IsNotFound(err) {
 				// Lost the race, or the ConfigMap was deleted under us:
 				// re-read and re-decide.
@@ -703,7 +769,9 @@ func (f *file) casLock(mutate func(*lockView) error) error {
 			}
 		} else {
 			cm = f.newLockConfigMap(lockLevel, holdersJSON, writerJSON)
-			_, err = configMaps.Create(f.vfs.ctx, cm, metav1.CreateOptions{})
+			ctx, cancel := f.vfs.lockCallCtx()
+			_, err = configMaps.Create(ctx, cm, metav1.CreateOptions{})
+			cancel()
 			if kerrors.IsAlreadyExists(err) {
 				// Another process created it first: re-read.
 				continue
@@ -715,6 +783,14 @@ func (f *file) casLock(mutate func(*lockView) error) error {
 		return nil
 	}
 	return fmt.Errorf("lock configmap %q did not settle after %d attempts", f.LockFileName(), maxLockCASAttempts)
+}
+
+// lockCallCtx returns the context for ONE lock-path Kubernetes call:
+// derived from lockCtx, which no caller can cancel, with a fresh
+// lockCallTimeout. See vfs.lockCtx for why the construction context must not
+// flow into these calls.
+func (v *vfs) lockCallCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(v.lockCtx, lockCallTimeout)
 }
 
 // errLockLeaseLost reports that this file's own lease expired and its
@@ -730,24 +806,30 @@ func (f *file) noteLeaseLost(err error) error {
 		f.lockLevel = sqlite3vfs.LockNone
 		f.lockKnown = true
 		f.dropCaches()
+		// The loss also gates the sector read/write path: renewForIO fails
+		// every read and write with BusyError until a successful Lock
+		// re-establishes this holder and adoptLockState clears the flag.
+		f.leaseLost = true
 	}
 	return err
 }
 
 // maybeRenew renews this file's lease when less than half of it remains. It
-// runs only from the lock-path operations (Lock, Unlock, Close and
-// CheckReservedLock) — never from the sector read/write path, which must
-// gain zero API calls. The renewal CAS is a no-op mutation: stampOwnLease
+// runs from the lock-path operations (Lock, Unlock, Close and
+// CheckReservedLock) and, through renewForIO, from the sector read/write
+// path; the guard below is a local timestamp check, so a lease with plenty
+// left still costs those paths zero API calls. The renewal CAS is a no-op mutation: stampOwnLease
 // makes the fresh expiry the only change, so a still-valid lease costs
 // nothing and a due one costs one Get plus one Update. A renewal whose CAS
 // finds this file's entries gone means the lease lapsed and another process
-// pruned us; noteLeaseLost resets the local state and the loss is reported
-// rather than pretending the lock still holds.
+// pruned us; noteLeaseLost resets the local state, sticks the loss for the
+// sector read/write path, and the loss is reported rather than pretending
+// the lock still holds.
 func (f *file) maybeRenew() error {
 	if !f.lockKnown || f.lockLevel == sqlite3vfs.LockNone {
 		return nil // this file holds nothing, so there is no lease to renew
 	}
-	if time.Until(f.leaseExpires) >= f.vfs.lockLease/2 {
+	if f.leaseExpires.Sub(f.vfs.clock()) >= f.vfs.lockLease/2 {
 		return nil
 	}
 	return f.noteLeaseLost(f.casLock(func(st *lockView) error {
@@ -756,6 +838,42 @@ func (f *file) maybeRenew() error {
 		}
 		return nil
 	}))
+}
+
+// renewForIO renews this file's lease from the sector read/write path when
+// less than half of it remains, and reports the sticky lease loss. A read or
+// write stretch longer than the lease used to outrun renewal entirely —
+// renewal lived only on the lock path — so the lease lapsed, another process
+// could prune this holder and take the lock, and WriteAt went on writing
+// sectors regardless. The guard in maybeRenew is a local timestamp check, so
+// the common case — a live lease — costs the read/write path zero API calls;
+// only a due renewal CASes. A file that holds no lock at all (the cmd tools,
+// which drive NewFile directly and never lock) stays exactly as ungated as
+// it ever was.
+func (f *file) renewForIO() error {
+	if f.leaseLost {
+		// The lease lapsed and the holder was pruned: whoever holds the lock
+		// now may be rewriting everything this file cached or is about to
+		// touch. Fail until sqlite re-locks (which revalidates the caches)
+		// instead of serving or writing without the lock.
+		return errLockLeaseLost
+	}
+	if !f.lockKnown || f.lockLevel == sqlite3vfs.LockNone {
+		return nil // this file holds no lock, so there is no lease to renew
+	}
+	return f.maybeRenew()
+}
+
+// ioFailure maps a renewal failure on the sector read/write path to the
+// error sqlite should see: a lost lease becomes sqlite3vfs.BusyError —
+// SQLITE_BUSY, which aborts the transaction and sends sqlite back through
+// Lock, where the state is re-established and every cache revalidated — and
+// any other error (a failed Kubernetes call) propagates as-is.
+func ioFailure(err error) error {
+	if errors.Is(err, errLockLeaseLost) {
+		return sqlite3vfs.BusyError
+	}
+	return err
 }
 
 // LockFileName returns the name of the ConfigMap holding this file's SQLite
@@ -794,7 +912,10 @@ func (f *file) adoptLockState(lock sqlite3vfs.LockType) {
 	// The entries this successful write left on the cluster expire at
 	// now+lease; keep the local approximation in step so maybeRenew fires
 	// at the right time.
-	f.leaseExpires = time.Now().UTC().Add(f.vfs.lockLease)
+	f.leaseExpires = f.vfs.clock().UTC().Add(f.vfs.lockLease)
+	// A successful transition re-established this holder: the sector
+	// read/write path may proceed again.
+	f.leaseLost = false
 	if lock < sqlite3vfs.LockShared {
 		f.dropCaches()
 	}
@@ -1200,14 +1321,42 @@ func (v *vfs) FullPathname(name string) string {
 	return name
 }
 
-// CheckReservedLock implements sqlite3vfs.File: it reports whether anyone
-// — this file included — holds RESERVED or above. When this file itself
-// holds a writer-level lock the answer is known locally and costs no API
-// call (beyond a due lease renewal); otherwise the lock ConfigMap is
-// consulted and the answer reports whether the writer entry is non-empty
-// after pruning: expired entries count as absent on this read and are not
-// rewritten.
+// CheckReservedLock implements sqlite3vfs.File — with a DELIBERATELY
+// INVERTED bool, working around a bug in the dependency at the cgo boundary.
+//
+// The bug: upstream github.com/psanford/sqlite3vfs (sqlite3vfscgo.go,
+// goVFSCheckReservedLock, at the pinned version
+// v0.0.0-20260519004904-f9180fa2acc9) writes *pResOut = 0 when the File
+// answers true and 1 when it answers false — the opposite of SQLite's
+// xCheckReservedLock contract, which is "set *pResOut to a non-zero value if
+// a reserved lock exists". SQLite consumes that value in hasHotJournal to
+// decide whether an existing rollback journal belongs to a live writer
+// (reserved lock held → live → leave it alone) or is a stale crash remnant
+// (nobody holds reserved → hot → play it back); with the uncorrected
+// inversion SQLite reads or deletes a live writer's journal mid-write.
+//
+// The workaround: negate here, at the last Go code the answer passes
+// through, so the value that reaches SQLite is correct. Remove this
+// negation — and the mirrored expectations in the tests — once upstream maps
+// the File's answer straight through. TestCheckReservedLockCrossesCGOBoundary
+// drives the answer through real SQLite across the cgo boundary, and the
+// README's "Known upstream bug" section documents it for users.
 func (f *file) CheckReservedLock() (bool, error) {
+	locked, err := f.reservedHeld()
+	if err != nil {
+		return false, err
+	}
+	return !locked, nil
+}
+
+// reservedHeld reports the true answer to "does anyone — this file included
+// — hold RESERVED or above?", the question the inverted CheckReservedLock
+// above forwards. When this file itself holds a writer-level lock the answer
+// is known locally and costs no API call (beyond a due lease renewal);
+// otherwise the lock ConfigMap is consulted and the answer reports whether
+// the writer entry is non-empty after pruning: expired entries count as
+// absent on this read and are not rewritten.
+func (f *file) reservedHeld() (bool, error) {
 	if f.lockKnown && f.lockLevel >= sqlite3vfs.LockReserved {
 		if err := f.maybeRenew(); err != nil {
 			return false, err
@@ -1215,7 +1364,9 @@ func (f *file) CheckReservedLock() (bool, error) {
 		return true, nil
 	}
 
-	cm, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Get(f.vfs.ctx, f.LockFileName(), metav1.GetOptions{})
+	ctx, cancel := f.vfs.lockCallCtx()
+	cm, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Get(ctx, f.LockFileName(), metav1.GetOptions{})
+	cancel()
 	if kerrors.IsNotFound(err) {
 		// No lockfile: nobody holds anything.
 		return false, nil
@@ -1228,6 +1379,6 @@ func (f *file) CheckReservedLock() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	st.pruneExpired(time.Now().UTC())
+	st.pruneExpired(f.vfs.clock().UTC())
 	return st.writer != nil, nil
 }
