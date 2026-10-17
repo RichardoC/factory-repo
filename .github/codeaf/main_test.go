@@ -672,11 +672,12 @@ func TestRecordMarker(t *testing.T) {
 // skipped as a non-call, and em-dashes when the ledger predates timing.
 func TestReportTiming(t *testing.T) {
 	result := Result{Stop: "done"}
-	base := time.Date(2026, 10, 16, 20, 0, 0, 0, time.UTC)
+	base := time.Now().Add(-time.Hour)
 	reasoning := 321
 	wall := 88 * time.Minute
-	// Calls [20:01, 20:02] and [20:01:30, 20:04]: three minutes with a call
-	// in flight, 2m30s of it alone and 30s of it two at once.
+	// Calls [base+1m, base+2m] and [base+90s, base+4m]: three minutes with a
+	// call in flight, 2m30s of it alone and 30s of it two at once. The base
+	// is relative to now because only spans that end by now are believed.
 	lines := []LedgerLine{
 		{Kind: "proxy_start", Time: base},
 		{Model: "zai-org/glm-5.3-flash", Time: base.Add(2 * time.Minute), Start: base.Add(time.Minute),
@@ -690,6 +691,7 @@ func TestReportTiming(t *testing.T) {
 		"| run job wall time | 1h28m0s |",
 		"| CodeAF session (proxy start → last call end) | 4m0s |",
 		"| time with a call in flight | 3m0s |",
+		"| idle (wall time minus in-flight) | 1h25m0s |",
 		"| in-flight split (1 / 2 / 3+ concurrent) | 2m30s · 30s · 0s |",
 		"255.6 tok/s", // (45003+1000) output tokens over the 3m in flight
 		"| longest single call | 2m30s · 1000 tok · `zai-org/glm-5.3` |",
@@ -715,6 +717,7 @@ func TestReportTiming(t *testing.T) {
 		"| run job wall time | — |",
 		"| CodeAF session (proxy start → last call end) | — |",
 		"| time with a call in flight | — |",
+		"| idle (wall time minus in-flight) | — |",
 		"| in-flight split (1 / 2 / 3+ concurrent) | — |",
 		"| output tok/s while in flight | — |",
 		"| longest single call | — |",
@@ -841,5 +844,98 @@ func TestSpentTodayRefusesPoisonedTotals(t *testing.T) {
 	t.Setenv("DAY_SPENT", "")
 	if got, err := spentToday("DAY_SPENT"); err != nil || got != 0 {
 		t.Errorf("spentToday(empty) = %v, %v", got, err)
+	}
+}
+
+// A hostile model string from the untrusted ledger must not reach the
+// comment's markdown: only configured model IDs render, and everything else
+// groups as "(other)", in the per-model table and in the longest-call row.
+func TestReportGroupsUnknownModels(t *testing.T) {
+	result := Result{Stop: "done"}
+	hostile := "x`\n\n# INJECT @user [i](http://e/x)"
+	base := time.Now().Add(-time.Hour)
+	lines := []LedgerLine{
+		{Model: hostile, Time: base.Add(2 * time.Minute), Start: base,
+			PromptTokens: 100, CompletionTokens: 500, CostUSD: 0.5, UsageSeen: true},
+		{Model: hostile + "2", Time: base.Add(time.Minute), Start: base,
+			PromptTokens: 100, CostUSD: 0.25, UsageSeen: true},
+		{Model: "zai-org/glm-5.3", Time: base.Add(30 * time.Second), Start: base,
+			PromptTokens: 1000, CompletionTokens: 200, CostUSD: 0.00228, UsageSeen: true},
+	}
+	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
+	report := Report(result, true, lines, cfg, nil, func(string) string { return "" })
+	for _, banned := range []string{"INJECT", "@user", "http://e/x"} {
+		if strings.Contains(report, banned) {
+			t.Errorf("hostile model string leaked %q into the report:\n%s", banned, report)
+		}
+	}
+	for _, want := range []string{
+		"| `(other)` | — · — · — | 2 | 200 | 0 | 500 | — | $0.7500 |",
+		"| `zai-org/glm-5.3` | 1.4 · 0.26 · 4.4 | 1 | 1000 | 0 | 200 | — | $0.0023 |",
+		"| longest single call | 2m0s · 500 tok · `(other)` |",
+	} {
+		if !strings.Contains(report, want) {
+			t.Errorf("report lacks %q:\n%s", want, report)
+		}
+	}
+	if n := strings.Count(report, "| `(other)` |"); n != 1 {
+		t.Errorf("distinct hostile models did not group into one (other) row (%d):\n%s", n, report)
+	}
+}
+
+// Absurd timestamps and counts from the hostile ledger must not render as
+// nonsense: spans that end after now, start before the proxy_start marker, or
+// last more than a day are dropped, and token counts and slot waits clamp to
+// sane bounds.
+func TestReportDropsAbsurdTiming(t *testing.T) {
+	result := Result{Stop: "done"}
+	now := time.Now()
+	huge := 1 << 62
+	lines := []LedgerLine{
+		{Kind: "proxy_start", Time: now.Add(-time.Hour)},
+		// Year 0001 to 9999: this overflowed to -2562047h47m16s.
+		{Model: "zai-org/glm-5.3", Start: time.Date(1, 1, 1, 0, 0, 1, 0, time.UTC),
+			Time: time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)},
+		// Ends after now.
+		{Model: "zai-org/glm-5.3", Start: now.Add(-time.Minute), Time: now.Add(30 * time.Minute)},
+		// Starts before the proxy_start marker.
+		{Model: "zai-org/glm-5.3", Start: now.Add(-2 * time.Hour), Time: now.Add(-90 * time.Minute)},
+		// The one believable call, with hostile counts and wait.
+		{Model: "zai-org/glm-5.3", Start: now.Add(-30 * time.Minute), Time: now.Add(-29 * time.Minute),
+			PromptTokens: huge, CompletionTokens: huge, ReasoningTokens: &huge,
+			SlotWaitS: 1e9, CostUSD: 0.01, UsageSeen: true},
+	}
+	cfg := Config{Limits: Limits{RunUSD: 5, DayUSD: 20}, Models: testModels(t)}
+	report := Report(result, true, lines, cfg, nil, func(string) string { return "" })
+	for _, banned := range []string{"2562047h", "4611686018427387904"} {
+		if strings.Contains(report, banned) {
+			t.Errorf("hostile timing reached the report (%q found):\n%s", banned, report)
+		}
+	}
+	for _, want := range []string{
+		"| time with a call in flight | 1m0s |",
+		"| CodeAF session (proxy start → last call end) | 31m0s |",
+		"| longest single call | 1m0s · 10000000 tok · `zai-org/glm-5.3` |",
+		"| queued at the model limit | 24h0m0s |",
+		"| `zai-org/glm-5.3` | 1.4 · 0.26 · 4.4 | 4 | 10000000 | 0 | 10000000 | 10000000 | $0.0100 (+3 unpriced) |",
+	} {
+		if !strings.Contains(report, want) {
+			t.Errorf("report lacks %q:\n%s", want, report)
+		}
+	}
+}
+
+// The metered total must not lose spend the hostile ledger marks with an
+// unknown kind: only the proxy_start marker is skipped. state pack falls back
+// to this total when the proxy is gone.
+func TestLedgerTotalCountsUnknownKinds(t *testing.T) {
+	lines := []LedgerLine{
+		{Kind: "proxy_start"},
+		{CostUSD: 0.001},
+		{Kind: "x", CostUSD: 5},
+		{Kind: "proxy_start", CostUSD: 100}, // a hostile duplicate marker
+	}
+	if got := ledgerTotal(lines); math.Abs(got-5.001) > 1e-9 {
+		t.Errorf("ledgerTotal = %v, want 5.001", got)
 	}
 }

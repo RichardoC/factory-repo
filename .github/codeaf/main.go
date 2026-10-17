@@ -1115,8 +1115,8 @@ func readLedger(path string) ([]LedgerLine, error) {
 func ledgerTotal(lines []LedgerLine) float64 {
 	total := 0.0
 	for _, l := range lines {
-		if l.Kind != "" {
-			continue // marker lines are not calls
+		if l.Kind == "proxy_start" {
+			continue // the start marker is not a call; unknown kinds still cost money
 		}
 		total += l.CostUSD
 	}
@@ -1242,6 +1242,44 @@ func trimNumber(x float64) string { return strconv.FormatFloat(x, 'f', -1, 64) }
 // fmtDuration renders a duration for the report, rounded to the second.
 func fmtDuration(d time.Duration) string { return d.Round(time.Second).String() }
 
+// The ledger is written by the untrusted run job, so every number in it is
+// hostile. Token counts and waits are clamped to bounds no real call reaches,
+// and timing spans that could not happen — starting before the proxy_start
+// marker, ending after now, or lasting more than a day — are dropped rather
+// than rendered as overflowing durations.
+const (
+	maxTokensPerCall = 10_000_000
+	maxSpan          = 24 * time.Hour
+)
+
+// clampTokens bounds a token count from the ledger.
+func clampTokens(n int) int {
+	if n < 0 {
+		return 0
+	}
+	if n > maxTokensPerCall {
+		return maxTokensPerCall
+	}
+	return n
+}
+
+// clampSeconds bounds a seconds figure from the ledger.
+func clampSeconds(s float64) float64 {
+	if math.IsNaN(s) || s < 0 {
+		return 0
+	}
+	if s > maxSpan.Seconds() {
+		return maxSpan.Seconds()
+	}
+	return s
+}
+
+// spanDuration converts ledger seconds to a duration for the report; the
+// clamp also keeps a sum of hostile figures from overflowing the int64.
+func spanDuration(s float64) time.Duration {
+	return time.Duration(clampSeconds(s) * float64(time.Second))
+}
+
 // callSpan is one call's time in flight, for the timing figures.
 type callSpan struct {
 	start, end time.Time
@@ -1292,23 +1330,39 @@ type modelTotals struct {
 // be tested; runReport gathers them, including the run job's wall time.
 func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall *time.Duration, env func(string) string) string {
 	models := cfg.Models
+	// The ledger is written by the untrusted run job, so its strings are
+	// hostile: only model IDs the trusted config knows are rendered, and
+	// everything else groups as "(other)". A crafted model name therefore
+	// cannot break out of the comment's markdown, and many distinct names
+	// cannot inflate the comment.
+	prices := make(map[string]Model, len(models))
+	for _, m := range models {
+		prices[m.ID] = m
+	}
+	ledgerModel := func(id string) string {
+		if _, ok := prices[id]; ok {
+			return id
+		}
+		return "(other)"
+	}
 	totals := map[string]*modelTotals{}
 	for _, l := range lines {
 		if l.Kind != "" {
 			continue // marker lines are not calls
 		}
-		t := totals[l.Model]
+		id := ledgerModel(l.Model)
+		t := totals[id]
 		if t == nil {
 			t = &modelTotals{}
-			totals[l.Model] = t
+			totals[id] = t
 		}
 		t.calls++
-		t.in += l.PromptTokens
-		t.cached += l.CachedTokens
-		t.out += l.CompletionTokens
+		t.in += clampTokens(l.PromptTokens)
+		t.cached += clampTokens(l.CachedTokens)
+		t.out += clampTokens(l.CompletionTokens)
 		t.cost += l.CostUSD
 		if l.ReasoningTokens != nil {
-			t.reasoning += *l.ReasoningTokens
+			t.reasoning += clampTokens(*l.ReasoningTokens)
 			t.reasoningKnown = true
 		}
 		if !l.UsageSeen {
@@ -1325,6 +1379,7 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 		slotWait        float64
 		haveStarts      bool // the ledger carries per-call timing at all
 	)
+	now := time.Now()
 	for _, l := range lines {
 		if l.Kind == "proxy_start" {
 			if marker.IsZero() || l.Time.Before(marker) {
@@ -1335,17 +1390,30 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 		if l.Kind != "" {
 			continue
 		}
-		totalOut += l.CompletionTokens
-		slotWait += l.SlotWaitS
-		if l.Time.After(lastEnd) {
+		totalOut += clampTokens(l.CompletionTokens)
+		slotWait += clampSeconds(l.SlotWaitS)
+		// A hostile ts must not reach the session figure either.
+		if !l.Time.After(now) && l.Time.After(lastEnd) {
 			lastEnd = l.Time
 		}
 		if !l.Start.IsZero() {
 			haveStarts = true
-			if l.Time.After(l.Start) {
-				spans = append(spans, callSpan{start: l.Start, end: l.Time, out: l.CompletionTokens, model: l.Model})
+			// A span is only believed when it could have happened: it ends by
+			// now and lasts at most a day. Spans that start before the
+			// proxy_start marker are dropped below, once the marker is known.
+			if l.Time.After(l.Start) && !l.Time.After(now) && l.Time.Sub(l.Start) <= maxSpan {
+				spans = append(spans, callSpan{start: l.Start, end: l.Time, out: clampTokens(l.CompletionTokens), model: ledgerModel(l.Model)})
 			}
 		}
+	}
+	if !marker.IsZero() {
+		kept := spans[:0]
+		for _, s := range spans {
+			if !s.start.Before(marker) {
+				kept = append(kept, s)
+			}
+		}
+		spans = kept
 	}
 	total := ledgerTotal(lines)
 	dayBefore, _ := strconv.ParseFloat(env("DAY_SPENT_BEFORE"), 64)
@@ -1390,10 +1458,6 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 	fmt.Fprintf(&b, "| files changed | %s |\n\n", orUnknown(env("CHANGED")))
 
 	if len(totals) > 0 {
-		prices := map[string]Model{}
-		for _, m := range models {
-			prices[m.ID] = m
-		}
 		ids := make([]string, 0, len(totals))
 		for id := range totals {
 			ids = append(ids, id)
@@ -1402,7 +1466,12 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 		b.WriteString("| model | $/M in · cached · out | calls | input tok | cached tok | output tok | reasoning tok | cost |\n")
 		b.WriteString("|---|---|---:|---:|---:|---:|---:|---:|\n")
 		for _, id := range ids {
-			t, p := totals[id], prices[id]
+			t := totals[id]
+			p, known := prices[id]
+			inPrice, cachedPrice, outPrice := "—", "—", "—"
+			if known {
+				inPrice, cachedPrice, outPrice = trimNumber(p.Input), trimNumber(p.CacheRead), trimNumber(p.Output)
+			}
 			cost := money(t.cost)
 			if t.unpriced > 0 {
 				cost += fmt.Sprintf(" (+%d unpriced)", t.unpriced)
@@ -1412,7 +1481,7 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 				reasoning = strconv.Itoa(t.reasoning)
 			}
 			fmt.Fprintf(&b, "| `%s` | %s · %s · %s | %d | %d | %d | %d | %s | %s |\n", id,
-				trimNumber(p.Input), trimNumber(p.CacheRead), trimNumber(p.Output), t.calls, t.in, t.cached, t.out, reasoning, cost)
+				inPrice, cachedPrice, outPrice, t.calls, t.in, t.cached, t.out, reasoning, cost)
 		}
 		b.WriteString("\n")
 	}
@@ -1424,17 +1493,31 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 	}
 	session := "—"
 	if !marker.IsZero() && lastEnd.After(marker) {
-		session = fmtDuration(lastEnd.Sub(marker))
+		if d := lastEnd.Sub(marker); d <= maxSpan {
+			session = fmtDuration(d)
+		}
 	}
+	union, at1, at2, at3 := inFlight(spans)
 	inFlightRow, splitRow, rateRow := "—", "—", "—"
-	if union, at1, at2, at3 := inFlight(spans); union > 0 {
-		inFlightRow = fmtDuration(time.Duration(union * float64(time.Second)))
-		splitRow = fmtDuration(time.Duration(at1*float64(time.Second))) + " · " +
-			fmtDuration(time.Duration(at2*float64(time.Second))) + " · " +
-			fmtDuration(time.Duration(at3*float64(time.Second)))
+	if union > 0 {
+		inFlightRow = fmtDuration(spanDuration(union))
+		splitRow = fmtDuration(spanDuration(at1)) + " · " +
+			fmtDuration(spanDuration(at2)) + " · " +
+			fmtDuration(spanDuration(at3))
 		if totalOut > 0 {
 			rateRow = fmt.Sprintf("%.1f tok/s", float64(totalOut)/union)
 		}
+	}
+	// Idle is what #20 asked for explicitly: wall time with no call in
+	// flight. It needs both figures; a ledger claiming more in-flight time
+	// than the job had clamps at zero.
+	idleRow := "—"
+	if wall != nil && union > 0 {
+		idle := *wall - spanDuration(union)
+		if idle < 0 {
+			idle = 0
+		}
+		idleRow = fmtDuration(idle)
 	}
 	longestRow := "—"
 	if len(spans) > 0 {
@@ -1448,12 +1531,13 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 	}
 	queuedRow := "—"
 	if haveStarts {
-		queuedRow = fmtDuration(time.Duration(slotWait * float64(time.Second)))
+		queuedRow = fmtDuration(spanDuration(slotWait))
 	}
 	b.WriteString("| timing | |\n|---|---|\n")
 	fmt.Fprintf(&b, "| run job wall time | %s |\n", wallRow)
 	fmt.Fprintf(&b, "| CodeAF session (proxy start → last call end) | %s |\n", session)
 	fmt.Fprintf(&b, "| time with a call in flight | %s |\n", inFlightRow)
+	fmt.Fprintf(&b, "| idle (wall time minus in-flight) | %s |\n", idleRow)
 	fmt.Fprintf(&b, "| in-flight split (1 / 2 / 3+ concurrent) | %s |\n", splitRow)
 	fmt.Fprintf(&b, "| output tok/s while in flight | %s |\n", rateRow)
 	fmt.Fprintf(&b, "| longest single call | %s |\n", longestRow)
