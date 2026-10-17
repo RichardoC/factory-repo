@@ -654,3 +654,24 @@ jobs:
           if [ "$target" != "$NUMBER" ] && [ "$MODE" = issue ]; then
             gh issue comment "$NUMBER" --body "CodeAF opened #$target for this issue."
           fi
+
+  queue-next:
+    # Starts the queue (codeaf-queue.yml) once this run is over, so the next
+    # queued issue begins without waiting for a schedule. A run the queue
+    # started was dispatched with GITHUB_TOKEN, and such runs fire no
+    # workflow_run event, so the queue would never see it finish. This run is
+    # still in progress while this job runs, so it names itself and the
+    # queue leaves it out.
+    needs: [gate, publish]
+    if: ${{ always() && needs.gate.outputs.run == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          gh workflow run codeaf-queue.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f finished_run="$GITHUB_RUN_ID" \
+            || echo "::warning::could not start the queue; it will run on its schedule"

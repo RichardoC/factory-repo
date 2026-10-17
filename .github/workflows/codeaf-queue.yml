@@ -31,6 +31,11 @@ on:
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
+    inputs:
+      finished_run:
+        description: a CodeAF run that is finishing and must not count as in progress
+        required: false
+        type: string
   workflow_run:
     workflows: [CodeAF]
     types: [completed]
@@ -105,9 +110,14 @@ jobs:
       - name: Read the open issues and the recent CodeAF runs
         env:
           GH_TOKEN: ${{ github.token }}
+          FINISHED_RUN: ${{ inputs.finished_run }}
         run: |
           gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" > issues.json
-          gh run list --workflow=codeaf.yml --json status --limit 100 > runs.json
+          # A CodeAF run that dispatched this tick as its last job is still in
+          # progress; leave it out. Digits only, or nothing is left out.
+          [[ "$FINISHED_RUN" =~ ^[0-9]{1,20}$ ]] || FINISHED_RUN=""
+          gh run list --workflow=codeaf.yml --json databaseId,status --limit 100 \
+            | jq --arg id "$FINISHED_RUN" '[.[] | select((.databaseId | tostring) != $id)]' > runs.json
 
       - name: Pick the next queued issue
         id: next
