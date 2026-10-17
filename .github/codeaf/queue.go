@@ -46,6 +46,17 @@ type queueOptions struct {
 	// be queued or in progress at once. Each gets a lane and its own slice
 	// of the models' concurrency.
 	MaxParallelRuns int
+	// PRFiles holds the changed-file paths of the open pull requests
+	// in-flight runs are working on, by PR number (issue #132): a PR run's
+	// title names the PR, and a PR item carries no area of its own, so the
+	// queue reads what the PR touched. The paths are raw filenames; runAreas
+	// maps each through pathArea. runNext fills the map from the API, and a
+	// fetch failure leaves the entry absent; Next itself only reads it.
+	PRFiles map[int][]string
+	// NoAreaHeld, when non-nil, is called once per candidate held because it
+	// names no area (reason "no area label", issue #132). Like Logf, it is
+	// the caller's side effect; Next's pick never depends on it.
+	NoAreaHeld func(number int)
 	// Logf is where the queue explains itself; nil discards.
 	Logf func(string, ...any)
 }
@@ -140,7 +151,18 @@ func Next(issues []item, runs []runStatus, o queueOptions) (int, int, string) {
 			continue
 		}
 		areas := issueAreas(c)
-		if busy, r, conflict := areaBusy(areas, inflight, byNumber); conflict {
+		if len(areas) == 0 {
+			// An issue that names no area is held, not started, and blocks
+			// no one (issue #132): it is skipped like any other hold, and
+			// the next candidate is still considered.
+			logf("holding #%d: no area label", c.Number)
+			hold("no area label")
+			if o.NoAreaHeld != nil {
+				o.NoAreaHeld(c.Number)
+			}
+			continue
+		}
+		if busy, r, conflict := areaBusy(areas, inflight, byNumber, o.PRFiles); conflict {
 			reason := fmt.Sprintf("area %s busy (run %d)", busy, r.DatabaseId)
 			if len(areas) == 0 {
 				reason = fmt.Sprintf("no area; conflicts with run %d", r.DatabaseId)
@@ -252,6 +274,17 @@ func issueAreas(it item) []string {
 			areas = append(areas, a)
 		}
 	}
+	labelAreas(it, add)
+	for _, p := range bodyPaths(cappedBody(it.Body)) {
+		add(p)
+	}
+	slices.Sort(areas)
+	return areas
+}
+
+// labelAreas adds an item's area labels — area:harness and area:app/<name> —
+// to add. Shared by issueAreas and runAreas, which reads a PR's own labels.
+func labelAreas(it item, add func(string)) {
 	for _, l := range it.Labels {
 		switch {
 		case l.Name == "area:"+areaHarness:
@@ -260,11 +293,6 @@ func issueAreas(it item) []string {
 			add(strings.TrimPrefix(l.Name, "area:"))
 		}
 	}
-	for _, p := range bodyPaths(cappedBody(it.Body)) {
-		add(p)
-	}
-	slices.Sort(areas)
-	return areas
 }
 
 // bodyPathRe finds path-like text in an issue body that names the harness or
@@ -310,7 +338,15 @@ func pathArea(p string) string {
 // title that does not parse, or an issue that is not open in the list, gives
 // an empty set, which conflicts with everything — an unknown run must not
 // start a second one on top of itself.
-func runAreas(r runStatus, byNumber map[int]item) []string {
+//
+// A run on a pull request (a review, a continuation or a fix run, titled
+// `CodeAF #<pr>`; issue #132) takes its areas from three sources, united:
+// the issue the PR closes (`Closes #N`, looked up in byNumber), the PR's
+// changed files from prFiles, and the PR's own area: labels, if any. A PR
+// item itself names no area, and without the union every review run would
+// conflict with everything. An empty set after all three sources still
+// conflicts with everything, as above.
+func runAreas(r runStatus, byNumber map[int]item, prFiles map[int][]string) []string {
 	n, _ := runTitleFields(r.DisplayTitle)
 	if n <= 0 {
 		return nil
@@ -319,7 +355,30 @@ func runAreas(r runStatus, byNumber map[int]item) []string {
 	if !ok {
 		return nil
 	}
-	return issueAreas(it)
+	if len(it.PullRequest) == 0 {
+		return issueAreas(it)
+	}
+	var areas []string
+	seen := map[string]bool{}
+	add := func(a string) {
+		if a != "" && !seen[a] {
+			seen[a] = true
+			areas = append(areas, a)
+		}
+	}
+	if m := linkedIssue(it.Body); m > 0 {
+		if linked, ok := byNumber[m]; ok {
+			for _, a := range issueAreas(linked) {
+				add(a)
+			}
+		}
+	}
+	for _, p := range prFiles[n] {
+		add(pathArea(p))
+	}
+	labelAreas(it, add)
+	slices.Sort(areas)
+	return areas
 }
 
 // areaBusy finds the first in-flight run whose areas collide with the
@@ -329,12 +388,12 @@ func runAreas(r runStatus, byNumber map[int]item) []string {
 // issue run, and two plan runs are kept apart by the planner's cooldown,
 // not by areas. When the collision is an intersection, the first (sorted)
 // shared area is named.
-func areaBusy(areas []string, inflight []runStatus, byNumber map[int]item) (busy string, r runStatus, conflict bool) {
+func areaBusy(areas []string, inflight []runStatus, byNumber map[int]item, prFiles map[int][]string) (busy string, r runStatus, conflict bool) {
 	for _, run := range inflight {
 		if isPlanRun(run) {
 			continue
 		}
-		other := runAreas(run, byNumber)
+		other := runAreas(run, byNumber, prFiles)
 		switch {
 		case len(areas) == 0 || len(other) == 0:
 			if len(areas) != 0 {
@@ -483,6 +542,12 @@ func runNext() error {
 	if err != nil {
 		return err
 	}
+	// A PR run's areas come from its changed files (issue #132), fetched
+	// here so Next stays pure. With no token the map stays empty and the
+	// runs' area sets fall back to the issues the PRs close.
+	gh := newGitHub()
+	prFiles := fetchPRFiles(gh, issues, runs, log.Printf)
+	var noArea []int
 	number, lane, reason := Next(issues, runs, queueOptions{
 		Label:           envOr("CODEAF_LABEL", "codeaf"),
 		QueuedLabel:     envOr("CODEAF_QUEUED_LABEL", "codeaf-queued"),
@@ -490,12 +555,104 @@ func runNext() error {
 		WeekCap:         cfg.Limits.WeeklyCreditUSD,
 		WeekSpent:       spent,
 		MaxParallelRuns: cfg.Queue.MaxParallelRuns,
+		PRFiles:         prFiles,
+		NoAreaHeld:      func(n int) { noArea = append(noArea, n) },
 		Logf:            log.Printf,
 	})
+	// One comment per held issue, posted once: the marker check keeps a
+	// repeat tick from stacking copies (issue #132). Best effort: a failed
+	// comment never fails the pick.
+	if gh.token != "" {
+		for _, n := range noArea {
+			if err := ensureHoldComment(gh, n); err != nil {
+				log.Printf("hold comment on #%d: %v", n, err)
+			}
+		}
+	}
 	if number == 0 {
 		log.Print(reason)
 		return nil
 	}
 	fmt.Printf("number=%d\nlane=%d\n", number, lane)
 	return nil
+}
+
+// maxPRFiles caps how many changed paths are read per pull request: one
+// page of 100, matching the API's own page size.
+const maxPRFiles = 100
+
+// fetchPRFiles fetches the changed-file paths of every open pull request an
+// in-flight run is working on (issue #132): a PR item carries no area of its
+// own, so the queue reads what the PR touched. A number whose item is not an
+// open PR in the issues list is skipped, and a fetch failure leaves the
+// entry absent — which makes that run's area set empty and conflict with
+// everything, fail closed.
+func fetchPRFiles(g github, issues []item, runs []runStatus, logf func(string, ...any)) map[int][]string {
+	prFiles := map[int][]string{}
+	if g.token == "" {
+		return prFiles
+	}
+	byNumber := map[int]item{}
+	for _, it := range issues {
+		if it.State == "open" {
+			byNumber[it.Number] = it
+		}
+	}
+	seen := map[int]bool{}
+	for _, r := range runs {
+		if r.Status != "queued" && r.Status != "in_progress" {
+			continue
+		}
+		n, _ := runTitleFields(r.DisplayTitle)
+		if n <= 0 || seen[n] {
+			continue
+		}
+		it, ok := byNumber[n]
+		if !ok || len(it.PullRequest) == 0 {
+			continue
+		}
+		seen[n] = true
+		var files []prFile
+		if err := g.get(fmt.Sprintf("/pulls/%d/files?per_page=%d", n, maxPRFiles), &files); err != nil {
+			logf("pr files for #%d: %v", n, err)
+			continue
+		}
+		if len(files) > maxPRFiles {
+			files = files[:maxPRFiles]
+		}
+		paths := make([]string, 0, len(files))
+		for _, f := range files {
+			paths = append(paths, f.Filename)
+		}
+		prFiles[n] = paths
+	}
+	return prFiles
+}
+
+// queueHoldMarker marks the comment the queue posts on an issue it holds for
+// want of an area label (issue #132); the marker keeps repeat ticks from
+// posting the comment twice.
+const queueHoldMarker = "<!-- codeaf-queue-hold -->"
+
+// holdCommentBody is the comment's fixed text, built from the issue number
+// alone: no issue text — untrusted data — goes into it.
+func holdCommentBody(n int) string {
+	return fmt.Sprintf("%s\nCodeAF's queue is holding this issue (#%d): it carries no `area:harness` or `area:app/<name>` label and its body names no path under one. Add an area label to queue it (see [running several tickets at once](https://github.com/RichardoC/factory-repo#running-several-tickets-at-once-issue-60)).", queueHoldMarker, n)
+}
+
+// ensureHoldComment posts the hold comment on issue n unless a comment
+// carrying the marker is already there.
+func ensureHoldComment(g github, n int) error {
+	var comments []struct {
+		Body string `json:"body"`
+	}
+	if err := g.get(fmt.Sprintf("/issues/%d/comments?per_page=100", n), &comments); err != nil {
+		return err
+	}
+	for _, c := range comments {
+		if strings.Contains(c.Body, queueHoldMarker) {
+			return nil
+		}
+	}
+	return g.post(fmt.Sprintf("/issues/%d/comments", n), map[string]string{"body": holdCommentBody(n)}, nil)
 }

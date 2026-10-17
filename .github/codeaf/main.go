@@ -1657,9 +1657,11 @@ type github struct {
 
 func newGitHub() github {
 	return github{
-		api:    strings.TrimRight(envOr("GITHUB_API_URL", "https://api.github.com"), "/"),
-		repo:   os.Getenv("GITHUB_REPOSITORY"),
-		token:  os.Getenv("GITHUB_TOKEN"),
+		api:  strings.TrimRight(envOr("GITHUB_API_URL", "https://api.github.com"), "/"),
+		repo: os.Getenv("GITHUB_REPOSITORY"),
+		// The queue job's step sets only GH_TOKEN; the run jobs set
+		// GITHUB_TOKEN. Either names the same installation.
+		token:  envOr("GITHUB_TOKEN", os.Getenv("GH_TOKEN")),
 		client: &http.Client{Timeout: 30 * time.Second},
 	}
 }
@@ -1681,6 +1683,36 @@ func (g github) get(path string, into any) error {
 		return fmt.Errorf("GET %s: %s: %.300s", path, response.Status, data)
 	}
 	return json.NewDecoder(response.Body).Decode(into)
+}
+
+// post sends a JSON body to the API and decodes the reply, when into is not
+// nil. The queue uses it to post one hold comment (issue #132); everything
+// else the harness reads.
+func (g github) post(path string, body, into any) error {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequest(http.MethodPost, g.api+"/repos/"+g.repo+path, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Authorization", "Bearer "+g.token)
+	request.Header.Set("Accept", "application/vnd.github+json")
+	request.Header.Set("Content-Type", "application/json")
+	response, err := g.client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		reply, _ := io.ReadAll(response.Body)
+		return fmt.Errorf("POST %s: %s: %.300s", path, response.Status, reply)
+	}
+	if into != nil {
+		return json.NewDecoder(response.Body).Decode(into)
+	}
+	return nil
 }
 
 // diff fetches a pull request's diff (issue #32): the review brief embeds

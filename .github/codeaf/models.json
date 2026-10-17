@@ -85,6 +85,23 @@
       "input_modalities": ["text"],
       "efforts": ["low", "medium", "high"],
       "efforts_note": "role experiment: never picked by a lane, only by a model-experiment profile (experiments.json). Prices from https://synthetic.new/pricing/models, 2026-10-17. Whether it honours reasoning_effort is unverified."
+    },
+    {
+      "id": "synthetic/deepseek-v4.1-flash-infinite",
+      "upstream": "infinite:small:vision",
+      "max_concurrent": 8,
+      "name": "DeepSeek-V4.1-Flash, infinite mode (synthetic.new)",
+      "role": "experiment",
+      "input": 0,
+      "output": 0,
+      "cache_read": 0,
+      "api_input": 0,
+      "api_cached": 0,
+      "api_output": 0,
+      "context_length": 524288,
+      "input_modalities": ["text", "image"],
+      "efforts": ["none", "low", "high", "xhigh", "max"],
+      "efforts_note": "role experiment: never picked by a lane. synthetic.new's infinite mode (Big plan, beta): the same DeepSeek-V4.1-Flash weights, free and not counted against the weekly credit, but much slower, with long pauses mid-stream; requests must stream. Prices are 0 because it draws no credit."
     }
   ]
 }

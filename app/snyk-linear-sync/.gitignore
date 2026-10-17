@@ -1,0 +1,21 @@
+.tmp/
+
+# credentials
+.env
+
+# macos nonsense
+.DS_Store
+
+# run logs
+logs/
+
+# contains the sqlite3 db for the cache
+data/
+
+# binaries
+/snyk-linear-sync
+/investigate-duedate
+
+# Bots suggesting commit messages
+COMMIT_MSG
+COMMIT_MSG.md

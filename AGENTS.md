@@ -202,7 +202,15 @@ whether through prompt injection or a compromised model.
   - changed triggers (a `workflow_dispatch` may only gain inputs);
   - changed permissions or environments;
   - a new or edited step, job env or `with` that references secrets;
-  - new jobs that aren't read-only;
+  - any change to a privileged job: one that names a secret or
+    `github.token` anywhere, has an environment or a reusable workflow, or
+    can write (its own permissions or the top level's). Its unprivileged
+    steps are frozen too, because they feed the privileged ones (they build
+    the binary the key is piped to, pick the checkout ref, set
+    `$GITHUB_ENV`). So is everything outside `jobs` in a workflow with a
+    privileged job. In practice every CodeAF workflow is frozen, and only
+    read-only jobs such as CI's can change without a maintainer;
+  - new jobs that aren't read-only, or that use `github.token`;
   - new or unpinned actions;
   - new `github.event` interpolation in `run:`.
 
@@ -211,7 +219,11 @@ whether through prompt injection or a compromised model.
   anything the default branch's cannot. The PR is labelled
   `codeaf-workflow-change`. It is merged only after the independent review
   run (on another model, with a workflow-security checklist) passes it, and
-  only by a person or Claude acting for the owner. Never widen the policy
+  only by a person or Claude acting for the owner. A patch the policy
+  refuses is not a dead end: for now (the owner's decision, 2026-10-17)
+  Claude, acting for the owner, is the maintainer here. It reviews the
+  refused workflow change and applies it by hand when sound, so keep such
+  changes minimal and explain them in the run's answer. Never widen the policy
   to allow secret-bearing steps, triggers or permissions to change without
   a maintainer, and never auto-merge a `codeaf-workflow-change` PR.
 - `codeaf-state.yml` runs no agent and handles no secret. It reads other runs'

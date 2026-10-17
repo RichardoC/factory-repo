@@ -266,8 +266,14 @@ slice caps them at 2 calls per model per run.
 **Area conflicts.** The queue does not start a run on an area another run is
 already working. Areas are `app/<name>/` for each app and the harness
 (`.github/`), taken from `area:harness` and `area:app/<name>` labels or from
-paths in the issue body. An issue with no area conflicts with everything,
-and so does an in-flight run whose area is unknown.
+paths in the issue body. A run on a pull request — a review, a continuation
+or a fix run, titled `CodeAF #<pr>` — takes its areas from three sources
+united: the issue the PR closes (`Closes #N`), the PR's changed files
+(fetched from the API, up to 100 paths) and the PR's own `area:` labels, if
+any. An issue with no area label and no path in its body is not started and
+blocks no one: it is held with reason `no area label`, and the queue comments
+on it once to ask for an area label. A PR run that names no area at all, and
+any in-flight run whose area is unknown, still conflicts with everything.
 
 **The budget.** Unchanged: the queue holds new starts once the shared
 rolling-week spend reaches 75% of `limits.weekly_credit_usd`, and all
@@ -454,6 +460,10 @@ knowing*).
     can't:
     - no new triggers, permissions or environments;
     - no new or edited steps that reference secrets;
+    - no change at all to a privileged job (one holding a secret, the
+      token, an environment or a write permission), since its unprivileged
+      steps feed its privileged ones; in practice only read-only jobs
+      such as CI's can change;
     - no new or unpinned actions;
     - no new `github.event` interpolation;
     - no new or deleted workflow files.
