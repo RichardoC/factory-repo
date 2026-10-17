@@ -41,6 +41,10 @@ on:
         description: PR number a finished run wants continued
         required: false
         type: string
+      review:
+        description: PR number a finished run wants independently reviewed
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -204,7 +208,14 @@ jobs:
       - name: Write the brief
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: '"$HARNESS" brief'
+        run: |
+          # A review run's brief asks for a review of the PR's diff against
+          # the issue instead of working the issue.
+          if [ "$MODE" = review ]; then
+            "$HARNESS" review-brief
+          else
+            "$HARNESS" brief
+          fi
 
       - name: Run CodeAF
         # CodeAF's settings (seat models, budgets, telemetry off) are in
@@ -222,7 +233,14 @@ jobs:
         env:
           CODEAF_BASE_URL: http://127.0.0.1:8787/v1
         run: |
-          cp "$RUNNER_TEMP/harness/codeaf-config.json" "$CODEAF_HOME/config.json"
+          # In review mode the harness prints the reviewer seat's config (its
+          # model differs from the worker's, so the review does not share the
+          # patch author's blind spots); otherwise the profile config above.
+          if [ "$MODE" = review ]; then
+            "$HARNESS" review-config > "$CODEAF_HOME/config.json"
+          else
+            cp "$RUNNER_TEMP/harness/codeaf-config.json" "$CODEAF_HOME/config.json"
+          fi
           set +e
           "$TOOLS/codeaf" do "$(cat "$BRIEF_PATH")" --dir . --json --yes-spend --timeout "${CODEAF_BUDGET_MINUTES:-100}m" \
             > "$RESULT_PATH" 2> "$RUNNER_TEMP/codeaf.stderr"
@@ -237,7 +255,10 @@ jobs:
         id: package
         # Not on cancel: partial work from a cancelled run is never handed on.
         # (Its state below is still packed, so a cancelled run's cost counts.)
-        if: ${{ !cancelled() }}
+        # Never in review mode: a reviewer must not hand publish a patch — a
+        # stray file write by the reviewer would route publish into the
+        # approval-gated environment for a patch that is never applied.
+        if: ${{ !cancelled() && needs.gate.outputs.mode != 'review' }}
         run: |
           # Changes under .github/ are included. Those outside .github/codeaf/
           # (workflows, CODEOWNERS) are applied only after a maintainer
@@ -372,6 +393,8 @@ jobs:
             # and continue-plan writes the comment body to post on the PR.
             echo "PR_BODY_EXTRA_PATH=$RUNNER_TEMP/pr-body-extra.md"
             echo "CONTINUE_COMMENT_PATH=$RUNNER_TEMP/continue-comment.md"
+            # Where review-report writes the findings comment to post on the PR.
+            echo "REVIEW_COMMENT_PATH=$RUNNER_TEMP/review-comment.md"
           } >> "$GITHUB_ENV"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -401,7 +424,8 @@ jobs:
 
       - name: Check the maintainer's approval
         id: approval
-        if: needs.run.outputs.touches_harness == 'true'
+        # Review mode never applies a patch, so nothing needs approving.
+        if: needs.run.outputs.touches_harness == 'true' && needs.gate.outputs.mode != 'review'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -424,6 +448,8 @@ jobs:
 
       - name: Apply the patch
         id: apply
+        # Review mode: publish never applies or pushes anything.
+        if: needs.gate.outputs.mode != 'review'
         env:
           HARNESS_APPROVED: ${{ steps.approval.outputs.approved }}
           GH_TOKEN: ${{ github.token }}
@@ -499,7 +525,7 @@ jobs:
 
       - name: Push and open/update PR
         id: pr
-        if: steps.apply.outputs.changed != '0'
+        if: steps.apply.outputs.changed != '0' && needs.gate.outputs.mode != 'review'
         env:
           GH_TOKEN: ${{ github.token }}
           # GITHUB_TOKEN can never push changes to .github/workflows/, so an
@@ -608,7 +634,7 @@ jobs:
         # posted next, so it never counts against the continuation cap.
         # Fail-soft: a continuation that cannot start must not fail publishing
         # (the report below still posts).
-        if: steps.pr.outputs.number != ''
+        if: steps.pr.outputs.number != '' && needs.gate.outputs.mode != 'review'
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -637,8 +663,65 @@ jobs:
               ;;
           esac
 
+      - name: Independent review
+        # Every run that opens or updates the PR is followed by one read-only
+        # review run of its diff (the gate's `review` input): the reviewer seat
+        # sits on a different model from the worker that wrote the patch.
+        # Fail-soft: a review that cannot start must not fail publishing.
+        # Only once the work is finished (stop: done): an early stop is
+        # continued instead, and reviewing code about to change wastes a run.
+        if: steps.pr.outputs.number != '' && steps.pr.outputs.ready == 'true' && needs.gate.outputs.mode != 'review'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          gh workflow run codeaf.yml -f review="$PR_NUMBER" \
+            || echo "::warning::could not start the independent review of #$PR_NUMBER automatically; a maintainer can start it by hand"
+
+      - name: Independent review findings
+        # The review run's ending: the findings comment (severity and file:line
+        # per finding, with the spend line instead of the run report) is posted
+        # on the PR, and its verdict is acted on. Fail-soft: a review that
+        # cannot report must not fail publishing.
+        if: ${{ !cancelled() && needs.gate.outputs.mode == 'review' }}
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ needs.gate.outputs.number }}
+        run: |
+          # Kept identical to the harness's review-passed label const.
+          label=codeaf-review-passed
+          "$HARNESS" review-report "$NUMBER" > "$RUNNER_TEMP/review-plan.env"
+          # Parsed, never sourced: only the two known actions are acted on.
+          action=report-only
+          if grep -qx 'action=fix' "$RUNNER_TEMP/review-plan.env"; then action=fix
+          elif grep -qx 'action=label' "$RUNNER_TEMP/review-plan.env"; then action=label
+          fi
+          gh pr comment "$NUMBER" --body-file "$REVIEW_COMMENT_PATH"
+          case "$action" in
+            fix)
+              # Blocking findings: drop the pass label, then start a fix run on
+              # this PR's branch (the gate's `pr` input). If the dispatch
+              # fails, say so: a maintainer can start it by hand.
+              gh pr edit "$NUMBER" --remove-label "$label" || true
+              gh workflow run codeaf.yml -f pr="$NUMBER" \
+                || echo "::warning::could not start the fix run for #$NUMBER automatically; a maintainer can start it by hand with a /codeaf comment on the PR"
+              ;;
+            label)
+              # Nothing blocking: make sure the label exists, then add it, so
+              # a person (or a merge rule) can merge with confidence.
+              gh label create "$label" --color 0e8a16 --description "Independent CodeAF review found no blocking findings" || true
+              gh pr edit "$NUMBER" --add-label "$label"
+              ;;
+          esac
+
       - name: Report
-        if: always()
+        # In review mode the findings comment below carries the spend line
+        # instead of the run report.
+        if: always() && needs.gate.outputs.mode != 'review'
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GH_TOKEN: ${{ github.token }}
