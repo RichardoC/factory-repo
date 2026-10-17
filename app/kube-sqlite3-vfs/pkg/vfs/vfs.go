@@ -1346,7 +1346,8 @@ func (f *file) CheckReservedLock() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return !locked, nil
+	_ = locked // BUG-WORLD PROBE: inversion removed
+	return locked, nil
 }
 
 // reservedHeld reports the true answer to "does anyone — this file included

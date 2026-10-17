@@ -74,9 +74,11 @@ func openTestFile(tb testing.TB, v *vfs, name string) *file {
 	return f
 }
 
-// registerUniqueVFS registers the vfs under a process-unique name:
+// registerUniqueVFS registers the VFS under a process-unique name:
 // sqlite3vfs.RegisterVFS is process-global, so every test needs its own.
-func registerUniqueVFS(tb testing.TB, v *vfs) string {
+// It accepts any sqlite3vfs.VFS so test wrappers (such as the
+// journal-visible one in vfs_concurrent_test.go) can register too.
+func registerUniqueVFS(tb testing.TB, v sqlite3vfs.VFS) string {
 	tb.Helper()
 	name := fmt.Sprintf("kube-vfs-test-%d", atomic.AddUint64(&vfsNameCounter, 1))
 	if err := sqlite3vfs.RegisterVFS(name, v); err != nil {
@@ -1062,9 +1064,13 @@ func TestOpenDoesNotAdoptAnotherProcessLock(t *testing.T) {
 		t.Errorf("opened file lock state = (known=%v, level=%v), want (true, NONE): the stored level must never be adopted", fa.lockKnown, fa.lockLevel)
 	}
 
-	// A must still learn, from the cluster, that a lock is held.
-	if reserved, err := fa.CheckReservedLock(); err != nil || !reserved {
-		t.Errorf("A CheckReservedLock while B holds Exclusive = (%v, %v), want (true, nil)", reserved, err)
+	// A must still learn, from the cluster, that a lock is held. The
+	// answer is the KNOWN INVERSION the upstream dependency forces on
+	// CheckReservedLock (see file.CheckReservedLock): B holding EXCLUSIVE
+	// means reservedHeld is true, so CheckReservedLock answers false —
+	// true would mean nobody holds a writer lock.
+	if reserved, err := fa.CheckReservedLock(); err != nil || reserved {
+		t.Errorf("A CheckReservedLock while B holds Exclusive = (%v, %v), want (false, nil): the inverted answer for a held writer lock", reserved, err)
 	}
 
 	// A holds nothing, so unlocking to NONE is a no-op that must not write:
@@ -1434,6 +1440,16 @@ func TestLeaseRenewedFromIOPathWhenNearExpiry(t *testing.T) {
 	buf := make([]byte, 64)
 	fillPattern(buf)
 
+	// Warm the sector cache outside the counted windows: the counts below
+	// measure the lease machinery, not the cold-cache sector fetch a first
+	// write legitimately pays (one GET of sector 0). FileSize is the
+	// revalidating call that warms it — one LIST, happening with 60s of
+	// lease left, so it renews nothing itself. (A ReadAt would not: the
+	// file is still empty, so it returns io.EOF before touching sectors.)
+	if _, err := f.FileSize(); err != nil {
+		t.Fatalf("cache-warming FileSize: %v", err)
+	}
+
 	// A write well inside the lease renews nothing: exactly one API call
 	// (the sector write), and the stored lease does not move.
 	clock.Advance(lease / 4) // 15s in: 45s of the 60s lease remain
@@ -1456,11 +1472,14 @@ func TestLeaseRenewedFromIOPathWhenNearExpiry(t *testing.T) {
 	if n, err := f.WriteAt(buf, 128); err != nil || n != len(buf) {
 		t.Fatalf("WriteAt past half lease = (%d, %v), want (%d, nil)", n, err, len(buf))
 	}
+	// Count before the verification read below: sharedHoldersIn is itself
+	// a fake-clientset GET, and it must not be counted as the VFS's.
+	calls := len(fcs.Actions()) - before
 	second := sharedHoldersIn(t, fcs, f)[f.holderID]
 	if want := first.Add(35 * time.Second); !second.Equal(want) {
 		t.Errorf("stored lease after write past half = %v, want %v (renewed to now+lease at the renewal)", second, want)
 	}
-	if got := len(fcs.Actions()) - before; got != 3 {
+	if got := calls; got != 3 {
 		t.Errorf("write past half the lease caused %d API calls, want 3 (renewal Get + Update, then the sector write)", got)
 	}
 

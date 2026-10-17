@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -474,6 +475,139 @@ func TestConcurrentReaderSeesConsistentDataWhileWriterHoldsTx(t *testing.T) {
 		t.Fatalf("Commit: %v", err)
 	}
 	if n := readerCount(); n != seededRows+heldRows {
+		t.Errorf("reader COUNT(*) after commit = %d, want %d", n, seededRows+heldRows)
+	}
+}
+
+// journalVisibleVFS wraps a vfs to answer xAccess(SQLITE_ACCESS_EXISTS) for
+// sqlite's rollback-journal names from the cluster truth — whether the
+// journal's sector ConfigMaps exist — instead of the base VFS's blanket
+// "sqlite side files never exist". The base answer keeps hasHotJournal
+// (pager.c) from ever reaching xCheckReservedLock, so the cgo inversion
+// this package works around would be invisible to any test: SQLite would
+// never ask the question the workaround fixes. A real local filesystem
+// reports the journal's existence, and this wrapper emulates exactly that
+// much of one; everything else is the base VFS.
+type journalVisibleVFS struct{ *vfs }
+
+func (w journalVisibleVFS) Access(name string, flags sqlite3vfs.AccessFlag) (bool, error) {
+	if strings.HasSuffix(name, "-journal") {
+		cms, err := NewFile(name, w.vfs).listSectorConfigMaps()
+		if err != nil {
+			return false, err
+		}
+		return len(cms) > 0, nil
+	}
+	return w.vfs.Access(name, flags)
+}
+
+// openRollbackJournalSQLDB opens one sqlite connection through the named
+// VFS in sqlite's default DELETE journal mode — with a rollback journal on
+// the "disk", which is what makes hasHotJournal (and with it
+// xCheckReservedLock) part of every reader's first lock. No busy timeout:
+// a reader of an uncommitted transaction must not fail at all here, and a
+// failure should surface immediately rather than after handler retries.
+func openRollbackJournalSQLDB(tb testing.TB, vfsName, fileName string) *sql.DB {
+	tb.Helper()
+	dsn := fmt.Sprintf("file:%s?vfs=%s", fileName, vfsName)
+	db, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		tb.Fatalf("sql.Open(%q) failed: %v", dsn, err)
+	}
+	db.SetMaxOpenConns(1)
+	return db
+}
+
+// TestCheckReservedLockCrossesCGOBoundary pins the CheckReservedLock answer
+// END TO END, through sqlite itself: two connections through two registered
+// VFS instances over one fake clientset, writer A in DELETE journal mode
+// holding an open write transaction (RESERVED, journal on the "disk"),
+// reader B's first read reaching hasHotJournal — the only SQLite consumer
+// of xCheckReservedLock — which must learn, across the cgo boundary, that a
+// live writer holds the database and leave A's journal alone.
+//
+// Upstream github.com/psanford/sqlite3vfs inverts the answer at the shim
+// (goVFSCheckReservedLock writes *pResOut = 0 for a Go true), which is why
+// file.CheckReservedLock returns the negation. Without that workaround the
+// answer SQLite consumes here is "no writer" while A's journal exists: B
+// judges the journal hot and tries to play it back, which from B's
+// unlocked state means an EXCLUSIVE lock the VFS refuses — B's plain SELECT
+// fails while A merely holds an uncommitted transaction. This test fails
+// the moment the negation is removed (until upstream maps the answer
+// straight through), which is the point: in-process asserts cannot see
+// what SQLite finally consumes.
+func TestCheckReservedLockCrossesCGOBoundary(t *testing.T) {
+	v1, v2 := newContendingVFSInstances(t)
+	vfs1Name := registerUniqueVFS(t, v1)
+	vfs2Name := registerUniqueVFS(t, journalVisibleVFS{v2})
+	fileName := newSQLFileName()
+
+	dbA := openRollbackJournalSQLDB(t, vfs1Name, fileName)
+	defer dbA.Close()
+	dbB := openRollbackJournalSQLDB(t, vfs2Name, fileName)
+	defer dbB.Close()
+
+	// Setup runs on A alone: table plus committed rows. B stays untouched —
+	// its first read below must be its first contact with the database, so
+	// it walks the PAGER_OPEN -> hasHotJournal path the boundary crossing
+	// lives on (a reader with a lock already held skips that check).
+	if _, err := dbA.Exec(`CREATE TABLE books (
+		id text NOT NULL PRIMARY KEY,
+		title text
+	)`); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	const seededRows = 10
+	insertBatchWithBusyRetry(t, dbA, "a", seededRows)
+	if t.Failed() {
+		return
+	}
+
+	// A writer transaction left open: A holds RESERVED and its rollback
+	// journal is on the disk (visible to B through journalVisibleVFS).
+	const heldRows = 5
+	tx, err := dbA.Begin()
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	stmt, err := tx.Prepare("INSERT INTO books (id, title) VALUES (?, ?)")
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	for i := seededRows; i < seededRows+heldRows; i++ {
+		if _, err := stmt.Exec(fmt.Sprintf("a-%03d", i), fmt.Sprintf("title a %d", i)); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		t.Fatalf("stmt.Close: %v", err)
+	}
+
+	// THE BOUNDARY: B's first read while A's journal exists and A holds
+	// RESERVED. xCheckReservedLock on B's file must tell SQLite (via the
+	// shim) that a writer holds the database, so A's journal is treated as
+	// live and left alone: the read succeeds on the pre-transaction
+	// snapshot, uncommitted rows invisible. With the inversion unworked,
+	// this read fails — SQLite would roll back a live writer's journal.
+	var n int
+	if err := dbB.QueryRow("SELECT COUNT(*) FROM books").Scan(&n); err != nil {
+		t.Fatalf("reader COUNT(*) while writer holds an open transaction and its journal: %v (with a correct xCheckReservedLock answer the live journal is left alone)", err)
+	}
+	if n != seededRows {
+		t.Errorf("reader COUNT(*) during writer tx = %d, want %d (uncommitted rows must be invisible)", n, seededRows)
+	}
+
+	// The journal leaves with the commit, and B reads the committed rows
+	// through the same path: Access(journal) now answers false, so no
+	// boundary crossing is even needed — proving the setup was the journal,
+	// not the writer lock, that shaped the first read.
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if err := dbB.QueryRow("SELECT COUNT(*) FROM books").Scan(&n); err != nil {
+		t.Fatalf("reader COUNT(*) after commit: %v", err)
+	}
+	if n != seededRows+heldRows {
 		t.Errorf("reader COUNT(*) after commit = %d, want %d", n, seededRows+heldRows)
 	}
 }
