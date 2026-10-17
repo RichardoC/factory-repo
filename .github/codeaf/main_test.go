@@ -446,11 +446,56 @@ func TestDecide(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := Decide(c.event, c.ev, "codeaf", c.lookup)
+			got, err := Decide(c.event, c.ev, "codeaf", c.lookup, noLookup)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if got.Run != c.run || got.Mode != c.mode || got.Branch != c.branch {
+				t.Fatalf("Decide = %+v", got)
+			}
+		})
+	}
+
+	// workflow_dispatch names its issue in an untrusted input, so only
+	// digits are read and the fetched issue must pass the label gate.
+	openIssue := item{Number: 3, State: "open", Labels: labelled}
+	dispatch := []struct {
+		name  string
+		input string // the `issue` input; empty means no input at all
+		issue item
+		fetch bool // whether lookupIssue should be called at all
+		run   bool
+	}{
+		{"labelled issue", "3", openIssue, true, true},
+		{"non-numeric input", "three", openIssue, false, false},
+		{"zero input", "0", openIssue, false, false},
+		{"missing input", "", openIssue, false, false},
+		{"unlabelled issue", "3", item{Number: 3, State: "open"}, true, false},
+		{"closed issue", "3", item{Number: 3, State: "closed", Labels: labelled}, true, false},
+		{"an issue that is a PR", "3", item{Number: 3, State: "open", Labels: labelled, PullRequest: prMarker}, true, false},
+	}
+	for _, c := range dispatch {
+		t.Run("dispatch "+c.name, func(t *testing.T) {
+			called := false
+			lookupIssue := func(int) (item, error) {
+				called = true
+				return c.issue, nil
+			}
+			got, err := Decide("workflow_dispatch", with(func(e *event) {
+				if c.input != "" {
+					e.Inputs = map[string]string{"issue": c.input}
+				}
+			}), "codeaf", noLookup, lookupIssue)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if called != c.fetch {
+				t.Fatalf("lookupIssue called = %t, want %t", called, c.fetch)
+			}
+			if got.Run != c.run {
+				t.Fatalf("Decide = %+v", got)
+			}
+			if c.run && (got.Mode != "issue" || got.Number != 3 || got.Branch != "codeaf/issue-3-42") {
 				t.Fatalf("Decide = %+v", got)
 			}
 		})
@@ -481,6 +526,9 @@ func TestDecideRefusesABadRunID(t *testing.T) {
 	ev.Issue = &item{Number: 3, Labels: []label{{Name: "codeaf"}}}
 	if _, err := Decide("issues", ev, "codeaf", func(int) (item, error) {
 		t.Fatal("unexpected PR lookup")
+		return item{}, nil
+	}, func(int) (item, error) {
+		t.Fatal("unexpected issue lookup")
 		return item{}, nil
 	}); err == nil {
 		t.Fatal("Decide accepted a non-numeric GITHUB_RUN_ID")
