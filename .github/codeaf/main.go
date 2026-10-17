@@ -6,6 +6,8 @@
 //	                 upstream with usage.cost added and spend caps enforced
 //	harness gate     decide whether this GitHub event may run CodeAF; writes step
 //	                 outputs (run, reason, mode, number, branch, base)
+//	harness next     pick the queued issue CodeAF should work next and print
+//	                 its number, or nothing; the queue job labels it to start
 //	harness brief    write the task brief for `codeaf do` to $BRIEF_PATH
 //	harness summary  print CodeAF's JSON result without its long answer
 //	harness state    the state shared between runs (state.go): load the shared
@@ -44,11 +46,12 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("harness: ")
 	if len(os.Args) < 2 {
-		log.Fatal("usage: harness proxy|gate|brief|summary|state|report")
+		log.Fatal("usage: harness proxy|gate|next|brief|summary|state|report")
 	}
 	commands := map[string]func() error{
 		"proxy":   runProxy,
 		"gate":    runGate,
+		"next":    runNext,
 		"brief":   runBrief,
 		"summary": runSummary,
 		"state":   runState,
@@ -717,6 +720,7 @@ type item struct {
 	State       string          `json:"state"`
 	Labels      []label         `json:"labels"`
 	Comments    int             `json:"comments"`
+	CreatedAt   string          `json:"created_at"`
 	PullRequest json.RawMessage `json:"pull_request"` // present on issues that are PRs
 	Head        struct {
 		Ref  string `json:"ref"`
@@ -744,11 +748,12 @@ type comment struct {
 }
 
 type event struct {
-	Label       *label   `json:"label"`
-	Issue       *item    `json:"issue"`
-	PullRequest *item    `json:"pull_request"`
-	Comment     *comment `json:"comment"`
-	Review      *comment `json:"review"`
+	Label       *label            `json:"label"`
+	Issue       *item             `json:"issue"`
+	PullRequest *item             `json:"pull_request"`
+	Comment     *comment          `json:"comment"`
+	Review      *comment          `json:"review"`
+	Inputs      map[string]string `json:"inputs"` // workflow_dispatch inputs
 	Repository  struct {
 		DefaultBranch string `json:"default_branch"`
 	} `json:"repository"`
@@ -831,10 +836,30 @@ func runID() (string, error) {
 	return id, nil
 }
 
+// dispatchIssue reads the `issue` input of a workflow_dispatch: digits only,
+// and positive. Anything else is refused; the input is untrusted, and the
+// issue it names is checked against the label gate after it is fetched.
+func dispatchIssue(raw string) (int, bool) {
+	if raw == "" {
+		return 0, false
+	}
+	for _, r := range raw {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
+}
+
 // Decide applies the trust rules to one event. lookupPR fetches a PR when the
-// event only carries its issue form; it is only called once the event has
-// passed every check that needs no network.
-func Decide(name string, ev event, labelName string, lookupPR func(int) (item, error)) (Decision, error) {
+// event only carries its issue form, and lookupIssue fetches an issue for the
+// dispatch path; either is only called once the event has passed every check
+// that needs no network.
+func Decide(name string, ev event, labelName string, lookupPR, lookupIssue func(int) (item, error)) (Decision, error) {
 	issueRun := func(i item, reason string) (Decision, error) {
 		id, err := runID()
 		if err != nil {
@@ -855,6 +880,30 @@ func Decide(name string, ev event, labelName string, lookupPR func(int) (item, e
 			return skip("labelled a PR; PRs act on " + command + " commands"), nil
 		}
 		return issueRun(*ev.Issue, "issue labelled")
+	case "workflow_dispatch":
+		// The queue starts runs by dispatching this workflow with the
+		// issue number in its `issue` input: a GITHUB_TOKEN-labelled
+		// event does not fire workflows, so dispatch is the machine
+		// path. The input is untrusted, so only its digits are read,
+		// and the issue it names must still pass the same checks as a
+		// labelled event: open, not a PR, and labelled labelName.
+		n, ok := dispatchIssue(ev.Inputs["issue"])
+		if !ok {
+			return skip("workflow_dispatch needs a numeric issue input"), nil
+		}
+		i, err := lookupIssue(n)
+		if err != nil {
+			return Decision{}, err
+		}
+		switch {
+		case i.State != "open":
+			return skip("issue is not open"), nil
+		case len(i.PullRequest) > 0:
+			return skip("issue is a PR"), nil
+		case !i.labelled(labelName):
+			return skip("issue is not labelled " + labelName), nil
+		}
+		return issueRun(i, "workflow dispatch")
 	case "issue_comment":
 		target, trigger = ev.Issue, ev.Comment
 		if trigger != nil {
@@ -913,6 +962,9 @@ func runGate() error {
 	decision, err := Decide(os.Getenv("GITHUB_EVENT_NAME"), ev, envOr("CODEAF_LABEL", "codeaf"), func(n int) (item, error) {
 		var pr item
 		return pr, gh.get(fmt.Sprintf("/pulls/%d", n), &pr)
+	}, func(n int) (item, error) {
+		var it item
+		return it, gh.get(fmt.Sprintf("/issues/%d", n), &it)
 	})
 	if err != nil {
 		return err

@@ -78,6 +78,41 @@ Three workflow artifacts are uploaded, none of them encrypted:
   - [`codeaf.yml`](.github/workflows/codeaf.yml) explains how to turn it back on
     once CodeAF is fixed.
 
+## The queue
+
+Issues labelled **`codeaf-queued`** are the backlog. Every 10 minutes (and on
+demand, via *Run workflow*)
+[`codeaf-queue.yml`](.github/workflows/codeaf-queue.yml) asks the harness
+(`harness next`) to start the next run: the oldest queued issue —
+**`codeaf-priority`** jumps the queue — for which all four hold:
+
+- no CodeAF run is queued or in progress;
+- every issue named in a "Depends on #N" line in its body is closed;
+- the day's spend in the shared state is under 75% of `limits.day_usd` in
+  [`models.json`](.github/codeaf/models.json) — an unknown spend starts nothing;
+- the issue is queued and not already active.
+
+A run is started by adding the **`codeaf`** label — the same trust gate as a
+person adding it — and then by dispatching
+[`codeaf.yml`](.github/workflows/codeaf.yml) with the issue number. The
+dispatch step exists because events raised with `GITHUB_TOKEN` (labelling
+included) do not trigger other workflows; `workflow_dispatch` is the one event
+it can start. The queue starts nothing while a CodeAF run is queued or in
+progress, so queued work never overlaps. Runs started by hand (a label or a
+`/codeaf` comment) can still overlap with one; they are not held in a single
+concurrency group, because GitHub would cancel all but the newest pending run
+in it and silently drop a command.
+
+Manual controls: *Run workflow* on either workflow — `codeaf-queue.yml` runs
+the queue's checks now, `codeaf.yml` starts an issue when given its number.
+Known failure modes:
+- a "Depends on #N" line naming an open pull request blocks too (the issues
+  API lists PRs);
+- if the dispatch step fails after labelling, the issue keeps `codeaf` but
+  nothing runs — a maintainer runs `codeaf.yml` by hand with the issue number;
+- a self-dependency or a dependency cycle blocks the issue until its body is
+  edited.
+
 ## Limits worth knowing
 
 - The agent has a shell on the runner, so treat it as having the same access as any

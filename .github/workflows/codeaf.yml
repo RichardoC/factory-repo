@@ -31,6 +31,12 @@ on:
     types: [created]
   pull_request_review:
     types: [submitted]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: issue number the queue labelled codeaf
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -45,7 +51,8 @@ jobs:
     if: >-
       (github.event_name == 'issues' && github.event.label.name == 'codeaf') ||
       (github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/codeaf')) ||
-      (github.event_name == 'pull_request_review' && (github.event.review.state == 'changes_requested' || startsWith(github.event.review.body, '/codeaf')))
+      (github.event_name == 'pull_request_review' && (github.event.review.state == 'changes_requested' || startsWith(github.event.review.body, '/codeaf'))) ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -80,6 +87,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     concurrency:
+      # One group per issue or PR, not one for all runs: GitHub keeps only the
+      # newest pending run in a group and cancels the others, so a global group
+      # would silently drop a /codeaf comment made while another run is going.
+      # The queue (codeaf-queue.yml) keeps queued work from overlapping.
       group: codeaf-run-${{ needs.gate.outputs.number }}
       cancel-in-progress: false
     # No write access of any kind: the agent can read anything this job can.
