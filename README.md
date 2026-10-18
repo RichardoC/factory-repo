@@ -631,6 +631,18 @@ knowing*).
     not merged yet.
   - When runs overlap, spend is added and ratings and events are merged. The
     memory db comes only from a run that started from the latest generation.
+  - Every packed run also carries one **run record** (`run-record.json`,
+    issue #140): the run's mode, number, lane, stop reason, wall time, call
+    and 429 counts, cost and tokens, and whether the patch touches the
+    harness. Every field is bounded, and a record that cannot be believed is
+    dropped — never the run it belongs to. The merge appends valid records as
+    one JSON line each to `records.jsonl` in the bundle and keeps the newest
+    2000; every line is re-validated on every load and merge, and nothing in
+    the file is ever executed.
+  - `harness metrics BUNDLE [DAYS]` summarises those records as Markdown:
+    runs by mode and stop, store-finished runs, mean and p50 wall time and
+    mean cost by mode, cost by day, upstream 429s, total slot wait, and PRs
+    that needed more than one `pr`-mode run.
 
   Everything is checked before it is merged, and again before CodeAF sees it
   (see [`AGENTS.md`](AGENTS.md#caches-and-carried-state)). Saved memories reach
