@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -248,5 +249,179 @@ func TestLoadProtectedLabelsCanBeDisabled(t *testing.T) {
 	}
 	if len(cfg.Linear.Labels.Protected) != 0 {
 		t.Fatalf("Protected = %#v, want empty when disabled with \"off\"", cfg.Linear.Labels.Protected)
+	}
+}
+
+// setRequiredVars sets the three variables Load requires, with valid values,
+// so a test can isolate the malformed variable it actually cares about.
+func setRequiredVars(t *testing.T) {
+	t.Helper()
+	t.Setenv("SNYK_DAST_API_KEY", "api-key")
+	t.Setenv("LINEAR_API_KEY", "linear-key")
+	t.Setenv("LINEAR_TEAM_ID", "team-id")
+}
+
+// TestLoadRejectsMalformedIntegers verifies that a typo'd integer variable
+// stops the run with an error naming the variable and echoing the raw value,
+// instead of being silently replaced by the default. The archive lookback
+// window is the dangerous one: a silent fallback to a too-short window hides
+// recently auto-archived tickets and the sync mints duplicates.
+func TestLoadRejectsMalformedIntegers(t *testing.T) {
+	for _, key := range []string{
+		"SYNC_WORKERS",
+		"SNYK_DAST_HTTP_CONCURRENCY",
+		"LINEAR_HTTP_CONCURRENCY",
+		"LINEAR_DUE_DAYS_CRITICAL",
+		"LINEAR_DUE_DAYS_HIGH",
+		"LINEAR_DUE_DAYS_MEDIUM",
+		"LINEAR_DUE_DAYS_LOW",
+		"LINEAR_ARCHIVE_LOOKBACK_DAYS",
+	} {
+		t.Run(key, func(t *testing.T) {
+			setRequiredVars(t)
+			t.Setenv(key, "1o")
+
+			_, err := Load(nil)
+			if err == nil {
+				t.Fatalf("Load() error = nil, want error naming %s", key)
+			}
+			if !strings.Contains(err.Error(), key) {
+				t.Fatalf("Load() error = %q, want it to name %s", err, key)
+			}
+			if !strings.Contains(err.Error(), "1o") {
+				t.Fatalf("Load() error = %q, want it to quote the value %q", err, "1o")
+			}
+		})
+	}
+
+	t.Run("reports all malformed integers at once", func(t *testing.T) {
+		setRequiredVars(t)
+		t.Setenv("LINEAR_ARCHIVE_LOOKBACK_DAYS", "30d")
+		t.Setenv("SYNC_WORKERS", "1O")
+
+		_, err := Load(nil)
+		if err == nil {
+			t.Fatal("Load() error = nil, want an error naming both variables")
+		}
+		for _, want := range []string{"LINEAR_ARCHIVE_LOOKBACK_DAYS", "30d", "SYNC_WORKERS", "1O"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("Load() error = %q, want it to mention %q", err, want)
+			}
+		}
+	})
+}
+
+// TestLoadRejectsMalformedBooleans verifies the same for the two boolean
+// variables, which only accept the forms strconv.ParseBool accepts: "yes" and
+// "no" are not among them, so they must fail the run rather than flip a
+// setting silently.
+func TestLoadRejectsMalformedBooleans(t *testing.T) {
+	setRequiredVars(t)
+	t.Setenv("LINEAR_COMMENTS", "yes")
+	t.Setenv("LINEAR_UNSUBSCRIBE_ACTOR", "no")
+
+	_, err := Load(nil)
+	if err == nil {
+		t.Fatal("Load() error = nil, want an error naming both variables")
+	}
+	for _, want := range []string{"LINEAR_COMMENTS", "LINEAR_UNSUBSCRIBE_ACTOR"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("Load() error = %q, want it to mention %s", err, want)
+		}
+	}
+}
+
+// TestLoadAcceptsParseBoolSpellings pins the accepted spellings: every form
+// strconv.ParseBool accepts is valid, not just "true"/"false".
+func TestLoadAcceptsParseBoolSpellings(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{value: "T", want: true},
+		{value: "1", want: true},
+		{value: "TRUE", want: true},
+		{value: "False", want: false},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			setRequiredVars(t)
+			t.Setenv("LINEAR_COMMENTS", tc.value)
+
+			cfg, err := Load(nil)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Linear.CommentsEnabled != tc.want {
+				t.Fatalf("CommentsEnabled = %v, want %v", cfg.Linear.CommentsEnabled, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoadEmptyValuesUseDefaults verifies that unset, empty and whitespace-only
+// values still fall back to the default: the change only rejects values that
+// are present but do not parse.
+func TestLoadEmptyValuesUseDefaults(t *testing.T) {
+	setRequiredVars(t)
+	t.Setenv("SYNC_WORKERS", "")
+	t.Setenv("LINEAR_COMMENTS", "  ")
+
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Sync.Workers != defaultWorkerCount {
+		t.Fatalf("Workers = %d, want %d", cfg.Sync.Workers, defaultWorkerCount)
+	}
+	if cfg.Linear.CommentsEnabled {
+		t.Fatal("CommentsEnabled = true, want the default false")
+	}
+}
+
+// TestLoadReportsMalformedValuesBeforeMissingCredentials verifies that the
+// malformed-value errors come back on their own, before the missing-credential
+// validation errors: an operator with a typo should not have to read past a
+// wall of "is required" errors to find it.
+func TestLoadReportsMalformedValuesBeforeMissingCredentials(t *testing.T) {
+	t.Setenv("SNYK_DAST_API_KEY", "")
+	t.Setenv("LINEAR_API_KEY", "")
+	t.Setenv("LINEAR_TEAM_ID", "")
+	t.Setenv("SYNC_WORKERS", "x")
+
+	_, err := Load(nil)
+	if err == nil {
+		t.Fatal("Load() error = nil, want an error naming SYNC_WORKERS")
+	}
+	if !strings.Contains(err.Error(), "SYNC_WORKERS") {
+		t.Fatalf("Load() error = %q, want it to mention SYNC_WORKERS", err)
+	}
+	if strings.Contains(err.Error(), "is required") {
+		t.Fatalf("Load() error = %q, want malformed values reported before missing credentials", err)
+	}
+}
+
+// TestLoadEnvFileWithMalformedValue exercises the real flag parsing and
+// godotenv.Overload path the binary uses: a malformed integer in the dotenv
+// file must fail startup with an error naming the variable and quoting the
+// value, not silently fall back to the default.
+func TestLoadEnvFileWithMalformedValue(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	content := "SNYK_DAST_API_KEY=api-key\n" +
+		"LINEAR_API_KEY=linear-key\n" +
+		"LINEAR_TEAM_ID=team-id\n" +
+		"LINEAR_DUE_DAYS_HIGH=thirty\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	_, err := Load([]string{"--env-file", path})
+	if err == nil {
+		t.Fatal("Load() error = nil, want an error naming LINEAR_DUE_DAYS_HIGH")
+	}
+	for _, want := range []string{"LINEAR_DUE_DAYS_HIGH", "thirty"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("Load() error = %q, want it to mention %q", err, want)
+		}
 	}
 }

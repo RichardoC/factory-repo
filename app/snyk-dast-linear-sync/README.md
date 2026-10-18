@@ -490,6 +490,12 @@ Optional:
 - `ERROR_LOG_FILE`
 - `CACHE_DB_FILE`
 
+Integer variables must be plain integers, and boolean variables must be
+`true`/`false` (or another form `strconv.ParseBool` accepts: `1`, `0`, `t`,
+`f`, `T`, `F`; spelling is case-insensitive). A malformed value stops the run
+at startup with an error naming the variable and quoting the value it could
+not parse; it is never silently replaced by the default.
+
 See [.env.example](/.env.example).
 
 ## Diagnostic Tool
