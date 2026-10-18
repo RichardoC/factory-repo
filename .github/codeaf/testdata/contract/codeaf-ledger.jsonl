@@ -1,0 +1,5 @@
+{"ts":"2026-10-17T00:01:00Z","start":"2026-10-17T00:00:30Z","kind":"proxy_start"}
+{"ts":"2026-10-17T00:01:10Z","start":"2026-10-17T00:00:40Z","model":"zai-org/glm-5.3-flash","upstream":"hf:zai-org/GLM-5.3-Flash","prompt_tokens":1000,"cached_tokens":100,"completion_tokens":500,"reasoning_tokens":300,"cost_usd":0.05,"stream":true,"usage_seen":true,"slot_wait_s":0.25}
+{"ts":"2026-10-17T00:02:20Z","start":"2026-10-17T00:01:50Z","model":"deepseek-ai/deepseek-v4.1-flash","upstream":"hf:deepseek-ai/DeepSeek-V4.1-Flash","prompt_tokens":2000,"cached_tokens":0,"completion_tokens":400,"reasoning_tokens":150,"cost_usd":0.02,"stream":false,"usage_seen":true}
+{"ts":"2026-10-17T00:03:30Z","start":"2026-10-17T00:03:00Z","model":"zai-org/glm-5.3","upstream":"hf:zai-org/GLM-5.3","prompt_tokens":3000,"cached_tokens":500,"completion_tokens":600,"reasoning_chars":2000,"output_chars":3500,"cost_usd":0.4,"stream":true,"usage_seen":true,"repaired_tool_args":1}
+{"ts":"2026-10-17T00:03:31Z","kind":"quotas","quotas":"{\"subscription\":{\"limit\":1000,\"requests\":123,\"renewsAt\":\"2026-10-24T00:00:00Z\"},\"weeklyTokenLimit\":{\"percentRemaining\":62.3}}"}
