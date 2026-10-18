@@ -226,6 +226,14 @@ func linearIssueToModel(issue linearIssueNode) model.ExistingIssue {
 // landed; an archived one is not, and counting it would suppress the deliberate
 // replacement ticket created when an archived issue's finding becomes active
 // again.
+//
+// The query is scoped exactly like the snapshot (identityFilter): team AND the
+// sync's identity arms, so a team shared with another sync does not get paged
+// through during the retry path. It used to carry an Or of
+// `description: { contains: fingerprint }` clauses instead, but Linear does not
+// apply that predicate, which silently widened the filter to every issue in the
+// team. The fingerprint check below still runs on each decoded description, so
+// the scope only governs which issues are read, not what counts as a match.
 func (c *Client) ExistingFingerprints(ctx context.Context, fingerprints []string) (map[string]struct{}, error) {
 	wanted := make(map[string]struct{}, len(fingerprints))
 	for _, fingerprint := range fingerprints {
@@ -240,19 +248,11 @@ func (c *Client) ExistingFingerprints(ctx context.Context, fingerprints []string
 		return nil, err
 	}
 
-	clauses := make([]linearapi.IssueFilter, 0, len(wanted))
-	for fingerprint := range wanted {
-		clauses = append(clauses, linearapi.IssueFilter{
-			Description: &linearapi.NullableStringComparator{
-				Contains: new(fingerprint),
-			},
-		})
-	}
 	filter := linearapi.IssueFilter{
 		Team: &linearapi.TeamFilter{
 			Id: &linearapi.IDComparator{Eq: c.teamID()},
 		},
-		Or: clauses,
+		And: []linearapi.IssueFilter{c.identityFilter()},
 	}
 
 	found := map[string]struct{}{}
@@ -668,6 +668,36 @@ query teamStates($id: String!, $after: String) {
 	return nil
 }
 
+// identityFilter builds the scope that selects this sync's own tickets: a
+// title-prefix arm, plus the managed-label arm when label management is enabled.
+// Every managed issue's title is built with the titlePrefix, and the managed
+// label is stamped at create and re-asserted on every update, so either alone
+// identifies a managed ticket. Both are kept as alternatives so that losing
+// one -- a retitled issue, or a label removed by hand -- does not hide the
+// ticket and mint a duplicate.
+//
+// The snapshot query (loadIssues) and the ambiguous-create reconciliation query
+// (ExistingFingerprints) share this scope, so neither can widen to the rest of
+// a team shared with another sync.
+func (c *Client) identityFilter() linearapi.IssueFilter {
+	arms := []linearapi.IssueFilter{
+		{Title: &linearapi.StringComparator{StartsWith: new(titlePrefix)}},
+	}
+	// Only when label management is enabled: with LINEAR_MANAGED_LABEL=off there
+	// is no label to match, and an arm matching nothing would narrow the scope
+	// rather than widen it.
+	if managedLabel := strings.TrimSpace(c.cfg.Labels.Managed); managedLabel != "" {
+		arms = append(arms, linearapi.IssueFilter{
+			Labels: &linearapi.IssueLabelCollectionFilter{
+				Some: &linearapi.IssueLabelFilter{
+					Name: &linearapi.StringComparator{EqIgnoreCase: &managedLabel},
+				},
+			},
+		})
+	}
+	return linearapi.IssueFilter{Or: arms}
+}
+
 func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) {
 	// Linear auto-archives closed issues after the team's configured inactivity
 	// period, and archived issues are excluded from the default issues query.
@@ -691,30 +721,11 @@ func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) 
 	// field IS NULL, i.e. issues that have NOT been auto-archived.
 	archivedAtIsNull := true
 
-	// Every managed issue's title is built with the titlePrefix, and the managed
-	// label is stamped at create and re-asserted on every update, so either alone
-	// identifies a managed ticket. Both are kept as alternatives so that losing
-	// one -- a retitled issue, or a label removed by hand -- does not hide the
-	// ticket and mint a duplicate.
-	identityArms := []linearapi.IssueFilter{
-		{Title: &linearapi.StringComparator{StartsWith: new(titlePrefix)}},
-	}
-	// Only when label management is enabled: with LINEAR_MANAGED_LABEL=off there
-	// is no label to match, and an arm matching nothing would narrow the snapshot
-	// rather than widen it.
-	if managedLabel := strings.TrimSpace(c.cfg.Labels.Managed); managedLabel != "" {
-		identityArms = append(identityArms, linearapi.IssueFilter{
-			Labels: &linearapi.IssueLabelCollectionFilter{
-				Some: &linearapi.IssueLabelFilter{
-					Name: &linearapi.StringComparator{EqIgnoreCase: &managedLabel},
-				},
-			},
-		})
-	}
+	identity := c.identityFilter()
 	c.log.Info("Linear issue snapshot identity scope",
 		slog.String("title_prefix", titlePrefix),
 		slog.String("managed_label", c.cfg.Labels.Managed),
-		slog.Int("identity_arms", len(identityArms)),
+		slog.Int("identity_arms", len(identity.Or)),
 	)
 	filter := linearapi.IssueFilter{
 		Team: &linearapi.TeamFilter{
@@ -744,9 +755,7 @@ func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) 
 			// ignored rather than applied, silently widening the OR to everything.
 			// The metadata block is still the authority for identity once an issue
 			// is loaded; it just cannot be trusted to select which ones to load.
-			{
-				Or: identityArms,
-			},
+			identity,
 		},
 	}
 

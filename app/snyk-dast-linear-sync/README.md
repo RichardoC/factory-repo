@@ -346,6 +346,11 @@ supporting the string comparators at all. The metadata block remains the
 authority for identity once an issue is loaded; it just cannot be trusted to
 select which issues to load.
 
+The same scope bounds the ambiguous-create reconciliation query
+(`ExistingFingerprints`), which runs in the retry path right after a failed
+batch create: scoped this way it pages only through this sync's own tickets,
+instead of every non-archived issue in the team.
+
 ### Archived Linear Issues
 
 Linear auto-archives closed issues after the team's configured inactivity
