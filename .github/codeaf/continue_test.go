@@ -244,8 +244,16 @@ func TestContinuePlan(t *testing.T) {
 	}
 
 	// Stops that must not be continued return no action at all, and a
-	// failing API is an error, not an empty plan.
-	for _, stop := range []string{stopDone, stopError, stopQuestion, stopUnchecked, "", "junk", stopUnknown} {
+	// failing API is an error, not an empty plan. A done stop is decided by
+	// the mergeable_state probe instead: an unconflicted PR gets no action,
+	// and its fetch errors surface (TestContinuePlanContinuesADirtyPR
+	// covers the conflicted and failing sides).
+	cleanServer := prStateServer(t, "clean", reportComments(1))
+	ghEnv(t, cleanServer)
+	if action, body, used, err := continuePlan(newGitHub(), 7, stopDone); err != nil || action != "" || body != "" || used != 0 {
+		t.Errorf("continuePlan(stop=done, clean) = (%q, %q, %d, %v), want no action", action, body, used, err)
+	}
+	for _, stop := range []string{stopError, stopQuestion, stopUnchecked, "", "junk", stopUnknown} {
 		server := commentsServer(t, reportComments(1), http.StatusOK)
 		ghEnv(t, server)
 		action, body, used, err := continuePlan(newGitHub(), 7, stop)
@@ -430,7 +438,9 @@ func TestRunContinuePlan(t *testing.T) {
 	})
 
 	t.Run("a finished run means no action", func(t *testing.T) {
-		server := commentsServer(t, reportComments(1), http.StatusOK)
+		// The done stop probes the pull request (issue #137): PR 7 is not
+		// conflicted, so the run finishes with no action and no comment.
+		server := prStateServer(t, "clean", reportComments(1))
 		ghEnv(t, server)
 		setArgs("7")
 		writeResult(t, stopDone)
@@ -658,6 +668,26 @@ func prStateServer(t *testing.T, state string, comments []issueComment) *httptes
 	return server
 }
 
+// pullsServer serves the pull request of PR 7 with mergeable_state state,
+// and fails the comments path with status: the mirror of commentsServer,
+// for the error branch of the comments fetch.
+func pullsServer(t *testing.T, state string, status int) *httptest.Server {
+	t.Helper()
+	prBody := fmt.Sprintf(`{"number":7,"mergeable_state":%q}`, state)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/RichardoC/factory-repo/issues/7/comments":
+			http.Error(w, "comments unavailable", status)
+		case "/repos/RichardoC/factory-repo/pulls/7":
+			_, _ = io.WriteString(w, prBody)
+		default:
+			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
 // stubSleep replaces the injectable continueSleep with a recorder, so the
 // mergeable_state retries are observed without waiting. The returned slice
 // holds one entry per call.
@@ -693,13 +723,22 @@ func TestContinuePlanContinuesADirtyPR(t *testing.T) {
 		}
 	})
 
-	t.Run("dirty with the cap reached does nothing", func(t *testing.T) {
+	t.Run("dirty with the cap reached hands over with the cap comment", func(t *testing.T) {
 		sleeps := stubSleep(t)
 		server := prStateServer(t, "dirty", reportComments(3))
 		ghEnv(t, server)
-		action, body, _, err := continuePlan(newGitHub(), 7, stopDone)
-		if err != nil || action != "" || body != "" {
-			t.Errorf("continuePlan = (%q, %q, %v), want no action", action, body, err)
+		action, body, used, err := continuePlan(newGitHub(), 7, stopDone)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if action != "cap" {
+			t.Fatalf("action = %q, want cap", action)
+		}
+		if want := conflictCapBody(); body != want {
+			t.Errorf("body = %q, want the fixed cap body %q", body, want)
+		}
+		if used != 2 {
+			t.Errorf("used = %d, want 2", used)
 		}
 		if len(*sleeps) != 0 {
 			t.Errorf("unexpected sleeps: %v", *sleeps)
@@ -721,13 +760,32 @@ func TestContinuePlanContinuesADirtyPR(t *testing.T) {
 		}
 	})
 
-	t.Run("a failing pull request fetch does nothing", func(t *testing.T) {
+	t.Run("a failing pull request fetch fails the plan", func(t *testing.T) {
 		sleeps := stubSleep(t)
 		server := commentsServer(t, reportComments(1), http.StatusOK) // 404s /pulls/7
 		ghEnv(t, server)
 		action, body, _, err := continuePlan(newGitHub(), 7, stopDone)
-		if err != nil || action != "" || body != "" {
-			t.Errorf("continuePlan = (%q, %q, %v), want no action", action, body, err)
+		if err == nil {
+			t.Fatalf("continuePlan = (%q, %q, nil), want the fetch error", action, body)
+		}
+		if action != "" || body != "" {
+			t.Errorf("continuePlan = (%q, %q), want no action beside the error", action, body)
+		}
+		if len(*sleeps) != 0 {
+			t.Errorf("unexpected sleeps: %v", *sleeps)
+		}
+	})
+
+	t.Run("a failing comments fetch fails the plan", func(t *testing.T) {
+		sleeps := stubSleep(t)
+		server := pullsServer(t, "dirty", http.StatusInternalServerError) // 500s the comments
+		ghEnv(t, server)
+		action, body, _, err := continuePlan(newGitHub(), 7, stopDone)
+		if err == nil {
+			t.Fatalf("continuePlan = (%q, %q, nil), want the fetch error", action, body)
+		}
+		if action != "" || body != "" {
+			t.Errorf("continuePlan = (%q, %q), want no action beside the error", action, body)
 		}
 		if len(*sleeps) != 0 {
 			t.Errorf("unexpected sleeps: %v", *sleeps)
@@ -803,6 +861,37 @@ func TestContinuePlanWaitsForUnknownMergeable(t *testing.T) {
 		}
 		if len(*sleeps) != 2 {
 			t.Errorf("sleep calls = %v, want 2 before the dirty answer", *sleeps)
+		}
+	})
+
+	t.Run("the probe never runs past its budget", func(t *testing.T) {
+		sleeps := stubSleep(t)
+		fetches := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/repos/RichardoC/factory-repo/issues/7/comments":
+				_, _ = io.WriteString(w, "[]")
+			case "/repos/RichardoC/factory-repo/pulls/7":
+				fetches++
+				_, _ = io.WriteString(w, `{"number":7,"mergeable_state":"unknown"}`)
+			default:
+				http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
+			}
+		}))
+		t.Cleanup(server.Close)
+		ghEnv(t, server)
+		old := mergeableStateBudget
+		mergeableStateBudget = -time.Second // already past: no retry may start
+		t.Cleanup(func() { mergeableStateBudget = old })
+		action, body, _, err := continuePlan(newGitHub(), 7, stopDone)
+		if err != nil || action != "" || body != "" {
+			t.Errorf("continuePlan = (%q, %q, %v), want no action past the budget", action, body, err)
+		}
+		if fetches != 1 {
+			t.Errorf("/pulls fetches = %d, want 1 (no retry past the budget)", fetches)
+		}
+		if len(*sleeps) != 0 {
+			t.Errorf("sleeps = %v, want none past the budget", *sleeps)
 		}
 	})
 
