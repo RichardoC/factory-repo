@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -54,6 +55,17 @@ type fakeLinear struct {
 	// PostComments call so a test can assert no retry happened.
 	commentBatchErr error
 	commentCalls    []int
+
+	// updateErr, when non-nil, makes every UpdateIssues call fail — the batch
+	// call and each per-entry retry — while the attempted writes are still
+	// recorded so a test can see what was attempted. It models a
+	// transport-level failure where no per-alias data comes back at all.
+	updateErr error
+	// updateFailFingerprints makes every UpdateIssues call that carries one of
+	// these fingerprints fail, batch or single-entry retry alike, while calls
+	// with only other fingerprints succeed. It models a per-ticket Linear
+	// failure that survives the retry.
+	updateFailFingerprints map[string]struct{}
 }
 
 type fakeCache struct {
@@ -111,6 +123,18 @@ func (f *fakeLinear) CreateIssues(_ context.Context, desired []model.DesiredIssu
 }
 
 func (f *fakeLinear) UpdateIssues(_ context.Context, updates []model.IssueUpdate) error {
+	for _, update := range updates {
+		if _, ok := f.updateFailFingerprints[update.Desired.Fingerprint]; ok {
+			return fmt.Errorf("update failed for %s", update.Desired.Fingerprint)
+		}
+	}
+	if f.updateErr != nil {
+		for _, update := range updates {
+			f.updated = append(f.updated, update.Desired)
+			f.updates = append(f.updates, update)
+		}
+		return f.updateErr
+	}
 	for _, update := range updates {
 		f.updated = append(f.updated, update.Desired)
 		f.updates = append(f.updates, update)
@@ -1282,6 +1306,236 @@ func minimalCfg() config.Config {
 	}
 }
 
+// emptySnykDASTSnapshot is a snapshot whose target and finding lists came
+// back empty: the documented symptom of an API key without the view_target
+// permission, of a team filter matching no targets, or of an outage.
+func emptySnykDASTSnapshot() model.SnykDASTSnapshot {
+	return model.SnykDASTSnapshot{}
+}
+
+func openManagedIssues() []model.ExistingIssue {
+	return []model.ExistingIssue{
+		{
+			ID:          "existing-1",
+			Identifier:  "SEC-1",
+			Title:       "finding on project-a",
+			Description: "old description",
+			StateName:   "Todo",
+			Fingerprint: "snyk-dast:project-a:finding-1",
+		},
+		{
+			ID:          "existing-2",
+			Identifier:  "SEC-2",
+			Title:       "finding on project-b",
+			Description: "old description",
+			StateName:   "In Progress",
+			Fingerprint: "snyk-dast:project-b:finding-2",
+		},
+	}
+}
+
+func cacheSavedIsEmpty(saved cache.Snapshot) bool {
+	return saved.SchemaSignature == "" && len(saved.SnykDASTHashes) == 0 && len(saved.LinearHashes) == 0
+}
+
+func TestRunRefusesToResolveFromEmptySnapshot(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	snykdast := fakeSnykDAST{snapshot: emptySnykDASTSnapshot()}
+	cacheStore := &fakeCache{
+		// Pre-load a plausible cache so a stray save would be observable.
+		snapshot: cache.Snapshot{
+			SchemaSignature: managedSchemaSignature(),
+			SnykDASTHashes:  map[string]string{"snyk-dast:project-a:finding-1": "hash"},
+			LinearHashes:    map[string]string{"snyk-dast:project-a:finding-1": "hash"},
+		},
+	}
+	linear := &fakeLinear{snapshot: openManagedIssues()}
+
+	service := New(cfg, logger, snykdast, linear, cacheStore)
+
+	result, err := service.Run(context.Background())
+	if err == nil {
+		t.Fatal("Run() error = nil, want the empty-snapshot guard error")
+	}
+	if !strings.Contains(err.Error(), "view_target") {
+		t.Fatalf("Run() error = %q, want it to name the view_target remedy", err)
+	}
+	if len(linear.updated) != 0 {
+		t.Fatalf("updated = %d entries, want 0 (no Linear write)", len(linear.updated))
+	}
+	if !cacheSavedIsEmpty(cacheStore.saved) {
+		t.Fatalf("cache saved = %#v, want zero value (cache must not be refreshed)", cacheStore.saved)
+	}
+	if result.PlannedResolves != 0 {
+		t.Fatalf("PlannedResolves = %d, want 0", result.PlannedResolves)
+	}
+}
+
+func TestRunEmptySnapshotAndNoManagedIssuesSucceeds(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	snykdast := fakeSnykDAST{snapshot: emptySnykDASTSnapshot()}
+	linear := &fakeLinear{}
+
+	service := New(cfg, logger, snykdast, linear, nil)
+
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil for a brand-new deployment", err)
+	}
+	if result.PlannedResolves != 0 {
+		t.Fatalf("PlannedResolves = %d, want 0", result.PlannedResolves)
+	}
+	if len(linear.updated) != 0 || len(linear.created) != 0 {
+		t.Fatalf("writes made: updated=%d created=%d, want none", len(linear.updated), len(linear.created))
+	}
+}
+
+func TestRunEmptySnapshotDryRunReportsPlanWithoutError(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.DryRun = true
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	snykdast := fakeSnykDAST{snapshot: emptySnykDASTSnapshot()}
+	cacheStore := &fakeCache{}
+	linear := &fakeLinear{snapshot: openManagedIssues()}
+
+	service := New(cfg, logger, snykdast, linear, cacheStore)
+
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil in dry-run mode", err)
+	}
+	if result.PlannedResolves != 2 {
+		t.Fatalf("PlannedResolves = %d, want 2 (plan still reported)", result.PlannedResolves)
+	}
+	if len(linear.updated) != 0 {
+		t.Fatalf("updated = %d entries, want 0 (dry run must not write)", len(linear.updated))
+	}
+	if !cacheSavedIsEmpty(cacheStore.saved) {
+		t.Fatalf("cache saved = %#v, want zero value", cacheStore.saved)
+	}
+}
+
+func TestRunStillResolvesWhenOnlyOneTargetDisappears(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// project-a is still listed; its finding is still open. project-b is gone
+	// from the listing entirely, so only its ticket may be cancelled.
+	snykdast := fakeSnykDAST{
+		snapshot: model.SnykDASTSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint:       "snyk-dast:project-a:finding-1",
+					SnykDASTFindingID: "SNYK-100",
+					TargetID:          "project-a",
+					TargetName:        "Example App",
+					TargetHost:        "example.test",
+					IssueTitle:        "Reflected XSS",
+					Severity:          "high",
+					Status:            model.FindingOpen,
+					IssueURL:          "https://example.test/findings/1",
+				},
+			},
+			TargetIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{snapshot: openManagedIssues()}
+
+	service := New(cfg, logger, snykdast, linear, nil)
+
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.PlannedResolves != 1 {
+		t.Fatalf("PlannedResolves = %d, want 1", result.PlannedResolves)
+	}
+	cancelled := cancelledIdentifiers(linear.updates)
+	if len(cancelled) != 1 || cancelled[0] != "SEC-2" {
+		t.Fatalf("cancelled = %v, want only SEC-2 (project-b)", cancelled)
+	}
+	for _, update := range linear.updates {
+		if update.Existing.Identifier == "SEC-1" && update.Desired.State == model.StateCancelled {
+			t.Fatalf("SEC-1 (project-a) was cancelled, want its open state kept: %#v", update)
+		}
+	}
+}
+
+func TestRunEmptySnapshotWithRealCacheKeepsCachedRows(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "cache.db")
+	store, err := cache.Open(path)
+	if err != nil {
+		t.Fatalf("cache.Open() error = %v", err)
+	}
+	defer store.Close()
+
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fingerprint := "snyk-dast:project-a:finding-1"
+	snykdast := fakeSnykDAST{
+		snapshot: model.SnykDASTSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint:       fingerprint,
+					SnykDASTFindingID: "SNYK-100",
+					TargetID:          "project-a",
+					TargetName:        "Example App",
+					TargetHost:        "example.test",
+					IssueTitle:        "Reflected XSS",
+					Severity:          "high",
+					Status:            model.FindingOpen,
+					IssueURL:          "https://example.test/findings/1",
+				},
+			},
+			TargetIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	managedIssue := model.ExistingIssue{
+		ID:          "existing-1",
+		Identifier:  "SEC-1",
+		Title:       "finding on project-a",
+		Description: "old description",
+		StateName:   "Todo",
+		Fingerprint: fingerprint,
+	}
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{managedIssue}}
+
+	// First run: a healthy snapshot, seeded into the real SQLite cache.
+	first := New(cfg, logger, snykdast, linear, store)
+	if _, err := first.Run(ctx); err != nil {
+		t.Fatalf("first Run() error = %v", err)
+	}
+
+	// Second run: the snapshot comes back empty while the managed issue
+	// exists in Linear. The guard must refuse and leave the cache untouched.
+	second := New(cfg, logger, fakeSnykDAST{snapshot: emptySnykDASTSnapshot()}, &fakeLinear{
+		snapshot: []model.ExistingIssue{managedIssue},
+	}, store)
+	_, err = second.Run(ctx)
+	if err == nil {
+		t.Fatal("second Run() error = nil, want the empty-snapshot guard error")
+	}
+	if !strings.Contains(err.Error(), "view_target") {
+		t.Fatalf("second Run() error = %q, want it to name the view_target remedy", err)
+	}
+
+	cached, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("store.Load() error = %v", err)
+	}
+	if cached.SchemaSignature != managedSchemaSignature() {
+		t.Fatalf("cached schema signature = %q, want %q", cached.SchemaSignature, managedSchemaSignature())
+	}
+	if _, ok := cached.SnykDASTHashes[fingerprint]; !ok {
+		t.Fatalf("cached Snyk DAST hashes lost the first run row: %#v", cached.SnykDASTHashes)
+	}
+	if _, ok := cached.LinearHashes[fingerprint]; !ok {
+		t.Fatalf("cached Linear hashes lost the first run row: %#v", cached.LinearHashes)
+	}
+}
+
 func cancelledIdentifiers(updates []model.IssueUpdate) []string {
 	var out []string
 	for _, u := range updates {
@@ -2222,5 +2476,336 @@ func TestRunSucceedsWhenOnlyCommentsFail(t *testing.T) {
 	}
 	if err := result.Err(); err != nil {
 		t.Fatalf("Err() = %v, want nil: only an explanatory comment was lost", err)
+	}
+}
+
+// openDASTFinding returns a neutral open finding on the given target.
+func openDASTFinding(fingerprint, targetID, title, severity string) model.Finding {
+	return model.Finding{
+		Fingerprint:       fingerprint,
+		SnykDASTFindingID: "su2d3k-" + fingerprint,
+		TargetID:          targetID,
+		TargetName:        "Example App",
+		TargetHost:        "example.test",
+		IssueTitle:        title,
+		Severity:          severity,
+		Status:            model.FindingOpen,
+		CreatedAt:         time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+	}
+}
+
+// staleTicket returns an open ticket that no longer matches the finding it is
+// keyed to, so a run plans an update for it.
+func staleTicket(fingerprint, identifier, title string) model.ExistingIssue {
+	return model.ExistingIssue{
+		ID:          "existing-" + identifier,
+		Identifier:  identifier,
+		Title:       title,
+		Description: "old description",
+		StateName:   "Todo",
+		Fingerprint: fingerprint,
+	}
+}
+
+// TestRunDoesNotCacheFingerprintWhoseUpdateFailed verifies that a fingerprint
+// whose Linear update failed is left out of the refreshed cache — its Snyk DAST
+// hash and its Linear hash alike — while an unrelated fingerprint whose update
+// succeeded in the same run is cached normally. Without the exclusion the next
+// run would skip the stale ticket on the cache fast-path and never retry.
+func TestRunDoesNotCacheFingerprintWhoseUpdateFailed(t *testing.T) {
+	cfg := minimalCfg()
+
+	failing := openDASTFinding("snyk-dast:target-a:finding-1", "target-a", "Reflected XSS", "high")
+	healthy := openDASTFinding("snyk-dast:target-b:finding-2", "target-b", "SQL Injection", "low")
+	snykdast := fakeSnykDAST{
+		snapshot: model.SnykDASTSnapshot{
+			Findings:  []model.Finding{failing, healthy},
+			TargetIDs: map[string]struct{}{"target-a": {}, "target-b": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			staleTicket(failing.Fingerprint, "SNYK-100", "stale title"),
+			staleTicket(healthy.Fingerprint, "SNYK-101", "stale title"),
+		},
+		updateFailFingerprints: map[string]struct{}{failing.Fingerprint: {}},
+	}
+	store := &fakeCache{}
+
+	result, err := New(cfg, discardLogger(), snykdast, linear, store).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.PlannedUpdates != 2 {
+		t.Fatalf("PlannedUpdates = %d, want 2", result.PlannedUpdates)
+	}
+	if result.FailedOps != 1 {
+		t.Fatalf("FailedOps = %d, want 1", result.FailedOps)
+	}
+	if hash, ok := store.saved.SnykDASTHashes[failing.Fingerprint]; ok {
+		t.Fatalf("SnykDASTHashes[%q] = %q, want the failed fingerprint absent", failing.Fingerprint, hash)
+	}
+	if hash, ok := store.saved.LinearHashes[failing.Fingerprint]; ok {
+		t.Fatalf("LinearHashes[%q] = %q, want the failed fingerprint absent", failing.Fingerprint, hash)
+	}
+	if _, ok := store.saved.SnykDASTHashes[healthy.Fingerprint]; !ok {
+		t.Fatalf("SnykDASTHashes[%q] missing, want the successfully updated fingerprint cached", healthy.Fingerprint)
+	}
+	if _, ok := store.saved.LinearHashes[healthy.Fingerprint]; !ok {
+		t.Fatalf("LinearHashes[%q] missing, want the successfully updated fingerprint cached", healthy.Fingerprint)
+	}
+}
+
+// TestRunRetriesFailedUpdateOnNextRun replays the saved cache of a run whose
+// update failed into a second run with a healthy Linear: the ticket must be
+// planned and written again instead of being skipped as reconciled.
+func TestRunRetriesFailedUpdateOnNextRun(t *testing.T) {
+	cfg := minimalCfg()
+
+	finding := openDASTFinding("snyk-dast:target-a:finding-1", "target-a", "Reflected XSS", "high")
+	snykdast := fakeSnykDAST{
+		snapshot: model.SnykDASTSnapshot{
+			Findings:  []model.Finding{finding},
+			TargetIDs: map[string]struct{}{"target-a": {}},
+		},
+	}
+	existing := staleTicket(finding.Fingerprint, "SNYK-100", "stale title")
+	linearSnapshot := []model.ExistingIssue{existing}
+	desired := desiredIssue(cfg, finding)
+	store := &fakeCache{}
+
+	// Run 1: every update fails.
+	failing := &fakeLinear{snapshot: linearSnapshot, updateErr: errors.New("linear unavailable")}
+	first, err := New(cfg, discardLogger(), snykdast, failing, store).Run(context.Background())
+	if err != nil {
+		t.Fatalf("run 1: Run() error = %v", err)
+	}
+	if first.PlannedUpdates != 1 {
+		t.Fatalf("run 1: PlannedUpdates = %d, want 1", first.PlannedUpdates)
+	}
+	if first.FailedOps != 1 {
+		t.Fatalf("run 1: FailedOps = %d, want 1", first.FailedOps)
+	}
+	if _, ok := store.saved.SnykDASTHashes[finding.Fingerprint]; ok {
+		t.Fatalf("run 1: SnykDASTHashes[%q] present, want the failed fingerprint absent", finding.Fingerprint)
+	}
+	if _, ok := store.saved.LinearHashes[finding.Fingerprint]; ok {
+		t.Fatalf("run 1: LinearHashes[%q] present, want the failed fingerprint absent", finding.Fingerprint)
+	}
+
+	// Run 2: same inputs, healthy Linear, and only run 1's saved cache.
+	healthy := &fakeLinear{snapshot: linearSnapshot}
+	secondStore := &fakeCache{snapshot: store.saved}
+	second, err := New(cfg, discardLogger(), snykdast, healthy, secondStore).Run(context.Background())
+	if err != nil {
+		t.Fatalf("run 2: Run() error = %v", err)
+	}
+	if second.PlannedUpdates != 1 {
+		t.Fatalf("run 2: PlannedUpdates = %d, want 1 (the failed update must be retried)", second.PlannedUpdates)
+	}
+	if second.FailedOps != 0 {
+		t.Fatalf("run 2: FailedOps = %d, want 0", second.FailedOps)
+	}
+	if len(healthy.updated) != 1 {
+		t.Fatalf("run 2: updated = %d, want 1", len(healthy.updated))
+	}
+	if healthy.updated[0].Title != desired.Title {
+		t.Fatalf("run 2: ticket title = %q, want the desired title %q", healthy.updated[0].Title, desired.Title)
+	}
+	if _, ok := secondStore.saved.SnykDASTHashes[finding.Fingerprint]; !ok {
+		t.Fatalf("run 2: SnykDASTHashes[%q] missing after a successful write", finding.Fingerprint)
+	}
+	if _, ok := secondStore.saved.LinearHashes[finding.Fingerprint]; !ok {
+		t.Fatalf("run 2: LinearHashes[%q] missing after a successful write", finding.Fingerprint)
+	}
+}
+
+// TestRunDoesNotCacheFingerprintWhoseResolveFailed verifies that a ticket whose
+// closure failed keeps its Linear hash out of the cache, so the next run
+// re-resolves it instead of treating the stale open ticket as reconciled. The
+// fingerprint has no Snyk hash this run — the finding is gone — and that
+// absence must not leak a Linear hash into the snapshot either.
+func TestRunDoesNotCacheFingerprintWhoseResolveFailed(t *testing.T) {
+	cfg := minimalCfg()
+
+	// The target is still registered, but its finding is gone: the ticket
+	// should be resolved.
+	snykdast := fakeSnykDAST{
+		snapshot: model.SnykDASTSnapshot{
+			TargetIDs: map[string]struct{}{"target-a": {}},
+		},
+	}
+	fingerprint := "snyk-dast:target-a:finding-1"
+	linear := &fakeLinear{
+		snapshot:  []model.ExistingIssue{staleTicket(fingerprint, "SNYK-100", "Reflected XSS")},
+		updateErr: errors.New("linear unavailable"),
+	}
+	store := &fakeCache{}
+
+	result, err := New(cfg, discardLogger(), snykdast, linear, store).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.PlannedResolves != 1 {
+		t.Fatalf("PlannedResolves = %d, want 1", result.PlannedResolves)
+	}
+	if result.FailedOps != 1 {
+		t.Fatalf("FailedOps = %d, want 1", result.FailedOps)
+	}
+	if hash, ok := store.saved.LinearHashes[fingerprint]; ok {
+		t.Fatalf("LinearHashes[%q] = %q, want the failed fingerprint absent", fingerprint, hash)
+	}
+	if hash, ok := store.saved.SnykDASTHashes[fingerprint]; ok {
+		t.Fatalf("SnykDASTHashes[%q] = %q, want the failed fingerprint absent", fingerprint, hash)
+	}
+}
+
+// TestRunDoesNotCacheFingerprintWhoseDuplicateCancelFailed verifies that a
+// duplicate whose cancellation failed is kept out of the cache. The canonical
+// ticket shares the fingerprint, so it is excluded too: the same string is the
+// cache key for both tickets, and the next run must reconsider them together.
+func TestRunDoesNotCacheFingerprintWhoseDuplicateCancelFailed(t *testing.T) {
+	cfg := minimalCfg()
+
+	fingerprint := "snyk-dast:target-a:finding-1"
+	snykdast := fakeSnykDAST{
+		snapshot: model.SnykDASTSnapshot{
+			Findings:  []model.Finding{openDASTFinding(fingerprint, "target-a", "Snyk DAST: [high] CVE-2026-1234", "high")},
+			TargetIDs: map[string]struct{}{"target-a": {}},
+		},
+	}
+	// Two live tickets carry the same fingerprint: SNYK-10 is the canonical
+	// (already up to date) ticket, SNYK-20 the duplicate to cancel.
+	desired := desiredIssue(cfg, snykdast.snapshot.Findings[0])
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			staleTicket(fingerprint, "SNYK-20", "Snyk DAST: [high] CVE-2026-1234"),
+			{
+				ID:          "existing-SNYK-10",
+				Identifier:  "SNYK-10",
+				Title:       desired.Title,
+				Description: desired.Description,
+				DueDate:     desired.DueDate,
+				StateName:   "Todo",
+				Fingerprint: fingerprint,
+				Priority:    desired.Priority,
+			},
+		},
+		updateErr: errors.New("linear unavailable"),
+	}
+	store := &fakeCache{}
+
+	result, err := New(cfg, discardLogger(), snykdast, linear, store).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.Conflicts != 1 {
+		t.Fatalf("Conflicts = %d, want 1", result.Conflicts)
+	}
+	if result.CancelledDuplicates != 1 {
+		t.Fatalf("CancelledDuplicates = %d, want 1", result.CancelledDuplicates)
+	}
+	if result.FailedOps != 1 {
+		t.Fatalf("FailedOps = %d, want 1", result.FailedOps)
+	}
+	if hash, ok := store.saved.LinearHashes[fingerprint]; ok {
+		t.Fatalf("LinearHashes[%q] = %q, want the failed fingerprint absent", fingerprint, hash)
+	}
+	if hash, ok := store.saved.SnykDASTHashes[fingerprint]; ok {
+		t.Fatalf("SnykDASTHashes[%q] = %q, want the failed fingerprint absent", fingerprint, hash)
+	}
+}
+
+// TestRunDoesNotCacheBatchLeftForNextRunAfterFailedReconciliation covers the
+// ambiguous batch create whose reconciliation query also failed: nothing is
+// retried, the whole batch is counted as failed, and none of its fingerprints
+// may enter the cache — the next run must re-create whatever is missing.
+func TestRunDoesNotCacheBatchLeftForNextRunAfterFailedReconciliation(t *testing.T) {
+	linear := &fakeLinear{
+		createBatchErr: errors.New("connection reset by peer"),
+		existingErr:    errors.New("lookup failed too"),
+	}
+	store := &fakeCache{}
+
+	result, err := New(baseTestConfig(), discardLogger(), threeOpenFindings(), linear, store).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.PlannedCreates != 3 {
+		t.Fatalf("PlannedCreates = %d, want 3", result.PlannedCreates)
+	}
+	if result.FailedOps != 3 {
+		t.Fatalf("FailedOps = %d, want 3 (the whole unreconciled batch)", result.FailedOps)
+	}
+	if len(store.saved.SnykDASTHashes) != 0 {
+		t.Fatalf("SnykDASTHashes = %#v, want empty: none of the batch's fingerprints may be cached", store.saved.SnykDASTHashes)
+	}
+}
+
+// TestRunWithSQLiteCacheRetriesFailedUpdate drives the real entry point with
+// the real SQLite cache: a run whose update fails must not leave the
+// fingerprint cached, and a second run over the persisted snapshot must retry
+// the update and then cache the fingerprint in both maps.
+func TestRunWithSQLiteCacheRetriesFailedUpdate(t *testing.T) {
+	cfg := minimalCfg()
+
+	finding := openDASTFinding("snyk-dast:target-a:finding-1", "target-a", "Reflected XSS", "high")
+	snykdast := fakeSnykDAST{
+		snapshot: model.SnykDASTSnapshot{
+			Findings:  []model.Finding{finding},
+			TargetIDs: map[string]struct{}{"target-a": {}},
+		},
+	}
+	existing := staleTicket(finding.Fingerprint, "SNYK-100", "stale title")
+	linearSnapshot := []model.ExistingIssue{existing}
+	desired := desiredIssue(cfg, finding)
+
+	store, err := cache.Open(t.TempDir() + "/cache.db")
+	if err != nil {
+		t.Fatalf("cache.Open() error = %v", err)
+	}
+	defer store.Close()
+
+	// Run 1: every update fails.
+	failing := &fakeLinear{snapshot: linearSnapshot, updateErr: errors.New("linear unavailable")}
+	first, err := New(cfg, discardLogger(), snykdast, failing, store).Run(context.Background())
+	if err != nil {
+		t.Fatalf("run 1: Run() error = %v", err)
+	}
+	if first.PlannedUpdates != 1 {
+		t.Fatalf("run 1: PlannedUpdates = %d, want 1", first.PlannedUpdates)
+	}
+	if first.FailedOps != 1 {
+		t.Fatalf("run 1: FailedOps = %d, want 1", first.FailedOps)
+	}
+
+	// Run 2: Linear healthy, same inputs, the persisted cache from run 1.
+	healthy := &fakeLinear{snapshot: linearSnapshot}
+	second, err := New(cfg, discardLogger(), snykdast, healthy, store).Run(context.Background())
+	if err != nil {
+		t.Fatalf("run 2: Run() error = %v", err)
+	}
+	if second.PlannedUpdates != 1 {
+		t.Fatalf("run 2: PlannedUpdates = %d, want 1 (the failed update must be retried)", second.PlannedUpdates)
+	}
+	if second.FailedOps != 0 {
+		t.Fatalf("run 2: FailedOps = %d, want 0", second.FailedOps)
+	}
+	if len(healthy.updated) != 1 {
+		t.Fatalf("run 2: updated = %d, want 1", len(healthy.updated))
+	}
+	if healthy.updated[0].Title != desired.Title {
+		t.Fatalf("run 2: ticket title = %q, want the desired title %q", healthy.updated[0].Title, desired.Title)
+	}
+
+	loaded, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("cache load after run 2: error = %v", err)
+	}
+	if _, ok := loaded.SnykDASTHashes[finding.Fingerprint]; !ok {
+		t.Fatalf("loaded SnykDASTHashes[%q] missing after a successful write", finding.Fingerprint)
+	}
+	if _, ok := loaded.LinearHashes[finding.Fingerprint]; !ok {
+		t.Fatalf("loaded LinearHashes[%q] missing after a successful write", finding.Fingerprint)
 	}
 }

@@ -146,7 +146,12 @@ Permissions **not** required (the sync does not write back to Snyk DAST):
 > shows findings. This is the API filtering out everything because the API key
 > has no target visibility — findings are scoped under targets. A token with
 > only `change_finding` + `correlation_viewer` (a common mistake) will see
-> zero findings for this reason. Add `view_target` to fix it.
+> zero findings for this reason. Because an empty snapshot is not a truthful
+> source, the sync now fails the run in this state — with managed tickets
+> present in Linear and a snapshot listing no targets, it returns an error and
+> makes no changes, instead of cancelling every managed ticket as if all
+> findings had gone away (`--dry-run` still reports the plan, logging the same
+> message at error level). Add `view_target` to fix it.
 
 See the Snyk docs on [roles and scopes by plan](https://docs.snyk.io/scan-fix-and-prevent/scan-with-snyk/snyk-api-web/managing-account/roles-and-scopes-by-plan) and [understanding permissions](https://docs.snyk.io/scan-fix-and-prevent/scan-with-snyk/snyk-api-web/managing-account/understanding-permissions).
 
@@ -441,7 +446,9 @@ On a normal run:
 2. Load the current Linear snapshot.
 3. Skip fingerprints whose source hash and Linear hash both match the last successful run.
 4. Apply creates, updates, and resolves for the rest.
-5. Refresh the cache from the live post-write Linear snapshot.
+5. Refresh the cache from the live post-write Linear snapshot. A fingerprint
+   whose Linear write failed in this run is left out of the refresh, so the next
+   run retries it instead of skipping it as unchanged.
 
 The cache fast-path never suppresses a pending move into a terminal state
 (`Done`/`Cancelled`). Use `--bypass-cache` to ignore the cache for a run and
@@ -483,6 +490,12 @@ Optional:
 - `LINEAR_HTTP_CONCURRENCY`
 - `ERROR_LOG_FILE`
 - `CACHE_DB_FILE`
+
+Integer variables must be plain integers, and boolean variables must be
+`true`/`false` (or another form `strconv.ParseBool` accepts: `1`, `0`, `t`,
+`f`, `T`, `F`; spelling is case-insensitive). A malformed value stops the run
+at startup with an error naming the variable and quoting the value it could
+not parse; it is never silently replaced by the default.
 
 See [.env.example](/.env.example).
 
