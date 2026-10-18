@@ -66,7 +66,7 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("harness: ")
 	if len(os.Args) < 2 {
-		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|plan-check|plan-brief|plan-report|ref-check|merge-default|search")
+		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|plan-check|plan-brief|plan-report|ref-check|merge-default|search|metrics")
 	}
 	commands := map[string]func() error{
 		"proxy":         runProxy,
@@ -106,6 +106,9 @@ func main() {
 		// Web search through the proxy (issue #58): the CLI posts to the
 		// proxy on 127.0.0.1; the key never leaves the proxy.
 		"search": runSearch,
+		// Per-run records, summed (issue #140): a Markdown summary of the
+		// run records the shared state bundle carries.
+		"metrics": runMetrics,
 		// The deterministic gate on a workflow change published without a
 		// maintainer's approval (workflowpolicy.go).
 		"workflow-policy": runWorkflowPolicy,
@@ -822,12 +825,24 @@ type LedgerLine struct {
 	// must not land in the ledger.
 	QueryLen int `json:"query_len,omitempty"`
 	Results  int `json:"results,omitempty"`
+	// Status is the upstream HTTP status when upstream answered with anything
+	// other than 200 (issue #140); 0 on a recorded call. The line is written
+	// as a marker (kind "status"), so every report figure that counts calls
+	// or timing skips it, the way it skips proxy_start and search lines.
+	Status int `json:"status,omitempty"`
 }
 
-func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slotWait time.Duration, chars charCounts, repaired int) {
+func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slotWait time.Duration, chars charCounts, repaired, status int) {
 	line := LedgerLine{Time: time.Now().UTC(), Model: m.ID, Upstream: m.Upstream, Stream: stream,
 		Start: start.UTC(), SlotWaitS: slotWait.Seconds(),
 		ReasoningChars: chars.reasoning, OutputChars: chars.output, RepairedToolArgs: repaired}
+	if status != 0 {
+		// A non-200 upstream answer is recorded as a status line (issue #140):
+		// it carries no usage and no cost, and the kind keeps it out of every
+		// call and timing figure the report computes.
+		line.Kind = "status"
+		line.Status = status
+	}
 	if usage != nil {
 		line.UsageSeen = true
 		line.PromptTokens, line.CachedTokens, line.CompletionTokens = usage.PromptTokens, usage.cached(), usage.CompletionTokens
@@ -836,7 +851,9 @@ func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slot
 		if n, ok := usage.reasoningTokens(); ok {
 			line.ReasoningTokens = &n
 		}
-	} else {
+	} else if status == 0 {
+		// A refused call has no usage by construction; only a 200 without
+		// usage is worth a warning.
 		log.Printf("warning: %s returned no usage; this call is unpriced", m.Upstream)
 	}
 	p.mu.Lock()
@@ -1254,6 +1271,10 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 	if response.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(response.Body)
 		log.Printf("upstream %d for %s: %.300s", response.StatusCode, m.Upstream, data)
+		// The refusal goes in the ledger too (issue #140): a run whose
+		// upstream kept answering 429 costs real time, and the record
+		// counts it. No usage, no cost.
+		p.record(m, nil, stream, started, slotWait, charCounts{}, repaired, response.StatusCode)
 		if out == nil {
 			w.Header().Set("Content-Type", response.Header.Get("Content-Type"))
 			w.WriteHeader(response.StatusCode)
@@ -1489,7 +1510,7 @@ func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, st
 		chars.addChoices(choices, "message")
 	}
 	payload["model"], _ = json.Marshal(m.ID)
-	p.record(m, usage, false, started, slotWait, chars, repaired)
+	p.record(m, usage, false, started, slotWait, chars, repaired, 0)
 	writeJSON(w, http.StatusOK, payload)
 }
 
@@ -1580,7 +1601,7 @@ func (p *proxy) relayStream(out *sseSink, upstream io.Reader, m Model, started t
 	}
 	close(stop)
 	done.Wait()
-	p.record(m, usage, true, started, slotWait, chars, repaired)
+	p.record(m, usage, true, started, slotWait, chars, repaired, 0)
 }
 
 // ---------------------------------------------------------------- GitHub

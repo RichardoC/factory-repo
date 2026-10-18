@@ -169,10 +169,11 @@ func CleanEvents(data []byte) ([]string, int) {
 
 // Files are the state files of a bundle or a packed run, checked.
 type Files struct {
-	Ledger RouterLedger
-	Events []string
-	DB     []byte
-	WAL    []byte
+	Ledger  RouterLedger
+	Events  []string
+	Records []RunRecord
+	DB      []byte
+	WAL     []byte
 }
 
 // readFiles reads and checks the state files in dir. With strict (the shared
@@ -208,6 +209,20 @@ func readFiles(dir string, models []Model, strict bool) (Files, error) {
 		var dropped int
 		if f.Events, dropped = CleanEvents(events); dropped > 0 {
 			log.Printf("warning: %s: dropped %d invalid router-events lines", dir, dropped)
+		}
+	}
+	// Run records (issue #140) are line data like the events: a line that
+	// does not validate is dropped and counted, in the shared bundle too —
+	// the file is re-checked on every load and merge.
+	records, err := readRegular(filepath.Join(dir, recordsFile), maxRecordsBytes)
+	if err != nil {
+		if err := bad(err); err != nil {
+			return f, err
+		}
+	} else if records != nil {
+		var dropped int
+		if f.Records, dropped = CleanRecords(records); dropped > 0 {
+			log.Printf("warning: %s: dropped %d invalid run-record lines", dir, dropped)
 		}
 	}
 	db, err := readRegular(filepath.Join(dir, dbFile), maxDBBytes)
@@ -253,6 +268,19 @@ func (f Files) write(dir string) error {
 	_ = os.Remove(filepath.Join(dir, eventsFile))
 	if len(f.Events) > 0 {
 		if err := writeFile(filepath.Join(dir, eventsFile), []byte(strings.Join(f.Events, "\n")+"\n")); err != nil {
+			return err
+		}
+	}
+	_ = os.Remove(filepath.Join(dir, recordsFile))
+	if len(f.Records) > 0 {
+		var buf bytes.Buffer
+		enc := json.NewEncoder(&buf)
+		for _, r := range f.Records {
+			if err := enc.Encode(r); err != nil {
+				return err
+			}
+		}
+		if err := writeFile(filepath.Join(dir, recordsFile), buf.Bytes()); err != nil {
 			return err
 		}
 	}
@@ -383,10 +411,11 @@ func MergeEvents(base, run []string) []string {
 // its own copy stays in its codeaf-state artifact.
 func mergeRun(shared Files, generation int, meta RunMeta, run Files) (Files, string) {
 	merged := Files{
-		Ledger: MergeLedger(shared.Ledger, run.Ledger),
-		Events: MergeEvents(shared.Events, run.Events),
-		DB:     shared.DB,
-		WAL:    shared.WAL,
+		Ledger:  MergeLedger(shared.Ledger, run.Ledger),
+		Events:  MergeEvents(shared.Events, run.Events),
+		Records: MergeRecords(shared.Records, run.Records),
+		DB:      shared.DB,
+		WAL:     shared.WAL,
 	}
 	switch {
 	case meta.BaseGeneration == generation:
@@ -529,6 +558,7 @@ func stateLoad(bundle, home string, cfg Config, now time.Time) error {
 	week := weekSpend(m, now)
 	log.Printf("loaded shared state generation %d (%d ratings, %d events, memory db %d bytes); spent today $%.4f, this week $%.4f",
 		m.Generation, len(files.Ledger.Entries), len(files.Events), len(files.DB), today, week)
+	log.Printf("records: %d (last 7 days: %s)", len(files.Records), recordShape(files.Records, now))
 	return setOutput("generation", strconv.Itoa(m.Generation),
 		"day_usd", strconv.FormatFloat(today, 'f', -1, 64),
 		"week_usd", strconv.FormatFloat(week, 'f', -1, 64))
@@ -569,6 +599,24 @@ func statePack(home, out string, cfg Config, now time.Time) error {
 	files, _ := readFiles(home, cfg.Models, false)
 	if err := files.write(out); err != nil {
 		return err
+	}
+	// The run record (issue #140): one bounded line about this run for the
+	// shared bundle. The environment the run job already carries names the
+	// mode, the number, the ledger and the result; a field that cannot be
+	// computed stays zero, and packing never fails because of the record.
+	if rec := runRecordFromRun(now); rec.validate() == nil {
+		data, err := json.MarshalIndent(rec, "", "  ")
+		if err == nil {
+			if err := writeFile(filepath.Join(out, runRecordFile), append(data, '\n')); err != nil {
+				log.Printf("warning: run record not packed: %v", err)
+			}
+		} else {
+			log.Printf("warning: run record not packed: %v", err)
+		}
+		log.Printf("run record: mode %s, stop %s, %d call(s), %d 429(s), $%.4f",
+			rec.Mode, rec.Stop, rec.Calls, rec.Rate429, rec.CostUSD)
+	} else {
+		log.Printf("warning: run record left out: %v", rec.validate())
 	}
 	data, _ := json.MarshalIndent(meta, "", "  ")
 	log.Printf("packed run %s: base generation %d, $%.4f, %d ratings, %d events, memory db %d bytes",
@@ -647,6 +695,14 @@ func stateMerge(bundle, out string, runDirs []string, cfg Config, now time.Time)
 		usd := RunSpend(r.meta.RunUSD, cfg.Limits.RunCreditUSD)
 		m.Spend[day] += usd
 		files, _ := readFiles(r.dir, cfg.Models, false)
+		// The run record (issue #140) is appended to the bundle's
+		// records.jsonl. A record that cannot be believed is left out; the
+		// run itself still merges.
+		if rec, err := readRunRecord(r.dir); err != nil {
+			log.Printf("warning: run %s: run record left out: %v", r.meta.key(), err)
+		} else if rec.RunID != "" {
+			files.Records = append(files.Records, rec)
+		}
 		var how string
 		shared, how = mergeRun(shared, m.Generation, r.meta, files)
 		log.Printf("run %s: %s; spend $%.4f on %s", r.meta.key(), how, usd, day)
