@@ -353,25 +353,26 @@ func TestWorkflowsSendWhatTheGateReads(t *testing.T) {
 
 	// The same drift on a shell-continuation line: the flag sits under the
 	// `gh workflow run` command itself, where a check reading only the
-	// command line would never see it (the review dispatch in codeaf.yml
-	// carries its input this way).
+	// command line would never see it. Since issue #137 the queue makes
+	// every codeaf.yml dispatch, so the drift is planted in its review
+	// dispatch, split over two lines.
 	t.Run("continuation input fails", func(t *testing.T) {
-		data, err := os.ReadFile(codeafPath)
+		data, err := os.ReadFile(queuePath)
 		if err != nil {
 			t.Fatal(err)
 		}
-		old := `&& gh workflow run codeaf.yml -f pr="$PR_NUMBER" \`
-		continued := "&& gh workflow run codeaf.yml \\\n" +
-			"                -f pr=\"$PR_NUMBER\" -f planner=true \\"
+		old := `gh workflow run codeaf.yml --ref "$DEFAULT_BRANCH" -f "review=$N" -f "lane=$LANE"`
+		continued := "gh workflow run codeaf.yml --ref \"$DEFAULT_BRANCH\" \\\n" +
+			"                  -f \"review=$N\" -f \"lane=$LANE\" -f planner=true"
 		renamed := strings.Replace(string(data), old, continued, 1)
 		if renamed == string(data) {
-			t.Fatal("codeaf.yml no longer dispatches with -f pr on a continued line; update this test")
+			t.Fatal("codeaf-queue.yml no longer dispatches reviews on one line; update this test")
 		}
-		path := filepath.Join(t.TempDir(), "codeaf.yml")
+		path := filepath.Join(t.TempDir(), "codeaf-queue.yml")
 		if err := os.WriteFile(path, []byte(renamed), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		err = checkWorkflowsSendWhatTheGateReads(queuePath, path)
+		err = checkWorkflowsSendWhatTheGateReads(path, codeafPath)
 		if err == nil || !strings.Contains(err.Error(), "planner") {
 			t.Fatalf("continued input: err = %v; want one naming planner", err)
 		}

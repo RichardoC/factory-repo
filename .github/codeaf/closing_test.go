@@ -128,6 +128,10 @@ func TestContinuePlanDoesNotContinueStoreFinished(t *testing.T) {
 	t.Cleanup(func() { os.Args = oldArgs })
 	os.Args = []string{"harness", "continue-plan", "7"}
 	useFixture(t, fixtureIssue)
+	// A done stop probes the pull request (issue #137): the fake API
+	// answers, and PR 7 is open and not conflicted, so nothing continues.
+	server := prStateServer(t, "clean", nil)
+	ghEnv(t, server)
 	out, err := captureStdout(t, runContinuePlan)
 	if err != nil {
 		t.Fatal(err)

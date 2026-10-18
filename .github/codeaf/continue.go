@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // The stop words CodeAF can report, verified in Agent-Field/codeaf
@@ -155,13 +156,24 @@ func prMode() error {
 
 // continuePlan decides what a pull request needs after a run stopped early.
 // The action is "continue" while the cap allows it, "cap" once it is used
-// up, and "" for everything that needs no comment: a finished run, an early
-// stop that must not be continued, or a missing result. The returned body is
-// built only from fixed sentences, the sanitized stop word and counters —
-// never from remote text — so it is safe to post as a comment.
+// up, and "" for everything that needs no comment: an early stop that must
+// not be continued, or a missing result. A run that finished (stop "done")
+// is not automatically "" either — a pull request born conflicted is
+// continued once, or handed over with a cap comment (continueConflicted).
+// The returned body is built only from fixed sentences, the sanitized stop
+// word and counters — never from remote text — so it is safe to post as a
+// comment.
 func continuePlan(gh github, pr int, stop string) (action string, body string, used int, err error) {
 	stop = sanitizeStop(stop)
 	if !earlyStop(stop) || !continuesAfter(stop) {
+		// Issue #137: a run that finished (stop "done") on a pull request
+		// born conflicted — publish started its branch from an old base
+		// and the 3-way apply failed — still needs one continuation,
+		// through the base-merge path (merge.go, issue #57) that a
+		// codeaf-continue-needed run takes.
+		if stop == stopDone {
+			return continueConflicted(gh, pr)
+		}
 		return "", "", 0, nil
 	}
 	var comments []issueComment
@@ -173,6 +185,94 @@ func continuePlan(gh github, pr int, stop string) (action string, body string, u
 		return "cap", capBody(stop), used, nil
 	}
 	return "continue", continueBody(stop, used), used, nil
+}
+
+// ---------------------------------------------------------------- the PR born conflicted
+
+// Mergeable states of a pull request that this file distinguishes (issue
+// #137). GitHub computes mergeable_state asynchronously: "unknown" means
+// the answer is not ready yet, and "dirty" means the branch conflicts with
+// its base.
+const (
+	mergeableDirty   = "dirty"
+	mergeableUnknown = "unknown"
+)
+
+// conflictBody is the comment that starts the continuation of a pull
+// request born conflicted: fixed text only, never remote text, with the
+// trailing newline the other comment bodies carry.
+const conflictBody = "The branch conflicts with its base branch; a continuation brings the base in and resolves the conflicts\n"
+
+// continueSleep is injectable so tests of the mergeable_state retries do
+// not actually sleep.
+var continueSleep = time.Sleep
+
+// mergeableStateBudget bounds the whole mergeable_state probe (the review
+// of this change): the retry schedule alone is 15 seconds of sleeps, and
+// each fetch may stall for the API client's full 30-second timeout, so an
+// unbounded probe could stretch the continue-plan step into minutes. Fast
+// answers never touch the budget — the 3-retries-5-seconds-apart schedule
+// of issue #137 completes in about 15 seconds — and a probe that runs out
+// of budget returns the last state it read, which the caller treats as no
+// conflict. Injected as a var so tests can shrink it.
+var mergeableStateBudget = 20 * time.Second
+
+// mergeableState fetches a pull request's mergeable_state (issue #137). While
+// GitHub is still computing it the fetch is retried up to 3 times, 5
+// seconds apart; past that — or past mergeableStateBudget — the last state
+// is returned and the caller does nothing with it.
+func (g github) mergeableState(pr int) (string, error) {
+	const unknownRetries = 3
+	const retryWait = 5 * time.Second
+	deadline := time.Now().Add(mergeableStateBudget)
+	for attempt := 0; ; attempt++ {
+		var p struct {
+			MergeableState string `json:"mergeable_state"`
+		}
+		if err := g.get(fmt.Sprintf("/pulls/%d", pr), &p); err != nil {
+			return "", err
+		}
+		if p.MergeableState != mergeableUnknown || attempt >= unknownRetries {
+			return p.MergeableState, nil
+		}
+		// GitHub has answered "unknown" every time: one more fetch would
+		// wait, and must still start inside the budget.
+		if !time.Now().Before(deadline) {
+			return p.MergeableState, nil
+		}
+		continueSleep(retryWait)
+	}
+}
+
+// continueConflicted plans the continuation of a pull request born
+// conflicted: its run finished (stop "done"), so the early-stop path does
+// not apply, but the branch conflicts with its base and only a PR-mode run
+// resolves that. A fetch error is returned, not swallowed (the review of
+// this change): a failing /pulls call would otherwise print action=none and
+// silently leave a conflicted pull request unresolved, while a returned
+// error fails the continue-plan step — the workflow runs it
+// continue-on-error, so publishing still goes on and the failure is
+// visible. A state other than dirty does nothing. The continuation cap
+// already used up does not drop the pull request silently either: like the
+// early-stop path, it hands over with a "cap" comment, worded for a run
+// that finished, not one that stopped early.
+func continueConflicted(gh github, pr int) (action string, body string, used int, err error) {
+	var comments []issueComment
+	if err := gh.get(fmt.Sprintf("/issues/%d/comments?per_page=100", pr), &comments); err != nil {
+		return "", "", 0, err
+	}
+	used = continuationsUsed(countReports(comments))
+	state, err := gh.mergeableState(pr)
+	if err != nil {
+		return "", "", 0, err
+	}
+	if state != mergeableDirty {
+		return "", "", 0, nil
+	}
+	if continuationCapReached(used) {
+		return "cap", conflictCapBody(), used, nil
+	}
+	return "continue", conflictBody, used, nil
 }
 
 // continueBody is the comment that starts the next run: its first line is
@@ -190,6 +290,16 @@ func capBody(stop string) string {
 	return fmt.Sprintf("The continuation cap (%d per issue) is reached, and this run stopped early again (stop reason: `%s`). "+
 		"The pull request stays a draft for a person to review. "+
 		"A maintainer can continue it by hand with a %s comment.\n", maxContinuations, stop, command)
+}
+
+// conflictCapBody is the cap comment for a pull request born conflicted,
+// whose run finished (stop "done"): the early-stop cap body above says the
+// run "stopped early again", which reads wrong here, so this says what
+// actually holds. Fixed text only, like every body this file posts.
+func conflictCapBody() string {
+	return fmt.Sprintf("The continuation cap (%d per issue) is reached, and the pull request still conflicts with its base branch. "+
+		"The pull request stays a draft for a person to review. "+
+		"A maintainer can continue it by hand with a %s comment.\n", maxContinuations, command)
 }
 
 // runContinuePlan implements `harness continue-plan PR`. It prints exactly
