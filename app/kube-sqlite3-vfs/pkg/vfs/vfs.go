@@ -31,6 +31,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"sort"
 	"strings"
 	"time"
 
@@ -1289,11 +1290,55 @@ func (v *vfs) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sql
 
 // Delete implements sqlite3vfs.VFS: it removes every sector ConfigMap of
 // the named file and then its lock ConfigMap, retrying transient races up
-// to the VFS's retry budget.
+// to the VFS's retry budget. A Delete that reports NotFound is not an
+// error: the object is in the state this call wanted, so a half-deleted
+// file left by an earlier crash converges to fully deleted on the next
+// attempt, and SQLite's ordinary "delete the journal I never created" (and
+// the "I already deleted it" race between two connections) succeed.
+//
+// Deleting a file is several Kubernetes calls, so a crash at any point
+// leaves a half-state. For a rollback journal the half-states matter,
+// because SQLite decides whether a journal must be played back from two
+// observable facts: xAccess (here: does the name have at least one sector
+// ConfigMap?) and the first byte read at offset 0 (here: the first byte of
+// sector 0; a missing sector reads as zeros). SQLite's hasHotJournal skips
+// a journal whose first byte is zero, and treats a journal it can access
+// but not read a non-zero first byte from as cold. So the order below is
+// chosen to make every prefix of it a state SQLite reads as "not hot":
+//
+//  1. sector 0 (the journal header) FIRST. Writing a header is what made
+//     the journal hot in the first place, and the header is the last sector
+//     a hot journal ever needs, so removing it first means no prefix of
+//     this delete can leave a journal that is still hot. Before the call
+//     the journal is intact — a complete, replayable journal is a safe
+//     state (that is what crash recovery is for). After it, the first byte
+//     at offset 0 reads as zero: SQLite sees a cold journal.
+//  2. the remaining sectors, ascending. Each one is NotFound-tolerant, so
+//     leftovers from an earlier crashed delete are collected too. While any
+//     of them remains, Access still answers true — the name "exists" — so
+//     SQLite may still open the journal, but with no header it cannot
+//     replay anything: it sees a cold journal and (for a read-only or
+//     recovery open) ignores it until some later delete or truncate clears
+//     the rest. Leaving re-playable bytes behind is impossible; leaving
+//     unreachable sectors behind is merely untidy.
+//  3. the lockfile LAST. Access answers from the sector count, so the name
+//     stops existing exactly when its last sector goes — after the header
+//     is already gone. Deleting the lockfile first would instead let
+//     another opener create a fresh journal and lockfile for this name
+//     (a fresh transaction) only for this delete to delete its sectors.
+//
+// A non-journal name keeps the historical order — every sector, then the
+// lockfile. Header-first is not safer there: no SQLite hot/cold decision
+// reads sector 0 of a database file, so the order only changes which
+// partial state a crash exposes, and deleting the database's own sector 0
+// first would expose a header-less database for longer. None of the states
+// this delete passes through is a valid database, so recovery from a crash
+// mid-delete is the caller's job, not an ordering this loop can fix.
 func (v *vfs) Delete(name string, dirSync bool) error {
 	v.logger.Debug("Delete", "name", name, "dirSync", dirSync)
 	// in case we're racing another client
 	f := NewFile(name, v)
+	isJournal := strings.HasSuffix(name, "-journal")
 	var lastErr error
 	for range f.vfs.retries + 1 {
 		v.logger.Debug("Deleting configmaps representing this filename", "name", name)
@@ -1306,16 +1351,10 @@ func (v *vfs) Delete(name string, dirSync bool) error {
 			continue
 		}
 
-		aDeleteFailed := false
-		for _, c := range cms {
-			if err := v.kc.CoreV1().ConfigMaps(v.namespace).Delete(v.ctx, c.Name, metav1.DeleteOptions{}); err != nil {
-				v.logger.Error("Delete: delete sector configmap", "configmap", c.Name, "err", err)
-				aDeleteFailed = true
-				continue
-			}
-			v.logger.Debug("Deleted configmap", "configmap", c.Name)
-		}
-		if aDeleteFailed {
+		if !deleteSectorsInSafeOrder(v, f, cms, isJournal) {
+			// A sector DELETE failed for a reason other than NotFound:
+			// another round re-LISTs and picks up whatever survived, the
+			// header first again.
 			continue
 		}
 
@@ -1329,6 +1368,79 @@ func (v *vfs) Delete(name string, dirSync bool) error {
 	}
 	v.logger.Error("Failed to delete file", "filename", name, "dirSync", dirSync, "err", lastErr)
 	return sqlite3vfs.IOError
+}
+
+// deleteSectorsInSafeOrder deletes the sector ConfigMaps of one file and
+// reports whether every one of them is gone.
+//
+// The order is the heart of crash-safe journal deletion (see Delete): for a
+// rollback journal, sector 0 — the header SQLite reads to decide whether the
+// journal is hot — goes FIRST, and the rest follow in ascending index order.
+// For any other file the order is the order the LIST returned, which is the
+// historical behaviour.
+//
+// It tolerates NotFound: that sector is already in the wanted state, so the
+// delete continues rather than reporting an error. Once the header sector is
+// gone, no crash anywhere in this loop can leave a journal SQLite would try
+// to replay: at every intermediate step the first byte at offset 0 reads as
+// zero (see Access and file.ReadAt), so hasHotJournal calls the journal cold.
+// The leftover sectors are garbage that the next delete (this one's retry,
+// or SQLite's next xDelete of the name) or a truncate collects.
+func deleteSectorsInSafeOrder(v *vfs, f *file, cms []corev1.ConfigMap, journalHeaderFirst bool) bool {
+	ordered := make([]corev1.ConfigMap, 0, len(cms))
+	if journalHeaderFirst {
+		// Header first, then everything else in ascending sector order, so
+		// a resumable retry makes monotonic progress through the leftovers
+		// of a crashed attempt.
+		ordered = append(ordered, cms...)
+		sort.SliceStable(ordered, func(i, j int) bool {
+			return sectorIndexLess(f, ordered[i].Name, ordered[j].Name)
+		})
+		if len(ordered) > 0 {
+			if idx, ok := f.sectorIndexFromConfigMapName(ordered[0].Name); ok && idx != 0 {
+				// The header sector is not in the LIST: it is already gone,
+				// so this journal is already cold and the rest is junk.
+				v.logger.Debug("Delete: journal header sector already gone", "name", f.RawName)
+			}
+		}
+	} else {
+		ordered = append(ordered, cms...)
+	}
+
+	aDeleteFailed := false
+	for i := range ordered {
+		if err := v.kc.CoreV1().ConfigMaps(v.namespace).Delete(v.ctx, ordered[i].Name, metav1.DeleteOptions{}); err != nil {
+			if kerrors.IsNotFound(err) {
+				// Already deleted (an earlier crash, or the retry after one):
+				// the wanted state holds for this sector.
+				v.logger.Debug("Delete: sector configmap already gone", "configmap", ordered[i].Name)
+				continue
+			}
+			v.logger.Error("Delete: delete sector configmap", "configmap", ordered[i].Name, "err", err)
+			aDeleteFailed = true
+			continue
+		}
+		v.logger.Debug("Deleted configmap", "configmap", ordered[i].Name)
+	}
+
+	return !aDeleteFailed
+}
+
+// sectorIndexLess orders two sector ConfigMap names by sector index, with an
+// unparsable name last. Sector indices are unbounded in principle and the
+// base32 file name contains no '-', so the index is parsed out of the name
+// rather than compared as a string (which would order "10" before "2").
+func sectorIndexLess(f *file, a, b string) bool {
+	ia, oka := f.sectorIndexFromConfigMapName(a)
+	ib, okb := f.sectorIndexFromConfigMapName(b)
+	switch {
+	case oka && okb:
+		return ia < ib
+	case oka:
+		return true
+	default:
+		return false
+	}
 }
 
 // Access implements sqlite3vfs.VFS. It reports whether the named file
