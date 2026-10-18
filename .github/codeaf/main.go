@@ -2617,6 +2617,9 @@ func runBrief() error {
 		}
 		targetBody = issue.Body
 		parts = append(parts, fmt.Sprintf("# Task: issue #%d — %s\n\n%s", number, issue.Title, issue.Body))
+		// Issue #136: name the acceptance sections right after the issue
+		// body they live in, so the bar to clear is the worker's last read.
+		parts = append(parts, "The sections `## Done when` and `## End-to-end check` above are the acceptance criteria.")
 		if issue.Comments > 0 {
 			thread, err := gh.thread(number)
 			if err != nil {
@@ -2654,6 +2657,8 @@ func runBrief() error {
 				parts = append(parts, fmt.Sprintf("(the issue this PR closes, #%d, is unavailable: %s)\n", n, escapeMD(err.Error(), 200, true)))
 			} else {
 				parts = append(parts, fmt.Sprintf("## The issue this PR closes (#%d) — %s\n\n%s", n, escapeMD(closes.Title, 200, true), closes.Body))
+				// Issue #136: the acceptance sections govern a continuation too.
+				parts = append(parts, "The sections `## Done when` and `## End-to-end check` above are the acceptance criteria.")
 			}
 		}
 		var reviews []reviewComment

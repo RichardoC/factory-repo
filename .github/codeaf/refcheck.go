@@ -156,7 +156,18 @@ func refIssueBody(pin, head string, c compare) string {
 	if left := len(c.Commits) - shown; left > 0 {
 		fmt.Fprintf(&b, "- ... and %d more\n", left)
 	}
+	// The acceptance sections the queue's gate reads (issue #136): the
+	// body is generated, so the sections are written here rather than
+	// demanded of whoever opens the issue.
 	fmt.Fprintf(&b, `
+## Done when
+
+- The workaround report names every disabled workaround that is no longer needed, with the upstream commit that makes each unnecessary, and the pin moves only after a test run of this repo's CodeAF workflow on a small task succeeds.
+
+## End-to-end check
+
+A codeaf-ref-update run on this issue completes with the module checks green and the pin file at the new head.
+
 ## What CodeAF should do
 
 1. Read the upstream commits since the pin in %s.

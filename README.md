@@ -209,6 +209,14 @@ queue — for which all of these hold:
   and the harness `.github/`, taken from `area:` labels or paths in the
   issue body; an issue with no area conflicts with everything;
 - every issue named in a "Depends on #N" line in its body is closed;
+- the issue is ready (issue #136): its body has a `## Done when` heading with
+  at least one `- ` bullet under it and a `## End-to-end check` heading with
+  some text under it, and it carries an `area:` label — issues labelled
+  `codeaf-ref-update` or `codeaf-experiment`, whose bodies are generated, are
+  exempt from the two body sections, not from the area label. An issue held
+  for any of these gets a one-time comment naming what is missing. Copy
+  [`.github/codeaf/issue-template.md`](.github/codeaf/issue-template.md) to
+  `.github/ISSUE_TEMPLATE/codeaf-task.md` to give new issues the sections;
 - the rolling week's credit spend in the shared state is under 75% of
   `limits.weekly_credit_usd` in [`models.json`](.github/codeaf/models.json) — an
   unknown spend starts nothing;

@@ -43,6 +43,7 @@ Write one section per proposal, in exactly this shape:
 - Problem: <text>
 - What to do: <text>
 - Done when: <text>
+- End-to-end check: <text>   (optional line)
 - Area: harness | app/<name>
 - Depends on: #12, #34   (optional line)
 
@@ -51,6 +52,9 @@ Write one section per proposal, in exactly this shape:
   ends the field.
 - `Area` is either `harness` or `app/<name>` (the app's directory name);
   anything else is dropped, and the proposal then carries no area label.
+- `End-to-end check` (optional): the one command or run that proves the
+  seams of the change work end to end. Leave it out and the opened issue
+  carries a placeholder a person must fill in before it is queued.
 - `Depends on` lists issue numbers as `#N`; other text on that line is
   ignored.
 - A proposal with an empty `Problem` and an empty `What to do` is dropped.

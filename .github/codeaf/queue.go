@@ -57,6 +57,11 @@ type queueOptions struct {
 	// names no area (reason "no area label", issue #132). Like Logf, it is
 	// the caller's side effect; Next's pick never depends on it.
 	NoAreaHeld func(number int)
+	// NotReadyHeld, when non-nil, is called once per candidate held because
+	// it is not ready (reason "not ready: ...", issue #136), with the
+	// gate's own fixed missing-item names. Like Logf, it is the caller's
+	// side effect; Next's pick never depends on it.
+	NotReadyHeld func(number int, missing []string)
 	// Logf is where the queue explains itself; nil discards.
 	Logf func(string, ...any)
 }
@@ -210,6 +215,7 @@ func Next(issues []item, runs []runStatus, o queueOptions) pick {
 			hold("lane capacity full")
 			return pick{}
 		}
+<<<<<<< 4723da524cdda5d3a9f7719ab7753bf79dc715ed
 		areas := []string(nil)
 		switch kind {
 		case kindIssue:
@@ -217,6 +223,35 @@ func Next(issues []item, runs []runStatus, o queueOptions) pick {
 				logf("holding #%d: dependencies open for #%d", c.Number, n)
 				hold(fmt.Sprintf("dependencies open for #%d", n))
 				return pick{}
+=======
+		if n := openDep(depsFromBody(cappedBody(c.Body)), open); n > 0 {
+			logf("holding #%d: dependencies open for #%d", c.Number, n)
+			hold(fmt.Sprintf("dependencies open for #%d", n))
+			continue
+		}
+		areas := issueAreas(c)
+		// The acceptance gate (issue #132 for the area, #136 for the body),
+		// run as one check: an issue missing both the area and the sections
+		// is held with a reason - and a hold comment - that names everything
+		// it is missing, not just the first thing the gate noticed.
+		if missing := issueReady(c); len(missing) > 0 {
+			if slices.Equal(missing, []string{"area label"}) {
+				// An issue that names no area is held, not started, and
+				// blocks no one (issue #132): it is skipped like any other
+				// hold, and the next candidate is still considered.
+				logf("holding #%d: no area label", c.Number)
+				hold("no area label")
+				if o.NoAreaHeld != nil {
+					o.NoAreaHeld(c.Number)
+				}
+				continue
+			}
+			reason := "not ready: " + strings.Join(missing, ", ")
+			logf("holding #%d: %s", c.Number, reason)
+			hold(reason)
+			if o.NotReadyHeld != nil {
+				o.NotReadyHeld(c.Number, missing)
+>>>>>>> fb304f1ece1a3b7b3d69dbbb59197ea7ecfb7f8b
 			}
 			areas = issueAreas(c)
 			if len(areas) == 0 {
@@ -422,6 +457,140 @@ func issueAreas(it item) []string {
 	}
 	slices.Sort(areas)
 	return areas
+}
+
+// issueReady reports what an issue still needs before the queue may start it
+// (issue #136): an area label or a body path naming one, a "## Done when"
+// section with at least one "- " bullet under it, and a "## End-to-end
+// check" section with some real text. The names are the gate's own fixed
+// strings — never issue text — so they are safe to log and to post as a
+// comment. Headings match case-insensitively at levels 1 to 3, and the body
+// is scanned only up to maxBodyScan.
+func issueReady(it item) (missing []string) {
+	if len(issueAreas(it)) == 0 {
+		missing = append(missing, "area label")
+	}
+	return append(missing, issueBodyReady(it)...)
+}
+
+// issueBodyReady is the body half of the acceptance gate (issue #136): the
+// two section checks of issueReady without the area check, so Next can name
+// the area and the sections in one hold. Issues whose bodies are generated
+// — ref updates and model experiments — are exempt from it, not from the
+// area check: their body is written by the harness, and refIssueBody
+// renders the same acceptance sections into it for the people who read the
+// issue. The queue never reads those sections on a generated body.
+func issueBodyReady(it item) (missing []string) {
+	if it.labelled(refUpdateLabel) || it.labelled(experimentLabel) {
+		return nil // generated body: the body checks do not apply
+	}
+	body := cappedBody(it.Body)
+	if done, ok := issueSection(body, issueDoneWhenHeading); !ok || !issueHasBullet(done) {
+		missing = append(missing, "## Done when bullets")
+	}
+	e2e, ok := issueSection(body, issueEndToEndHeading)
+	if !ok || e2eUnfilled(e2e) {
+		missing = append(missing, "## End-to-end check")
+	}
+	return missing
+}
+
+// e2eUnfilled reports whether the text of an "## End-to-end check" section
+// is not a filled-in check (issue #136): empty once HTML comments are
+// stripped, or still carrying part of the unfilled placeholder. A check
+// hidden in a comment — the template's instructions, a reviewer's note —
+// is not a check (issue #136 review): the comment is stripped before the
+// text is judged. An unclosed "<!--" comments out the rest of the section,
+// so everything from it on is comment too. The placeholder marks are read
+// on the visible text, so a filled-in check that quotes the placeholder
+// inside a comment still passes.
+func e2eUnfilled(e2e string) bool {
+	visible := stripHTMLComments(e2e)
+	if strings.TrimSpace(visible) == "" {
+		return true
+	}
+	return holdsE2EPlaceholder(visible)
+}
+
+// stripHTMLComments removes whole HTML comments — "<!--" through the first
+// "-->" — and, when a comment is never closed, everything from the "<!--"
+// to the end, which is how markdown reads it. What is left is the text a
+// reader sees.
+func stripHTMLComments(s string) string {
+	i := strings.Index(s, "<!--")
+	if i < 0 {
+		return s
+	}
+	j := strings.Index(s[i:], "-->")
+	if j < 0 {
+		return s[:i] // unclosed: the rest of the section is comment
+	}
+	return stripHTMLComments(s[:i] + s[i+j+len("-->"):])
+}
+
+// e2ePlaceholderMarks are the fixed phrases that mark an "## End-to-end
+// check" section as not filled in (issue #136): the placeholder that
+// ProposalBody and issue-template.md render begins with the first phrase
+// and ends with the second, so a truncated or half-edited copy of it still
+// carries one of them. A section that carries any of them holds the issue,
+// so a promoted proposal or a fresh template issue is never queued
+// unfilled. They are the gate's own fixed strings — never issue text — so
+// they are safe to match against an arbitrary body.
+var e2ePlaceholderMarks = []string{"fill in before", "the seams work)"}
+
+// holdsE2EPlaceholder reports whether the text of an "## End-to-end check"
+// section still carries part of the unfilled placeholder.
+func holdsE2EPlaceholder(e2e string) bool {
+	for _, mark := range e2ePlaceholderMarks {
+		if strings.Contains(e2e, mark) {
+			return true
+		}
+	}
+	return false
+}
+
+// issueAnyHeading is any markdown heading line, of any level: it ends the
+// section before it.
+var issueAnyHeading = regexp.MustCompile(`^#{1,6}(\s|$)`)
+
+// issueDoneWhenHeading and issueEndToEndHeading match the two acceptance
+// headings (issue #136), case-insensitive, at levels 1 to 3 ("#", "##",
+// "###"), with the exact heading text and nothing else on the line.
+var (
+	issueDoneWhenHeading = regexp.MustCompile(`(?i)^#{1,3}[ \t]+done[ \t]+when[ \t]*$`)
+	issueEndToEndHeading = regexp.MustCompile(`(?i)^#{1,3}[ \t]+end-to-end[ \t]+check[ \t]*$`)
+)
+
+// issueSection returns the text of the first section whose heading matches
+// head — the lines from the heading to the next heading of any level — and
+// whether the heading was there at all.
+func issueSection(body string, head *regexp.Regexp) (text string, found bool) {
+	var lines []string
+	in := false
+	for _, raw := range strings.Split(body, "\n") {
+		line := strings.TrimSpace(strings.TrimSuffix(raw, "\r"))
+		if in {
+			if issueAnyHeading.MatchString(line) {
+				break
+			}
+			lines = append(lines, line)
+			continue
+		}
+		if head.MatchString(line) {
+			in = true
+		}
+	}
+	return strings.Join(lines, "\n"), in
+}
+
+// issueHasBullet reports whether any line of the section is a "- " bullet.
+func issueHasBullet(section string) bool {
+	for _, line := range strings.Split(section, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "- ") {
+			return true
+		}
+	}
+	return false
 }
 
 // labelAreas adds an item's area labels — area:harness and area:app/<name> —
@@ -707,7 +876,12 @@ func runNext() error {
 	gh := newGitHub()
 	prFiles := fetchPRFiles(gh, issues, runs, log.Printf)
 	var noArea []int
+<<<<<<< 4723da524cdda5d3a9f7719ab7753bf79dc715ed
 	p := Next(issues, runs, queueOptions{
+=======
+	notReady := map[int][]string{}
+	number, lane, reason := Next(issues, runs, queueOptions{
+>>>>>>> fb304f1ece1a3b7b3d69dbbb59197ea7ecfb7f8b
 		Label:           envOr("CODEAF_LABEL", "codeaf"),
 		QueuedLabel:     envOr("CODEAF_QUEUED_LABEL", "codeaf-queued"),
 		PriorityLabel:   envOr("CODEAF_PRIORITY_LABEL", "codeaf-priority"),
@@ -716,14 +890,20 @@ func runNext() error {
 		MaxParallelRuns: cfg.Queue.MaxParallelRuns,
 		PRFiles:         prFiles,
 		NoAreaHeld:      func(n int) { noArea = append(noArea, n) },
+		NotReadyHeld:    func(n int, missing []string) { notReady[n] = missing },
 		Logf:            log.Printf,
 	})
 	// One comment per held issue, posted once: the marker check keeps a
-	// repeat tick from stacking copies (issue #132). Best effort: a failed
-	// comment never fails the pick.
+	// repeat tick from stacking copies (issue #132, #136). Best effort: a
+	// failed comment never fails the pick.
 	if gh.token != "" {
 		for _, n := range noArea {
-			if err := ensureHoldComment(gh, n); err != nil {
+			if err := ensureHoldCommentBody(gh, n, holdCommentBody(n)); err != nil {
+				log.Printf("hold comment on #%d: %v", n, err)
+			}
+		}
+		for n, missing := range notReady {
+			if err := ensureHoldCommentBody(gh, n, notReadyHoldCommentBody(n, missing)); err != nil {
 				log.Printf("hold comment on #%d: %v", n, err)
 			}
 		}
@@ -800,9 +980,24 @@ func holdCommentBody(n int) string {
 	return fmt.Sprintf("%s\nCodeAF's queue is holding this issue (#%d): it carries no `area:harness` or `area:app/<name>` label and its body names no path under one. Add an area label to queue it (see [running several tickets at once](https://github.com/RichardoC/factory-repo#running-several-tickets-at-once-issue-60)).", queueHoldMarker, n)
 }
 
-// ensureHoldComment posts the hold comment on issue n unless a comment
+// notReadyHoldCommentBody is the comment the queue posts on an issue held
+// because it is not ready (issue #136). The missing names are the gate's
+// own fixed strings — issue #132's rule that no issue text goes into these
+// comments holds here too.
+func notReadyHoldCommentBody(n int, missing []string) string {
+	return fmt.Sprintf("%s\nCodeAF's queue is holding this issue (#%d): it is not ready to run. Missing: %s. Add what is missing — a `## Done when` section with bullets, a `## End-to-end check` section, an `area:` label (see the issue template) — and the next queue tick will start it.", queueHoldMarker, n, strings.Join(missing, ", "))
+}
+
+// ensureHoldComment posts the area hold comment on issue n unless a comment
 // carrying the marker is already there.
 func ensureHoldComment(g github, n int) error {
+	return ensureHoldCommentBody(g, n, holdCommentBody(n))
+}
+
+// ensureHoldCommentBody posts body as the hold comment on issue n unless a
+// comment carrying the marker is already there; the marker keeps repeat
+// ticks from posting the comment twice.
+func ensureHoldCommentBody(g github, n int, body string) error {
 	var comments []struct {
 		Body string `json:"body"`
 	}
@@ -814,5 +1009,5 @@ func ensureHoldComment(g github, n int) error {
 			return nil
 		}
 	}
-	return g.post(fmt.Sprintf("/issues/%d/comments", n), map[string]string{"body": holdCommentBody(n)}, nil)
+	return g.post(fmt.Sprintf("/issues/%d/comments", n), map[string]string{"body": body}, nil)
 }
