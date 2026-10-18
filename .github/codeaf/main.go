@@ -66,7 +66,7 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("harness: ")
 	if len(os.Args) < 2 {
-		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|plan-check|plan-brief|plan-report|ref-check|merge-default|search")
+		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|plan-check|plan-brief|plan-report|ref-check|merge-default|search|gh-retry")
 	}
 	commands := map[string]func() error{
 		"proxy":         runProxy,
@@ -109,6 +109,10 @@ func main() {
 		// The deterministic gate on a workflow change published without a
 		// maintainer's approval (workflowpolicy.go).
 		"workflow-policy": runWorkflowPolicy,
+		// Retry a GitHub CLI write call on transient upstream failures --
+		// 5xx or a network error, never 4xx (issue #146). The workflow
+		// prefixes its publish write calls with it: gh-retry -- gh ...
+		"gh-retry": runGhRetry,
 	}
 	command, ok := commands[os.Args[1]]
 	if !ok {
