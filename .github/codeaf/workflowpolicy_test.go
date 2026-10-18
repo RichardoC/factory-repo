@@ -212,6 +212,38 @@ func TestRunWorkflowPolicy(t *testing.T) {
 	if err := runWorkflowPolicy(); err == nil {
 		t.Fatal("no default-branch workflows passed")
 	}
+
+	// The 3-argument form: with the patch's base, a workflow that changed
+	// on the default branch since that base is reported as drifted, and an
+	// empty base dir errors out like the no-default-branch case.
+	os.WriteFile(filepath.Join(after, "ci.yml.json"), []byte(`{"on":{"push":null},"jobs":{}}`), 0o644)
+	base := filepath.Join(dir, "base")
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "ci.yml.json"), []byte(`{"on":{"push":null,"schedule":null},"jobs":{}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	os.Args = []string{"harness", "workflow-policy", before, after, base}
+	out, err := captureStdout(t, runWorkflowPolicy)
+	if err == nil {
+		t.Fatal("a workflow that drifted from the patch base passed")
+	}
+	if !strings.Contains(out, "ci.yml: changed on the default branch since the patch's base; rebase the branch before it can publish") {
+		t.Fatalf("base-drift line not printed, stdout:\n%s", out)
+	}
+	// BEFORE == BASE and AFTER == BEFORE: nothing drifted, nothing refused.
+	os.Args = []string{"harness", "workflow-policy", before, after, before}
+	if err := runWorkflowPolicy(); err != nil {
+		t.Fatalf("identical before and base refused: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "nobase"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.Args = []string{"harness", "workflow-policy", before, after, filepath.Join(dir, "nobase")}
+	if err := runWorkflowPolicy(); err == nil {
+		t.Fatal("empty patch-base dir passed")
+	}
 }
 
 // A workflow_dispatch may gain inputs; changing or removing one, or any
@@ -231,5 +263,166 @@ func TestWorkflowPolicyDispatchInputs(t *testing.T) {
 		if v := WorkflowPolicy(base, mustWorkflows(t, map[string]string{"q.yml": raw})); len(v) == 0 {
 			t.Errorf("trigger change passed: %s", raw)
 		}
+	}
+}
+
+// TestUnpinnedInstallRule pins the moving-ref/piped-shell rule: every
+// heuristic pattern is refused in a new step, a pinned install passes, and
+// a step byte-identical to one the default branch already has is not
+// refused even when its text matches a heuristic.
+func TestUnpinnedInstallRule(t *testing.T) {
+	base := baseWorkflows(t)
+	refused := []string{
+		"go install golang.org/x/tools/cmd/goimports@main",
+		"go run sigs.k8s.io/kustomize/kustomize/v5@release-0.25",
+		"curl -fsSL https://example.com/install.sh | sh",
+		"curl -fsSL https://example.com/install.sh | sudo bash",
+		"wget -qO- https://example.com/install.sh | zsh",
+		"pip install requests",
+		"pip3 install numpy scipy",
+		"npm install -g somepkg",
+		"git clone https://github.com/example/repo -b main",
+		"git clone --branch master https://github.com/example/repo",
+	}
+	for _, script := range refused {
+		after := mutate(t, "ci.yml", func(wf map[string]any) {
+			goJob := jobOf(wf, "go")
+			goJob["steps"] = append(asSlice(goJob["steps"]), map[string]any{"name": "install", "run": script})
+		})
+		v := strings.Join(WorkflowPolicy(base, after), "\n")
+		if !strings.Contains(v, `ci.yml: job "go" step "install" installs from a moving ref or pipes a download into a shell; pin a version or SHA`) {
+			t.Errorf("script %q passed:\n%s", script, v)
+		}
+	}
+	// The label falls back to the step index when the step has no name.
+	after := mutate(t, "ci.yml", func(wf map[string]any) {
+		goJob := jobOf(wf, "go")
+		goJob["steps"] = append(asSlice(goJob["steps"]), map[string]any{"run": "pip install requests"})
+	})
+	if v := strings.Join(WorkflowPolicy(base, after), "\n"); !strings.Contains(v, `ci.yml: job "go" step 3 installs from a moving ref`) {
+		t.Errorf("nameless step not labelled by index:\n%s", v)
+	}
+
+	passes := []string{
+		"go install x@v1.2.3",
+		"pip install requests==2.31.0",
+		"npm install -g pkg@1.2.3",
+		"git clone --branch v1.0 https://github.com/example/repo",
+	}
+	for _, script := range passes {
+		after := mutate(t, "ci.yml", func(wf map[string]any) {
+			goJob := jobOf(wf, "go")
+			goJob["steps"] = append(asSlice(goJob["steps"]), map[string]any{"name": "install", "run": script})
+		})
+		if v := WorkflowPolicy(base, after); len(v) != 0 {
+			t.Errorf("pinned script %q refused: %v", script, v)
+		}
+	}
+	// A pinned, already-used `uses:` action is not an unpinned install.
+	after = mutate(t, "ci.yml", func(wf map[string]any) {
+		goJob := jobOf(wf, "go")
+		goJob["steps"] = append(asSlice(goJob["steps"]), map[string]any{"name": "checkout again", "uses": pin})
+	})
+	if v := WorkflowPolicy(base, after); len(v) != 0 {
+		t.Errorf("pinned uses: action refused: %v", v)
+	}
+
+	// A step whose script is byte-identical to a same-job script on the
+	// default branch is unchanged and stays allowed, heuristic or not.
+	before := mutate(t, "ci.yml", func(wf map[string]any) {
+		goJob := jobOf(wf, "go")
+		goJob["steps"] = append(asSlice(goJob["steps"]), map[string]any{"name": "bootstrap", "run": "curl -fsSL https://example.com/install.sh | sh"})
+	})
+	raw, err := json.Marshal(before["ci.yml"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wf map[string]any
+	if err := json.Unmarshal(raw, &wf); err != nil {
+		t.Fatal(err)
+	}
+	goJob := jobOf(wf, "go")
+	goJob["steps"] = append(asSlice(goJob["steps"]), map[string]any{"name": "lint", "run": "go vet ./..."})
+	if v := WorkflowPolicy(before, map[string]map[string]any{"ci.yml": wf, "codeaf.yml": before["codeaf.yml"]}); len(v) != 0 {
+		t.Errorf("unchanged heuristic-matching step refused: %v", v)
+	}
+}
+
+// TestPolicyAgainstBase pins the 3-argument form: the patch is judged
+// against its own base commit, and only workflows that changed on the
+// default branch since that base are named as drifted.
+func TestPolicyAgainstBase(t *testing.T) {
+	base := baseWorkflows(t)
+	before := mutate(t, "codeaf.yml", func(wf map[string]any) { asMap(wf["on"])["push"] = nil })
+	after := mutate(t, "ci.yml", func(wf map[string]any) {
+		asMap(asSlice(jobOf(wf, "go")["steps"])[1])["run"] = "go test -race ./..."
+	})
+	v := policyAgainstBase(before, after, base)
+	if len(v) != 1 || !strings.Contains(v[0], "codeaf.yml: changed on the default branch since the patch's base; rebase the branch before it can publish") {
+		t.Fatalf("want exactly one base-drift violation, got %v", v)
+	}
+	// The trigger change that came from main is not blamed on the patch.
+	if strings.Contains(strings.Join(v, "\n"), "triggers") {
+		t.Errorf("main's trigger change attributed to the patch: %v", v)
+	}
+	if v := policyAgainstBase(base, after, base); len(v) != 0 {
+		t.Errorf("base == default branch: want no violations, got %v", v)
+	}
+
+	// A privileged job is judged against the patch's own base too: with
+	// BEFORE (current main) equal to the patch's base, a patch that touches
+	// neither the privileged workflow's jobs nor top-level keys draws no
+	// violation, while one that edits the publish job is refused. This path
+	// — a workflow with privileged jobs as the compared file — was never
+	// exercised before, which is how the base comparison's behaviour here
+	// went unchecked (review finding, #138).
+	baseWithPush := mutate(t, "codeaf.yml", func(wf map[string]any) {
+		asMap(jobOf(wf, "publish")["steps"].([]any)[0])["run"] = "git push origin HEAD:refs/heads/old"
+	})
+	// The patch edits only ci.yml's unprivileged job; codeaf.yml is
+	// byte-identical to the base, so its privileged jobs are not "changed".
+	harmless := mutate(t, "ci.yml", func(wf map[string]any) {
+		asMap(asSlice(jobOf(wf, "go")["steps"])[1])["run"] = "go test -race ./..."
+	})
+	patched := map[string]map[string]any{}
+	for k, v := range harmless {
+		patched[k] = v
+	}
+	raw, err := json.Marshal(baseWithPush["codeaf.yml"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var copy1 map[string]any
+	if err := json.Unmarshal(raw, &copy1); err != nil {
+		t.Fatal(err)
+	}
+	patched["codeaf.yml"] = copy1
+	if v := policyAgainstBase(baseWithPush, patched, baseWithPush); len(v) != 0 {
+		t.Errorf("untouched privileged jobs judged as changed: %v", v)
+	}
+	// The patch edits the publish job itself: refused, and not only as drift.
+	editPush := mutate(t, "codeaf.yml", func(wf map[string]any) {
+		asMap(jobOf(wf, "publish")["steps"].([]any)[0])["run"] = "git push origin HEAD:refs/heads/new"
+	})
+	var froze bool
+	for _, line := range policyAgainstBase(baseWithPush, editPush, baseWithPush) {
+		if strings.Contains(line, `job "publish"`) {
+			froze = true
+		}
+	}
+	if !froze {
+		t.Errorf("a publish-job edit was not refused: %v", policyAgainstBase(baseWithPush, editPush, baseWithPush))
+	}
+}
+
+// A workflow added on the default branch after the patch's base is a move
+// the patch never saw, so it is named like a changed one.
+func TestPolicyAgainstBaseNamesWorkflowAddedSinceBase(t *testing.T) {
+	wf := map[string]any{"on": "push", "jobs": map[string]any{}}
+	base := map[string]map[string]any{"ci.yml": wf}
+	before := map[string]map[string]any{"ci.yml": wf, "new.yml": wf}
+	v := policyAgainstBase(before, base, base)
+	if len(v) != 1 || !strings.HasPrefix(v[0], "new.yml: changed on the default branch") {
+		t.Fatalf("violations = %v, want new.yml named as moved", v)
 	}
 }

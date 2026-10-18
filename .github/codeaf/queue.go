@@ -870,6 +870,14 @@ func runNext() error {
 	// here so Next stays pure. With no token the map stays empty and the
 	// runs' area sets fall back to the issues the PRs close.
 	gh := newGitHub()
+	// With a token (the queue job sets GH_TOKEN), make sure every app has
+	// its area label before the pick runs (issue #139): a new app's first
+	// issues then queue instead of stalling. Best effort, never fatal.
+	if gh.token != "" {
+		if err := ensureAreaLabels(gh, log.Printf); err != nil {
+			log.Printf("area labels: %v", err)
+		}
+	}
 	prFiles := fetchPRFiles(gh, issues, runs, log.Printf)
 	var noArea []int
 	notReady := map[int][]string{}
@@ -959,6 +967,66 @@ func fetchPRFiles(g github, issues []item, runs []runStatus, logf func(string, .
 		prFiles[n] = paths
 	}
 	return prFiles
+}
+
+// appDirNameRe matches the app directory names the area labels are built
+// from (issue #139): anything else in the listing is ignored, so an entry
+// from the API — untrusted data — can never become a label name.
+var appDirNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// maxAreaApps caps how many directories the label sweep reads from the
+// listing, so an API reply that names thousands of entries cannot make the
+// queue tick post for all of them.
+const maxAreaApps = 50
+
+// ensureAreaLabels makes sure a label `area:app/<name>` exists for every
+// app directory (issue #139), so a new app's first issues do not stall for
+// want of a hand-made label. The queue job checks out only .github/codeaf,
+// so the app names come from the API, not the filesystem. Best effort by
+// design: an unreadable listing, a too-long listing, or a label post that
+// fails is logged and never fails the pick; a 422 "already_exists" reply
+// means the label is there and counts as success.
+func ensureAreaLabels(g github, logf func(string, ...any)) error {
+	if g.token == "" {
+		return nil
+	}
+	var entries []struct {
+		Name string `json:"name"`
+		Type string `json:"type"`
+	}
+	if err := g.get("/contents/app", &entries); err != nil {
+		logf("area labels: reading app/ contents: %v", err)
+		return nil
+	}
+	if len(entries) == 0 {
+		logf("area labels: nothing under app/ to label")
+		return nil
+	}
+	for i, e := range entries {
+		if i >= maxAreaApps {
+			logf("area labels: stopped at the %d-entry cap", maxAreaApps)
+			break
+		}
+		if e.Type != "dir" || !appDirNameRe.MatchString(e.Name) {
+			continue
+		}
+		body := map[string]string{
+			"name":        "area:app/" + e.Name,
+			"color":       "cccccc",
+			"description": "CodeAF area: app/" + e.Name,
+		}
+		if err := g.post("/labels", body, nil); err != nil {
+			// The label already exists: fine, that is the steady state on
+			// every tick after the first. The error text carries the status
+			// (POST /labels: 422 ...).
+			text := err.Error()
+			if strings.Contains(text, "422") || strings.Contains(text, "already_exists") {
+				continue
+			}
+			logf("area labels: %v", err)
+		}
+	}
+	return nil
 }
 
 // queueHoldMarker marks the comment the queue posts on an issue it holds for

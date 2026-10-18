@@ -83,6 +83,17 @@ still exists, move the Linear issue to the resolved (`Done`) state.
 When a previously tracked finding no longer exists because its Snyk DAST target
 no longer exists, cancel the Linear issue instead.
 
+An empty Snyk DAST snapshot is not trusted: if the snapshot lists no targets at
+all while managed issues exist in Linear, the run fails with an error instead of
+resolving anything, and makes no Linear write and no cache refresh. A silently
+empty target and finding list is the documented symptom of an API key without
+the `view_target` permission, of a `SNYK_DAST_TEAM` filter that matches no
+targets, or of an outage — acting on it would cancel every managed ticket in one
+run. In `--dry-run` the plan is still reported, with the same message logged at
+error level. A brand-new deployment with no managed issues yet is not affected.
+The guard covers the "nothing at all" case only; a partial listing is not a
+plausibility failure.
+
 ### Conflict
 
 If multiple Linear issues share the same fingerprint, the sync treats that as a
@@ -108,6 +119,10 @@ It includes:
 - Snyk DAST REST API link
 - the fix description when Snyk DAST provides one
 - target and finding identifiers
+- the Snyk Code correlation block when the API key has the
+  `correlation_viewer` permission; without it the run fails with an error
+  naming the missing permission, and a `404` for a single finding's
+  correlations only drops that finding's block
 - metadata block
 
 The synced title is also structured for scanability. It leads with the scanned
@@ -305,7 +320,10 @@ It uses:
 - concurrent Snyk DAST and Linear snapshot loading
 - worker-based reconciliation
 - batched Linear mutations
-- rate-limit backoff
+- rate-limit backoff -- only retryable statuses (429, 502, 503, 504) are retried;
+  a response that exhausts the request budget (`X-RateLimit-Requests-Remaining <= 0`) --
+  including a successful `200` -- is delivered to the caller and is not re-sent; its only
+  effect is to delay the next request until the reset instant.
 - SQLite caching
 
 The cache is critical for steady-state performance. A healthy steady-state run
@@ -328,8 +346,10 @@ tickets:
   rejected the mutation, which may have been committed before the response was
   lost. Creates are therefore reconciled first: `ExistingFingerprints` asks Linear
   which of the batch's fingerprints now have a live issue, and only the rest are
-  re-created. If that lookup also fails, nothing is retried and the entries are
-  counted as failed. The finding remains in the next Snyk DAST snapshot either
+  re-created. That reconciliation query is scoped the same way as the snapshot
+  (team plus the identity arms), so a shared team cannot be paged through
+  during the retry path. If that lookup also fails, nothing is retried and the
+  entries are counted as failed. The finding remains in the next Snyk DAST snapshot either
   way; if its issue was never created it is absent from the next Linear snapshot
   and gets created on the next run. Missing a ticket for one cycle is recoverable;
   a duplicate is only undone later by the duplicate-cancellation pass.
@@ -379,10 +399,12 @@ Normal behavior:
 2. Read live Linear data.
 3. Compare both against the last successful cached hashes.
 4. Skip unchanged fingerprints.
-5. After successful writes, refresh the cache from the live post-write Linear snapshot.
+5. After writes, refresh the cache from the live post-write Linear snapshot.
 
 The post-write refresh matters because Linear may rewrite markdown bodies after
-mutation.
+mutation. A fingerprint whose Linear write failed in this run is left out of the
+refreshed cache, so the next run compares it against live data again and retries
+the write instead of treating the failed one as reconciled.
 
 The cache fast-path never suppresses a pending move into a terminal state
 (`Done`/`Cancelled`): a finding that became fixed or permanently
@@ -402,6 +424,12 @@ closed, even if its hashes are unchanged since the last run.
   never written, never deleted, and read live rather than from the snapshot.
 - Linear issue history matters, so deleting and recreating all issues is a last resort, not a normal repair path.
 - Cache bypass is the correct operator action when the rendering schema or compare logic changes.
+- The Snyk DAST snapshot is verified complete against the API reported `count` before any resolve or cancel is planned: a paginated listing shorter than its reported `count` fails the run instead of being treated as the full target/finding set.
+- An empty Snyk DAST snapshot alongside existing managed issues is treated as an
+  implausible source, not as "every finding went away": the run fails rather
+  than cancelling all managed tickets (see Resolve). Only the "nothing at all"
+  case is guarded here; a partial listing is caught by the completeness check
+  above.
 
 ## Operator Guidance
 
@@ -424,6 +452,9 @@ Use a dry run to inspect planned changes:
 ```bash
 go run ./cmd/snyk-dast-linear-sync --env-file .env --dry-run
 ```
+
+A malformed numeric or boolean configuration value fails the run at startup
+with an error naming the variable; it never falls back to the default.
 
 Use cache bypass when you intentionally changed the managed rendering or need a
 full live reconciliation:

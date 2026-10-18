@@ -205,6 +205,25 @@ sending the model as the `infinite:` alias (`infinite:small:vision` resolves to
 DeepSeek-V4.1-Flash), which requires `stream: true` and a Big plan. The `:flex`
 model suffix suggested in the issue is not documented anywhere reachable.
 
+## Adding an app
+
+More applications live side by side under `app/<name>/`, each its own Go
+module. To onboard one:
+
+- the app directory must have four files: `go.mod`, `README.md`, `LICENSE`
+  and `AGENTS.md` (an app-specific rules file; `TestAppLayout` in the
+  harness checks all four);
+- an **`area:app/<name>`** label must exist (the queue job creates it
+  automatically from the directories under `app/`, colour `cccccc`) and must
+  be on **every issue** for the app — an issue without an area label is held
+  by the queue until it has one;
+- the worker, reviewer and planner briefs embed the app's `AGENTS.md` (the
+  worker and reviewer read it from the default branch, never the PR head)
+  automatically, so app-specific rules (build flags, build tags, benchmark
+  conventions, invariants) belong there, not in the issue. See
+  [app/kube-sqlite3-vfs/AGENTS.md](app/kube-sqlite3-vfs/AGENTS.md) for an
+  example.
+
 ## The queue
 
 Issues labelled **`codeaf-queued`** are the backlog. Every 10 minutes (and on
@@ -532,6 +551,41 @@ knowing*).
     refuses, such as an edit to a step that holds a secret, still waits for a
     maintainer.
 
+    `harness workflow-policy BEFORE AFTER BASE` (a third directory, not yet
+    passed by the publish job) compares the patched workflows against the
+    **patch's own base commit**, not current `main`: when a branch has fallen behind and
+    `main`'s workflows moved (a trigger change, a new step), the policy
+    reports `<workflow>: changed on the default branch since the patch's
+    base; rebase the branch before it can publish` instead of blaming the patch
+    for a change it did not make. Rebase the branch and re-run.
+
+    New or changed `run:` scripts must not **install from moving refs**. The
+    policy refuses `go install`/`go run` of `@main`, `@master`, `@latest` or
+    a `@release-*` ref, `curl | sh` (or `wget` piped into `sh`, `bash`,
+    `zsh`), a `pip install` whose specifier names no version, a global
+    `npm`/`yarn` install of a package that is unpinned or pinned to a
+    moving ref (`npm install -g pkg`, `npm install -g pkg@latest`,
+    `npm i -g @scope/pkg`, `yarn global add pkg`), and `git clone -b
+    main`/`-b master`. A version pin of any kind passes — `==`, `>=`,
+    `~=`, or a tag via `@` — and so does a commented-out line. These are
+    heuristics over the script text, not a parser: they catch the common
+    spellings and deliberate spellings may still slip through, so pin the
+    version or SHA anyway.
+
+    **Splitting a refused patch** (`harness patch-split`, not yet called by
+    the publish job, which still refuses the whole patch) keeps the rest: every file section outside
+    `.github/` (except `.github/codeaf/`, which a maintainer never has to
+    approve) is applied and published as before, and the refused workflow
+    diff is written out for a PR comment (`harness refused-comment`)
+    instead of the whole patch being dropped. A refused section that renames or copies a file,
+    a patch over 50 MB, or a header that does not parse refuses the whole
+    patch (exit 2, nothing written) rather than publishing a partial one.
+    To move forward, read the violated rule — the run report quotes it
+    under "Workflow policy" — then either
+    approve the `codeaf-harness` environment deployment for that run, or
+    fix the patch (pin the install, drop the refused workflow file, rebase
+    onto the current default branch) and re-run.
+
   One-off setup:
   - *Settings → Environments → New environment* `codeaf-harness`:
     - **Required reviewers**: yourself. Leave *Prevent self-review* off, since
@@ -577,6 +631,18 @@ knowing*).
     not merged yet.
   - When runs overlap, spend is added and ratings and events are merged. The
     memory db comes only from a run that started from the latest generation.
+  - Every packed run also carries one **run record** (`run-record.json`,
+    issue #140): the run's mode, number, lane, stop reason, wall time, call
+    and 429 counts, cost and tokens, and whether the patch touches the
+    harness. Every field is bounded, and a record that cannot be believed is
+    dropped — never the run it belongs to. The merge appends valid records as
+    one JSON line each to `records.jsonl` in the bundle and keeps the newest
+    2000; every line is re-validated on every load and merge, and nothing in
+    the file is ever executed.
+  - `harness metrics BUNDLE [DAYS]` summarises those records as Markdown:
+    runs by mode and stop, store-finished runs, mean and p50 wall time and
+    mean cost by mode, cost by day, upstream 429s, total slot wait, and PRs
+    that needed more than one `pr`-mode run.
 
   Everything is checked before it is merged, and again before CodeAF sees it
   (see [`AGENTS.md`](AGENTS.md#caches-and-carried-state)). Saved memories reach

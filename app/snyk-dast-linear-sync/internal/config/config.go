@@ -177,6 +177,20 @@ func Load(args []string) (Config, error) {
 		return Config{}, err
 	}
 
+	// Collect every malformed numeric or boolean variable before returning, so
+	// an operator sees all of them at once instead of fixing one per run.
+	var errs []error
+	getInt := func(key string, fallback int) int {
+		v, err := getEnvInt(key, fallback)
+		errs = append(errs, err)
+		return v
+	}
+	getBool := func(key string, fallback bool) bool {
+		v, err := getEnvBool(key, fallback)
+		errs = append(errs, err)
+		return v
+	}
+
 	cfg := Config{
 		DryRun:  *dryRun,
 		Verbose: *verbose,
@@ -196,10 +210,10 @@ func Load(args []string) (Config, error) {
 		Linear: LinearConfig{
 			APIKey:           os.Getenv("LINEAR_API_KEY"),
 			TeamID:           os.Getenv("LINEAR_TEAM_ID"),
-			UnsubscribeActor: getEnvBool("LINEAR_UNSUBSCRIBE_ACTOR", true),
-			CommentsEnabled:  getEnvBool("LINEAR_COMMENTS", false),
+			UnsubscribeActor: getBool("LINEAR_UNSUBSCRIBE_ACTOR", true),
+			CommentsEnabled:  getBool("LINEAR_COMMENTS", false),
 
-			ArchiveLookbackDays: getEnvInt("LINEAR_ARCHIVE_LOOKBACK_DAYS", defaultArchiveLookbackDays),
+			ArchiveLookbackDays: getInt("LINEAR_ARCHIVE_LOOKBACK_DAYS", defaultArchiveLookbackDays),
 			States: StateConfig{
 				Todo:      getEnv("LINEAR_STATE_TODO", defaultLinearTodoState),
 				Backlog:   getEnv("LINEAR_STATE_BACKLOG", defaultLinearBacklogState),
@@ -215,17 +229,24 @@ func Load(args []string) (Config, error) {
 				Protected:         parseLabelList(os.Getenv("LINEAR_PROTECTED_LABELS")),
 			},
 			Due: DueDateConfig{
-				CriticalDays: getEnvInt("LINEAR_DUE_DAYS_CRITICAL", defaultCriticalDueDays),
-				HighDays:     getEnvInt("LINEAR_DUE_DAYS_HIGH", defaultHighDueDays),
-				MediumDays:   getEnvInt("LINEAR_DUE_DAYS_MEDIUM", defaultMediumDueDays),
-				LowDays:      getEnvInt("LINEAR_DUE_DAYS_LOW", defaultLowDueDays),
+				CriticalDays: getInt("LINEAR_DUE_DAYS_CRITICAL", defaultCriticalDueDays),
+				HighDays:     getInt("LINEAR_DUE_DAYS_HIGH", defaultHighDueDays),
+				MediumDays:   getInt("LINEAR_DUE_DAYS_MEDIUM", defaultMediumDueDays),
+				LowDays:      getInt("LINEAR_DUE_DAYS_LOW", defaultLowDueDays),
 			},
 		},
 		Sync: SyncConfig{
-			Workers:             getEnvInt("SYNC_WORKERS", defaultWorkerCount),
-			SnykDASTConcurrency: getEnvInt("SNYK_DAST_HTTP_CONCURRENCY", defaultSnykDASTConcurrency),
-			LinearConcurrency:   getEnvInt("LINEAR_HTTP_CONCURRENCY", defaultLinearConcurrency),
+			Workers:             getInt("SYNC_WORKERS", defaultWorkerCount),
+			SnykDASTConcurrency: getInt("SNYK_DAST_HTTP_CONCURRENCY", defaultSnykDASTConcurrency),
+			LinearConcurrency:   getInt("LINEAR_HTTP_CONCURRENCY", defaultLinearConcurrency),
 		},
+	}
+
+	// Report malformed values before validation: a typo'd variable is the
+	// operator's first problem to fix, and reporting it alongside the
+	// missing-credential errors would bury it.
+	if err := errors.Join(errs...); err != nil {
+		return Config{}, err
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -300,32 +321,42 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-func getEnvInt(key string, fallback int) int {
+// getEnvInt reads an integer environment variable. An unset, empty or
+// whitespace-only value yields the fallback with no error. Anything else that
+// does not parse as a plain integer is reported: silently substituting the
+// default hides an operator typo, and for some of these variables (the archive
+// lookback window especially) a silent fallback is worse than a failed run.
+func getEnvInt(key string, fallback int) (int, error) {
 	raw := strings.TrimSpace(os.Getenv(key))
 	if raw == "" {
-		return fallback
+		return fallback, nil
 	}
 
 	n, err := strconv.Atoi(raw)
 	if err != nil {
-		return fallback
+		return fallback, fmt.Errorf("%s must be an integer, got %q", key, raw)
 	}
 
-	return n
+	return n, nil
 }
 
-func getEnvBool(key string, fallback bool) bool {
+// getEnvBool reads a boolean environment variable, accepting every form
+// strconv.ParseBool accepts ("1", "t", "T", "TRUE", "true", "True", "0", "f",
+// "F", "FALSE", "false", "False"). An unset, empty or whitespace-only value
+// yields the fallback with no error; anything else that does not parse is
+// reported rather than silently replaced by the fallback.
+func getEnvBool(key string, fallback bool) (bool, error) {
 	raw := strings.TrimSpace(os.Getenv(key))
 	if raw == "" {
-		return fallback
+		return fallback, nil
 	}
 
 	v, err := strconv.ParseBool(raw)
 	if err != nil {
-		return fallback
+		return fallback, fmt.Errorf("%s must be a boolean (true/false), got %q", key, raw)
 	}
 
-	return v
+	return v, nil
 }
 
 func normalizeManagedLabel(raw string) string {

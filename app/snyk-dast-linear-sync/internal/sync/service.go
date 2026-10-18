@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -182,6 +183,31 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		}
 	}
 
+	// An empty Snyk DAST snapshot is not evidence that every finding went
+	// away. The documented symptom of an API key without the view_target
+	// permission — and of a SNYK_DAST_TEAM filter that matches no targets, or
+	// of an outage that returns success with no results — is a silently empty
+	// target and finding list. Resolving on such a snapshot would cancel every
+	// managed ticket in one run, so refuse instead: the only safe reading of
+	// "no targets at all" alongside existing managed issues is that the
+	// snapshot is not a truthful source right now. A brand-new deployment with
+	// no managed issues yet is unaffected. This is deliberately not a
+	// percentage threshold: a partial listing is a separate concern.
+	if len(snykdastSnapshot.TargetIDs) == 0 && len(existingByFingerprint) > 0 {
+		message := "the Snyk DAST snapshot contains no targets while managed Linear issues exist; " +
+			"this is the documented symptom of an API key without the view_target permission " +
+			"(target and finding queries silently return empty results), or of " +
+			"SNYK_DAST_TEAM matching no targets; " +
+			"grant view_target to the API key, or fix SNYK_DAST_TEAM, before running the sync again"
+		if s.cfg.DryRun {
+			// A dry run must still show the plan it would have executed, but
+			// the operator has to see that a live run would refuse.
+			s.logger.Error(message)
+		} else {
+			return RunResult{}, fmt.Errorf("%s", message)
+		}
+	}
+
 	desiredByFingerprint := make(map[string]model.DesiredIssue, len(findings))
 	snykdastHashes := make(map[string]string, len(findings))
 	for _, finding := range findings {
@@ -218,6 +244,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 
 	jobs := make(chan job)
 	var result RunResult
+	var failedWrites failedFingerprints
 	result.Findings = len(findings)
 	result.ExistingIssues = len(existingIssues)
 	result.Conflicts = len(duplicatesToCancel)
@@ -227,7 +254,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	for i := 0; i < s.cfg.Sync.Workers; i++ {
 		g.Go(func() error {
 			for job := range jobs {
-				if err := s.executeJob(workerCtx, job, &result); err != nil {
+				if err := s.executeJob(workerCtx, job, &result, &failedWrites); err != nil {
 					return err
 				}
 			}
@@ -390,10 +417,11 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	if !s.cfg.DryRun && s.cache != nil {
 		// Refresh the cache even if some Linear operations failed. Snyk DAST data
 		// is still valid and should be cached so the next run does not have to
-		// re-fetch everything. Linear hashes are taken from a fresh snapshot
-		// when possible; if the reload fails we fall back to the hashes from the
-		// initial load, which will cause the next run to retry any issues whose
-		// writes failed.
+		// re-fetch everything. Linear hashes are taken from a fresh snapshot when
+		// possible; if the reload fails we fall back to the hashes from the
+		// initial load. A fingerprint whose write failed this run is left out of
+		// both maps, so the next run compares it against live data again and
+		// retries the write instead of skipping it on the cache fast-path.
 		cacheLinearHashes := currentLinearHashes
 		if result.PlannedCreates > 0 || result.PlannedUpdates > 0 || result.PlannedResolves > 0 {
 			refreshedIssues, err := s.linear.LoadSnapshot(runCtx)
@@ -403,6 +431,22 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				)
 			} else {
 				cacheLinearHashes = linearHashesByFingerprint(refreshedIssues)
+			}
+		}
+		uncachedFailedCount := 0
+		for fingerprint := range snykdastHashes {
+			if failedWrites.has(fingerprint) {
+				delete(snykdastHashes, fingerprint)
+				delete(cacheLinearHashes, fingerprint)
+				uncachedFailedCount++
+			}
+		}
+		// A failed resolve or duplicate cancel can also leave a Linear hash
+		// behind for a fingerprint that has no Snyk hash this run.
+		for fingerprint := range cacheLinearHashes {
+			if failedWrites.has(fingerprint) {
+				delete(cacheLinearHashes, fingerprint)
+				uncachedFailedCount++
 			}
 		}
 		nextSnapshot := cache.Snapshot{
@@ -416,6 +460,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		s.logger.Info("refreshed sync cache",
 			slog.Int("snyk_dast_rows", len(nextSnapshot.SnykDASTHashes)),
 			slog.Int("linear_rows", len(nextSnapshot.LinearHashes)),
+			slog.Int("uncached_failed", uncachedFailedCount),
 			slog.Int64("failed_ops", result.FailedOps),
 		)
 	}
@@ -436,6 +481,34 @@ type job struct {
 	kind         jobKind
 	desiredBatch []model.DesiredIssue
 	updateBatch  []model.IssueUpdate
+}
+
+// failedFingerprints collects the fingerprints of the items whose Linear write
+// failed during a run. It is written from the worker goroutines and read once
+// the pool has finished, hence the mutex. Fingerprints whose write failed are
+// excluded from the refreshed cache so the next run compares them against live
+// data and retries them instead of being skipped by the cache fast-path.
+type failedFingerprints struct {
+	mu  sync.Mutex
+	set map[string]struct{}
+}
+
+func (f *failedFingerprints) add(fps ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.set == nil {
+		f.set = make(map[string]struct{}, len(fps))
+	}
+	for _, fp := range fps {
+		f.set[fp] = struct{}{}
+	}
+}
+
+func (f *failedFingerprints) has(fp string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.set[fp]
+	return ok
 }
 
 // createOne retries a single issue create. A per-entry failure reported through
@@ -478,7 +551,7 @@ func (s *Service) commentOne(ctx context.Context, update model.IssueUpdate) erro
 // by Snyk DAST and will be absent from the next snapshot. Missing a ticket for
 // one cycle is recoverable; a duplicate ticket is not automatically undone until
 // the duplicate-cancellation pass sees both copies.
-func (s *Service) retryUnlandedCreates(ctx context.Context, batch []model.DesiredIssue, result *RunResult) {
+func (s *Service) retryUnlandedCreates(ctx context.Context, batch []model.DesiredIssue, result *RunResult, failed *failedFingerprints) {
 	fingerprints := make([]string, 0, len(batch))
 	for _, desired := range batch {
 		fingerprints = append(fingerprints, desired.Fingerprint)
@@ -487,6 +560,10 @@ func (s *Service) retryUnlandedCreates(ctx context.Context, batch []model.Desire
 	landed, err := s.linear.ExistingFingerprints(ctx, fingerprints)
 	if err != nil {
 		atomic.AddInt64(&result.FailedOps, int64(len(batch)))
+		// No safe way to tell what landed, so every entry is treated as failed
+		// and kept out of the cache: the next run re-creates whatever is
+		// genuinely missing.
+		failed.add(fingerprints...)
 		s.logger.Error("could not reconcile an ambiguous batch create against Linear; not retrying, the next run will create whatever is missing",
 			slog.Int("batch_size", len(batch)),
 			slog.Any("error", err),
@@ -503,6 +580,7 @@ func (s *Service) retryUnlandedCreates(ctx context.Context, batch []model.Desire
 		}
 		if err := s.createOne(ctx, desired); err != nil {
 			atomic.AddInt64(&result.FailedOps, 1)
+			failed.add(desired.Fingerprint)
 			s.logger.Error("failed to create issue",
 				slog.String("fingerprint", desired.Fingerprint),
 				slog.Any("error", err),
@@ -519,7 +597,7 @@ func inRange(idx, length int) bool {
 	return idx >= 0 && idx < length
 }
 
-func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) error {
+func (s *Service) executeJob(ctx context.Context, job job, result *RunResult, failed *failedFingerprints) error {
 	switch job.kind {
 	case jobCreateBatch:
 		creates := atomic.AddInt64(&result.PlannedCreates, int64(len(job.desiredBatch)))
@@ -552,7 +630,7 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 				slog.Int("batch_size", len(job.desiredBatch)),
 				slog.Any("error", err),
 			)
-			s.retryUnlandedCreates(ctx, job.desiredBatch, result)
+			s.retryUnlandedCreates(ctx, job.desiredBatch, result, failed)
 		case len(failedIdx) > 0:
 			// Partial failure: only the reported entries still need creating.
 			// Retrying the whole batch would duplicate the ones that succeeded.
@@ -572,6 +650,7 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 				desired := job.desiredBatch[idx]
 				if err := s.createOne(ctx, desired); err != nil {
 					atomic.AddInt64(&result.FailedOps, 1)
+					failed.add(desired.Fingerprint)
 					s.logger.Error("failed to create issue",
 						slog.String("fingerprint", desired.Fingerprint),
 						slog.Any("error", err),
@@ -607,6 +686,11 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 			for _, update := range job.updateBatch {
 				if err := s.linear.UpdateIssues(ctx, []model.IssueUpdate{update}); err != nil {
 					atomic.AddInt64(&result.FailedOps, 1)
+					// Record both fingerprints: they differ when a ticket's
+					// fingerprint was rewritten, and the cache is keyed by the
+					// desired fingerprint at write time and by the ticket's own
+					// fingerprint on later runs.
+					failed.add(update.Desired.Fingerprint, update.Existing.Fingerprint)
 					s.logger.Error("failed to update issue",
 						slog.String("issue", update.Existing.Identifier),
 						slog.String("fingerprint", update.Desired.Fingerprint),
@@ -681,6 +765,11 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 			for _, update := range job.updateBatch {
 				if err := s.linear.UpdateIssues(ctx, []model.IssueUpdate{update}); err != nil {
 					atomic.AddInt64(&result.FailedOps, 1)
+					// Record both fingerprints: they differ when a ticket's
+					// fingerprint was rewritten, and the cache is keyed by the
+					// desired fingerprint at write time and by the ticket's own
+					// fingerprint on later runs.
+					failed.add(update.Desired.Fingerprint, update.Existing.Fingerprint)
 					s.logger.Error("failed to resolve issue",
 						slog.String("issue", update.Existing.Identifier),
 						slog.String("fingerprint", update.Desired.Fingerprint),
@@ -712,6 +801,11 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 			for _, update := range job.updateBatch {
 				if err := s.linear.UpdateIssues(ctx, []model.IssueUpdate{update}); err != nil {
 					atomic.AddInt64(&result.FailedOps, 1)
+					// Record both fingerprints: they differ when a ticket's
+					// fingerprint was rewritten, and the cache is keyed by the
+					// desired fingerprint at write time and by the ticket's own
+					// fingerprint on later runs.
+					failed.add(update.Desired.Fingerprint, update.Existing.Fingerprint)
 					s.logger.Error("failed to cancel duplicate issue",
 						slog.String("issue", update.Existing.Identifier),
 						slog.String("fingerprint", update.Desired.Fingerprint),

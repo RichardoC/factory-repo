@@ -3,15 +3,18 @@ package snykdast
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/tesslio/snyk-dast-linear-sync/internal/config"
 	"github.com/tesslio/snyk-dast-linear-sync/internal/model"
 )
 
@@ -189,5 +192,311 @@ func TestMapStatusRFC3339ExpiryUsesItsOwnTime(t *testing.T) {
 	}
 	if got, _ := mapStatus("accepted", &future); got != model.FindingSnoozed {
 		t.Fatalf("mapStatus(accepted, one hour ahead) = %q, want %q", got, model.FindingSnoozed)
+	}
+}
+
+// --- helpers for the correlation-failure tests ---
+
+// correlationTestPage builds a one-page listing envelope for the fake API.
+func correlationTestPage(t *testing.T, nodes any) pageEnvelope {
+	t.Helper()
+	raw, err := json.Marshal(nodes)
+	if err != nil {
+		t.Fatalf("marshal page results: %v", err)
+	}
+	return pageEnvelope{Count: 1, PageTotal: 1, Results: raw}
+}
+
+// correlationTestPageNoT is correlationTestPage for callers outside a test
+// (the shared handler registrations).
+func correlationTestPageNoT(nodes any) pageEnvelope {
+	raw, err := json.Marshal(nodes)
+	if err != nil {
+		panic(err)
+	}
+	return pageEnvelope{Count: 1, PageTotal: 1, Results: raw}
+}
+
+// registerCorrelationTestAPI serves a minimal Snyk DAST API on mux: one
+// target (project-a / example.test), definitions, and two findings, both
+// with has_sast_correlations=true. The caller registers the per-finding
+// correlation handlers under /targets/target-a/findings/{1,2}/... .
+func registerCorrelationTestAPI(mux *http.ServeMux) {
+	target := targetNode{ID: "target-a", Type: "web"}
+	target.Site.Name = "project-a"
+	target.Site.URL = "https://project-a.example.test/"
+	target.Site.Host = "project-a.example.test"
+
+	passive := false
+	definition := definitionNode{ID: "def-1", Name: "Cross-site scripting", Passive: &passive}
+
+	finding := func(id string) findingNode {
+		var fn findingNode
+		fn.ID = json.Number(id)
+		fn.State = "notfixed"
+		fn.Severity = 30
+		fn.Definition.ID = "def-1"
+		fn.Definition.Name = "Cross-site scripting"
+		fn.HasSASTCorrelations = true
+		fn.Target.ID = "target-a"
+		fn.Target.Name = "project-a"
+		return fn
+	}
+
+	mux.HandleFunc("/targets/", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(correlationTestPageNoT([]targetNode{target}))
+	})
+	mux.HandleFunc("/findings/", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(correlationTestPageNoT([]findingNode{finding("1"), finding("2")}))
+	})
+	mux.HandleFunc("/definitions/", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(correlationTestPageNoT([]definitionNode{definition}))
+	})
+}
+
+// TestEnrichCorrelationsReportsMissingPermission: a 403 from the correlation
+// endpoint fails the snapshot with an error naming the missing
+// correlation_viewer permission, and the message carries no target or
+// finding URL.
+func TestEnrichCorrelationsReportsMissingPermission(t *testing.T) {
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	registerCorrelationTestAPI(mux)
+	mux.HandleFunc("/targets/target-a/findings/1/integrations/snyk-sast/correlations/", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+	mux.HandleFunc("/targets/target-a/findings/2/integrations/snyk-sast/correlations/", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+
+	base, _ := url.Parse(server.URL + "/")
+	c := &Client{
+		apiBase:     base,
+		httpClient:  server.Client(),
+		logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		concurrency: 2,
+	}
+
+	_, err := c.LoadSnapshot(context.Background())
+	if err == nil {
+		t.Fatal("LoadSnapshot() = nil error, want the missing-permission error")
+	}
+	msg := err.Error()
+	if !errors.Is(err, ErrCorrelationForbidden) {
+		t.Fatalf("LoadSnapshot() error = %v, want errors.Is ErrCorrelationForbidden", err)
+	}
+	if !strings.Contains(msg, "correlation_viewer") {
+		t.Fatalf("error %q does not name the missing correlation_viewer permission", msg)
+	}
+	if strings.Contains(msg, server.URL) {
+		t.Fatalf("error %q leaks the server URL %q", msg, server.URL)
+	}
+}
+
+// TestEnrichCorrelationsToleratesNotFoundForOneFinding: a 404 for a single
+// finding's correlations degrades to "no correlations" for that finding
+// only; the rest of the snapshot loads and the other finding keeps its block.
+func TestEnrichCorrelationsToleratesNotFoundForOneFinding(t *testing.T) {
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	registerCorrelationTestAPI(mux)
+	mux.HandleFunc("/targets/target-a/findings/1/integrations/snyk-sast/correlations/", func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	})
+	mux.HandleFunc("/targets/target-a/findings/2/integrations/snyk-sast/correlations/", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(correlationTestPage(t, []correlationNode{
+			{ID: "corr-2", Confirmed: true, Markdown: "**Snyk Code:** XSS in `page.go:7`"},
+		}))
+	})
+
+	base, _ := url.Parse(server.URL + "/")
+	c := &Client{
+		apiBase:     base,
+		httpClient:  server.Client(),
+		logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		concurrency: 2,
+	}
+
+	snapshot, err := c.LoadSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("LoadSnapshot() error = %v, want success with the 404 tolerated", err)
+	}
+	var first, second *model.Finding
+	for i := range snapshot.Findings {
+		switch snapshot.Findings[i].SnykDASTFindingID {
+		case "1":
+			first = &snapshot.Findings[i]
+		case "2":
+			second = &snapshot.Findings[i]
+		}
+	}
+	if first == nil || second == nil {
+		t.Fatalf("snapshot findings = %+v, want findings 1 and 2", snapshot.Findings)
+	}
+	if len(first.CorrelationMarkdown) != 0 {
+		t.Fatalf("finding 1 CorrelationMarkdown = %#v, want none after its 404", first.CorrelationMarkdown)
+	}
+	if len(second.CorrelationMarkdown) != 1 || !strings.Contains(second.CorrelationMarkdown[0], "page.go:7") {
+		t.Fatalf("finding 2 CorrelationMarkdown = %#v, want one block", second.CorrelationMarkdown)
+	}
+}
+
+// TestEnrichCorrelationsStillFailsOnServerError: any other error from the
+// correlation endpoint (here a 500, with a plain http.Client so the adaptive
+// transport's retries are out of the picture) still fails the snapshot.
+func TestEnrichCorrelationsStillFailsOnServerError(t *testing.T) {
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	registerCorrelationTestAPI(mux)
+	mux.HandleFunc("/targets/target-a/findings/1/integrations/snyk-sast/correlations/", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/targets/target-a/findings/2/integrations/snyk-sast/correlations/", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(correlationTestPage(t, []correlationNode{{ID: "corr-2", Markdown: "ok"}}))
+	})
+
+	base, _ := url.Parse(server.URL + "/")
+	c := &Client{
+		apiBase:     base,
+		httpClient:  server.Client(),
+		logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		concurrency: 2,
+	}
+
+	if _, err := c.LoadSnapshot(context.Background()); err == nil {
+		t.Fatal("LoadSnapshot() = nil error, want the 500 to fail the snapshot")
+	} else if errors.Is(err, ErrCorrelationForbidden) {
+		t.Fatalf("LoadSnapshot() error = %v, a server error must not map to the permission error", err)
+	}
+}
+
+// TestEnrichCorrelationsSkipsUncorrelatedFindings pins existing behaviour: a
+// finding with has_sast_correlations=false triggers no correlation request.
+func TestEnrichCorrelationsSkipsUncorrelatedFindings(t *testing.T) {
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	registerCorrelationTestAPI(mux)
+
+	var correlationRequests atomic.Int64
+	mux.HandleFunc("/targets/target-a/findings/1/integrations/snyk-sast/correlations/", func(w http.ResponseWriter, r *http.Request) {
+		correlationRequests.Add(1)
+		json.NewEncoder(w).Encode(correlationTestPage(t, []correlationNode{{ID: "corr-1", Markdown: "ok"}}))
+	})
+	mux.HandleFunc("/targets/target-a/findings/2/integrations/snyk-sast/correlations/", func(w http.ResponseWriter, r *http.Request) {
+		correlationRequests.Add(1)
+		json.NewEncoder(w).Encode(correlationTestPage(t, []correlationNode{{ID: "corr-2", Markdown: "ok"}}))
+	})
+
+	base, _ := url.Parse(server.URL + "/")
+	c := &Client{
+		apiBase:     base,
+		httpClient:  server.Client(),
+		logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		concurrency: 2,
+	}
+
+	// Drive enrichCorrelations directly: both findings correlated=false.
+	findings := []model.Finding{
+		{Fingerprint: "snyk-dast:target-a:1", SnykDASTFindingID: "1", TargetID: "target-a"},
+		{Fingerprint: "snyk-dast:target-a:2", SnykDASTFindingID: "2", TargetID: "target-a"},
+	}
+	if err := c.enrichCorrelations(context.Background(), findings, []bool{false, false}); err != nil {
+		t.Fatalf("enrichCorrelations() error = %v", err)
+	}
+	if got := correlationRequests.Load(); got != 0 {
+		t.Fatalf("correlation endpoint received %d requests, want 0 for uncorrelated findings", got)
+	}
+}
+
+// TestDecodeJSONErrorOmitsQueryString: a failed request's error names the
+// method, path and status, but not the query string — the host and the
+// filters must not leak into error excerpts pasted into public issues.
+func TestDecodeJSONErrorOmitsQueryString(t *testing.T) {
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	mux.HandleFunc("/findings/", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+
+	resp, err := server.Client().Get(server.URL + "/findings/?length=100&page=1")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	c := &Client{}
+	err = c.decodeJSON(resp, &pageEnvelope{})
+	if err == nil {
+		t.Fatal("decodeJSON() = nil error, want a 403 apiError")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "/findings/") {
+		t.Fatalf("error %q does not name the path", msg)
+	}
+	if !strings.Contains(msg, "403") {
+		t.Fatalf("error %q does not name the status", msg)
+	}
+	if strings.Contains(msg, "page=1") || strings.Contains(msg, "length=100") {
+		t.Fatalf("error %q leaks the query string", msg)
+	}
+	if strings.Contains(msg, server.URL) {
+		t.Fatalf("error %q leaks the server host %q", msg, server.URL)
+	}
+}
+
+// TestLoadSnapshotFailsFastWithoutCorrelationViewer is the end-to-end check:
+// the real transport stack (snykdast.New) against a fake API where the
+// correlation endpoint answers 403. LoadSnapshot must return the typed
+// permission error, and the server must see exactly one correlation request
+// — a 403 is not retried.
+func TestLoadSnapshotFailsFastWithoutCorrelationViewer(t *testing.T) {
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	registerCorrelationTestAPI(mux)
+
+	var correlationRequests atomic.Int64
+	mux.HandleFunc("/targets/target-a/findings/1/integrations/snyk-sast/correlations/", func(w http.ResponseWriter, r *http.Request) {
+		correlationRequests.Add(1)
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+	mux.HandleFunc("/targets/target-a/findings/2/integrations/snyk-sast/correlations/", func(w http.ResponseWriter, r *http.Request) {
+		correlationRequests.Add(1)
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+
+	cfg := config.Config{
+		SnykDAST: config.SnykDASTConfig{
+			APIKey:  "test-key",
+			APIBase: server.URL,
+			AppBase: "https://app.example.test/",
+		},
+		// Concurrency 1 makes the fails-fast count deterministic: finding 1's
+		// 403 cancels the errgroup before finding 2's fetch is sent.
+		Sync: config.SyncConfig{SnykDASTConcurrency: 1},
+	}
+	c, err := New(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	_, err = c.LoadSnapshot(context.Background())
+	if err == nil {
+		t.Fatal("LoadSnapshot() = nil error, want the missing-permission error")
+	}
+	if !errors.Is(err, ErrCorrelationForbidden) {
+		t.Fatalf("LoadSnapshot() error = %v, want errors.Is ErrCorrelationForbidden", err)
+	}
+	if !strings.Contains(err.Error(), "correlation_viewer") {
+		t.Fatalf("error %q does not name the missing correlation_viewer permission", err.Error())
+	}
+	// The errgroup cancels the remaining fetches as soon as the first 403
+	// maps to the permission error, and the adaptive transport does not retry
+	// a 403: exactly one correlation request must reach the server.
+	if got := correlationRequests.Load(); got != 1 {
+		t.Fatalf("correlation endpoint received %d requests, want 1 (fails fast, no retries for a 403)", got)
 	}
 }
