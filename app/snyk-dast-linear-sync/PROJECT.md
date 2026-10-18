@@ -305,7 +305,10 @@ It uses:
 - concurrent Snyk DAST and Linear snapshot loading
 - worker-based reconciliation
 - batched Linear mutations
-- rate-limit backoff
+- rate-limit backoff -- only retryable statuses (429, 502, 503, 504) are retried;
+  a response that exhausts the request budget (`X-RateLimit-Requests-Remaining <= 0`) --
+  including a successful `200` -- is delivered to the caller and is not re-sent; its only
+  effect is to delay the next request until the reset instant.
 - SQLite caching
 
 The cache is critical for steady-state performance. A healthy steady-state run

@@ -118,7 +118,7 @@ CI enforces this: the `go fix` check runs `go fix ./...` and then
 - Keeps the Snyk DAST REST API link as a secondary reference.
 - Includes target, vulnerable URL, HTTP method, path, parameter, insertion point, CWE, and CVSS details when Snyk DAST provides them.
 - Batches Linear create and update mutations to reduce request pressure.
-- Retries and backs off on Linear rate limiting.
+- Retries and backs off on Linear rate limiting, but only for retryable statuses (429, 502, 503, 504); a response that exhausts the request budget (`X-RateLimit-Requests-Remaining <= 0`), including a successful `200`, is delivered to the caller and delays the next request rather than re-sending the current one.
 - Normalizes common Linear markdown rewrites when comparing descriptions so steady-state runs do not churn.
 
 ## Snyk DAST (Probely) API Permissions
