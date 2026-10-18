@@ -1,0 +1,12 @@
+{
+  "stop": "done",
+  "ok": true,
+  "verdict": "good",
+  "error": null,
+  "model": "zai-org/glm-5.3-flash",
+  "plan_model": "deepseek-ai/deepseek-v4.1-flash",
+  "check_model": "deepseek-ai/deepseek-v4.1-flash",
+  "spend_usd": 1.5,
+  "est_usd": 1.6,
+  "answer": "The work is finished."
+}

@@ -1,0 +1,9 @@
+{
+  "inputs": {
+    "plan": "true",
+    "lane": "1"
+  },
+  "repository": {
+    "default_branch": "main"
+  }
+}
