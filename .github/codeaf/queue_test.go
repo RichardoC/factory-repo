@@ -702,6 +702,15 @@ func TestQueueDispatchesPassTheGate(t *testing.T) {
 	// sees what the gate will see at run time: an open, labelled issue.
 	labelled := item{Number: 3, State: "open", Labels: []label{{Name: "codeaf"}}}
 	lookup := func(int) (item, error) { return labelled, nil }
+	// Reviews and continuations (issue #137) dispatch a PR number: the gate
+	// looks it up as a CodeAF PR on a branch of this repository.
+	pr := item{Number: 3, State: "open", Labels: []label{{Name: "codeaf"}}}
+	pr.Head.Ref = "codeaf/issue-3"
+	pr.Head.Repo = &struct {
+		FullName string `json:"full_name"`
+	}{FullName: "RichardoC/factory-repo"}
+	pr.Base.Ref = "main"
+	lookupPR := func(int) (item, error) { return pr, nil }
 	data, err := os.ReadFile("../workflows/codeaf-queue.yml")
 	if err != nil {
 		t.Fatal(err)
@@ -728,13 +737,15 @@ func TestQueueDispatchesPassTheGate(t *testing.T) {
 			flags = append(flags, inputs)
 		}
 	}
-	if len(flags) != 2 {
-		t.Fatalf("codeaf-queue.yml dispatches codeaf.yml %d times; want 2 (issues and planner)", len(flags))
+	// Issue #137: the queue starts reviews and continuations too, so it
+	// dispatches four kinds: review, continuation (pr), issue and planner.
+	if len(flags) != 4 {
+		t.Fatalf("codeaf-queue.yml dispatches codeaf.yml %d times; want 4 (review, continuation, issue and planner)", len(flags))
 	}
 	for _, inputs := range flags {
 		ev := event{Inputs: inputs}
 		ev.Repository.DefaultBranch = "main"
-		got, err := Decide("workflow_dispatch", ev, "codeaf", lookup, lookup)
+		got, err := Decide("workflow_dispatch", ev, "codeaf", lookupPR, lookup)
 		if err != nil {
 			t.Fatal(err)
 		}
