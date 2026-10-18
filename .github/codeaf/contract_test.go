@@ -331,6 +331,12 @@ func TestContract(t *testing.T) {
 				writeContractFile(t, dir, strings.TrimSuffix(e.Name(), ".yml")+".json", string(out))
 			}
 		}
+		// The publish job relies on mikefarah's yq, preinstalled on GitHub's
+		// runners; another tool named yq takes different arguments, so skip
+		// rather than fail where that one is installed.
+		if v, err := exec.Command("yq", "--version").CombinedOutput(); err != nil || !strings.Contains(string(v), "mikefarah") {
+			t.Skipf("mikefarah yq not available (yq --version: %q, %v)", strings.TrimSpace(string(v)), err)
+		}
 		before, after := t.TempDir(), t.TempDir()
 		convert(before)
 		convert(after)
