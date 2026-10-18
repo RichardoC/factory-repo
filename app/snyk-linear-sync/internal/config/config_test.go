@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -74,6 +75,158 @@ func TestLoadDefaultsAndValidation(t *testing.T) {
 	}
 	if cfg.Cache.BypassCache {
 		t.Fatal("BypassCache = true, want false")
+	}
+}
+
+// setRequiredVars sets the five variables Load requires, with valid values,
+// so a test can isolate the malformed variable it actually cares about.
+func setRequiredVars(t *testing.T) {
+	t.Helper()
+	t.Setenv("SNYK_CLIENT_ID", "client-id")
+	t.Setenv("SNYK_CLIENT_SECRET", "client-secret")
+	t.Setenv("SNYK_ORG_ID", "org-id")
+	t.Setenv("LINEAR_API_KEY", "linear-key")
+	t.Setenv("LINEAR_TEAM_ID", "team-id")
+}
+
+// TestLoadRejectsMalformedIntegers verifies that a typo'd integer variable
+// stops the run with an error naming the variable and echoing the bad value,
+// instead of being silently replaced by the default. The archive lookback
+// window is the dangerous one: a silent fallback to a too-short window hides
+// recently auto-archived tickets and the sync mints duplicates.
+func TestLoadRejectsMalformedIntegers(t *testing.T) {
+	for _, key := range []string{
+		"SYNC_WORKERS",
+		"SNYK_HTTP_CONCURRENCY",
+		"LINEAR_HTTP_CONCURRENCY",
+		"LINEAR_DUE_DAYS_CRITICAL",
+		"LINEAR_DUE_DAYS_HIGH",
+		"LINEAR_DUE_DAYS_MEDIUM",
+		"LINEAR_DUE_DAYS_LOW",
+		"LINEAR_ARCHIVE_LOOKBACK_DAYS",
+	} {
+		t.Run(key, func(t *testing.T) {
+			setRequiredVars(t)
+			t.Setenv(key, "1o")
+
+			_, err := Load(nil)
+			if err == nil {
+				t.Fatalf("Load() error = nil, want error naming %s", key)
+			}
+			if !strings.Contains(err.Error(), key) {
+				t.Fatalf("Load() error = %q, want it to name %s", err, key)
+			}
+			if !strings.Contains(err.Error(), "1o") {
+				t.Fatalf("Load() error = %q, want it to quote the value %q", err, "1o")
+			}
+		})
+	}
+}
+
+// TestLoadRejectsMalformedBooleans verifies the same for the two boolean
+// variables, which only accept the forms strconv.ParseBool accepts.
+func TestLoadRejectsMalformedBooleans(t *testing.T) {
+	for _, key := range []string{"LINEAR_UNSUBSCRIBE_ACTOR", "LINEAR_COMMENTS"} {
+		t.Run(key, func(t *testing.T) {
+			setRequiredVars(t)
+			value := "no"
+			if key == "LINEAR_COMMENTS" {
+				value = "yes"
+			}
+			t.Setenv(key, value)
+
+			_, err := Load(nil)
+			if err == nil {
+				t.Fatalf("Load() error = nil, want error naming %s", key)
+			}
+			if !strings.Contains(err.Error(), key) {
+				t.Fatalf("Load() error = %q, want it to name %s", err, key)
+			}
+		})
+	}
+}
+
+// TestLoadReportsAllMalformedValuesAtOnce verifies that Load keeps reading the
+// remaining variables after the first bad one, so an operator fixes every typo
+// in one pass instead of one per run.
+func TestLoadReportsAllMalformedValuesAtOnce(t *testing.T) {
+	setRequiredVars(t)
+	t.Setenv("SYNC_WORKERS", "x")
+	t.Setenv("LINEAR_COMMENTS", "y")
+
+	_, err := Load(nil)
+	if err == nil {
+		t.Fatal("Load() error = nil, want an error naming both variables")
+	}
+	if !strings.Contains(err.Error(), "SYNC_WORKERS") {
+		t.Fatalf("Load() error = %q, want it to mention SYNC_WORKERS", err)
+	}
+	if !strings.Contains(err.Error(), "LINEAR_COMMENTS") {
+		t.Fatalf("Load() error = %q, want it to mention LINEAR_COMMENTS", err)
+	}
+}
+
+// TestLoadAcceptsBooleanForms pins the accepted spellings: every form
+// strconv.ParseBool accepts is valid, not just "true"/"false".
+func TestLoadAcceptsBooleanForms(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		unset bool
+		want  bool
+	}{
+		{name: "true", value: "true", want: true},
+		{name: "zero", value: "0", want: false},
+		{name: "unset", unset: true, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequiredVars(t)
+			if tc.unset {
+				t.Setenv("LINEAR_COMMENTS", "")
+			} else {
+				t.Setenv("LINEAR_COMMENTS", tc.value)
+			}
+
+			cfg, err := Load(nil)
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Linear.CommentsEnabled != tc.want {
+				t.Fatalf("CommentsEnabled = %v, want %v", cfg.Linear.CommentsEnabled, tc.want)
+			}
+		})
+	}
+
+	t.Run("unsubscribe actor false", func(t *testing.T) {
+		setRequiredVars(t)
+		t.Setenv("LINEAR_UNSUBSCRIBE_ACTOR", "false")
+
+		cfg, err := Load(nil)
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.Linear.UnsubscribeActor {
+			t.Fatal("UnsubscribeActor = true, want false")
+		}
+	})
+}
+
+// TestLoadBlankValuesUseDefaults verifies that a blank or whitespace-only
+// value is not an error: it means "not configured", so the default applies.
+func TestLoadBlankValuesUseDefaults(t *testing.T) {
+	setRequiredVars(t)
+	t.Setenv("SYNC_WORKERS", " ")
+	t.Setenv("LINEAR_COMMENTS", "")
+
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Sync.Workers != defaultWorkerCount {
+		t.Fatalf("Workers = %d, want %d", cfg.Sync.Workers, defaultWorkerCount)
+	}
+	if cfg.Linear.CommentsEnabled {
+		t.Fatal("CommentsEnabled = true, want false")
 	}
 }
 
