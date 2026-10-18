@@ -45,7 +45,11 @@ sits on a different model from the worker that wrote the patch (worker
 [`models.json`](.github/codeaf/models.json)), so it does not share the same
 blind spots. It reviews the PR's diff against the issue for correctness,
 concurrency, error handling and whether the tests actually exercise the
-claims, and it re-runs the benchmarks the patch claims.
+claims, and it re-runs the benchmarks the patch claims. The queue starts the
+review run itself: `publish` no longer dispatches it directly, it labels the PR
+**`codeaf-review-needed`**, and the queue picks the PR up as a `CodeAF review #N
+(lane L)` run that holds no area, through the same spend threshold and lane
+capacity as issue runs.
 
 It posts one findings comment on the PR, with a severity and a file:line for
 each finding. When anything is high or medium, that comment doubles as a
@@ -191,8 +195,11 @@ model suffix suggested in the issue is not documented anywhere reachable.
 Issues labelled **`codeaf-queued`** are the backlog. Every 10 minutes (and on
 demand, via *Run workflow*)
 [`codeaf-queue.yml`](.github/workflows/codeaf-queue.yml) asks the harness
-(`harness next`) to start the next run: the oldest queued issue —
-**`codeaf-priority`** jumps the queue — for which all of these hold:
+(`harness next`) to start the next run: the next candidate — a pull request
+labelled **`codeaf`** and **`codeaf-review-needed`** (a review run), a pull
+request labelled **`codeaf`** and **`codeaf-continue-needed`** (a continuation
+of that PR), or the oldest queued issue, with **`codeaf-priority`** jumping the
+queue — for which all of these hold:
 
 - fewer than `queue.max_parallel_runs` (in
   [`models.json`](.github/codeaf/models.json), default 2) `codeaf.yml` runs
@@ -205,11 +212,21 @@ demand, via *Run workflow*)
 - the rolling week's credit spend in the shared state is under 75% of
   `limits.weekly_credit_usd` in [`models.json`](.github/codeaf/models.json) — an
   unknown spend starts nothing;
-- the issue is queued and not already active.
+- the candidate is queued — or is a PR labelled for review or continuation —
+  and not already the subject of an in-flight run.
+
+Review and continuation runs go through the same spend threshold, lane
+capacity and area rules as issue runs, with one difference in what they hold:
+a review run holds no area at all and never conflicts with anything, while a
+continuation holds the PR's areas, resolved the same way as any PR run's.
 
 A run is started by adding the **`codeaf`** label — the same trust gate as a
 person adding it — and then by dispatching
-[`codeaf.yml`](.github/workflows/codeaf.yml) with the issue number. The
+[`codeaf.yml`](.github/workflows/codeaf.yml) with the issue number, or with the
+PR number and the run's kind for a review or continuation. `publish` no longer
+dispatches those runs itself with `gh workflow run`; it only adds the
+`codeaf-review-needed` or `codeaf-continue-needed` label, and the queue starts
+the run. The
 dispatch step exists because events raised with `GITHUB_TOKEN` (labelling
 included) do not trigger other workflows; `workflow_dispatch` is the one event
 it can start. The queue starts runs only up to the parallel-run limit, and
@@ -352,6 +369,14 @@ becomes that merge commit, and the brief names the conflicted files and
 tells CodeAF to remove every conflict marker (the lines starting with
 `<<<<<<<`, `=======` and `>>>>>>>`). The merge commit exists only in the
 run job's checkout -- the run has no write token and never pushes.
+
+A new pull request can be born conflicted: when `publish` must start the
+PR's branch from a base that moved and the patch conflicts with the new base,
+the branch starts from the old base and the PR opens already in conflict with
+`main`. The queue then continues it once: `publish` labels the PR
+**`codeaf-continue-needed`**, and the continuation run takes the base-merge
+path above, which merges the base in and has CodeAF resolve the conflict
+markers -- so the PR is not left dirty until a person resolves it by hand.
 
 `publish`, which treats everything from `run` as untrusted data, recreates
 the merge commit itself from the same two parents (the PR head and the

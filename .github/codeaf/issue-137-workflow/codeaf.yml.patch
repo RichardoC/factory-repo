@@ -1,0 +1,74 @@
+--- codeaf.yml.orig	2026-10-18 03:33:44.262224799 +0000
++++ codeaf.yml	2026-10-18 03:35:30.472716308 +0000
+@@ -28,7 +28,7 @@
+ # plan dispatch (issue #61) renders "CodeAF plan (lane N)" instead — the
+ # shape the queue and plan-check read back out of the runs list (an absent
+ # lane means lane 0, so the fallback keeps the title parseable).
+-run-name: "${{ inputs.plan == 'true' && format('CodeAF plan (lane {0})', inputs.lane || '0') || format('CodeAF #{0}{1}', inputs.issue || github.event.issue.number || github.event.pull_request.number || inputs.pr || inputs.review, inputs.lane && format(' (lane {0})', inputs.lane) || '') }}"
++run-name: "${{ inputs.plan == 'true' && format('CodeAF plan (lane {0})', inputs.lane || '0') || (inputs.review && format('CodeAF review #{0}{1}', inputs.review, inputs.lane && format(' (lane {0})', inputs.lane) || '')) || format('CodeAF #{0}{1}', inputs.issue || github.event.issue.number || github.event.pull_request.number || inputs.pr, inputs.lane && format(' (lane {0})', inputs.lane) || '') }}"
+ 
+ on:
+   issues:
+@@ -890,6 +890,12 @@
+             gh label create codeaf-workflow-change --color B60205 --description "Workflow change published on the workflow policy; merge only after the independent review passes" 2>/dev/null || true
+             gh pr edit "$pr" --add-label codeaf-workflow-change || echo "::warning::could not label #$pr codeaf-workflow-change"
+           fi
++          # The labels that name a PR for its own review or continuation run
++          # (issue #137): publish only adds one, the queue starts the run.
++          # Created here so the `gh pr edit --add-label` calls below cannot
++          # fail on a label that does not exist yet. Best effort.
++          gh label create codeaf-review-needed --color 1d76db --description "The queue starts a read-only review run for this PR" 2>/dev/null || true
++          gh label create codeaf-continue-needed --color d4c5f9 --description "The queue continues this PR (brings the base branch in and resolves conflicts)" 2>/dev/null || true
+           echo "number=$pr" >> "$GITHUB_OUTPUT"
+           gh workflow run ci.yml --ref "$BRANCH" || echo "::warning::could not dispatch CI"
+ 
+@@ -917,12 +923,13 @@
+           echo "action=$action" >> "$GITHUB_OUTPUT"
+           case "$action" in
+             continue)
+-              # Post the "/codeaf continue: <stop>" comment, then start the run
+-              # on this PR's branch (the gate's `pr` input). If the dispatch
+-              # fails, say so: a maintainer can continue it by hand.
+-              gh pr comment "$PR_NUMBER" --body-file "$CONTINUE_COMMENT_PATH" \
+-                && gh workflow run codeaf.yml -f pr="$PR_NUMBER" \
+-                || echo "::warning::could not continue #$PR_NUMBER automatically; a maintainer can continue it by hand with a /codeaf comment on the PR"
++              # Post the "/codeaf continue: <stop>" comment, then label the
++              # PR so the queue starts the continuation run itself (issue
++              # #137): it dispatches with the `pr` input and a free lane. If
++              # the label fails, a maintainer can continue it by hand.
++              gh pr comment "$PR_NUMBER" --body-file "$CONTINUE_COMMENT_PATH" || true
++              gh pr edit "$PR_NUMBER" --add-label codeaf-continue-needed \
++                || echo "::warning::could not queue the continuation of #$PR_NUMBER automatically; a maintainer can continue it by hand with a /codeaf comment on the PR"
+               ;;
+             cap)
+               # The continuation cap is reached: leave the draft to a person.
+@@ -944,8 +951,8 @@
+           GH_TOKEN: ${{ github.token }}
+           PR_NUMBER: ${{ steps.pr.outputs.number }}
+         run: |
+-          gh workflow run codeaf.yml -f review="$PR_NUMBER" \
+-            || echo "::warning::could not start the independent review of #$PR_NUMBER automatically; a maintainer can start it by hand"
++          gh pr edit "$PR_NUMBER" --add-label codeaf-review-needed \
++            || echo "::warning::could not queue the independent review of #$PR_NUMBER automatically; a maintainer can start it by hand"
+ 
+       - name: Independent review findings
+         # The review run's ending: the findings comment (severity and file:line
+@@ -970,12 +977,13 @@
+           gh pr comment "$NUMBER" --body-file "$REVIEW_COMMENT_PATH"
+           case "$action" in
+             fix)
+-              # Blocking findings: drop the pass label, then start a fix run on
+-              # this PR's branch (the gate's `pr` input). If the dispatch
+-              # fails, say so: a maintainer can start it by hand.
++              # Blocking findings: drop the pass label, then label the PR so
++              # the queue starts the fix run on its branch (issue #137; the
++              # gate's `pr` input, with a free lane). If the label fails, a
++              # maintainer can start it by hand.
+               gh pr edit "$NUMBER" --remove-label "$label" || true
+-              gh workflow run codeaf.yml -f pr="$NUMBER" \
+-                || echo "::warning::could not start the fix run for #$NUMBER automatically; a maintainer can start it by hand with a /codeaf comment on the PR"
++              gh pr edit "$NUMBER" --add-label codeaf-continue-needed \
++                || echo "::warning::could not queue the fix run for #$NUMBER automatically; a maintainer can start it by hand with a /codeaf comment on the PR"
+               ;;
+             label)
+               # Nothing blocking: make sure the label exists, then add it, so

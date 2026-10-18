@@ -41,6 +41,20 @@ func areaIssue(n int, created, area string) item {
 	return queuedIssue(n, created, "codeaf-queued", "area:"+area)
 }
 
+// nextPick runs Next with a log collector and returns the pick with the log
+// lines, for the tests that check why the queue held.
+func nextPick(issues []item, runs []runStatus, o queueOptions) (pick, []string) {
+	var lines []string
+	o.Logf = func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
+	return Next(issues, runs, o), lines
+}
+
+// reviewRun builds an in-flight review run on PR n (issue #137).
+func reviewRun(n, lane, dbid int) runStatus {
+	return runStatus{Status: "in_progress", DatabaseId: dbid,
+		DisplayTitle: fmt.Sprintf("CodeAF review #%d (lane %d)", n, lane)}
+}
+
 // running builds an in-flight run whose title names issue n on a lane.
 func running(n, lane, dbid int) runStatus {
 	return runStatus{Status: "in_progress", DatabaseId: dbid,
@@ -64,8 +78,8 @@ func TestNextNothingQueued(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if n, _, reason := Next(c.issues, nil, nextOpts()); n != 0 || reason != "nothing queued" {
-				t.Fatalf("Next = %d, %q; want 0, nothing queued", n, reason)
+			if p := Next(c.issues, nil, nextOpts()); p.Kind != "" || p.Number != 0 {
+				t.Fatalf("Next = %+v; want a zero pick, nothing queued", p)
 			}
 		})
 	}
@@ -86,28 +100,28 @@ func TestNextParallelRuns(t *testing.T) {
 	o := nextOpts() // weekly credit $10
 	o.MaxParallelRuns = 2
 
-	if n, lane, _ := Next(issues, nil, o); n != 3 || lane != 0 {
-		t.Fatalf("no runs: Next = %d, lane %d; want 3, 0", n, lane)
+	if p := Next(issues, nil, o); p.Kind != kindIssue || p.Number != 3 || p.Lane != 0 {
+		t.Fatalf("no runs: Next = %+v; want issue 3, lane 0", p)
 	}
 	// One in flight, queued or in_progress alike: the issue starts, on the
 	// one free lane.
 	for _, status := range []string{"queued", "in_progress"} {
 		r := running(5, 0, 100)
 		r.Status = status
-		if n, lane, _ := Next(issues, []runStatus{r}, o); n != 3 || lane != 1 {
-			t.Fatalf("%s run: Next = %d, lane %d; want 3, 1", status, n, lane)
+		if p := Next(issues, []runStatus{r}, o); p.Kind != kindIssue || p.Number != 3 || p.Lane != 1 {
+			t.Fatalf("%s run: Next = %+v; want issue 3, lane 1", status, p)
 		}
 	}
 	// Two in flight: at the capacity, held.
 	two := []runStatus{running(5, 0, 100), running(7, 1, 101)}
-	if n, _, reason := Next(issues, two, o); n != 0 || reason != "lane capacity full" {
-		t.Fatalf("two runs: Next = %d, %q; want 0, lane capacity full", n, reason)
+	if p, lines := nextPick(issues, two, o); p.Kind != "" || !slices.Contains(lines, "lane capacity full") {
+		t.Fatalf("two runs: Next = %+v, log %v; want held, lane capacity full", p, lines)
 	}
 	// Completed runs do not count.
 	done := []runStatus{{Status: "completed", DatabaseId: 100, DisplayTitle: "CodeAF #5 (lane 0)"},
 		{Status: "completed", DatabaseId: 101, DisplayTitle: "CodeAF #7 (lane 1)"}}
-	if n, _, _ := Next(issues, done, o); n != 3 {
-		t.Fatalf("after completed runs Next = %d; want 3", n)
+	if p := Next(issues, done, o); p.Number != 3 {
+		t.Fatalf("after completed runs Next = %+v; want 3", p)
 	}
 }
 
@@ -115,12 +129,12 @@ func TestNextSpendThreshold(t *testing.T) {
 	issues := []item{areaIssue(3, "2024-01-01T00:00:00Z", "app/x")}
 	o := nextOpts()   // weekly credit $10
 	o.WeekSpent = 7.5 // exactly 0.75 of the credit
-	if n, _, reason := Next(issues, nil, o); n != 0 || reason != "spend threshold reached" {
-		t.Fatalf("at the threshold Next = %d, %q", n, reason)
+	if p, lines := nextPick(issues, nil, o); p.Kind != "" || !slices.Contains(lines, "spend threshold reached") {
+		t.Fatalf("at the threshold Next = %+v, log %v", p, lines)
 	}
 	o.WeekSpent = 7.4999
-	if n, _, _ := Next(issues, nil, o); n != 3 {
-		t.Fatalf("just under the threshold Next = %d", n)
+	if p := Next(issues, nil, o); p.Number != 3 {
+		t.Fatalf("just under the threshold Next = %+v", p)
 	}
 }
 
@@ -177,9 +191,9 @@ func TestNextDependsOn(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			n, _, reason := Next(c.issues, nil, nextOpts())
-			if n != c.want || (c.reason != "" && reason != c.reason) {
-				t.Fatalf("Next = %d, %q; want %d, %q", n, reason, c.want, c.reason)
+			p, lines := nextPick(c.issues, nil, nextOpts())
+			if p.Number != c.want || (c.reason != "" && !slices.Contains(lines, c.reason)) {
+				t.Fatalf("Next = %+v, log %v; want %d, %q", p, lines, c.want, c.reason)
 			}
 		})
 	}
@@ -204,26 +218,26 @@ func TestNextOrdering(t *testing.T) {
 	twinLater := queuedIssue(11, "2024-03-01T00:00:00Z", "codeaf-queued", "area:app/x")
 	badStamp := queuedIssue(1, "not-a-date", "codeaf-queued", "area:app/x")
 
-	if n, _, _ := Next([]item{newer, oldest}, nil, nextOpts()); n != 7 {
-		t.Fatalf("oldest first: Next = %d", n)
+	if p := Next([]item{newer, oldest}, nil, nextOpts()); p.Number != 7 {
+		t.Fatalf("oldest first: Next = %+v", p)
 	}
-	if n, _, _ := Next([]item{oldest, priority, newer}, nil, nextOpts()); n != 9 {
-		t.Fatalf("priority jumps the queue: Next = %d", n)
+	if p := Next([]item{oldest, priority, newer}, nil, nextOpts()); p.Number != 9 {
+		t.Fatalf("priority jumps the queue: Next = %+v", p)
 	}
-	if n, _, _ := Next([]item{priority, priorityOlder}, nil, nextOpts()); n != 4 {
-		t.Fatalf("two priority issues, oldest first: Next = %d", n)
+	if p := Next([]item{priority, priorityOlder}, nil, nextOpts()); p.Number != 4 {
+		t.Fatalf("two priority issues, oldest first: Next = %+v", p)
 	}
-	if n, _, _ := Next([]item{twinLater, twin}, nil, nextOpts()); n != 5 {
-		t.Fatalf("tie-break by number: Next = %d", n)
+	if p := Next([]item{twinLater, twin}, nil, nextOpts()); p.Number != 5 {
+		t.Fatalf("tie-break by number: Next = %+v", p)
 	}
-	if n, _, _ := Next([]item{badStamp, newer}, nil, nextOpts()); n != 6 {
-		t.Fatalf("unparseable created_at sorts last: Next = %d", n)
+	if p := Next([]item{badStamp, newer}, nil, nextOpts()); p.Number != 6 {
+		t.Fatalf("unparseable created_at sorts last: Next = %+v", p)
 	}
 	// The same input twice picks the same issue, whatever the order.
-	a, _, _ := Next([]item{newer, oldest, priority}, nil, nextOpts())
-	b, _, _ := Next([]item{priority, oldest, newer}, nil, nextOpts())
-	if a != 9 || b != 9 {
-		t.Fatalf("Next is not deterministic: %d then %d", a, b)
+	a := Next([]item{newer, oldest, priority}, nil, nextOpts())
+	b := Next([]item{priority, oldest, newer}, nil, nextOpts())
+	if a.Number != 9 || b.Number != 9 {
+		t.Fatalf("Next is not deterministic: %d then %d", a.Number, b.Number)
 	}
 }
 
@@ -322,9 +336,9 @@ func TestRunNext(t *testing.T) {
 	write(runsPath, `[{"status":"completed"}]`)
 
 	// A queued issue is picked, and the stdout carries exactly the
-	// GITHUB_OUTPUT lines: the number, then the lane.
+	// GITHUB_OUTPUT lines: the kind, the number, then the lane (issue #137).
 	t.Setenv("CODEAF_WEEK_SPENT_USD", "1")
-	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "number=3\nlane=0\n" {
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "kind=issue\nnumber=3\nlane=0\n" {
 		t.Fatalf("runNext printed %q, %v", out, err)
 	}
 
@@ -338,7 +352,7 @@ func TestRunNext(t *testing.T) {
 	// lane.
 	write(issuesPath, issues)
 	write(runsPath, `[{"status":"in_progress","databaseId":100,"displayTitle":"CodeAF #9 (lane 0)"}]`)
-	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "number=3\nlane=1\n" {
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "kind=issue\nnumber=3\nlane=1\n" {
 		t.Fatalf("runNext printed %q, %v", out, err)
 	}
 
@@ -408,8 +422,8 @@ func TestNextAreas(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if n, _, _ := Next(c.issues, c.runs, o); n != c.want {
-				t.Fatalf("Next = %d; want %d", n, c.want)
+			if p := Next(c.issues, c.runs, o); p.Number != c.want {
+				t.Fatalf("Next = %+v; want %d", p, c.want)
 			}
 		})
 	}
@@ -445,9 +459,9 @@ func TestNextLanes(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			n, lane, _ := Next(issues, c.runs, o)
-			if n != 3 || lane != c.lane {
-				t.Fatalf("Next = %d, lane %d; want 3, lane %d", n, lane, c.lane)
+			p := Next(issues, c.runs, o)
+			if p.Number != 3 || p.Lane != c.lane {
+				t.Fatalf("Next = %+v; want 3, lane %d", p, c.lane)
 			}
 		})
 	}
@@ -539,7 +553,7 @@ func TestNextLogs(t *testing.T) {
 			want: []string{
 				"runs in progress: 1/2, lanes in use: 0 (run 100)",
 				"holding #3: area app/y busy (run 100)",
-				"starting #4 (lane 1): next queued issue",
+				"starting #4 (lane 1): kind=issue, next queued issue",
 			},
 			start: 4, lane: 1,
 		},
@@ -554,6 +568,7 @@ func TestNextLogs(t *testing.T) {
 			want: []string{
 				"runs in progress: 2/2, lanes in use: 0 (run 100), 1 (run 101)",
 				"holding #3: lane capacity full",
+				"lane capacity full",
 			},
 		},
 		{
@@ -566,6 +581,7 @@ func TestNextLogs(t *testing.T) {
 			want: []string{
 				"runs in progress: 1/2, lanes in use: 0 (run 100)",
 				"holding #3: no area label",
+				"no area label",
 			},
 		},
 	}
@@ -575,17 +591,17 @@ func TestNextLogs(t *testing.T) {
 			o := nextOpts()
 			o.MaxParallelRuns = 2
 			o.Logf = func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
-			n, lane, _ := Next(c.issues, c.runs, o)
-			if n != c.start || lane != c.lane {
-				t.Fatalf("Next = %d, lane %d; want %d, lane %d", n, lane, c.start, c.lane)
+			p := Next(c.issues, c.runs, o)
+			if p.Number != c.start || p.Lane != c.lane {
+				t.Fatalf("Next = %+v; want %d, lane %d", p, c.start, c.lane)
 			}
 			if !slices.Equal(lines, c.want) {
 				t.Fatalf("log lines:\n%s\nwant:\n%s", strings.Join(lines, "\n"), strings.Join(c.want, "\n"))
 			}
 			// Without a Logf, Next still decides (the nil log is discarded).
 			o.Logf = nil
-			if n2, lane2, _ := Next(c.issues, c.runs, o); n2 != c.start || lane2 != c.lane {
-				t.Fatalf("silent Next = %d, lane %d; want %d, lane %d", n2, lane2, c.start, c.lane)
+			if p2 := Next(c.issues, c.runs, o); p2.Number != c.start || p2.Lane != c.lane {
+				t.Fatalf("silent Next = %+v; want %d, lane %d", p2, c.start, c.lane)
 			}
 		})
 	}
@@ -656,15 +672,16 @@ func TestNextPlanRunNoAreaConflict(t *testing.T) {
 	o.MaxParallelRuns = 2
 	// A plan run on lane 0 and the same-area issue still starts, on lane 1.
 	planRun := runStatus{Status: "in_progress", DatabaseId: 100, DisplayTitle: "CodeAF plan"}
-	if n, lane, _ := Next(issues, []runStatus{planRun}, o); n != 3 || lane != 1 {
-		t.Fatalf("plan run in flight: Next = %d, lane %d; want 3, 1", n, lane)
+	if p := Next(issues, []runStatus{planRun}, o); p.Number != 3 || p.Lane != 1 {
+		t.Fatalf("plan run in flight: Next = %+v; want 3, lane 1", p)
 	}
 	// An issue run on the same area blocks the same-area candidate, as
 	// always: run 100 works app/x, so #3 is held and #5 (its own area
 	// aside) is not picked either — the same area on both.
 	sameArea := []runStatus{running(3, 0, 100)}
-	if n, _, reason := Next([]item{areaIssue(5, "2024-01-01T00:00:00Z", "app/x")}, sameArea, o); n != 0 || !strings.Contains(reason, "busy") {
-		t.Fatalf("same-area issue run: Next = %d, %q; want held", n, reason)
+	p, lines := nextPick([]item{areaIssue(5, "2024-01-01T00:00:00Z", "app/x")}, sameArea, o)
+	if p.Kind != "" || !strings.Contains(strings.Join(lines, "\n"), "busy") {
+		t.Fatalf("same-area issue run: Next = %+v, log %v; want held", p, lines)
 	}
 }
 
@@ -749,12 +766,13 @@ func TestRunAreasOfPullRequest(t *testing.T) {
 		t.Fatalf("runAreas = %v; want [harness]", got)
 	}
 	issues := []item{pr, linked, areaIssue(3, "2024-01-01T00:00:00Z", "app/kube-sqlite3-vfs")}
-	if n, lane, _ := Next(issues, []runStatus{review}, o); n != 3 || lane != 1 {
-		t.Fatalf("app candidate vs PR review run: Next = %d, lane %d; want 3, 1", n, lane)
+	if p := Next(issues, []runStatus{review}, o); p.Kind != kindIssue || p.Number != 3 || p.Lane != 1 {
+		t.Fatalf("app candidate vs PR review run: Next = %+v; want 3, lane 1", p)
 	}
 	held := []item{pr, linked, areaIssue(4, "2024-01-01T00:00:00Z", "harness")}
-	if n, _, reason := Next(held, []runStatus{review}, o); n != 0 || reason != "area harness busy (run 39072194971)" {
-		t.Fatalf("harness candidate vs PR review run: Next = %d, %q; want held", n, reason)
+	p, lines := nextPick(held, []runStatus{review}, o)
+	if p.Kind != "" || !slices.Contains(lines, "area harness busy (run 39072194971)") {
+		t.Fatalf("harness candidate vs PR review run: Next = %+v, log %v; want held", p, lines)
 	}
 }
 
@@ -772,11 +790,11 @@ func TestRunAreasFromChangedFilesOnly(t *testing.T) {
 		t.Fatalf("runAreas = %v; want [app/x]", got)
 	}
 	// A candidate on the same area is held; another area starts.
-	if n, _, _ := Next([]item{pr, areaIssue(3, "2024-01-01T00:00:00Z", "app/x")}, []runStatus{review}, o); n != 0 {
-		t.Fatalf("same-area candidate: Next = %d; want held", n)
+	if p := Next([]item{pr, areaIssue(3, "2024-01-01T00:00:00Z", "app/x")}, []runStatus{review}, o); p.Kind != "" {
+		t.Fatalf("same-area candidate: Next = %+v; want held", p)
 	}
-	if n, _, _ := Next([]item{pr, areaIssue(3, "2024-01-01T00:00:00Z", "app/y")}, []runStatus{review}, o); n != 3 {
-		t.Fatalf("other-area candidate: Next = %d; want 3", n)
+	if p := Next([]item{pr, areaIssue(3, "2024-01-01T00:00:00Z", "app/y")}, []runStatus{review}, o); p.Number != 3 {
+		t.Fatalf("other-area candidate: Next = %+v; want 3", p)
 	}
 }
 
@@ -788,13 +806,13 @@ func TestNoAreaIssueIsHeldNotBlocking(t *testing.T) {
 	o := nextOpts()
 	var lines []string
 	o.Logf = func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
-	if n, _, reason := Next([]item{queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued")}, nil, o); n != 0 || reason != "no area label" {
-		t.Fatalf("area-less candidate alone: Next = %d, %q; want 0, no area label", n, reason)
+	if p := Next([]item{queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued")}, nil, o); p.Kind != "" || !slices.Contains(lines, "no area label") {
+		t.Fatalf("area-less candidate alone: Next = %+v, log %v; want 0, no area label", p, lines)
 	}
 	issues := []item{queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued"), areaIssue(5, "2024-01-01T00:00:00Z", "app/x")}
-	n, lane, _ := Next(issues, nil, o)
-	if n != 5 || lane != 0 {
-		t.Fatalf("area-less candidate first: Next = %d, lane %d; want 5, 0", n, lane)
+	p := Next(issues, nil, o)
+	if p.Number != 5 || p.Lane != 0 {
+		t.Fatalf("area-less candidate first: Next = %+v; want 5, lane 0", p)
 	}
 	if !slices.Contains(lines, "holding #3: no area label") {
 		t.Fatalf("log lines = %v; want the no-area hold", lines)
@@ -813,8 +831,9 @@ func TestPRRunWithUnknownAreasStillBlocks(t *testing.T) {
 	if got := runAreas(review, map[int]item{10: pr}, nil); len(got) != 0 {
 		t.Fatalf("runAreas = %v; want none", got)
 	}
-	if n, _, reason := Next([]item{pr, areaIssue(3, "2024-01-01T00:00:00Z", "app/x")}, []runStatus{review}, o); n != 0 || reason != "area app/x busy (run 100)" {
-		t.Fatalf("Next = %d, %q; want held on the unknown PR run", n, reason)
+	p, lines := nextPick([]item{pr, areaIssue(3, "2024-01-01T00:00:00Z", "app/x")}, []runStatus{review}, o)
+	if p.Kind != "" || !slices.Contains(lines, "area app/x busy (run 100)") {
+		t.Fatalf("Next = %+v, log %v; want held on the unknown PR run", p, lines)
 	}
 }
 
@@ -857,5 +876,242 @@ func TestHoldCommentIsPostedOnce(t *testing.T) {
 	}
 	if posts != 1 {
 		t.Fatalf("second call posted again (%d posts); want the marker to stop it", posts)
+	}
+}
+
+// TestNextPicksReviewBeforeIssues covers the queue's new head of the pass
+// (issue #137): a pull request labelled codeaf and codeaf-review-needed is
+// picked with kind review on the lowest free lane, ahead of any queued
+// issue — and, once the review is in flight as a mirrored run, it does not
+// block an area:harness issue picked in the same pass: a review holds no
+// area, and the pull request is not picked again while a run already has it
+// as its subject.
+func TestNextPicksReviewBeforeIssues(t *testing.T) {
+	o := nextOpts()
+	o.MaxParallelRuns = 2
+	pr := queuedIssue(124, "2024-01-01T00:00:00Z", "codeaf", "codeaf-review-needed", "area:harness")
+	pr.PullRequest = json.RawMessage(`{"number":124}`)
+	issue := areaIssue(3, "2024-01-01T00:00:00Z", "harness")
+	issues := []item{pr, issue}
+
+	if p := Next(issues, nil, o); p.Kind != kindReview || p.Number != 124 || p.Lane != 0 {
+		t.Fatalf("Next = %+v; want review #124 on lane 0", p)
+	}
+	// The review is now in flight as a mirrored run: the harness issue
+	// starts too, on the one free lane, and no second review is picked.
+	mirrored := []runStatus{reviewRun(124, 0, 100)}
+	if p := Next(issues, mirrored, o); p.Kind != kindIssue || p.Number != 3 || p.Lane != 1 {
+		t.Fatalf("Next after the review run = %+v; want issue 3 on lane 1", p)
+	}
+	// At the lane capacity the review is held like any other run.
+	o.MaxParallelRuns = 1
+	if p, lines := nextPick(issues, mirrored, o); p.Kind != "" || !slices.Contains(lines, "lane capacity full") {
+		t.Fatalf("Next at capacity = %+v, log %v; want held", p, lines)
+	}
+}
+
+// TestNextReviewHoldsNoArea covers the review side of areaBusy (issue #137):
+// an in-flight `CodeAF review #5 (lane 1)` run never conflicts with any
+// candidate, although the pull request it reviews closes a harness issue and
+// touches harness files — a `CodeAF #5` run in its place would hold the
+// harness area and block the harness candidate.
+func TestNextReviewHoldsNoArea(t *testing.T) {
+	o := nextOpts()
+	o.MaxParallelRuns = 2
+	o.PRFiles = map[int][]string{5: {".github/codeaf/queue.go"}}
+	pr := queuedIssue(5, "2024-01-01T00:00:00Z", "codeaf")
+	pr.Body = "Closes #119"
+	pr.PullRequest = json.RawMessage(`{"number":5}`)
+	linked := areaIssue(119, "2024-01-01T00:00:00Z", "harness")
+	byNumber := map[int]item{5: pr, 119: linked}
+	review := reviewRun(5, 1, 100)
+
+	// areaBusy itself: the review run is skipped exactly like a plan run.
+	if busy, r, conflict := areaBusy([]string{"harness"}, []runStatus{review}, byNumber, o.PRFiles); conflict {
+		t.Fatalf("areaBusy held on a review run: %q (run %d)", busy, r.DatabaseId)
+	}
+	// A harness candidate starts although the review's PR is all harness.
+	harness := []item{pr, linked, areaIssue(3, "2024-01-01T00:00:00Z", "harness")}
+	if p := Next(harness, []runStatus{review}, o); p.Kind != kindIssue || p.Number != 3 || p.Lane != 0 {
+		t.Fatalf("harness candidate vs review run: Next = %+v; want 3 on lane 0", p)
+	}
+	// An app candidate starts the same way.
+	app := []item{pr, linked, areaIssue(4, "2024-01-01T00:00:00Z", "app/x")}
+	if p := Next(app, []runStatus{review}, o); p.Kind != kindIssue || p.Number != 4 || p.Lane != 0 {
+		t.Fatalf("app candidate vs review run: Next = %+v; want 4 on lane 0", p)
+	}
+	// The same PR run as a `CodeAF #5` continuation does hold the area:
+	// the harness candidate is blocked, the review shape is what makes the
+	// difference.
+	continueRun := running(5, 1, 100)
+	if p, lines := nextPick(harness, []runStatus{continueRun}, o); p.Kind != "" || !slices.Contains(lines, "area harness busy (run 100)") {
+		t.Fatalf("harness candidate vs continuation run: Next = %+v, log %v; want held", p, lines)
+	}
+}
+
+// TestNextContinueHoldsPRAreas covers the continuation side (issue #137): an
+// in-flight `CodeAF #5 (lane 1)` run on a pull request that closes an
+// area:harness issue blocks an area:harness candidate, while the pull
+// request itself is not picked again as a continuation candidate — and with
+// nothing in flight, the continuation is picked ahead of the queued issues.
+func TestNextContinueHoldsPRAreas(t *testing.T) {
+	o := nextOpts()
+	o.MaxParallelRuns = 2
+	pr := queuedIssue(5, "2024-01-01T00:00:00Z", "codeaf", "codeaf-continue-needed")
+	pr.Body = "Closes #119"
+	pr.PullRequest = json.RawMessage(`{"number":5}`)
+	linked := areaIssue(119, "2024-01-01T00:00:00Z", "harness")
+	cont := running(5, 1, 100)
+
+	// A harness candidate is blocked by the continuation's PR areas.
+	held := []item{pr, linked, areaIssue(3, "2024-01-01T00:00:00Z", "harness")}
+	if p, lines := nextPick(held, []runStatus{cont}, o); p.Kind != "" || !slices.Contains(lines, "area harness busy (run 100)") {
+		t.Fatalf("harness candidate vs in-flight continuation: Next = %+v, log %v; want held", p, lines)
+	}
+	// The pull request is not picked again while its run is in flight; an
+	// candidate on another area still starts, on the free lane.
+	free := []item{pr, linked, areaIssue(4, "2024-01-01T00:00:00Z", "app/x")}
+	if p := Next(free, []runStatus{cont}, o); p.Kind != kindIssue || p.Number != 4 || p.Lane != 0 {
+		t.Fatalf("app candidate vs in-flight continuation: Next = %+v; want 4 on lane 0", p)
+	}
+	// With nothing in flight the continuation is picked before the issues.
+	if p := Next(held, nil, o); p.Kind != kindContinue || p.Number != 5 || p.Lane != 0 {
+		t.Fatalf("nothing in flight: Next = %+v; want continue #5 on lane 0", p)
+	}
+}
+
+// TestNextCountsReviewsAgainstLanes covers the capacity rule across kinds
+// (issue #137): in-flight runs of every kind — reviews, continuations, plan
+// runs and issue runs — count against max_parallel_runs alike, so with four
+// in flight and a capacity of four nothing is picked, for the usual reason.
+func TestNextCountsReviewsAgainstLanes(t *testing.T) {
+	o := nextOpts()
+	o.MaxParallelRuns = 4
+	pr := queuedIssue(124, "2024-01-01T00:00:00Z", "codeaf", "codeaf-review-needed")
+	pr.PullRequest = json.RawMessage(`{"number":124}`)
+	runs := []runStatus{
+		reviewRun(120, 0, 1),
+		running(121, 1, 2),
+		{Status: "in_progress", DatabaseId: 3, DisplayTitle: "CodeAF plan (lane 2)"},
+		{Status: "queued", DatabaseId: 4, DisplayTitle: "CodeAF #122 (lane 3)"},
+	}
+	issues := []item{pr, areaIssue(3, "2024-01-01T00:00:00Z", "app/x")}
+	p, lines := nextPick(issues, runs, o)
+	if p.Kind != "" || p.Number != 0 || !slices.Contains(lines, "holding #124: lane capacity full") {
+		t.Fatalf("Next = %+v, log %v; want held, lane capacity full", p, lines)
+	}
+	// One run finished: the review is picked, on the freed lane.
+	free := []runStatus{reviewRun(120, 0, 1), running(121, 1, 2),
+		{Status: "in_progress", DatabaseId: 3, DisplayTitle: "CodeAF plan (lane 2)"},
+		{Status: "completed", DatabaseId: 4, DisplayTitle: "CodeAF #122 (lane 3)"}}
+	if p := Next(issues, free, o); p.Kind != kindReview || p.Number != 124 || p.Lane != 3 {
+		t.Fatalf("one lane free: Next = %+v; want review #124 on lane 3", p)
+	}
+}
+
+// TestRunLaneReadsReviewTitles pins the strict parse of a review run's
+// display title (issue #137): only "CodeAF review #<n>" and "CodeAF review
+// #<n> (lane <n>)" match, and anything else — wrong prefix, letters in the
+// lane, trailing prose, the empty title — is no review run at all. A review
+// title parses to issue 0 in runTitleFields, which keeps matching only
+// `CodeAF #<n>` shapes; and runLane reads the review lane.
+func TestRunLaneReadsReviewTitles(t *testing.T) {
+	cases := []struct {
+		title  string
+		number int
+		lane   int
+		review bool
+		// issue marks an issue title the list carries to pin the shapes'
+		// disjointness: it parses to a real issue in runTitleFields.
+		issue bool
+	}{
+		{"CodeAF review #12", 12, 0, true, false},
+		{"CodeAF review #12 (lane 0)", 12, 0, true, false},
+		{"CodeAF review #12 (lane 3)", 12, 3, true, false},
+		{"CodeAF review #12 (lane 99)", 12, 99, true, false}, // out of range, still its value
+		{"CodeAF review #12 (lane abc)", 0, 0, false, false}, // lane letters
+		{"CodeAF review #12 (lane )", 0, 0, false, false},
+		{"CodeAF review #12 (lane -1)", 0, 0, false, false},
+		{"CodeAF review 12 (lane 3)", 0, 0, false, false},        // no #
+		{"CodeAF reviews #12 (lane 3)", 0, 0, false, false},      // wrong prefix
+		{"codeaf review #12 (lane 3)", 0, 0, false, false},       // case
+		{"CodeAF review #12 (lane 3) extra", 0, 0, false, false}, // trailing prose
+		{"CodeAF #12 (lane 3)", 0, 0, false, true},               // an issue title
+		{"CodeAF plan (lane 3)", 0, 0, false, false},             // a plan title
+		{"", 0, 0, false, false},                                 // empty title
+	}
+	for _, c := range cases {
+		number, lane, ok := runReviewFields(c.title)
+		if ok != c.review || (ok && (number != c.number || lane != c.lane)) {
+			t.Errorf("runReviewFields(%q) = (%d, %d, %v); want (%d, %d, %v)",
+				c.title, number, lane, ok, c.number, c.lane, c.review)
+		}
+		if got := isReviewRun(runStatus{DisplayTitle: c.title}); got != c.review {
+			t.Errorf("isReviewRun(%q) = %v; want %v", c.title, got, c.review)
+		}
+		// runLane reads the review lane, and only the review lane.
+		if got := runLane(runStatus{DisplayTitle: c.title}); c.review && got != c.lane {
+			t.Errorf("runLane(%q) = %d; want %d", c.title, got, c.lane)
+		}
+		// runTitleFields keeps matching only `CodeAF #<n>` shapes: a review
+		// title parses to issue 0 there.
+		if issue, _ := runTitleFields(c.title); issue != 0 && !c.issue {
+			t.Errorf("runTitleFields(%q) = %d; want 0 for a review shape", c.title, issue)
+		}
+	}
+	// An issue title still parses as before, review parsing or no.
+	if issue, lane := runTitleFields("CodeAF #12 (lane 3)"); issue != 12 || lane != 3 {
+		t.Fatalf("runTitleFields issue title = (%d, %d); want (12, 3)", issue, lane)
+	}
+}
+
+// TestRunNextOutputShape pins `harness next`'s stdout in the three pick
+// cases (issue #137): exactly "kind=<kind>", then "number=<n>", then
+// "lane=<n>", and nothing else — and an empty stdout when the queue holds.
+func TestRunNextOutputShape(t *testing.T) {
+	if _, err := loadConfig("models.json"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PROXY_MODELS", "models.json")
+	t.Setenv("CODEAF_WEEK_SPENT_USD", "1")
+
+	dir := t.TempDir()
+	issuesPath := filepath.Join(dir, "issues.json")
+	runsPath := filepath.Join(dir, "runs.json")
+	write := func(path, data string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pr := func(n int, extra string) string {
+		return fmt.Sprintf(`{"number":%d,"state":"open","created_at":"2024-01-01T00:00:00Z","pull_request":{"number":%d},"labels":[{"name":"codeaf"}%s]}`, n, n, extra)
+	}
+	cases := []struct {
+		name   string
+		issues string
+		runs   string
+		want   string
+	}{
+		{"issue", `[{"number":3,"state":"open","created_at":"2024-01-01T00:00:00Z","labels":[{"name":"codeaf-queued"},{"name":"area:app/x"}]}]`,
+			`[{"status":"completed"}]`, "kind=issue\nnumber=3\nlane=0\n"},
+		{"review", "[" + pr(124, `,{"name":"codeaf-review-needed"}`) + "]",
+			`[{"status":"completed"}]`, "kind=review\nnumber=124\nlane=0\n"},
+		{"continue", "[" + pr(125, `,{"name":"codeaf-continue-needed"},{"name":"area:app/x"}`) + "]",
+			`[{"status":"completed"}]`, "kind=continue\nnumber=125\nlane=0\n"},
+		{"held at the capacity", "[" + pr(124, `,{"name":"codeaf-review-needed"}`) + "]",
+			`[{"status":"in_progress","databaseId":1,"displayTitle":"CodeAF review #120 (lane 0)"},
+			  {"status":"in_progress","databaseId":2,"displayTitle":"CodeAF #121 (lane 1)"},
+			  {"status":"in_progress","databaseId":3,"displayTitle":"CodeAF plan (lane 2)"},
+			  {"status":"queued","databaseId":4,"displayTitle":"CodeAF #122 (lane 3)"}]`, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			write(issuesPath, c.issues)
+			write(runsPath, c.runs)
+			if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != c.want {
+				t.Fatalf("runNext printed %q, %v; want %q", out, err, c.want)
+			}
+		})
 	}
 }

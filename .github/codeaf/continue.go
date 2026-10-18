@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // The stop words CodeAF can report, verified in Agent-Field/codeaf
@@ -162,6 +163,14 @@ func prMode() error {
 func continuePlan(gh github, pr int, stop string) (action string, body string, used int, err error) {
 	stop = sanitizeStop(stop)
 	if !earlyStop(stop) || !continuesAfter(stop) {
+		// Issue #137: a run that finished (stop "done") on a pull request
+		// born conflicted — publish started its branch from an old base
+		// and the 3-way apply failed — still needs one continuation,
+		// through the base-merge path (merge.go, issue #57) that a
+		// codeaf-continue-needed run takes.
+		if stop == stopDone {
+			return continueConflicted(gh, pr)
+		}
 		return "", "", 0, nil
 	}
 	var comments []issueComment
@@ -173,6 +182,69 @@ func continuePlan(gh github, pr int, stop string) (action string, body string, u
 		return "cap", capBody(stop), used, nil
 	}
 	return "continue", continueBody(stop, used), used, nil
+}
+
+// ---------------------------------------------------------------- the PR born conflicted
+
+// Mergeable states of a pull request that this file distinguishes (issue
+// #137). GitHub computes mergeable_state asynchronously: "unknown" means
+// the answer is not ready yet, and "dirty" means the branch conflicts with
+// its base.
+const (
+	mergeableDirty   = "dirty"
+	mergeableUnknown = "unknown"
+)
+
+// conflictBody is the comment that starts the continuation of a pull
+// request born conflicted: fixed text only, never remote text, with the
+// trailing newline the other comment bodies carry.
+const conflictBody = "The branch conflicts with its base branch; a continuation brings the base in and resolves the conflicts\n"
+
+// continueSleep is injectable so tests of the mergeable_state retries do
+// not actually sleep.
+var continueSleep = time.Sleep
+
+// mergeableState fetches a pull request's mergeable_state (issue #137). While
+// GitHub is still computing it the fetch is retried up to 3 times, 5
+// seconds apart; past that the last state is returned and the caller does
+// nothing with it.
+func (g github) mergeableState(pr int) (string, error) {
+	const unknownRetries = 3
+	const retryWait = 5 * time.Second
+	for attempt := 0; ; attempt++ {
+		var p struct {
+			MergeableState string `json:"mergeable_state"`
+		}
+		if err := g.get(fmt.Sprintf("/pulls/%d", pr), &p); err != nil {
+			return "", err
+		}
+		if p.MergeableState != mergeableUnknown || attempt >= unknownRetries {
+			return p.MergeableState, nil
+		}
+		continueSleep(retryWait)
+	}
+}
+
+// continueConflicted plans the continuation of a pull request born
+// conflicted: its run finished (stop "done"), so the early-stop path does
+// not apply, but the branch conflicts with its base and only a PR-mode run
+// resolves that. A fetch error, a state other than dirty, or a
+// continuation cap already used up all do nothing: the existing cap
+// comment path is for early stops and would read wrong here.
+func continueConflicted(gh github, pr int) (action string, body string, used int, err error) {
+	var comments []issueComment
+	if err := gh.get(fmt.Sprintf("/issues/%d/comments?per_page=100", pr), &comments); err != nil {
+		return "", "", 0, nil
+	}
+	used = continuationsUsed(countReports(comments))
+	state, err := gh.mergeableState(pr)
+	if err != nil {
+		return "", "", 0, nil
+	}
+	if state != mergeableDirty || continuationCapReached(used) {
+		return "", "", 0, nil
+	}
+	return "continue", conflictBody, used, nil
 }
 
 // continueBody is the comment that starts the next run: its first line is

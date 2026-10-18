@@ -72,16 +72,62 @@ const queueSpendFraction = 0.75 // 75% of the weekly credit
 // prefix is read, like the harness's other reads of untrusted files.
 const maxBodyScan = 1 << 16 // 64KiB
 
-// Next picks the issue CodeAF should work next and the lane it should run
-// on. It returns 0 and a reason when nothing should run: fewer than
+// pick is one run the queue decides to start: what kind of run it is, the
+// issue or pull request number it works on, and the lane it runs on. Kind is
+// one of the kind* constants below; a zero pick (an empty Kind) means the
+// queue is holding.
+type pick struct {
+	Kind   string
+	Number int
+	Lane   int
+}
+
+// The kinds of run the queue schedules (issue #137): a queued issue, a
+// review of a pull request, or a continuation of one.
+const (
+	kindIssue    = "issue"
+	kindReview   = "review"
+	kindContinue = "continue"
+)
+
+// The labels that put a pull request in the queue (issue #137): publish adds
+// codeaf-review-needed or codeaf-continue-needed instead of dispatching the
+// workflow itself, and the queue picks the pull request up from the label.
+const (
+	labelReviewNeeded   = "codeaf-review-needed"
+	labelContinueNeeded = "codeaf-continue-needed"
+)
+
+// startReason is the log phrase for a started run of each kind.
+func startReason(kind string) string {
+	switch kind {
+	case kindReview:
+		return "review requested"
+	case kindContinue:
+		return "continuation requested"
+	}
+	return "next queued issue"
+}
+
+// Next picks the run CodeAF should start next and the lane it should run on.
+// Candidates, in this order per pass (issue #137): open pull requests
+// labelled codeaf and codeaf-review-needed (kind review), then open pull
+// requests labelled codeaf and codeaf-continue-needed (kind continue), then
+// the queued issues as before (kind issue). A pull request is a candidate
+// only while it is open and no in-flight run already has its number as its
+// subject; pull request candidates keep the queue's usual sort (oldest
+// first). Next returns a zero pick when nothing should run: fewer than
 // MaxParallelRuns CodeAF runs may be queued or in progress (they count
-// alike), the rolling week's credit spend must stay under the threshold, and
-// the pick is the oldest queued issue (priority-labelled ones first) whose
-// "Depends on" references are all closed and whose areas collide with no run
-// in flight. The queue logs the runs in progress with their lanes, and why
-// it held or started each candidate, through Logf. The pick and the lane are
-// deterministic; Next is pure except for Logf.
-func Next(issues []item, runs []runStatus, o queueOptions) (int, int, string) {
+// alike, every kind against the same lanes), the rolling week's credit spend
+// must stay under the threshold, and the pick is the first candidate whose
+// "Depends on" references (issues only) are all closed and whose areas
+// collide with no run in flight. A review holds no area and never conflicts;
+// a continuation holds its pull request's areas exactly like the run it
+// continues. The queue logs the runs in progress with their lanes, and why
+// it held or started each candidate, through Logf — including the final
+// reason when nothing is started, which the caller used to print. The pick
+// and the lane are deterministic; Next is pure except for Logf.
+func Next(issues []item, runs []runStatus, o queueOptions) pick {
 	quiet := func(string, ...any) {}
 	logf := quiet
 	if o.Logf != nil {
@@ -93,7 +139,7 @@ func Next(issues []item, runs []runStatus, o queueOptions) (int, int, string) {
 	}
 	// Runs in flight: queued counts like in_progress, completed does not
 	// count. Each fills a lane (from its title; an unparsable title is lane
-	// 0) and holds the areas of the issue it is working on.
+	// 0) and holds the areas of the issue or pull request it is working on.
 	var inflight []runStatus
 	lanes := map[int]bool{}
 	for _, r := range runs {
@@ -104,7 +150,8 @@ func Next(issues []item, runs []runStatus, o queueOptions) (int, int, string) {
 	}
 	logf("runs in progress: %d/%d, lanes in use: %s", len(inflight), mpr, laneList(inflight))
 	if o.WeekSpent >= queueSpendFraction*o.WeekCap {
-		return 0, 0, "spend threshold reached"
+		logf("spend threshold reached")
+		return pick{}
 	}
 	// open holds every open entry by number, PRs included: a "Depends on"
 	// an open PR blocks just like one on an open issue. byNumber is the
@@ -118,58 +165,88 @@ func Next(issues []item, runs []runStatus, o queueOptions) (int, int, string) {
 			byNumber[i.Number] = i
 		}
 	}
-	var candidates []item
+	// The candidates of one pass, in the fixed order: reviews, then
+	// continuations, then queued issues.
+	var reviews, continuations, queued []item
 	for _, i := range issues {
 		switch {
 		case i.State != "open":
-		case len(i.PullRequest) > 0: // PRs are never candidates
+		case len(i.PullRequest) > 0:
+			// A pull request is a candidate only while no in-flight run
+			// already has it as its subject (issue #137).
+			if !i.labelled(o.Label) || prInFlight(i.Number, inflight) {
+				continue
+			}
+			switch {
+			case i.labelled(labelReviewNeeded):
+				reviews = append(reviews, i)
+			case i.labelled(labelContinueNeeded):
+				continuations = append(continuations, i)
+			}
 		case !i.labelled(o.QueuedLabel):
 		case i.labelled(o.Label): // already picked up
 		default:
-			candidates = append(candidates, i)
+			queued = append(queued, i)
 		}
 	}
-	if len(candidates) == 0 {
-		return 0, 0, "nothing queued"
+	if len(reviews)+len(continuations)+len(queued) == 0 {
+		logf("nothing queued")
+		return pick{}
 	}
-	slices.SortFunc(candidates, func(a, b item) int { return queueLess(a, b, o.PriorityLabel) })
+	less := func(a, b item) int { return queueLess(a, b, o.PriorityLabel) }
+	slices.SortFunc(reviews, less)
+	slices.SortFunc(continuations, less)
+	slices.SortFunc(queued, less)
 	stuck := ""
 	hold := func(reason string) {
 		if stuck == "" {
 			stuck = reason
 		}
 	}
-	for _, c := range candidates {
+	// consider weighs one candidate and, if it starts, returns its pick.
+	consider := func(c item, kind string) pick {
 		if len(inflight) >= mpr {
 			logf("holding #%d: lane capacity full", c.Number)
 			hold("lane capacity full")
-			continue
+			return pick{}
 		}
-		if n := openDep(depsFromBody(cappedBody(c.Body)), open); n > 0 {
-			logf("holding #%d: dependencies open for #%d", c.Number, n)
-			hold(fmt.Sprintf("dependencies open for #%d", n))
-			continue
-		}
-		areas := issueAreas(c)
-		if len(areas) == 0 {
-			// An issue that names no area is held, not started, and blocks
-			// no one (issue #132): it is skipped like any other hold, and
-			// the next candidate is still considered.
-			logf("holding #%d: no area label", c.Number)
-			hold("no area label")
-			if o.NoAreaHeld != nil {
-				o.NoAreaHeld(c.Number)
+		areas := []string(nil)
+		switch kind {
+		case kindIssue:
+			if n := openDep(depsFromBody(cappedBody(c.Body)), open); n > 0 {
+				logf("holding #%d: dependencies open for #%d", c.Number, n)
+				hold(fmt.Sprintf("dependencies open for #%d", n))
+				return pick{}
 			}
-			continue
-		}
-		if busy, r, conflict := areaBusy(areas, inflight, byNumber, o.PRFiles); conflict {
-			reason := fmt.Sprintf("area %s busy (run %d)", busy, r.DatabaseId)
+			areas = issueAreas(c)
 			if len(areas) == 0 {
-				reason = fmt.Sprintf("no area; conflicts with run %d", r.DatabaseId)
+				// An issue that names no area is held, not started, and
+				// blocks no one (issue #132): it is skipped like any other
+				// hold, and the next candidate is still considered.
+				logf("holding #%d: no area label", c.Number)
+				hold("no area label")
+				if o.NoAreaHeld != nil {
+					o.NoAreaHeld(c.Number)
+				}
+				return pick{}
 			}
-			logf("holding #%d: %s", c.Number, reason)
-			hold(reason)
-			continue
+		case kindContinue:
+			// A continuation holds its pull request's areas exactly like
+			// the run it continues (issue #137).
+			areas = prAreas(c.Number, byNumber, o.PRFiles)
+		}
+		// A review holds no area and never conflicts; for the other kinds
+		// an empty set on either side conflicts with everything.
+		if kind != kindReview {
+			if busy, r, conflict := areaBusy(areas, inflight, byNumber, o.PRFiles); conflict {
+				reason := fmt.Sprintf("area %s busy (run %d)", busy, r.DatabaseId)
+				if len(areas) == 0 {
+					reason = fmt.Sprintf("no area; conflicts with run %d", r.DatabaseId)
+				}
+				logf("holding #%d: %s", c.Number, reason)
+				hold(reason)
+				return pick{}
+			}
 		}
 		// The capacity check above leaves a lane free: fewer than mpr runs
 		// are in flight, each occupying one lane value, so the scan always
@@ -177,10 +254,42 @@ func Next(issues []item, runs []runStatus, o queueOptions) (int, int, string) {
 		lane := 0
 		for ; lane < mpr && lanes[lane]; lane++ {
 		}
-		logf("starting #%d (lane %d): next queued issue", c.Number, lane)
-		return c.Number, lane, "next queued issue"
+		logf("starting #%d (lane %d): kind=%s, %s", c.Number, lane, kind, startReason(kind))
+		return pick{Kind: kind, Number: c.Number, Lane: lane}
 	}
-	return 0, 0, stuck
+	for _, c := range reviews {
+		if p := consider(c, kindReview); p.Kind != "" {
+			return p
+		}
+	}
+	for _, c := range continuations {
+		if p := consider(c, kindContinue); p.Kind != "" {
+			return p
+		}
+	}
+	for _, c := range queued {
+		if p := consider(c, kindIssue); p.Kind != "" {
+			return p
+		}
+	}
+	logf("%s", stuck)
+	return pick{}
+}
+
+// prInFlight reports whether an in-flight run already has pull request n as
+// its subject (issue #137): a `CodeAF #n` run — a continuation or a manual
+// pull request run — or a `CodeAF review #n` run. A review title parses to
+// issue 0 in runTitleFields, so the review shape is matched on its own.
+func prInFlight(n int, inflight []runStatus) bool {
+	for _, r := range inflight {
+		if m, _ := runTitleFields(r.DisplayTitle); m == n {
+			return true
+		}
+		if m, _, ok := runReviewFields(r.DisplayTitle); ok && m == n {
+			return true
+		}
+	}
+	return false
 }
 
 // runTitleRe matches the display title a queued dispatch writes: "CodeAF #3"
@@ -230,11 +339,44 @@ func isPlanRun(r runStatus) bool {
 	return ok
 }
 
+// runReviewRe matches the display title a review dispatch writes (issue
+// #137): "CodeAF review #5" or "CodeAF review #5 (lane 1)". Run titles are
+// untrusted data, so the match is anchored and strict, like runTitleRe:
+// anything else — another prefix, a lane with letters in it, trailing prose
+// — parses to no review run.
+var runReviewRe = regexp.MustCompile(`^CodeAF review #([0-9]+)(?: \(lane ([0-9]+)\))?$`)
+
+// runReviewFields reads the PR number and lane out of a review run's display
+// title. ok is false for every title that is not a review title, issue
+// titles included — the shapes are disjoint, so a review run is never
+// matched by runTitleRe and parses to issue 0 there.
+func runReviewFields(title string) (number, lane int, ok bool) {
+	m := runReviewRe.FindStringSubmatch(title)
+	if m == nil {
+		return 0, 0, false
+	}
+	number, _ = strconv.Atoi(m[1])
+	// m[2] is empty when the suffix is absent; that is lane 0 too.
+	lane, _ = strconv.Atoi(m[2])
+	return number, lane, true
+}
+
+// isReviewRun reports whether a run was dispatched in review mode (issue
+// #137). Like a plan run, a review run occupies its lane but works on no
+// area, so it never conflicts by area.
+func isReviewRun(r runStatus) bool {
+	_, _, ok := runReviewFields(r.DisplayTitle)
+	return ok
+}
+
 // runLane is the lane a run was dispatched on, read out of its title. Plan
-// runs and issue runs share the lane numbering: a plan run occupies its
-// lane like any other run, which is what keeps MaxParallelRuns honest.
+// runs, review runs and issue runs share the lane numbering: each occupies
+// its lane like any other run, which is what keeps MaxParallelRuns honest.
 func runLane(r runStatus) int {
 	if lane, ok := runPlanFields(r.DisplayTitle); ok {
+		return lane
+	}
+	if _, lane, ok := runReviewFields(r.DisplayTitle); ok {
 		return lane
 	}
 	_, lane := runTitleFields(r.DisplayTitle)
@@ -358,6 +500,21 @@ func runAreas(r runStatus, byNumber map[int]item, prFiles map[int][]string) []st
 	if len(it.PullRequest) == 0 {
 		return issueAreas(it)
 	}
+	return prAreas(n, byNumber, prFiles)
+}
+
+// prAreas is the area set a pull request holds (issue #132, #137): the issue
+// it closes (`Closes #N`, looked up in byNumber), united with the areas of
+// its changed files from prFiles and its own area: labels, if any. The queue
+// reads it for an in-flight pull request run through runAreas, and for a
+// continuation candidate — which holds its pull request's areas before the
+// run starts — straight from the candidate. An empty set after all three
+// sources conflicts with everything, fail closed.
+func prAreas(n int, byNumber map[int]item, prFiles map[int][]string) []string {
+	it, ok := byNumber[n]
+	if !ok {
+		return nil
+	}
 	var areas []string
 	seen := map[string]bool{}
 	add := func(a string) {
@@ -383,14 +540,14 @@ func runAreas(r runStatus, byNumber map[int]item, prFiles map[int][]string) []st
 
 // areaBusy finds the first in-flight run whose areas collide with the
 // candidate's, and the area to name in the log. An empty set on either side
-// conflicts with everything — except a plan run (issue #61): a plan run
-// occupies its lane but works on no area, so it never conflicts with an
-// issue run, and two plan runs are kept apart by the planner's cooldown,
-// not by areas. When the collision is an intersection, the first (sorted)
-// shared area is named.
+// conflicts with everything — except a plan run (issue #61) or a review run
+// (issue #137): each occupies its lane but works on no area, so neither
+// conflicts with an issue run. (Two plan runs are kept apart by the
+// planner's cooldown, not by areas.) When the collision is an intersection,
+// the first (sorted) shared area is named.
 func areaBusy(areas []string, inflight []runStatus, byNumber map[int]item, prFiles map[int][]string) (busy string, r runStatus, conflict bool) {
 	for _, run := range inflight {
-		if isPlanRun(run) {
+		if isPlanRun(run) || isReviewRun(run) {
 			continue
 		}
 		other := runAreas(run, byNumber, prFiles)
@@ -509,13 +666,15 @@ func readRuns(path string) ([]runStatus, error) {
 }
 
 // runNext implements `harness next ISSUES_JSON RUNS_JSON`: it picks the
-// queued issue and lane to run and prints them on stdout, which the queue
-// job writes straight into GITHUB_OUTPUT. On a start that is exactly
-// "number=<n>" then "lane=<digits>" and nothing else; when the queue holds,
+// issue, review or continuation to run and prints the pick on stdout, which
+// the queue job writes straight into GITHUB_OUTPUT. On a start that is
+// exactly three lines — "kind=<kind>", then "number=<n>", then
+// "lane=<digits>" — and nothing else (issue #137); when the queue holds,
 // stdout stays empty and the command still exits 0. stderr carries the human
 // log: the runs in progress with their lanes, and why each candidate was
-// held or started. The queue job labels that issue to start the run, which
-// keeps the trust gate: only the workflow's own token labels.
+// held or started, including the final reason when nothing is. The queue job
+// labels the pick to start the run, which keeps the trust gate: only the
+// workflow's own token labels.
 func runNext() error {
 	if len(os.Args) != 4 {
 		return errors.New("usage: harness next ISSUES_JSON RUNS_JSON")
@@ -548,7 +707,7 @@ func runNext() error {
 	gh := newGitHub()
 	prFiles := fetchPRFiles(gh, issues, runs, log.Printf)
 	var noArea []int
-	number, lane, reason := Next(issues, runs, queueOptions{
+	p := Next(issues, runs, queueOptions{
 		Label:           envOr("CODEAF_LABEL", "codeaf"),
 		QueuedLabel:     envOr("CODEAF_QUEUED_LABEL", "codeaf-queued"),
 		PriorityLabel:   envOr("CODEAF_PRIORITY_LABEL", "codeaf-priority"),
@@ -569,11 +728,10 @@ func runNext() error {
 			}
 		}
 	}
-	if number == 0 {
-		log.Print(reason)
+	if p.Kind == "" {
 		return nil
 	}
-	fmt.Printf("number=%d\nlane=%d\n", number, lane)
+	fmt.Printf("kind=%s\nnumber=%d\nlane=%d\n", p.Kind, p.Number, p.Lane)
 	return nil
 }
 
@@ -586,7 +744,9 @@ const maxPRFiles = 100
 // own, so the queue reads what the PR touched. A number whose item is not an
 // open PR in the issues list is skipped, and a fetch failure leaves the
 // entry absent — which makes that run's area set empty and conflict with
-// everything, fail closed.
+// everything, fail closed. Review titles (`CodeAF review #N`, issue #137) do
+// not parse through runTitleFields and are skipped here: a review holds no
+// area, so it needs no files.
 func fetchPRFiles(g github, issues []item, runs []runStatus, logf func(string, ...any)) map[int][]string {
 	prFiles := map[int][]string{}
 	if g.token == "" {
