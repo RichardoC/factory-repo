@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -402,9 +403,27 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		}
 
 		if matched {
+			// A fix arriving for an "ignored until fix available" finding: Snyk
+			// flips ignored=false, the issue comes back as open, and the sync
+			// must move the ticket it parked in Backlog out again. Computed
+			// once here because both the Backlog override below and the
+			// due-date recalculation further down depend on it.
+			//
+			// With LINEAR_AWAITING_FIX_LABEL=off the metadata records no
+			// awaiting-fix label, wasAwaitingFix is always false, and the sync
+			// cannot tell its own Backlog placement from a manual one: the
+			// ticket stays in Backlog as it did before.
+			fixNowAvailable := finding.Status == model.FindingOpen && wasAwaitingFix(existing.ManagedLabels, s.cfg.Linear.Labels.AwaitingFix)
+			// The sync itself parked this ticket in Backlog while Snyk reported
+			// the ignore as "until fix available". That is not a manual triage
+			// decision, so neither override below may treat it as one.
+			syncParkedInBacklog := fixNowAvailable && isConfiguredBacklogState(existing.StateName, s.cfg.Linear.States.Backlog)
+
 			// Respect manual Backlog override: if a user moved an open ticket from
-			// Todo to Backlog, don't move it back on subsequent syncs.
-			if desired.State == model.StateTodo && isConfiguredBacklogState(existing.StateName, s.cfg.Linear.States.Backlog) {
+			// Todo to Backlog, don't move it back on subsequent syncs. A Backlog
+			// placement the sync itself made for an awaiting-fix finding is not a
+			// manual move, so it is skipped here and the ticket returns to Todo.
+			if desired.State == model.StateTodo && isConfiguredBacklogState(existing.StateName, s.cfg.Linear.States.Backlog) && !syncParkedInBacklog {
 				desired.State = model.StateBacklog
 			}
 			// Respect manual non-terminal state override: when both the desired
@@ -416,8 +435,16 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			// state already matches the configured state, avoiding false-positive
 			// state-change detection due to model state names ("todo") differing
 			// from configured Linear state names ("Triage").
-			if isNonTerminalModelState(desired.State) && isNonTerminalLinearState(existing, s.cfg.Linear.States) {
+			if isNonTerminalModelState(desired.State) && isNonTerminalLinearState(existing, s.cfg.Linear.States) && !syncParkedInBacklog {
 				desired.PreserveState = true
+			}
+
+			// Explain the move out of Backlog in the change comment. Only the
+			// state the sync itself chose is overridden: if a person moved the
+			// awaiting-fix ticket somewhere else (say In Progress), the general
+			// override above still preserves their choice.
+			if syncParkedInBacklog {
+				desired.StateReason = "Snyk reports a fix is now available; moved out of Backlog"
 			}
 
 			// Sticky due date for the updated_at re-detection fallback: Snyk
@@ -443,7 +470,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			// fresh SLA from fix-availability gives a meaningful triage
 			// deadline without the daily churn that the old floor-to-today
 			// caused for all overdue issues.
-			if finding.Status == model.FindingOpen && wasAwaitingFix(existing.ManagedLabels, s.cfg.Linear.Labels.AwaitingFix) {
+			if fixNowAvailable {
 				desired.DueDate, desired.DueDateBase, desired.DueDateReason = issueDueDateFromFixAvailability(s.cfg.Linear.Due, finding)
 			}
 
@@ -470,6 +497,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 
 	jobs := make(chan job)
 	var result RunResult
+	var failedWrites failedFingerprints
 	result.Findings = len(findings)
 	result.ExistingIssues = len(existingIssues)
 	result.ActiveProjects = len(snykSnapshot.ProjectIDs)
@@ -485,7 +513,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	for i := 0; i < s.cfg.Sync.Workers; i++ {
 		g.Go(func() error {
 			for job := range jobs {
-				if err := s.executeJob(workerCtx, job, &result); err != nil {
+				if err := s.executeJob(workerCtx, job, &result, &failedWrites); err != nil {
 					return err
 				}
 			}
@@ -672,8 +700,14 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		// ignore metadata are still valid and should be cached so the next run
 		// does not have to re-fetch everything. Linear hashes are taken from a
 		// fresh snapshot when possible; if the reload fails we fall back to the
-		// hashes from the initial load, which will cause the next run to retry
-		// any issues whose writes failed.
+		// hashes from the initial load.
+		//
+		// Fingerprints whose write failed are left out of both maps below, so
+		// the next run compares them against live data again and retries them
+		// instead of being skipped by the cache fast-path. That covers both a
+		// snapshot of the ticket as it still is (the failed write left it
+		// unchanged) and a failed reload, whose fallback hashes are just as
+		// stale.
 		cacheLinearHashes := currentLinearHashes
 		if result.PlannedCreates > 0 || result.PlannedUpdates > 0 || result.PlannedResolves > 0 {
 			refreshedIssues, err := s.linear.LoadSnapshot(runCtx)
@@ -697,6 +731,23 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				}
 			}
 		}
+		uncachedFailedCount := 0
+		for fingerprint := range snykHashes {
+			if failedWrites.has(fingerprint) {
+				delete(snykHashes, fingerprint)
+				delete(cacheLinearHashes, fingerprint)
+				uncachedFailedCount++
+			}
+		}
+		// A failed resolve or duplicate cancel can also leave a Linear hash
+		// behind for a fingerprint that has no Snyk hash this run.
+		for fingerprint := range cacheLinearHashes {
+			if failedWrites.has(fingerprint) {
+				delete(cacheLinearHashes, fingerprint)
+				uncachedFailedCount++
+			}
+		}
+
 		nextSnapshot := cache.Snapshot{
 			SchemaSignature: cacheSignature,
 			SnykHashes:      snykHashes,
@@ -708,6 +759,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		s.logger.Info("refreshed sync cache",
 			slog.Int("snyk_rows", len(nextSnapshot.SnykHashes)),
 			slog.Int("linear_rows", len(nextSnapshot.LinearHashes)),
+			slog.Int("uncached_failed", uncachedFailedCount),
 			slog.Int64("failed_ops", result.FailedOps),
 		)
 	}
@@ -742,7 +794,35 @@ type job struct {
 	updateBatch  []model.IssueUpdate
 }
 
-func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) error {
+// failedFingerprints collects the fingerprints of the items whose Linear write
+// failed during a run. It is written from the worker goroutines and read once
+// the pool has finished, hence the mutex. Fingerprints whose write failed are
+// excluded from the refreshed cache so the next run compares them against live
+// data and retries them instead of being skipped by the cache fast-path.
+type failedFingerprints struct {
+	mu  sync.Mutex
+	set map[string]struct{}
+}
+
+func (f *failedFingerprints) add(fps ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.set == nil {
+		f.set = make(map[string]struct{}, len(fps))
+	}
+	for _, fp := range fps {
+		f.set[fp] = struct{}{}
+	}
+}
+
+func (f *failedFingerprints) has(fp string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.set[fp]
+	return ok
+}
+
+func (s *Service) executeJob(ctx context.Context, job job, result *RunResult, failed *failedFingerprints) error {
 	switch job.kind {
 	case jobCreateBatch:
 		creates := atomic.AddInt64(&result.PlannedCreates, int64(len(job.desiredBatch)))
@@ -761,6 +841,7 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 			for _, desired := range job.desiredBatch {
 				if _, err := s.linear.CreateIssues(ctx, []model.DesiredIssue{desired}); err != nil {
 					atomic.AddInt64(&result.FailedOps, 1)
+					failed.add(desired.Fingerprint)
 					s.logger.Error("failed to create issue",
 						slog.String("fingerprint", desired.Fingerprint),
 						slog.Any("error", err),
@@ -779,6 +860,7 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 				desired := job.desiredBatch[idx]
 				if _, err := s.linear.CreateIssues(ctx, []model.DesiredIssue{desired}); err != nil {
 					atomic.AddInt64(&result.FailedOps, 1)
+					failed.add(desired.Fingerprint)
 					s.logger.Error("failed to create issue",
 						slog.String("fingerprint", desired.Fingerprint),
 						slog.Any("error", err),
@@ -801,6 +883,11 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 			for _, update := range job.updateBatch {
 				if err := s.linear.UpdateIssues(ctx, []model.IssueUpdate{update}); err != nil {
 					atomic.AddInt64(&result.FailedOps, 1)
+					// Record both fingerprints: they differ for a
+					// coarse-fingerprint migration or an identity rebind, and
+					// the cache is keyed by the desired fingerprint at write
+					// time and by the ticket's own fingerprint on later runs.
+					failed.add(update.Desired.Fingerprint, update.Existing.Fingerprint)
 					s.logger.Error("failed to update issue",
 						slog.String("issue", update.Existing.Identifier),
 						slog.String("fingerprint", update.Desired.Fingerprint),
@@ -861,6 +948,7 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 			for _, update := range job.updateBatch {
 				if err := s.linear.UpdateIssues(ctx, []model.IssueUpdate{update}); err != nil {
 					atomic.AddInt64(&result.FailedOps, 1)
+					failed.add(update.Desired.Fingerprint, update.Existing.Fingerprint)
 					s.logger.Error("failed to resolve issue",
 						slog.String("issue", update.Existing.Identifier),
 						slog.String("fingerprint", update.Desired.Fingerprint),
@@ -884,6 +972,7 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult) er
 			for _, update := range job.updateBatch {
 				if err := s.linear.UpdateIssues(ctx, []model.IssueUpdate{update}); err != nil {
 					atomic.AddInt64(&result.FailedOps, 1)
+					failed.add(update.Desired.Fingerprint, update.Existing.Fingerprint)
 					s.logger.Error("failed to cancel duplicate issue",
 						slog.String("issue", update.Existing.Identifier),
 						slog.String("fingerprint", update.Desired.Fingerprint),

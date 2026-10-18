@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -2039,11 +2038,10 @@ func TestBriefBudget(t *testing.T) {
 	}
 }
 
-// TestRunSummaryShipsRunRecord covers the review-mode side of issue #49 and
-// the plan-mode side of issue #119: the root task's run record rides the
-// output artifact beside the result, newest regular file wins, a planted
-// symlink is never taken, and the copy is capped. Outside review and plan
-// mode nothing ships.
+// TestRunSummaryShipsRunRecord covers the review-mode side of issue #49: the
+// root task's run record rides the output artifact beside the result, newest
+// regular file wins, a planted symlink is never taken, and the copy is
+// capped. Since issue #134 every mode ships the record, not only review.
 func TestRunSummaryShipsRunRecord(t *testing.T) {
 	home := t.TempDir()
 	out := filepath.Join(t.TempDir(), "out")
@@ -2139,7 +2137,7 @@ func TestRunSummaryShipsRunRecord(t *testing.T) {
 		}
 	})
 
-	t.Run("outside review mode nothing ships", func(t *testing.T) {
+	t.Run("every mode ships, review mode included", func(t *testing.T) {
 		_ = os.Remove(shipped)
 		t.Setenv("CODEAF_HOME", home)
 		t.Setenv("RESULT_PATH", resultPath)
@@ -2147,8 +2145,8 @@ func TestRunSummaryShipsRunRecord(t *testing.T) {
 		if _, err := captureStdout(t, runSummary); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := os.Stat(shipped); !errors.Is(err, os.ErrNotExist) {
-			t.Errorf("a non-review run shipped the record: %v", err)
+		if _, err := os.Stat(shipped); err != nil {
+			t.Errorf("a non-review run did not ship the record: %v", err)
 		}
 	})
 }
@@ -2266,6 +2264,72 @@ func TestRepairToolArgs(t *testing.T) {
 	}
 	if !strings.Contains(string(big["messages"]), `"arguments":"bad"`) {
 		t.Error("oversized request was modified")
+	}
+}
+
+// shipRunRecord must say so when the runs directory exists but cannot be
+// read: filepath.Glob answers no matches for a permission error, so before
+// this check a CODEAF_HOME the agent user still owned (issue #62, the state
+// before the workflow took the tree back) made the record silently not ship.
+// A 0000 directory is unreadable to a non-root user; root reads anything, so
+// the test skips there.
+func TestShipRunRecordWarnsOnUnreadableRuns(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root reads a 0000 directory: the warning cannot fire")
+	}
+	home := t.TempDir()
+	out := filepath.Join(t.TempDir(), "out")
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(out, "result.json"), []byte(`{"stop":"done"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(home, "runs"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(home, "runs"), 0o755) }) // let TempDir clean up
+
+	logs := captureLogs(t)
+	t.Setenv("CODEAF_HOME", home)
+	t.Setenv("RESULT_PATH", filepath.Join(out, "result.json"))
+	if shipped := shipRunRecord(); shipped != "" {
+		t.Errorf("shipRunRecord shipped %q from an unreadable runs dir", shipped)
+	}
+	if got := logs.String(); !strings.Contains(got, "warning:") || !strings.Contains(got, "unreadable") {
+		t.Errorf("an unreadable runs dir logged no warning, got:\n%s", got)
+	}
+}
+
+// The workflow step order is a correctness property, not layout preference:
+// "Summarise the run" must come after "Take the tree back" (issue #162).
+// summary ships the root run record from $CODEAF_HOME, which only the agent
+// user can read while the tree is still handed over, so running it inside
+// "Run CodeAF" silently ships no record. Parse the workflow as text and
+// require the summary step to appear after the chown step.
+func TestWorkflowStepOrder(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "workflows", "codeaf.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(raw), "\n")
+	chown, summary := -1, -1
+	for i, line := range lines {
+		if chown < 0 && strings.Contains(line, `sudo -n chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE" "$CODEAF_HOME"`) {
+			chown = i
+		}
+		if summary < 0 && strings.Contains(line, `"$HARNESS" summary`) {
+			summary = i
+		}
+	}
+	if chown < 0 {
+		t.Fatal(`the "Take the tree back" step (sudo chown back to the runner user) is not in codeaf.yml`)
+	}
+	if summary < 0 {
+		t.Fatal(`the "$HARNESS" summary step is not in codeaf.yml`)
+	}
+	if summary < chown {
+		t.Errorf(`the "$HARNESS" summary step (line %d) runs before "Take the tree back" (line %d): while the agent user owns $CODEAF_HOME the run record cannot be read, so it ships nothing`, summary+1, chown+1)
 	}
 }
 
@@ -3282,6 +3346,24 @@ func TestNewGitHubFallsBackToGHToken(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "git")
 	if g := newGitHub(); g.token != "git" {
 		t.Fatalf("newGitHub token = %q; want the GITHUB_TOKEN value", g.token)
+	}
+}
+
+// TestBriefNamesAcceptanceCriteria pins the fixed paragraph runBrief adds
+// after the issue body (issue #136): the acceptance sections are named as
+// the criteria the worker reports against.
+func TestBriefNamesAcceptanceCriteria(t *testing.T) {
+	routes := map[string]string{
+		"/repos/RichardoC/factory-repo/issues/7":          `{"number":7,"title":"The task","body":"## Done when\n\n- TestBriefNamesAcceptanceCriteria passes\n\n## End-to-end check\n\nharness next holds #117\n","state":"open"}`,
+		"/repos/RichardoC/factory-repo/issues/7/comments": `[]`,
+	}
+	brief := runBriefInto(t, routes, "issue", issueEvent)
+	const para = "The sections `## Done when` and `## End-to-end check` above are the acceptance criteria."
+	if !strings.Contains(brief, para) {
+		t.Fatalf("brief does not name the acceptance criteria:\n%s", brief)
+	}
+	if i, j := strings.Index(brief, "## End-to-end check"), strings.Index(brief, para); i < 0 || j < i {
+		t.Fatalf("paragraph not after the issue body (e2e at %d, paragraph at %d)", i, j)
 	}
 }
 

@@ -79,6 +79,8 @@ func main() {
 		"pr-mode":       prMode,
 		"continue-plan": runContinuePlan,
 		"seat-config":   runSeatConfig, // the lane's CodeAF config (issue #60)
+		// The dispatch inputs and run title, one source of truth (issue #133).
+		"dispatch-args": runDispatchArgs,
 		// The independent review pass (issue #32): brief, model config and
 		// report of a read-only review run on a pull request.
 		"review-brief":  runReviewBrief,
@@ -2615,6 +2617,9 @@ func runBrief() error {
 		}
 		targetBody = issue.Body
 		parts = append(parts, fmt.Sprintf("# Task: issue #%d — %s\n\n%s", number, issue.Title, issue.Body))
+		// Issue #136: name the acceptance sections right after the issue
+		// body they live in, so the bar to clear is the worker's last read.
+		parts = append(parts, "The sections `## Done when` and `## End-to-end check` above are the acceptance criteria.")
 		if issue.Comments > 0 {
 			thread, err := gh.thread(number)
 			if err != nil {
@@ -2652,6 +2657,8 @@ func runBrief() error {
 				parts = append(parts, fmt.Sprintf("(the issue this PR closes, #%d, is unavailable: %s)\n", n, escapeMD(err.Error(), 200, true)))
 			} else {
 				parts = append(parts, fmt.Sprintf("## The issue this PR closes (#%d) — %s\n\n%s", n, escapeMD(closes.Title, 200, true), closes.Body))
+				// Issue #136: the acceptance sections govern a continuation too.
+				parts = append(parts, "The sections `## Done when` and `## End-to-end check` above are the acceptance criteria.")
 			}
 		}
 		var reviews []reviewComment
@@ -2740,18 +2747,13 @@ func runSummary() error {
 	delete(fields, "answer")
 	pretty, _ := json.MarshalIndent(fields, "", " ")
 	fmt.Printf("%.4000s\n", pretty)
-	// Issue #49: the review report runs in the publish job, which reads only
-	// this job's output artifact, and it falls back to the root task's run
-	// record when the result's answer carries no findings. So in review mode
-	// the record is shipped beside the result, capped here and read there as
-	// untrusted data. Issue #119: plan mode ships it too — a plan run's
-	// proposals can live only in the root task's closing result (the answer
-	// envelope is often empty), and plan-report's fallback reads this same
-	// copy out of the output artifact the publish job downloads.
-	if mode := envOr("MODE", ""); mode == "review" || mode == "plan" {
-		if from := shipRunRecord(); from != "" {
-			log.Printf("shipped the run record %s beside the result", from)
-		}
+	// Issue #49: the report commands run in the publish job, which reads
+	// only this job's output artifact, and they fall back to the root
+	// task's run record — for the answer the envelope left empty, and for
+	// the store ending (issue #134). So in every mode the record is shipped
+	// beside the result, capped here and read there as untrusted data.
+	if from := shipRunRecord(); from != "" {
+		log.Printf("shipped the run record %s beside the result", from)
 	}
 	return nil
 }
@@ -3412,6 +3414,7 @@ type ReportInputs struct {
 	DiffMore      int        // files past the diffstat's parse cap
 	DiffNote      string     // why there is no diffstat, when there is none
 	DiagArtifact  string     // the diagnostics artifact's id, if the API had one
+	Promoted      bool       // stop promoted from incomplete to done: the run finished in the store (issue #134)
 }
 
 func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall *time.Duration, in ReportInputs, env func(string) string) string {
@@ -3588,6 +3591,12 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 			ok = strconv.FormatBool(*result.OK)
 		}
 		fmt.Fprintf(&b, "| stop / ok | %s / `%s` |\n", tokenCell(result.Stop, 40), ok)
+		// Issue #134: the envelope said incomplete, but the run record's
+		// end line said the run finished in the store — say so, so the
+		// comment explains why this run counts as done.
+		if in.Promoted {
+			fmt.Fprintf(&b, "| closing | finished in the store (stop promoted from incomplete to done) |\n")
+		}
 		if result.Verdict != "" {
 			fmt.Fprintf(&b, "| verdict | %s |\n", tokenCell(result.Verdict, 200))
 		}
@@ -3905,8 +3914,16 @@ func runReport() error {
 		return err
 	}
 	var in ReportInputs
+	var c closing
 	if haveResult {
 		in.PlanTasks = planTasks(raw)
+		// Issue #134: the envelope's answer can be empty and its stop
+		// incomplete when the run finished in the store; the run record
+		// beside the result tells the real ending. Read as untrusted data.
+		c = readClosing(trajectoryPath())
+		result.Answer = effectiveAnswer(result, c)
+		in.Promoted = sanitizeStop(result.Stop) == stopIncomplete && c.StoreFinished
+		result.Stop = effectiveStop(result, c)
 	}
 	in.PublishErrors = readPublishErrors(os.Getenv("PUBLISH_ERRORS_PATH"))
 	in.Diff, in.DiffMore, in.DiffNote = patchDiffstat(os.Getenv("PATCH_PATH"))

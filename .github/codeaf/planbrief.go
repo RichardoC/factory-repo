@@ -278,6 +278,7 @@ func planOutputContract() string {
 		"- Problem: <text>\n"+
 		"- What to do: <text>\n"+
 		"- Done when: <text>\n"+
+		"- End-to-end check: <text>   (optional line)\n"+
 		"- Area: harness | app/<name>\n"+
 		"- Depends on: #12, #34   (optional line)\n"+
 		"```\n\n"+
@@ -285,6 +286,9 @@ func planOutputContract() string {
 		"  `- Field:` line, the next `### Proposal:` header or any other heading ends the field.\n"+
 		"- `Area` is either `harness` or `app/<name>` (the app's directory name); anything\n"+
 		"  else is dropped, and the proposal then carries no area label.\n"+
+		"- `End-to-end check` (optional): the one command or run that proves the seams of the\n"+
+		"  change work end to end; leave it out and the issue carries a placeholder a person\n"+
+		"  must fill in before it is queued.\n"+
 		"- `Depends on` lists issue numbers as `#N`; other text on that line is ignored.\n"+
 		"- A proposal with an empty `Problem` and an empty `What to do` is dropped.\n"+
 		"- Put every proposal in your FINAL ANSWER — the result you close the root task\n"+

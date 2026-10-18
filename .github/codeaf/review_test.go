@@ -337,6 +337,33 @@ func TestParseFindings(t *testing.T) {
 	}
 }
 
+// TestDoneWhenFindingIsActionable pins the format the review brief's
+// acceptance-criteria bullet tells the reviewer to quote (issue #136):
+// "[high] done-when: <bullet>". It carries no path:line location, so the
+// section pass alone rejects it — but parseFindings runs the inline pass
+// over every line, inside the findings section too, and textOnlyFinding
+// reads it as a recognized high finding. Either way the reviewer's answer
+// carries it, and it blocks.
+func TestDoneWhenFindingIsActionable(t *testing.T) {
+	bullet := "TestIssueReady bullets unmet"
+	for name, answer := range map[string]string{
+		"in the findings section": "## Findings\n\n- [high] done-when: " + bullet + "\n",
+		"inline in prose":         "The acceptance criteria are unmet: [high] done-when: " + bullet + "\n",
+	} {
+		findings, _ := parseFindings(answer)
+		if len(findings) != 1 {
+			t.Fatalf("%s: got %d findings, want 1: %+v", name, len(findings), findings)
+		}
+		f := findings[0]
+		if asciiLower(f.Severity) != "high" || !f.Recognized || f.Text != "done-when: "+bullet {
+			t.Fatalf("%s: finding = %+v; want a recognized high done-when finding", name, f)
+		}
+		if got := blockingFindings(findings); len(got) != 1 {
+			t.Fatalf("%s: blockingFindings = %+v; want the done-when finding to block", name, got)
+		}
+	}
+}
+
 // reviewHostileFindings is a finding set a hostile reviewer could have
 // written: markdown, mentions and shell in the cells, and a path that must
 // never reach the fix command line.
@@ -1173,7 +1200,7 @@ func TestRunReviewReport(t *testing.T) {
 		if err != nil {
 			t.Fatalf("record not shipped: %v", err)
 		}
-		if got := readTrajectoryAnswer(filepath.Join(filepath.Dir(resultPath), trajectoryFileName)); got == "" {
+		if got := readClosing(filepath.Join(filepath.Dir(resultPath), trajectoryFileName)); got.Answer == "" {
 			t.Errorf("the shipped copy lost the end record: %d bytes, tail starts %q", len(data), data[:40])
 		}
 	})

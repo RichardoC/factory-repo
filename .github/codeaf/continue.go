@@ -123,7 +123,12 @@ func countReports(comments []issueComment) int {
 func prMode() error {
 	stop := stopUnknown
 	if result, _, err := readResult(); err == nil {
-		stop = sanitizeStop(result.Stop)
+		// A run that finished in the store (issue #134) reports an
+		// incomplete envelope stop; its run record, shipped beside the
+		// result, tells the real ending. Read as untrusted data: the
+		// promotion only marks the PR ready — the review and publish
+		// checks still run on the work.
+		stop = effectiveStop(result, readClosing(trajectoryPath()))
 	}
 	early := earlyStop(stop)
 	fmt.Printf("early=%t\nready=%t\nstop=%s\n", early, readyForReview(stop), stop)
@@ -200,7 +205,10 @@ func runContinuePlan() error {
 	}
 	stop := stopUnknown
 	if result, _, err := readResult(); err == nil {
-		stop = sanitizeStop(result.Stop)
+		// A run that finished in the store (issue #134) needs no
+		// continuation; its run record, shipped beside the result, tells
+		// the real ending and is read as untrusted data.
+		stop = effectiveStop(result, readClosing(trajectoryPath()))
 	}
 	action, body, _, err := continuePlan(newGitHub(), pr, stop)
 	if err != nil {

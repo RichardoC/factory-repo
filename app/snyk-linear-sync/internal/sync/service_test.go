@@ -53,6 +53,13 @@ type fakeLinear struct {
 	lastOpenStates      map[string]model.WorkflowState
 	lastOpenStatesErr   error
 	lastOpenStatesCalls [][]string
+
+	// updateErr, when non-nil, makes every UpdateIssues call fail; the
+	// recording behaviour is kept so a test can still see what was attempted.
+	// createErr does the same for CreateIssues, which makes both the batch
+	// call and the per-item retries fail.
+	updateErr error
+	createErr error
 }
 
 type fakeCache struct {
@@ -66,6 +73,9 @@ func (f *fakeLinear) LoadSnapshot(context.Context) ([]model.ExistingIssue, error
 
 func (f *fakeLinear) CreateIssues(_ context.Context, desired []model.DesiredIssue) ([]int, error) {
 	f.createCallBatches = append(f.createCallBatches, append([]model.DesiredIssue(nil), desired...))
+	if f.createErr != nil {
+		return nil, f.createErr
+	}
 	var failed []int
 	for i, d := range desired {
 		if f.createFailFingerprints[d.Fingerprint] > 0 {
@@ -83,7 +93,7 @@ func (f *fakeLinear) UpdateIssues(_ context.Context, updates []model.IssueUpdate
 		f.updated = append(f.updated, update.Desired)
 		f.updates = append(f.updates, update)
 	}
-	return nil
+	return f.updateErr
 }
 
 func (f *fakeLinear) PostComments(_ context.Context, updates []model.IssueUpdate) ([]int, error) {
@@ -310,6 +320,243 @@ func TestNormalizeDescriptionForCompareTreatsLinearBoldRewriteAsEqual(t *testing
 	if normalizeDescriptionForCompare(written) != normalizeDescriptionForCompare(stored) {
 		t.Fatalf("normalizeDescriptionForCompare: written and Linear-stored forms should compare equal\nwritten: %q\nstored:  %q",
 			normalizeDescriptionForCompare(written), normalizeDescriptionForCompare(stored))
+	}
+}
+
+// failedUpdateConfig is the configuration the failed-write cache tests share:
+// worker pool of one and the default due-date windows, so the desired issue
+// (and therefore its hash) is the one desiredIssue computes.
+func failedUpdateConfig() config.Config {
+	return config.Config{
+		Cache: config.CacheConfig{},
+		Linear: config.LinearConfig{
+			Due: config.DueDateConfig{
+				CriticalDays: 15,
+				HighDays:     30,
+				MediumDays:   45,
+				LowDays:      90,
+			},
+		},
+		Sync: config.SyncConfig{Workers: 1},
+	}
+}
+
+// failedUpdateSnyk is the Snyk snapshot every test below drives Run with: one
+// open finding whose ticket already exists but is stale.
+func failedUpdateSnyk() fakeSnyk {
+	return fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint: "snyk:project-a:issue-1:lodash@1.0.0",
+					SnykIssueID: "issue-1",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "Outdated package",
+					PackageName: "lodash",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					IssueURL:    "https://example.test/issue-1",
+					CreatedAt:   time.Date(2026, time.August, 1, 14, 0, 0, 0, time.UTC),
+				},
+			},
+			ProjectIDs: map[string]struct{}{
+				"project-a": {},
+			},
+		},
+	}
+}
+
+// TestRunFailedUpdateIsRetriedOnNextRun is the end-to-end regression test for
+// a failed Linear write being cached as reconciled. Run 1 fails the update and
+// must leave the fingerprint out of both cache maps, so run 2 — which only sees
+// run 1's saved snapshot, exactly as a real second invocation would — plans and
+// performs the update instead of skipping it on the cache fast-path.
+func TestRunFailedUpdateIsRetriedOnNextRun(t *testing.T) {
+	cfg := failedUpdateConfig()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	snyk := failedUpdateSnyk()
+	fingerprint := snyk.snapshot.Findings[0].Fingerprint
+
+	existing := model.ExistingIssue{
+		ID:          "existing-1",
+		Identifier:  "SNYK-100",
+		Title:       "old title",
+		Description: "old description",
+		StateName:   "Todo",
+		Fingerprint: fingerprint,
+	}
+	// Run keeps the ticket's non-terminal Linear state (preserve marker), so
+	// this is the hash Run caches for the matched, unchanged ticket.
+	desired := desiredIssue(cfg, snyk.snapshot.Findings[0])
+	desired.PreserveState = true
+	linearSnapshot := []model.ExistingIssue{existing}
+	store := &fakeCache{}
+
+	// Run 1: every update fails.
+	failing := &fakeLinear{snapshot: linearSnapshot, updateErr: errors.New("linear unavailable")}
+	result, err := New(cfg, logger, snyk, failing, store).Run(context.Background())
+	if err != nil {
+		t.Fatalf("run 1: Run() error = %v", err)
+	}
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("run 1: PlannedUpdates = %d, want 1", result.PlannedUpdates)
+	}
+	if result.FailedOps != 1 {
+		t.Fatalf("run 1: FailedOps = %d, want 1", result.FailedOps)
+	}
+	if _, ok := store.saved.SnykHashes[fingerprint]; ok {
+		t.Fatalf("run 1: SnykHashes[%q] = %q, want the failed fingerprint absent",
+			fingerprint, store.saved.SnykHashes[fingerprint])
+	}
+	if hash, ok := store.saved.LinearHashes[fingerprint]; ok {
+		t.Fatalf("run 1: LinearHashes[%q] = %q, want the failed fingerprint absent", fingerprint, hash)
+	}
+
+	// Run 2: same inputs, healthy Linear, and only run 1's saved cache.
+	healthy := &fakeLinear{snapshot: linearSnapshot}
+	secondStore := &fakeCache{snapshot: store.saved}
+	second, err := New(cfg, logger, snyk, healthy, secondStore).Run(context.Background())
+	if err != nil {
+		t.Fatalf("run 2: Run() error = %v", err)
+	}
+	if second.PlannedUpdates != 1 {
+		t.Fatalf("run 2: PlannedUpdates = %d, want 1 (the failed update must be retried)", second.PlannedUpdates)
+	}
+	if len(healthy.updated) != 1 {
+		t.Fatalf("run 2: updated = %d, want 1", len(healthy.updated))
+	}
+	if second.FailedOps != 0 {
+		t.Fatalf("run 2: FailedOps = %d, want 0", second.FailedOps)
+	}
+	if _, ok := secondStore.saved.SnykHashes[fingerprint]; !ok {
+		t.Fatalf("run 2: SnykHashes[%q] missing after a successful write", fingerprint)
+	}
+	if _, ok := secondStore.saved.LinearHashes[fingerprint]; !ok {
+		t.Fatalf("run 2: LinearHashes[%q] missing after a successful write", fingerprint)
+	}
+	if want := desiredIssueHash(desired); secondStore.saved.SnykHashes[fingerprint] != want {
+		t.Fatalf("run 2: SnykHashes[%q] = %q, want %q", fingerprint, secondStore.saved.SnykHashes[fingerprint], want)
+	}
+	if want := existingIssueHash(existing); secondStore.saved.LinearHashes[fingerprint] != want {
+		t.Fatalf("run 2: LinearHashes[%q] = %q, want the initial snapshot's hash %q",
+			fingerprint, secondStore.saved.LinearHashes[fingerprint], want)
+	}
+}
+
+// TestRunFailedCreateIsNotCached verifies that a finding whose creation failed
+// is left out of the Snyk hash cache, so the next run tries the create again
+// instead of caching a ticket that does not exist.
+func TestRunFailedCreateIsNotCached(t *testing.T) {
+	cfg := failedUpdateConfig()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	snyk := failedUpdateSnyk()
+	fingerprint := snyk.snapshot.Findings[0].Fingerprint
+
+	linear := &fakeLinear{createErr: errors.New("linear unavailable")}
+	store := &fakeCache{}
+
+	result, err := New(cfg, logger, snyk, linear, store).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.PlannedCreates != 1 {
+		t.Fatalf("PlannedCreates = %d, want 1", result.PlannedCreates)
+	}
+	if result.FailedOps != 1 {
+		t.Fatalf("FailedOps = %d, want 1", result.FailedOps)
+	}
+	if hash, ok := store.saved.SnykHashes[fingerprint]; ok {
+		t.Fatalf("SnykHashes[%q] = %q, want the failed fingerprint absent", fingerprint, hash)
+	}
+}
+
+// TestRunFailedResolveIsNotCached verifies that a ticket whose closure failed
+// keeps its Linear hash out of the cache, so the next run re-resolves it rather
+// than treating the stale open ticket as reconciled. A resolve records the
+// ticket's own fingerprint, which has no Snyk hash at all this run — that
+// absence is part of the assertion too.
+func TestRunFailedResolveIsNotCached(t *testing.T) {
+	cfg := failedUpdateConfig()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	snyk := failedUpdateSnyk()
+	// Only a project ID, no findings: the registered ticket's finding is gone.
+	snyk.snapshot.Findings = nil
+	fingerprint := "snyk:project-a:issue-1:lodash@1.0.0"
+
+	existing := model.ExistingIssue{
+		ID:          "existing-1",
+		Identifier:  "SNYK-100",
+		Title:       "outdated package",
+		Description: "old description",
+		StateName:   "Todo",
+		Fingerprint: fingerprint,
+	}
+	linear := &fakeLinear{
+		snapshot:  []model.ExistingIssue{existing},
+		updateErr: errors.New("linear unavailable"),
+	}
+	store := &fakeCache{}
+
+	result, err := New(cfg, logger, snyk, linear, store).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.PlannedResolves != 1 {
+		t.Fatalf("PlannedResolves = %d, want 1", result.PlannedResolves)
+	}
+	if result.FailedOps != 1 {
+		t.Fatalf("FailedOps = %d, want 1", result.FailedOps)
+	}
+	if hash, ok := store.saved.LinearHashes[fingerprint]; ok {
+		t.Fatalf("LinearHashes[%q] = %q, want the failed fingerprint absent", fingerprint, hash)
+	}
+	if hash, ok := store.saved.SnykHashes[fingerprint]; ok {
+		t.Fatalf("SnykHashes[%q] = %q, want the failed fingerprint absent", fingerprint, hash)
+	}
+}
+
+// TestRunSuccessfulRunCachesEveryFingerprint guards the exclusion logic against
+// over-deleting: with no write failing, both maps still carry the fingerprint
+// after a single run.
+func TestRunSuccessfulRunCachesEveryFingerprint(t *testing.T) {
+	cfg := failedUpdateConfig()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	snyk := failedUpdateSnyk()
+	fingerprint := snyk.snapshot.Findings[0].Fingerprint
+
+	desired := desiredIssue(cfg, snyk.snapshot.Findings[0])
+	// Run preserves the ticket's non-terminal state, so the cached hash
+	// carries the preserve marker.
+	desired.PreserveState = true
+	existing := model.ExistingIssue{
+		ID:          "existing-1",
+		Identifier:  "SNYK-100",
+		Title:       "old title",
+		Description: "old description",
+		StateName:   "Todo",
+		Fingerprint: fingerprint,
+	}
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+	store := &fakeCache{}
+
+	result, err := New(cfg, logger, snyk, linear, store).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("PlannedUpdates = %d, want 1", result.PlannedUpdates)
+	}
+	if result.FailedOps != 0 {
+		t.Fatalf("FailedOps = %d, want 0", result.FailedOps)
+	}
+	if want := desiredIssueHash(desired); store.saved.SnykHashes[fingerprint] != want {
+		t.Fatalf("SnykHashes[%q] = %q, want %q", fingerprint, store.saved.SnykHashes[fingerprint], want)
+	}
+	// The fake Linear snapshot is unchanged, so the refreshed Linear snapshot
+	// still yields the ticket's pre-update hash.
+	if want := existingIssueHash(existing); store.saved.LinearHashes[fingerprint] != want {
+		t.Fatalf("LinearHashes[%q] = %q, want %q", fingerprint, store.saved.LinearHashes[fingerprint], want)
 	}
 }
 
@@ -4035,6 +4282,309 @@ func TestRunAwaitingFixToOpenRecalculatesDueDateFromFixAvailability(t *testing.T
 		if label == "triage-dependency" {
 			t.Fatalf("updated managed labels should not contain triage-dependency after fix is available: %v", updated.ManagedLabels)
 		}
+	}
+
+	// The sync parked this ticket in Backlog itself, so the manual Backlog
+	// override must not apply: the ticket moves back to Todo, and the update
+	// must actually carry the state change instead of preserving Backlog.
+	if updated.State != model.StateTodo {
+		t.Fatalf("updated state = %q, want %q (fix arrived, ticket must leave Backlog)", updated.State, model.StateTodo)
+	}
+	if updated.PreserveState {
+		t.Fatalf("updated PreserveState = true, want false (Backlog was the sync's own placement, not a manual move)")
+	}
+	if len(linear.updates) != 1 {
+		t.Fatalf("updates = %d, want 1", len(linear.updates))
+	}
+	if !linear.updates[0].Diff.StateChanged {
+		t.Fatalf("Diff.StateChanged = false, want true (state must be sent to Linear)")
+	}
+	if linear.updates[0].Diff.StateTo != "todo" {
+		t.Fatalf("Diff.StateTo = %q, want %q", linear.updates[0].Diff.StateTo, "todo")
+	}
+}
+
+// TestRunAwaitingFixToOpenKeepsManuallyChosenInProgress verifies that only the
+// Backlog state the sync chose for an awaiting-fix finding is overridden when
+// the fix arrives. A person who moved that ticket to another non-terminal
+// state (here In Progress) made a real triage decision, and the sync keeps it:
+// the label is still removed and the due date recalculated, but no stateId is
+// sent.
+func TestRunAwaitingFixToOpenKeepsManuallyChosenInProgress(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.States.Backlog = "Backlog"
+	cfg.Linear.Labels.AwaitingFix = "triage-dependency"
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  "XSS in postcss",
+		IssueType:   "package_vulnerability",
+		Severity:    "high",
+		Status:      model.FindingOpen,                                      // fix is now available
+		CreatedAt:   time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC), // months ago
+	}
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:            "existing-1",
+				Identifier:    "SEC-1",
+				Title:         "Snyk: [high] XSS in postcss",
+				Description:   "old body\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\nmanaged_labels: snyk-automation,triage-dependency\n-->",
+				DueDate:       "",            // was cleared for awaiting-fix
+				StateName:     "In Progress", // a person moved it here, not the sync
+				Fingerprint:   finding.Fingerprint,
+				Priority:      2,
+				ManagedLabels: []string{"snyk-automation", "triage-dependency"},
+				Labels:        []model.IssueLabel{{ID: "l1", Name: "snyk-automation"}, {ID: "l2", Name: "triage-dependency"}},
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("PlannedUpdates = %d, want 1", result.PlannedUpdates)
+	}
+	if len(linear.updated) != 1 {
+		t.Fatalf("updated = %d, want 1", len(linear.updated))
+	}
+	updated := linear.updated[0]
+
+	if !updated.PreserveState {
+		t.Fatalf("updated PreserveState = false, want true (a manual non-terminal state must be kept)")
+	}
+	if len(linear.updates) != 1 {
+		t.Fatalf("updates = %d, want 1", len(linear.updates))
+	}
+	if linear.updates[0].Diff.StateChanged {
+		t.Fatalf("Diff.StateChanged = true, want false (the user's In Progress state must not be overridden)")
+	}
+
+	// The label removal happens regardless of which state the ticket sits in:
+	// the awaiting-fix condition is over, so the label goes.
+	for _, label := range updated.ManagedLabels {
+		if label == "triage-dependency" {
+			t.Fatalf("updated managed labels should not contain triage-dependency after fix is available: %v", updated.ManagedLabels)
+		}
+	}
+}
+
+// TestRunAwaitingFixLabelOffLeavesBacklogAlone pins the documented limitation:
+// with no configured awaiting-fix label the metadata records none, so
+// wasAwaitingFix is always false and the sync cannot tell its own Backlog
+// placement from a manual move. The ticket stays in Backlog, exactly as it did
+// before this change.
+func TestRunAwaitingFixLabelOffLeavesBacklogAlone(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.States.Backlog = "Backlog"
+	cfg.Linear.Labels.AwaitingFix = "" // LINEAR_AWAITING_FIX_LABEL=off
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  "XSS in postcss",
+		IssueType:   "package_vulnerability",
+		Severity:    "high",
+		Status:      model.FindingOpen, // fix is now available
+		CreatedAt:   time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+	}
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:            "existing-1",
+				Identifier:    "SEC-1",
+				Title:         "stale title", // title change so an update is produced
+				Description:   "old body\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\nmanaged_labels: snyk-automation\n-->",
+				DueDate:       "",
+				StateName:     "Backlog",
+				Fingerprint:   finding.Fingerprint,
+				Priority:      2,
+				ManagedLabels: []string{"snyk-automation"},
+				Labels:        []model.IssueLabel{{ID: "l1", Name: "snyk-automation"}},
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("PlannedUpdates = %d, want 1 (title changed)", result.PlannedUpdates)
+	}
+	if len(linear.updated) != 1 {
+		t.Fatalf("updated = %d, want 1", len(linear.updated))
+	}
+	updated := linear.updated[0]
+
+	if !updated.PreserveState {
+		t.Fatalf("updated PreserveState = false, want true (no awaiting-fix label: Backlog stays put)")
+	}
+	if updated.State != model.StateBacklog {
+		t.Fatalf("updated state = %q, want %q", updated.State, model.StateBacklog)
+	}
+}
+
+// TestRunAwaitingFixStaysInBacklogWhileStillAwaiting verifies that nothing
+// moves while the find is still missing: the ticket stays in Backlog with no
+// due date, even when the title changes enough to produce an update.
+func TestRunAwaitingFixStaysInBacklogWhileStillAwaiting(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.States.Backlog = "Backlog"
+	cfg.Linear.Labels.AwaitingFix = "triage-dependency"
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  "XSS in postcss",
+		IssueType:   "package_vulnerability",
+		Severity:    "high",
+		Status:      model.FindingAwaitingFix, // still no fix
+		CreatedAt:   time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+	}
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:            "existing-1",
+				Identifier:    "SEC-1",
+				Title:         "stale title", // title change so an update is produced
+				Description:   "old body\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\nmanaged_labels: snyk-automation,triage-dependency\n-->",
+				DueDate:       "",
+				StateName:     "Backlog",
+				Fingerprint:   finding.Fingerprint,
+				Priority:      2,
+				ManagedLabels: []string{"snyk-automation", "triage-dependency"},
+				Labels:        []model.IssueLabel{{ID: "l1", Name: "snyk-automation"}, {ID: "l2", Name: "triage-dependency"}},
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("PlannedUpdates = %d, want 1 (title changed)", result.PlannedUpdates)
+	}
+	if len(linear.updated) != 1 {
+		t.Fatalf("updated = %d, want 1", len(linear.updated))
+	}
+	updated := linear.updated[0]
+
+	if updated.State != model.StateBacklog {
+		t.Fatalf("updated state = %q, want %q", updated.State, model.StateBacklog)
+	}
+	if updated.DueDate != "" {
+		t.Fatalf("updated due date = %q, want \"\" (SLA paused while the fix is still missing)", updated.DueDate)
+	}
+}
+
+// TestRunAwaitingFixToOpenPostsStateChangeComment drives the first scenario
+// through the real entry point with comments enabled, so the whole run —
+// match, override logic, diff, update, comment — is exercised. The pick-up at
+// Backlog is the sync's own placement, so the change comment must explain the
+// move out of Backlog and mention the label it removed.
+func TestRunAwaitingFixToOpenPostsStateChangeComment(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.States.Backlog = "Backlog"
+	cfg.Linear.Labels.AwaitingFix = "triage-dependency"
+	cfg.Linear.CommentsEnabled = true
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  "XSS in postcss",
+		IssueType:   "package_vulnerability",
+		Severity:    "high",
+		Status:      model.FindingOpen, // fix is now available
+		CreatedAt:   time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC),
+	}
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:            "existing-1",
+				Identifier:    "SEC-1",
+				Title:         "Snyk: [high] XSS in postcss",
+				Description:   "old body\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\nmanaged_labels: snyk-automation,triage-dependency\n-->",
+				DueDate:       "",
+				StateName:     "Backlog",
+				Fingerprint:   finding.Fingerprint,
+				Priority:      2,
+				ManagedLabels: []string{"snyk-automation", "triage-dependency"},
+				Labels:        []model.IssueLabel{{ID: "l1", Name: "snyk-automation"}, {ID: "l2", Name: "triage-dependency"}},
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("PlannedUpdates = %d, want 1", result.PlannedUpdates)
+	}
+	if len(linear.comments) != 1 {
+		t.Fatalf("comments = %d, want 1", len(linear.comments))
+	}
+	comment := linear.comments[0]
+	if comment.Diff == nil {
+		t.Fatal("comment Diff = nil, want a populated diff")
+	}
+	if !comment.Diff.StateChanged {
+		t.Fatalf("comment Diff.StateChanged = false, want true")
+	}
+	if !strings.Contains(comment.Desired.StateReason, "fix is now available") {
+		t.Fatalf("comment StateReason = %q, want it to contain %q", comment.Desired.StateReason, "fix is now available")
+	}
+	if !slices.Contains(comment.Diff.LabelsRemoved, "triage-dependency") {
+		t.Fatalf("comment Diff.LabelsRemoved = %v, want it to contain triage-dependency", comment.Diff.LabelsRemoved)
 	}
 }
 

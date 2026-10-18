@@ -424,3 +424,18 @@ func TestRunRefCheck(t *testing.T) {
 		t.Fatalf("runRefCheck with two paths = %v, want a usage error", err)
 	}
 }
+
+// TestRefIssueBodyHasAcceptanceSections pins the generated ref-update body
+// against the queue's acceptance gate (issue #136): both sections are in it,
+// Done when with a bullet, End-to-end check with text.
+func TestRefIssueBodyHasAcceptanceSections(t *testing.T) {
+	body := refIssueBody(strings.Repeat("a", 40), strings.Repeat("b", 40), compare{AheadBy: 3})
+	done, ok := issueSection(body, issueDoneWhenHeading)
+	if !ok || !issueHasBullet(done) {
+		t.Fatalf("refIssueBody Done when missing or without bullets:\n%s", body)
+	}
+	e2e, ok := issueSection(body, issueEndToEndHeading)
+	if !ok || strings.TrimSpace(e2e) == "" {
+		t.Fatalf("refIssueBody End-to-end check missing or empty:\n%s", body)
+	}
+}

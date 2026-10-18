@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -390,7 +391,7 @@ func TestProposalBodyEscapesAndTemplate(t *testing.T) {
 		"### Proposal: Title with \\`backticks\\` and &lt;html&gt;",
 		"text &amp; more &lt;text&gt;",
 		"**What to do**",
-		"**Done when**",
+		"## Done when",
 		"**Area**: app/widgets",
 		"**Depends on**: #12, #34",
 	} {
@@ -659,4 +660,67 @@ func planJSONString(s string) string {
 		panic(err)
 	}
 	return string(data)
+}
+
+// TestProposalBodyHasAcceptanceSections pins the proposal body against the
+// queue's acceptance gate (issue #136): "## Done when" renders the field as
+// bullets, "## End-to-end check" the planner's field or the placeholder.
+func TestProposalBodyHasAcceptanceSections(t *testing.T) {
+	body := ProposalBody(Proposal{Title: "t", Problem: "p", What: "w", Done: "first bullet\nsecond bullet"})
+	done, ok := issueSection(body, issueDoneWhenHeading)
+	if !ok || !issueHasBullet(done) || !strings.Contains(done, "- first bullet") || !strings.Contains(done, "- second bullet") {
+		t.Fatalf("ProposalBody Done when missing or not bullets:\n%s", body)
+	}
+	e2e, ok := issueSection(body, issueEndToEndHeading)
+	// The whole placeholder, character for character: a truncated or
+	// half-edited copy must not pass for the real thing.
+	if !ok || strings.TrimSpace(e2e) != proposalE2EPlaceholder {
+		t.Fatalf("ProposalBody End-to-end check = %q; want the full placeholder %q", e2e, proposalE2EPlaceholder)
+	}
+	// The placeholder carries every mark the queue's gate holds on
+	// (e2ePlaceholderMarks, issue #136): an unfilled proposal is never
+	// queued, and a truncated or half-edited copy still carries one. This
+	// keeps the two constants from drifting apart.
+	for _, mark := range e2ePlaceholderMarks {
+		if !strings.Contains(proposalE2EPlaceholder, mark) {
+			t.Fatalf("proposalE2EPlaceholder %q lost the gate mark %q", proposalE2EPlaceholder, mark)
+		}
+	}
+	// The planner's own End-to-end check is used when it gave one.
+	body = ProposalBody(Proposal{Title: "t", Problem: "p", What: "w", Done: "b", EndToEnd: "go test -race ./... is green"})
+	e2e, _ = issueSection(body, issueEndToEndHeading)
+	if !strings.Contains(e2e, "go test -race ./... is green") || strings.Contains(e2e, "fill in before queueing") {
+		t.Fatalf("planner End-to-end check not used:\n%s", body)
+	}
+	// The planner's own check passes the gate, the placeholder does not:
+	// with no field, the rendered body is held until a person fills it in.
+	if missing := issueBodyReady(queuedIssue(1, "2024-01-01T00:00:00Z", "codeaf-queued", "area:harness").with(body)); len(missing) != 0 {
+		t.Fatalf("planner-provided End-to-end check held: %v", missing)
+	}
+	body = ProposalBody(Proposal{Title: "t", Problem: "p", What: "w", Done: "b"})
+	if missing := issueBodyReady(queuedIssue(1, "2024-01-01T00:00:00Z", "codeaf-queued", "area:harness").with(body)); !slices.Equal(missing, []string{"## End-to-end check"}) {
+		t.Fatalf("placeholder body not held: missing = %v; want [## End-to-end check]", missing)
+	}
+}
+
+func TestParseProposalsEndToEndField(t *testing.T) {
+	answer := "### Proposal: Fix the gate\n" +
+		"- Problem: p\n- What to do: w\n- Done when: tests pass\n" +
+		"- End-to-end check: go test -race ./... is green\n- Area: harness\n"
+	props := ParseProposals(answer, 5)
+	if len(props) != 1 {
+		t.Fatalf("ParseProposals kept %d proposals; want 1", len(props))
+	}
+	if props[0].EndToEnd != "go test -race ./... is green" {
+		t.Fatalf("EndToEnd = %q", props[0].EndToEnd)
+	}
+	// The field is optional: without it, EndToEnd is empty and the body
+	// carries the placeholder.
+	props = ParseProposals("### Proposal: Fix the gate\n- Problem: p\n- What to do: w\n", 5)
+	if len(props) != 1 || props[0].EndToEnd != "" {
+		t.Fatalf("absent field: props = %+v", props)
+	}
+	if body := ProposalBody(props[0]); !strings.Contains(body, "fill in before queueing") {
+		t.Fatalf("placeholder missing from body:\n%s", body)
+	}
 }

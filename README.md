@@ -217,6 +217,14 @@ demand, via *Run workflow*)
   and the harness `.github/`, taken from `area:` labels or paths in the
   issue body; an issue with no area conflicts with everything;
 - every issue named in a "Depends on #N" line in its body is closed;
+- the issue is ready (issue #136): its body has a `## Done when` heading with
+  at least one `- ` bullet under it and a `## End-to-end check` heading with
+  some text under it, and it carries an `area:` label — issues labelled
+  `codeaf-ref-update` or `codeaf-experiment`, whose bodies are generated, are
+  exempt from the two body sections, not from the area label. An issue held
+  for any of these gets a one-time comment naming what is missing. Copy
+  [`.github/codeaf/issue-template.md`](.github/codeaf/issue-template.md) to
+  `.github/ISSUE_TEMPLATE/codeaf-task.md` to give new issues the sections;
 - the rolling week's credit spend in the shared state is under 75% of
   `limits.weekly_credit_usd` in [`models.json`](.github/codeaf/models.json) — an
   unknown spend starts nothing;
@@ -342,6 +350,16 @@ report comments — the first report is the run that opened the PR, not a
 continuation. At the cap the PR gets a comment and stays a draft for a person
 (a maintainer can still continue it by hand with a `/codeaf` comment). A run
 that ends with `stop: done` marks the PR ready for review.
+
+A run can also finish through its task store: CodeAF then leaves the envelope
+saying `stop: incomplete` with an empty answer, while the run record's final
+`end` line carries reason "finished in the store" and the real answer. The
+harness ships that record beside the result in every mode and reads the ending
+from it (`closing.go`), so a store-finished run counts as done — the PR is
+marked ready and no continuation starts — and the report gains a `closing` row
+saying the stop was promoted. The record is untrusted data: the promotion only
+changes the draft/ready decision, and the independent review and `publish`'s
+checks still run on the work.
 
 ### Bringing the base branch in (issue #57)
 
