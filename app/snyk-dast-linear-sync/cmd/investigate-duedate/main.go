@@ -62,7 +62,7 @@ func main() {
 	defer stop()
 	go func() {
 		<-ctx.Done()
-		logger.Info("shutdown requested, cancelling in-flight calls and leaving the cache untouched")
+		logger.Info("shutdown requested, cancelling in-flight calls and exiting non-zero")
 	}()
 
 	snykdast, err := snykdastclient.New(ctx, cfg, logger.With("service", "snyk-dast"))

@@ -47,6 +47,13 @@ type Service struct {
 	snykdast SnykDASTClient
 	linear   LinearClient
 	cache    CacheStore
+
+	// executeHook, when non-nil, runs at the entry of every executeJob call
+	// before any work starts, and a non-nil error stops the worker pool with
+	// that error. It exists only as a test seam: it lets a test inject an
+	// independent worker failure (one that is not a context cancellation) and
+	// so pin the g.Wait() guard in Run. It is nil in production.
+	executeHook func(job) error
 }
 
 const (
@@ -435,15 +442,25 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		return nil
 	})
 
-	if err := g.Wait(); err != nil {
-		// An interrupted run has written only part of its plan: the findings
-		// whose jobs never ran look reconciled in a refreshed cache simply
-		// because their ticket was untouched. Returning before the cache save
-		// below is what keeps such a run from hiding them from the next one.
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return result, fmt.Errorf("sync interrupted before all work was written: %w", err)
-		}
-		return result, err
+	waitErr := g.Wait()
+	// An interrupted run has written only part of its plan: the findings whose
+	// jobs never ran look reconciled in a refreshed cache simply because their
+	// ticket was untouched. Returning before the cache save below is what keeps
+	// such a run from hiding them from the next one.
+	//
+	// g.Wait() alone is not enough to notice an interruption. When the context
+	// was already cancelled before Run started, or the cancellation landed
+	// while no job was in flight, errgroup never sees an error and returns nil,
+	// so the wait error is checked alongside the run context's own error.
+	interruptionErr := waitErr
+	if interruptionErr == nil {
+		interruptionErr = runCtx.Err()
+	}
+	if errors.Is(interruptionErr, context.Canceled) || errors.Is(interruptionErr, context.DeadlineExceeded) {
+		return result, fmt.Errorf("sync interrupted before all work was written: %w", interruptionErr)
+	}
+	if waitErr != nil {
+		return result, waitErr
 	}
 
 	if !s.cfg.DryRun && s.cache != nil {
@@ -645,6 +662,15 @@ func (s *Service) enqueue(ctx context.Context, jobs chan<- job, j job) error {
 }
 
 func (s *Service) executeJob(ctx context.Context, job job, result *RunResult, failed *failedFingerprints) error {
+	// The test seam runs first, before any counter or client call, so an
+	// injected failure behaves exactly like a worker error that stopped the
+	// pool: the job leaves no trace and Run must notice it through g.Wait().
+	// Nil in production.
+	if s.executeHook != nil {
+		if err := s.executeHook(job); err != nil {
+			return err
+		}
+	}
 	// A cancelled context means the run is over: touch no counter and make no
 	// Linear call — every one of them would fail, and each item of the batch
 	// would be counted in FailedOps as if the write had been attempted.

@@ -6,14 +6,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-<<<<<<< b4539e03895fa4fe914372d5c985251d0e25ed2e
-	"reflect"
-=======
 	"path/filepath"
->>>>>>> ef15a7a752be8b88bd302f5bd39de5c8e4341321
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -93,6 +91,14 @@ func (f *fakeLinear) LoadSnapshot(context.Context) ([]model.ExistingIssue, error
 }
 
 func (f *fakeLinear) ExistingFingerprints(_ context.Context, fingerprints []string) (map[string]struct{}, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.recordExistingFingerprintsLocked(fingerprints)
+}
+
+// recordExistingFingerprintsLocked is the body of ExistingFingerprints; it
+// assumes f.mu is held so it can be called from a method that already locked.
+func (f *fakeLinear) recordExistingFingerprintsLocked(fingerprints []string) (map[string]struct{}, error) {
 	f.existingCalls++
 	if f.existingErr != nil {
 		return nil, f.existingErr
@@ -113,6 +119,11 @@ func (f *fakeLinear) ExistingFingerprints(_ context.Context, fingerprints []stri
 func (f *fakeLinear) CreateIssues(ctx context.Context, desired []model.DesiredIssue) ([]int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.createIssuesLocked(ctx, desired)
+}
+
+// createIssuesLocked is the body of CreateIssues; it assumes f.mu is held.
+func (f *fakeLinear) createIssuesLocked(_ context.Context, desired []model.DesiredIssue) ([]int, error) {
 	f.createCallBatches = append(f.createCallBatches, append([]model.DesiredIssue(nil), desired...))
 	if f.cancelCreate != nil {
 		// Simulate a run interrupted while this batch was in flight.
@@ -147,6 +158,15 @@ func (f *fakeLinear) CreateIssues(ctx context.Context, desired []model.DesiredIs
 }
 
 func (f *fakeLinear) UpdateIssues(_ context.Context, updates []model.IssueUpdate) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.updateIssuesLocked(updates)
+}
+
+// updateIssuesLocked is the body of UpdateIssues; it assumes f.mu is held. A
+// single-lock public entry point keeps the retry loops from re-entering it
+// (f.mu is a plain sync.Mutex and is not reentrant).
+func (f *fakeLinear) updateIssuesLocked(updates []model.IssueUpdate) error {
 	for _, update := range updates {
 		if _, ok := f.updateFailFingerprints[update.Desired.Fingerprint]; ok {
 			return fmt.Errorf("update failed for %s", update.Desired.Fingerprint)
@@ -167,6 +187,13 @@ func (f *fakeLinear) UpdateIssues(_ context.Context, updates []model.IssueUpdate
 }
 
 func (f *fakeLinear) PostComments(_ context.Context, updates []model.IssueUpdate) ([]int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.postCommentsLocked(updates)
+}
+
+// postCommentsLocked is the body of PostComments; it assumes f.mu is held.
+func (f *fakeLinear) postCommentsLocked(updates []model.IssueUpdate) ([]int, error) {
 	f.commentCalls = append(f.commentCalls, len(updates))
 	if f.commentBatchErr != nil {
 		err := f.commentBatchErr
@@ -2902,6 +2929,46 @@ func TestRunReturnsContextErrorAndLeavesCacheUntouched(t *testing.T) {
 	}
 }
 
+// TestRunReturnsContextErrorWhenWaitObservesNoJobError pins the post-wait
+// interruption guard in Run: the fallback to runCtx.Err() taken when g.Wait()
+// returned nil. Deleting that fallback leaves the rest of this file green,
+// because every other interruption test lets a job observe the cancellation:
+// with one planned create the worker's executeJob entry guard (or the create
+// case's trailing `return ctx.Err()`) makes errgroup surface context canceled
+// through waitErr, so the earlier check catches it and the fallback is never
+// reached. The same is true of Workers: 0 — the producer's enqueue selects on
+// the (already done) worker context and returns ctx.Err() from its own g.Go, so
+// waitErr is non-nil again.
+//
+// This test therefore uses a run with no planned work at all. Then no job ever
+// runs, no executeJob call can see the cancelled context, the producer makes no
+// enqueue call, and g.Wait() returns nil while runCtx.Err() is context.Canceled.
+// That is the only job-invisible stop: the interruption is invisible to every
+// worker, so only the post-wait runCtx fallback can notice it. With the fallback
+// removed Run instead returns err=<nil> and saves a non-zero snapshot (signature
+// "2026-08-19-snyk-dast-sync-cache-v2") for a run that did nothing.
+func TestRunReturnsContextErrorWhenWaitObservesNoJobError(t *testing.T) {
+	cfg := interruptionCfg(1)
+	// No findings and no existing issues: the plan is empty, so the pool drains
+	// without a single job and g.Wait() sees no error.
+	snykdast := fakeSnykDAST{snapshot: interruptionSnapshot(nil)}
+	linear := &fakeLinear{}
+	store := &fakeCache{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := New(cfg, discardLogger(), snykdast, linear, store).Run(ctx)
+	if err == nil {
+		t.Fatal("Run() error = nil, want the context error; the post-wait runCtx fallback is missing")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want errors.Is(err, context.Canceled)", err)
+	}
+	if !reflect.DeepEqual(store.saved, cache.Snapshot{}) {
+		t.Fatalf("saved cache = %+v, want the zero cache.Snapshot (an interrupted run must not refresh the cache)", store.saved)
+	}
+}
+
 // TestRunStopsStartingJobsAfterCancellation: the first create batch is
 // interrupted; the producer must stop queueing the remaining batches, so
 // Linear sees at most one CreateIssues call, and the run reports the context
@@ -2930,24 +2997,42 @@ func TestRunStopsStartingJobsAfterCancellation(t *testing.T) {
 	}
 }
 
-// TestRunDoesNotDeadlockWhenWorkerFails: a worker that returns an error (here:
-// an interrupted run, which makes executeJob report the context error) stops
-// the whole pool while the producer may still hold batches to queue. Run must
-// return with an error within the test's timeout instead of blocking forever
-// on a jobs channel nobody reads any more.
+// TestRunDoesNotDeadlockWhenWorkerFails: an independent worker error — one the
+// run context knows nothing about, injected through the executeHook test seam —
+// stops the whole pool while the producer may still hold batches to queue. Run
+// must return with that error within the test's timeout instead of blocking
+// forever on a jobs channel nobody reads any more.
+//
+// The context is deliberately left uncancelled: an interruption would make the
+// producer stop by itself and would test caller cancellation, not the worker
+// error this test is about. More findings than createBatchSize are used so the
+// producer still has batches left to queue when the first worker dies.
 func TestRunDoesNotDeadlockWhenWorkerFails(t *testing.T) {
 	cfg := interruptionCfg(2) // two workers: both can die while batches are pending
-	findings := interruptionFindings(35)
+	findings := interruptionFindings(3*createBatchSize + 5)
 	snykdast := fakeSnykDAST{snapshot: interruptionSnapshot(findings)}
-	ctx, cancel := context.WithCancel(context.Background())
-	linear := &fakeLinear{cancelCreate: cancel}
+	linear := &fakeLinear{}
+	store := &fakeCache{}
+
+	workerErr := errors.New("injected worker failure")
+	var calls atomic.Int64
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
+	service := New(cfg, discardLogger(), snykdast, linear, store)
+	service.executeHook = func(job) error {
+		// Only the first job fails, so the failure is independent of any
+		// context cancellation the error then triggers in errgroup.
+		if calls.Add(1) == 1 {
+			return workerErr
+		}
+		return nil
+	}
 
 	done := make(chan struct{})
 	var err error
 	go func() {
 		defer close(done)
-		_, err = New(cfg, discardLogger(), snykdast, linear, &fakeCache{}).Run(ctx)
+		_, err = service.Run(ctx)
 	}()
 	select {
 	case <-done:
@@ -2957,8 +3042,91 @@ func TestRunDoesNotDeadlockWhenWorkerFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("Run() error = nil, want the error that stopped the worker pool")
 	}
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run() error = %v, want errors.Is(err, context.Canceled)", err)
+	if !errors.Is(err, workerErr) {
+		t.Fatalf("Run() error = %v, want errors.Is(err, workerErr)", err)
+	}
+}
+
+// TestRunWorkerErrorLeavesCacheUnrefreshed pins the g.Wait() guard in Run: a
+// worker that returns an error without any context cancellation must keep the
+// cache untouched, because the jobs that never ran would otherwise look
+// reconciled in a refreshed snapshot.
+func TestRunWorkerErrorLeavesCacheUnrefreshed(t *testing.T) {
+	cfg := interruptionCfg(2)
+	findings := interruptionFindings(3*createBatchSize + 5)
+	snykdast := fakeSnykDAST{snapshot: interruptionSnapshot(findings)}
+	linear := &fakeLinear{}
+	store := &fakeCache{}
+
+	workerErr := errors.New("injected worker failure")
+	var calls atomic.Int64
+	service := New(cfg, discardLogger(), snykdast, linear, store)
+	service.executeHook = func(job) error {
+		// Let the first batch through, so the run has planned work in hand and
+		// the cache-refresh code below the guard is genuinely reachable; then
+		// fail every later job. No context is ever cancelled by this test.
+		if calls.Add(1) == 1 {
+			return nil
+		}
+		return workerErr
+	}
+
+	_, err := service.Run(t.Context())
+	if !errors.Is(err, workerErr) {
+		t.Fatalf("Run() error = %v, want errors.Is(err, workerErr)", err)
+	}
+	if !reflect.DeepEqual(store.saved, cache.Snapshot{}) {
+		t.Fatalf("saved cache = %+v, want the zero cache.Snapshot (a failed run must not refresh the cache)", store.saved)
+	}
+	// The guard is the only thing keeping the cache untouched: a batch was
+	// accepted before the pool died, so without the guard Run would fall
+	// through to the refresh below it and save a snapshot.
+	if len(linear.createCallBatches) == 0 {
+		t.Fatal("no batch reached Linear before the failure; this test would not reach the cache-refresh point without the guard")
+	}
+}
+
+// TestFakeLinearRecordsAreRaceFreeAcrossWorkers drives the fake's recording
+// methods from a pool of two workers at once — UpdateIssues, PostComments and
+// ExistingFingerprints in particular, which used to append to and read their
+// fields unguarded while CreateIssues was the only method holding f.mu. Run
+// under -race it proves the fake's state is guarded, because the detector sees
+// the concurrent access the guard now serialises.
+func TestFakeLinearRecordsAreRaceFreeAcrossWorkers(t *testing.T) {
+	cfg := interruptionCfg(2)
+	cfg.Linear.CommentsEnabled = true
+	// Enough findings that both workers are busy, and stale titles on the
+	// existing issues so update and comment work flows through the pool too.
+	const n = 3 * createBatchSize
+	findings := interruptionFindings(n)
+	existing := make([]model.ExistingIssue, 0, n)
+	for _, finding := range findings {
+		existing = append(existing, model.ExistingIssue{
+			ID:          "existing-" + finding.SnykDASTFindingID,
+			Identifier:  "SEC-1",
+			Title:       "stale title",
+			Description: "old description",
+			StateName:   "Triage",
+			Fingerprint: finding.Fingerprint,
+		})
+	}
+	snykdast := fakeSnykDAST{snapshot: interruptionSnapshot(findings)}
+	linear := &fakeLinear{snapshot: existing}
+	store := &fakeCache{}
+
+	// One run already exercises the guarded paths concurrently; repeat it so the
+	// scheduler is likely to interleave the two workers and the race detector
+	// sees the access even on a fast machine.
+	for range 3 {
+		if _, err := New(cfg, discardLogger(), snykdast, linear, store).Run(t.Context()); err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	}
+	if len(linear.updates) == 0 {
+		t.Fatal("no update was recorded; the concurrently guarded path was never exercised")
+	}
+	if len(linear.commentCalls) == 0 {
+		t.Fatal("no PostComments call was recorded; the concurrently guarded path was never exercised")
 	}
 }
 
