@@ -1146,6 +1146,32 @@ var fullSHARx = regexp.MustCompile(`^[0-9a-fA-F]{40}$`)
 // bodies are read.
 type bodyComments []struct {
 	Body string `json:"body"`
+	User struct {
+		Type string `json:"type"`
+	} `json:"user"`
+}
+
+// strandedByFailedRun reports whether a PR's comments end in a failed CodeAF
+// run: its latest bot comment, the re-pick markers aside, is a run report
+// whose outcome is "publishing failed" or "run job failed". That is the one
+// state the re-pick exists for (issue #215). Every other way a PR ends with no
+// queue label is a deliberate hand-off to a person -- a spent fix budget, an
+// unrecognised severity, an incomplete review -- and re-reviewing those would
+// keep asking until a review passed. Only bot comments count, so a comment
+// anyone can post on a public repository cannot fake a failed run.
+func strandedByFailedRun(comments bodyComments) bool {
+	for i := len(comments) - 1; i >= 0; i-- {
+		c := comments[i]
+		if c.User.Type != "Bot" || strings.Contains(c.Body, queueRepickMarker) {
+			continue
+		}
+		if !strings.HasPrefix(c.Body, reportMarker+"\n") {
+			return false
+		}
+		return strings.HasPrefix(c.Body, reportMarker+"\n### CodeAF run — publishing failed\n") ||
+			strings.HasPrefix(c.Body, reportMarker+"\n### CodeAF run — run job failed\n")
+	}
+	return false
 }
 
 // repickMarkers collects the head SHAs the re-pick marker comments name, in
@@ -1215,6 +1241,11 @@ func fetchStrandedPRs(g github, issues []item, runs []runStatus, lbl string, log
 		var comments bodyComments
 		if err := g.get(fmt.Sprintf("/issues/%d/comments?per_page=100", i.Number), &comments); err != nil {
 			logf("stranded PR #%d comments: %v", i.Number, err)
+			continue
+		}
+		if !strandedByFailedRun(comments) {
+			// No label because a person was handed the PR, not because a
+			// run failed: leave it to them.
 			continue
 		}
 		heads[i.Number] = head
