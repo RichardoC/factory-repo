@@ -25,7 +25,10 @@ Review the embedded diff against the issue the pull request closes:
 - **Acceptance criteria** — for every bullet of the issue's `## Done when`,
   run the named test or command yourself; run the `## End-to-end check`. An
   unmet bullet or a failing end-to-end check is a **high** finding, quoted as
-  `[high] done-when: <bullet>`.
+  `[high] done-when: <bullet>`. A bullet that only sets a size target (lines
+  removed, file length) is not worth meeting at the cost of clarity: never
+  ask for comments to be cut or code squashed to hit a number; report the
+  shortfall as `low`, saying the behaviour is what counts.
 - **Workflow security** — when the diff touches `.github/workflows/`, it was
   published without a maintainer, on the deterministic workflow policy
   alone, and your review is what stands between it and the default branch.

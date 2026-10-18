@@ -12,7 +12,11 @@ change.
 <!-- Replace this paragraph with bullets, each a test name or a command and
 its expected output. These are the acceptance criteria: the worker reports
 against them and the reviewer re-runs them. An issue with no bullets here is
-held by the queue. -->
+held by the queue.
+
+Criteria are behaviour, never a size target: no "at least N fewer lines".
+A line-count criterion was met once by squashing arguments onto one line
+and cutting the comments that explain why (PR #170). -->
 
 No bullets yet: this issue is not ready to run until this section has at
 least one `- ` bullet.
