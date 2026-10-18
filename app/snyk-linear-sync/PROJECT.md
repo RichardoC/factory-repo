@@ -330,6 +330,10 @@ Normal behavior:
 
 The post-write refresh matters because Linear may rewrite markdown bodies after mutation.
 
+An interrupted run (signal, cancelled context) does not refresh the cache. It
+has made no promise about the findings it never reached, and caching "still as
+it was" hashes for them would make the next run skip them.
+
 ## Safety Assumptions
 
 - The metadata block must remain intact.

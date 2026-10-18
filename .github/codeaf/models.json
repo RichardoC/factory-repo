@@ -11,8 +11,8 @@
   },
   "limits": {
     "plan": "big",
-    "plan_note": "Big plan $90/mo. The weekly credit is not published; 22 is an ESTIMATE from GET /v2/quotas on 2026-10-17 (weeklyTokenLimit.percentRemaining fell 1.41% for $0.306 of subscription-rate usage). The hard stop is synthetic.new's own percentRemaining: with overage_usd 0, the proxy refuses below min_credit_percent, re-reading /v2/quotas every 5 minutes. run_credit_usd replaces the old run_usd. overage_usd 0 = stop rather than pay past the quota.",
-    "weekly_credit_usd": 22,
+    "plan_note": "Big plan $90/mo. The weekly credit is not published; 36 is an ESTIMATE, recalibrated on 2026-10-18 from GET /v2/quotas (58% of the weekly credit left after about $15.8 of ledger spend, so roughly $37/week; the first estimate of 22, from a 1.41% drop for $0.306 on 2026-10-17, was too low and stopped the queue early). The hard stop is synthetic.new's own percentRemaining: with overage_usd 0, the proxy refuses below min_credit_percent, re-reading /v2/quotas every 5 minutes. run_credit_usd replaces the old run_usd. overage_usd 0 = stop rather than pay past the quota.",
+    "weekly_credit_usd": 36,
     "min_credit_percent": 10,
     "run_credit_usd": 5,
     "overage_usd": 0,
