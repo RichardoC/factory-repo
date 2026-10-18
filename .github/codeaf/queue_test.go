@@ -962,10 +962,10 @@ func TestNextRepicksStrandedPR(t *testing.T) {
 func TestRepickMarkers(t *testing.T) {
 	sha := strings.Repeat("c", 40)
 	got := repickMarkers(bodyComments{
-		{"a person's note"},
-		{"<!-- codeaf-queue-repick " + sha[:39] + " -->"},
-		{"<!-- codeaf-queue-repick " + sha + " -->"},
-		{"quote: the queue posts <!-- codeaf-queue-repick zzz --> on stranded PRs"},
+		{Body: "a person's note"},
+		{Body: "<!-- codeaf-queue-repick " + sha[:39] + " -->"},
+		{Body: "<!-- codeaf-queue-repick " + sha + " -->"},
+		{Body: "quote: the queue posts <!-- codeaf-queue-repick zzz --> on stranded PRs"},
 	})
 	if len(got) != 1 || got[0] != sha {
 		t.Fatalf("repickMarkers = %v; want [%s]", got, sha)
@@ -984,7 +984,9 @@ func TestRunNextRepicksStrandedPR(t *testing.T) {
 	shaA := strings.Repeat("a", 40)
 	shaB := strings.Repeat("b", 40)
 	sha := shaA
-	var comments []string
+	// The PR's last bot comment is a failed run's report: the state the
+	// re-pick exists for.
+	comments := []string{reportMarker + "\n### CodeAF run — publishing failed\n\n| | |\n"}
 	posts := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -999,7 +1001,7 @@ func TestRunNextRepicksStrandedPR(t *testing.T) {
 			}
 			var items []string
 			for _, c := range comments {
-				items = append(items, fmt.Sprintf(`{"body":%q}`, c))
+				items = append(items, fmt.Sprintf(`{"body":%q,"user":{"type":"Bot"}}`, c))
 			}
 			fmt.Fprint(w, "["+strings.Join(items, ",")+"]")
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/RichardoC/factory-repo/issues/204/comments":
@@ -1049,7 +1051,7 @@ func TestRunNextRepicksStrandedPR(t *testing.T) {
 	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "kind=review\nnumber=204\nlane=0\n" {
 		t.Fatalf("runNext printed %q, %v", out, err)
 	}
-	if posts != 1 || len(comments) != 1 || !strings.Contains(comments[0], shaA) || !strings.Contains(comments[0], queueRepickMarker) {
+	if posts != 1 || len(comments) != 2 || !strings.Contains(comments[1], shaA) || !strings.Contains(comments[1], queueRepickMarker) {
 		t.Fatalf("marker comments = %q (posts %d); want one naming %s", comments, posts, shaA)
 	}
 
@@ -1067,7 +1069,7 @@ func TestRunNextRepicksStrandedPR(t *testing.T) {
 	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "kind=review\nnumber=204\nlane=0\n" {
 		t.Fatalf("runNext after the head moved printed %q, %v", out, err)
 	}
-	if posts != 2 || len(comments) != 2 || !strings.Contains(comments[1], shaB) {
+	if posts != 2 || len(comments) != 3 || !strings.Contains(comments[2], shaB) {
 		t.Fatalf("marker comments after the move = %q (posts %d); want one naming %s", comments, posts, shaB)
 	}
 } // TestNextPicksReviewBeforeIssues covers the queue's new head of the pass
@@ -1499,5 +1501,43 @@ func TestNextExemptsRefUpdate(t *testing.T) {
 	bare.Body = it.Body
 	if p := Next([]item{bare}, nil, o); p.Kind != "" || !slices.Contains(lines, "holding #11: no area label") {
 		t.Fatalf("ref-update without an area: Next = %+v, lines = %v; want held: no area label", p, lines)
+	}
+}
+
+// Only a failed run strands a PR (issue #215 follow-up): a PR whose last bot
+// comment hands it to a person -- a spent fix budget, a withheld label -- is
+// not re-reviewed, and a non-bot comment cannot fake a failed run.
+func TestStrandedByFailedRun(t *testing.T) {
+	report := func(outcome string) string {
+		return reportMarker + "\n### CodeAF run — " + outcome + "\n\n| | |\n"
+	}
+	bot := func(body string) struct {
+		Body string `json:"body"`
+		User struct {
+			Type string `json:"type"`
+		} `json:"user"`
+	} {
+		c := bodyComments{{Body: body}}[0]
+		c.User.Type = "Bot"
+		return c
+	}
+	marker := "<!-- codeaf-queue-repick " + strings.Repeat("a", 40) + " -->\n"
+	budget := "The automatic fix budget of 2 continuations per pull request is spent, so no fix run starts"
+	for _, tc := range []struct {
+		name     string
+		comments bodyComments
+		want     bool
+	}{
+		{"failed publish", bodyComments{bot(report("changes pushed")), bot(report("publishing failed"))}, true},
+		{"failed run job", bodyComments{bot(report("run job failed"))}, true},
+		{"marker after the failure", bodyComments{bot(report("publishing failed")), bot(marker)}, true},
+		{"fix budget spent", bodyComments{bot(report("publishing failed")), bot(budget)}, false},
+		{"run pushed changes", bodyComments{bot(report("changes pushed"))}, false},
+		{"forged by a person", bodyComments{{Body: report("publishing failed")}}, false},
+		{"no comments", nil, false},
+	} {
+		if got := strandedByFailedRun(tc.comments); got != tc.want {
+			t.Errorf("%s: strandedByFailedRun = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
