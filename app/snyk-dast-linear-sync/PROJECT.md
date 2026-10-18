@@ -430,6 +430,9 @@ Use a dry run to inspect planned changes:
 go run ./cmd/snyk-dast-linear-sync --env-file .env --dry-run
 ```
 
+A malformed numeric or boolean configuration value fails the run at startup
+with an error naming the variable; it never falls back to the default.
+
 Use cache bypass when you intentionally changed the managed rendering or need a
 full live reconciliation:
 
