@@ -3639,7 +3639,7 @@ func proxyFor145(t *testing.T, modelID string, interval time.Duration, upstream 
 	models := []Model{mustResolve(t, testModels(t), modelID)}
 	return &proxy{upstream: upstream.URL, apiKey: "k", ledger: filepath.Join(t.TempDir(), "l.jsonl"),
 		runCap: 5, weekCap: 20, models: models, client: upstream.Client(),
-		slots: newSlots(models, 1), heartbeatEvery: interval}
+		slots: newSlots(models, 1), heartbeatEvery: interval, headerGrace: time.Second}
 }
 
 // TestProxyHeartbeatsWhileWaitingForUpstreamHeaders (issue #145): an upstream
@@ -4178,5 +4178,14 @@ func TestProductionProxyClientHasNoHeaderTimeout(t *testing.T) {
 	// exposes one, this catches it.
 	if h, ok := interface{}(c).(interface{ HeaderTimeout() time.Duration }); ok {
 		t.Errorf("proxy client exposes a header timeout (%v); #145 removes the client-side silence that caused \"net/http: timeout awaiting response headers\"", h.HeaderTimeout())
+	}
+}
+
+// The production grace before the proxy commits a 200 must stay well above an
+// ordinary call's time to headers, so upstream refusals keep their real status
+// (CodeAF retries a 429), and below CodeAF's 30s hedge.
+func TestProductionHeaderWaitGrace(t *testing.T) {
+	if g := (&proxy{}).headerWaitGrace(); g < 10*time.Second || g >= 30*time.Second {
+		t.Fatalf("default header wait grace = %v, want in [10s, 30s)", g)
 	}
 }

@@ -394,6 +394,8 @@ type proxy struct {
 	// proxy proves the path with an SSE comment line; 0 means the 10s
 	// default (shorter in tests).
 	heartbeatEvery time.Duration
+	// headerGrace overrides headerWaitGrace when set (tests shorten it).
+	headerGrace time.Duration
 	// Web search (issue #58): where forwarded searches go and this run's
 	// cap; searches counts this run's forwarded attempts under p.mu.
 	searchURL      string
@@ -1380,7 +1382,7 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 // this handler selects on its result, a heartbeat ticker and the client's
 // context:
 //
-//   - Nothing is written for the first headerWaitGrace: an upstream that
+//   - Nothing is written for the first headerWaitGrace(): an upstream that
 //     answers within it keeps today's fast path, so an immediate 402/429/4xx
 //     still reaches CodeAF as a real status code.
 //   - After that, the 200 is committed (out is set, and stays set, so every
@@ -1426,10 +1428,10 @@ func (p *proxy) doWithHeartbeats(ctx context.Context, request *http.Request, w h
 	// The ticker keeps beating while the headers are awaited and, past them,
 	// until the first content data line -- relayStream's quiet beat covers
 	// the silence after that (issue #145). The header wait proper is a
-	// separate timer: the 200 is committed only once headerWaitGrace is out
+	// separate timer: the 200 is committed only once headerWaitGrace() is out
 	// with no headers, so an upstream that answers at once keeps today's real
 	// status codes.
-	headers := time.NewTimer(headerWaitGrace)
+	headers := time.NewTimer(p.headerWaitGrace())
 	defer headers.Stop()
 	committed := *out != nil // an earlier slot wait already committed the 200
 	answer := func(r result) (*http.Response, time.Duration, error) {
@@ -1453,7 +1455,7 @@ func (p *proxy) doWithHeartbeats(ctx context.Context, request *http.Request, w h
 		case r := <-done:
 			return answer(r)
 		case <-headers.C:
-			// 1s with no headers: commit and heartbeat from here on.
+			// The grace is out with no headers: commit and heartbeat from here on.
 			if *out == nil {
 				*out = newSSESink(w, every)
 				(*out).commit()
@@ -1550,14 +1552,22 @@ const (
 	upstreamQuietComment = "codeaf-proxy upstream quiet"
 )
 
-// headerWaitGrace is how long a streaming call may sit without upstream
-// headers before the proxy commits its 200 and heartbeats (issue #145). Below
-// it the response is still uncommitted, so an upstream that answers at once
-// with a real status (402, 429, any 4xx) still reaches CodeAF as that status
-// rather than as an SSE event; above it the wait is the long one -- infinite
-// mode's 40-236s to first token -- and the silence is what makes CodeAF hedge
-// a second arm and then time the turn out.
-const headerWaitGrace = time.Second
+// defaultHeaderWaitGrace is how long a streaming call may sit without
+// upstream headers before the proxy commits its 200 and heartbeats (issue
+// #145). Below it the response is still uncommitted, so an upstream that
+// answers with a real status (402, 429, any 4xx) still reaches CodeAF as that
+// status, which CodeAF's 429 retry depends on, rather than as an SSE event.
+// An ordinary call's headers arrive well inside it even under load; past it
+// the wait is the long one -- infinite mode's 40-236s to first token -- and
+// committing then still beats CodeAF's 30s hedge and 120s header deadline.
+const defaultHeaderWaitGrace = 15 * time.Second
+
+func (p *proxy) headerWaitGrace() time.Duration {
+	if p.headerGrace > 0 {
+		return p.headerGrace
+	}
+	return defaultHeaderWaitGrace
+}
 
 // defaultHeartbeat is how long a streaming client may hear nothing before the
 // proxy proves the path with a comment line (issue #90).
