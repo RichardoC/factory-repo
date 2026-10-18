@@ -84,6 +84,10 @@ Bypass cache:
 go run ./cmd/snyk-linear-sync --env-file .env --bypass-cache
 ```
 
+Stopping a run: Ctrl-C or SIGTERM stops the run after the Linear batch in
+flight; the exit code is 1 and the cache is left untouched, so the next run
+re-examines everything that was not written.
+
 `--env-file` uses `github.com/joho/godotenv`, so the file can be a normal dotenv file and does not need to be sourced by your shell.
 
 ## Validation

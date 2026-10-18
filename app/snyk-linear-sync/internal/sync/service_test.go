@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -73,6 +74,14 @@ type fakeLinear struct {
 	// call after the failed batch carries exactly one update) rather than
 	// inferring it from the recorded writes alone.
 	updateCallBatches [][]model.IssueUpdate
+
+	// cancelCreate / cancelUpdate, when non-nil, cancel the run's context the
+	// first time CreateIssues / UpdateIssues is called. From that moment the
+	// fake answers every call with the context error and records nothing,
+	// exactly as a real client does: it models a signal arriving while that
+	// Linear batch is in flight.
+	cancelCreate func()
+	cancelUpdate func()
 }
 
 type fakeCache struct {
@@ -84,7 +93,16 @@ func (f *fakeLinear) LoadSnapshot(context.Context) ([]model.ExistingIssue, error
 	return f.snapshot, nil
 }
 
-func (f *fakeLinear) CreateIssues(_ context.Context, desired []model.DesiredIssue) ([]int, error) {
+func (f *fakeLinear) CreateIssues(ctx context.Context, desired []model.DesiredIssue) ([]int, error) {
+	if f.cancelCreate != nil {
+		cancel := f.cancelCreate
+		f.cancelCreate = nil
+		cancel()
+		return nil, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f.createCallBatches = append(f.createCallBatches, append([]model.DesiredIssue(nil), desired...))
 	if f.createErr != nil {
 		return nil, f.createErr
@@ -101,7 +119,16 @@ func (f *fakeLinear) CreateIssues(_ context.Context, desired []model.DesiredIssu
 	return failed, nil
 }
 
-func (f *fakeLinear) UpdateIssues(_ context.Context, updates []model.IssueUpdate) error {
+func (f *fakeLinear) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) error {
+	if f.cancelUpdate != nil {
+		cancel := f.cancelUpdate
+		f.cancelUpdate = nil
+		cancel()
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.updateCallBatches = append(f.updateCallBatches, append([]model.IssueUpdate(nil), updates...))
 	if f.batchErrAbove > 0 && len(updates) > f.batchErrAbove {
 		return errors.New("batch update failed")
@@ -6918,4 +6945,198 @@ func TestRunUpdatesResolvesAndCancelsWithBatchFallback(t *testing.T) {
 	if singleItem != 5 {
 		t.Fatalf("single-item UpdateIssues calls = %d, want 5 (every write the run landed)", singleItem)
 	}
+}
+
+// cancellableFinding returns a distinct open finding of project-a, one per i.
+func cancellableFinding(i int) model.Finding {
+	return model.Finding{
+		Fingerprint: fmt.Sprintf("snyk:project-a:issue-%d", i),
+		SnykIssueID: fmt.Sprintf("issue-%d", i),
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  fmt.Sprintf("Outdated package %d", i),
+		PackageName: "github.com/example/pkg",
+		Severity:    "high",
+		Status:      model.FindingOpen,
+		IssueURL:    fmt.Sprintf("https://example.test/issue-%d", i),
+		CreatedAt:   time.Date(2026, time.August, 1, 14, 0, 0, 0, time.UTC),
+	}
+}
+
+// TestRunStopsCreatingWhenContextCancelled: a signal arrives while the first
+// create batch is in flight, so the sync stops there. The plan has 25 creates
+// (batches of 10, 10, 5); the cancelled batch call and every later call fail
+// because the context is done, and the only calls that may follow are the
+// cancelled batch's per-item retries — never a second full batch. The run
+// returns the context error and saves no cache: the 15 findings whose jobs
+// never ran must be re-examined by the next run instead of looking reconciled.
+func TestRunStopsCreatingWhenContextCancelled(t *testing.T) {
+	cfg := minimalCfg() // Sync.Workers: 1
+	findings := make([]model.Finding, 0, 25)
+	for i := range 25 {
+		findings = append(findings, cancellableFinding(i))
+	}
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+		Findings:   findings,
+		ProjectIDs: map[string]struct{}{"project-a": {}},
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	linear := &fakeLinear{cancelCreate: cancel}
+	store := &fakeCache{}
+
+	result, err := New(cfg, discardLogger(), snyk, linear, store).Run(ctx)
+	if err == nil {
+		t.Fatal("Run() error = nil, want the context error of an interrupted run")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want errors.Is(err, context.Canceled)", err)
+	}
+	if len(linear.createCallBatches) > 2 {
+		t.Fatalf("CreateIssues calls = %d, want at most 2 (the cancelled batch plus its per-item retries), sizes %v",
+			len(linear.createCallBatches), createCallSizes(linear.createCallBatches))
+	}
+	for i, batch := range linear.createCallBatches {
+		if len(batch) > 1 && len(batch) != createBatchSize {
+			t.Fatalf("CreateIssues call %d carried %d items, want the planned batch %d or a single-item retry",
+				i, len(batch), createBatchSize)
+		}
+	}
+	// The first call is the plan's first full batch and it was cancelled; a
+	// later call of the same size would mean the producer queued the second
+	// batch after the context was already done.
+	for i := 1; i < len(linear.createCallBatches); i++ {
+		if len(linear.createCallBatches[i]) == createBatchSize {
+			t.Fatalf("CreateIssues call %d carried a full batch of %d after cancellation, want single-item retries only (sizes %v)",
+				i, createBatchSize, createCallSizes(linear.createCallBatches))
+		}
+	}
+	if result.PlannedCreates >= 25 {
+		t.Fatalf("PlannedCreates = %d, want fewer than the whole plan of 25", result.PlannedCreates)
+	}
+	if len(linear.created) != 0 {
+		t.Fatalf("created = %d, want 0 (every create call was cancelled)", len(linear.created))
+	}
+	if !reflect.DeepEqual(store.saved, cache.Snapshot{}) {
+		t.Fatalf("saved cache = %+v, want the zero cache.Snapshot (an interrupted run must not refresh the cache)", store.saved)
+	}
+}
+
+// TestRunStopsResolvingWhenContextCancelled runs the same interruption over the
+// resolve plan: no findings, 25 open tickets of a still-active project, all of
+// which the sync means to close. The first resolve batch is cancelled, so at
+// most two batches are planned, the run returns the context error and the cache
+// stays unsaved.
+func TestRunStopsResolvingWhenContextCancelled(t *testing.T) {
+	cfg := minimalCfg() // Sync.Workers: 1
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+		ProjectIDs: map[string]struct{}{"project-a": {}},
+	}}
+	issues := make([]model.ExistingIssue, 0, 25)
+	for i := range 25 {
+		issues = append(issues, model.ExistingIssue{
+			ID:          fmt.Sprintf("existing-%d", i),
+			Identifier:  fmt.Sprintf("SNYK-%d", i),
+			Title:       fmt.Sprintf("stale %d", i),
+			Description: "old description",
+			StateName:   "Todo",
+			Fingerprint: fmt.Sprintf("snyk:project-a:gone-%d", i),
+		})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	linear := &fakeLinear{snapshot: issues, cancelUpdate: cancel}
+	store := &fakeCache{}
+
+	result, err := New(cfg, discardLogger(), snyk, linear, store).Run(ctx)
+	if err == nil {
+		t.Fatal("Run() error = nil, want the context error of an interrupted run")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want errors.Is(err, context.Canceled)", err)
+	}
+	// Two batches of ten at most: the cancelled one plus one the producer may
+	// already have handed over before it noticed the context was done.
+	if result.PlannedResolves > 20 {
+		t.Fatalf("PlannedResolves = %d, want at most 20 (the producer must stop queueing once the context is done)", result.PlannedResolves)
+	}
+	if len(linear.updated) != 0 {
+		t.Fatalf("updated = %d, want 0 (every resolve call was cancelled)", len(linear.updated))
+	}
+	if !reflect.DeepEqual(store.saved, cache.Snapshot{}) {
+		t.Fatalf("saved cache = %+v, want the zero cache.Snapshot (an interrupted run must not refresh the cache)", store.saved)
+	}
+}
+
+// TestExecuteJobReturnsImmediatelyWhenContextAlreadyCancelled: a job reached
+// executeJob with the run already cancelled. It must report the context error
+// without counting the work as planned and without calling Linear — counting it
+// would report a batch of failed writes that was never attempted.
+func TestExecuteJobReturnsImmediatelyWhenContextAlreadyCancelled(t *testing.T) {
+	cfg := minimalCfg()
+	existing := model.ExistingIssue{
+		ID:          "existing-1",
+		Identifier:  "SNYK-1",
+		Title:       "stale title",
+		Description: "old description",
+		StateName:   "Todo",
+		Fingerprint: "snyk:project-a:issue-1",
+	}
+	desired := desiredIssue(cfg, cancellableFinding(1))
+	desired.PreserveState = true
+	linear := &fakeLinear{}
+	service := New(cfg, discardLogger(), fakeSnyk{}, linear, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var result RunResult
+	var failed failedFingerprints
+	err := service.executeJob(ctx, job{kind: jobUpdate, updateBatch: []model.IssueUpdate{{Existing: existing, Desired: desired}}}, &result, &failed)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("executeJob() error = %v, want errors.Is(err, context.Canceled)", err)
+	}
+	if result.PlannedUpdates != 0 || result.FailedOps != 0 {
+		t.Fatalf("PlannedUpdates = %d, FailedOps = %d, want 0 and 0 (no counter may be touched)", result.PlannedUpdates, result.FailedOps)
+	}
+	if len(linear.updated) != 0 {
+		t.Fatalf("updated = %d, want 0 (Linear must not be called)", len(linear.updated))
+	}
+}
+
+// TestRunCompletesAndSavesCacheWhenNotCancelled is the control for the two
+// interruption tests above: the very same inputs with a context that is never
+// cancelled must run to the end, create every finding and refresh the cache.
+func TestRunCompletesAndSavesCacheWhenNotCancelled(t *testing.T) {
+	cfg := minimalCfg() // Sync.Workers: 1
+	findings := make([]model.Finding, 0, 25)
+	for i := range 25 {
+		findings = append(findings, cancellableFinding(i))
+	}
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+		Findings:   findings,
+		ProjectIDs: map[string]struct{}{"project-a": {}},
+	}}
+	linear := &fakeLinear{}
+	store := &fakeCache{}
+
+	result, err := New(cfg, discardLogger(), snyk, linear, store).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(linear.created) != 25 {
+		t.Fatalf("created = %d, want 25", len(linear.created))
+	}
+	if result.PlannedCreates != 25 {
+		t.Fatalf("PlannedCreates = %d, want 25", result.PlannedCreates)
+	}
+	if store.saved.SchemaSignature == "" {
+		t.Fatalf("saved cache = %+v, want a refreshed snapshot with a schema signature", store.saved)
+	}
+}
+
+// createCallSizes reports the item count of every recorded CreateIssues call.
+func createCallSizes(batches [][]model.DesiredIssue) []int {
+	sizes := make([]int, 0, len(batches))
+	for _, batch := range batches {
+		sizes = append(sizes, len(batch))
+	}
+	return sizes
 }
