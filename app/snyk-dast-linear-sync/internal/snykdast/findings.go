@@ -3,6 +3,7 @@ package snykdast
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -477,11 +478,18 @@ func (c *Client) enrichCorrelations(ctx context.Context, findings []model.Findin
 		}
 		pos := i
 		compositeID := findings[i].SnykDASTFindingID
+		fingerprint := findings[i].Fingerprint
 		sem <- struct{}{}
 		g.Go(func() error {
 			defer func() { <-sem }()
-			blocks, err := c.fetchCorrelationMarkdown(gctx, targetID, numeric)
+			blocks, err := c.fetchCorrelationMarkdown(gctx, targetID, numeric, fingerprint)
 			if err != nil {
+				// The missing-permission error describes the whole fetch, not
+				// one finding: return it unchanged so the run fails fast with
+				// the message naming correlation_viewer.
+				if errors.Is(err, ErrCorrelationForbidden) {
+					return err
+				}
 				return fmt.Errorf("fetch snyk code correlations for finding %s: %w", compositeID, err)
 			}
 			findings[pos].CorrelationMarkdown = blocks
@@ -492,11 +500,28 @@ func (c *Client) enrichCorrelations(ctx context.Context, findings []model.Findin
 	return g.Wait()
 }
 
+// ErrCorrelationForbidden reports that the Snyk DAST API key cannot read the
+// Snyk Code correlation endpoint. It aborts the run: without the permission
+// every correlated finding would lose its description block. The message
+// names the missing permission and deliberately omits the target and finding
+// URL, so it is safe to paste into an issue.
+var ErrCorrelationForbidden = errors.New("Snyk DAST API GET correlations failed with 401/403: the API key is missing the correlation_viewer permission; add it to the custom role (see README, Snyk DAST (Probely) API Permissions)")
+
 // fetchCorrelationMarkdown returns the pre-rendered markdown blocks for the
 // Snyk Code correlations of a single finding. The endpoint is
 // /targets/{target_id}/findings/{finding_id}/integrations/snyk-sast/correlations/
 // where finding_id is the numeric finding id (suffix of the composite id).
-func (c *Client) fetchCorrelationMarkdown(ctx context.Context, targetID, numericFindingID string) ([]string, error) {
+//
+// Two statuses are handled specially, everything else fails the snapshot:
+//
+//   - 401/403 maps to ErrCorrelationForbidden (the API key lacks the
+//     correlation_viewer permission) so the run fails with a diagnosable
+//     message instead of a URL;
+//   - 404 for one finding is tolerated as "no correlations" (warn log, no
+//     block): a correlation removed between the findings listing and this
+//     fetch produces the same description as one that never existed, so
+//     degrading it does not churn the description on the next run.
+func (c *Client) fetchCorrelationMarkdown(ctx context.Context, targetID, numericFindingID, fingerprint string) ([]string, error) {
 	var blocks []string
 	path := fmt.Sprintf("targets/%s/findings/%s/integrations/snyk-sast/correlations/", targetID, numericFindingID)
 	err := c.listPages(ctx, path, nil, func(results json.RawMessage) error {
@@ -512,6 +537,16 @@ func (c *Client) fetchCorrelationMarkdown(ctx context.Context, targetID, numeric
 		return nil
 	})
 	if err != nil {
+		if apiErr, ok := errors.AsType[*apiError](err); ok {
+			switch apiErr.Status {
+			case http.StatusUnauthorized, http.StatusForbidden:
+				return nil, ErrCorrelationForbidden
+			case http.StatusNotFound:
+				c.logger.Warn("Snyk DAST Code correlations disappeared for finding, continuing without the description block",
+					slog.String("fingerprint", fingerprint))
+				return nil, nil
+			}
+		}
 		return nil, err
 	}
 	return blocks, nil

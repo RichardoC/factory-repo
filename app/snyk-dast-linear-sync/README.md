@@ -153,6 +153,18 @@ Permissions **not** required (the sync does not write back to Snyk DAST):
 > findings had gone away (`--dry-run` still reports the plan, logging the same
 > message at error level). Add `view_target` to fix it.
 
+> **Symptom of missing `correlation_viewer`:** every target and finding
+> loads, then the run fails with an error naming the missing
+> `correlation_viewer` permission (the error does not include the target or
+> finding URL). The sync cannot build the Snyk Code correlation block without
+> it, so the whole run fails instead of silently dropping the block from every
+> description. Add `correlation_viewer` to the custom role to fix it.
+
+The per-finding correlation endpoint is also tolerated to answer `404` for a
+single finding: that finding is logged at warn and synced without its
+correlation block, the same as a finding that never had one. Any other error
+from the endpoint (for example a `500`) still fails the run.
+
 See the Snyk docs on [roles and scopes by plan](https://docs.snyk.io/scan-fix-and-prevent/scan-with-snyk/snyk-api-web/managing-account/roles-and-scopes-by-plan) and [understanding permissions](https://docs.snyk.io/scan-fix-and-prevent/scan-with-snyk/snyk-api-web/managing-account/understanding-permissions).
 
 ## Linear Permissions
