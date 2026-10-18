@@ -156,22 +156,22 @@ func Next(issues []item, runs []runStatus, o queueOptions) (int, int, string) {
 			continue
 		}
 		areas := issueAreas(c)
-		if len(areas) == 0 {
-			// An issue that names no area is held, not started, and blocks
-			// no one (issue #132): it is skipped like any other hold, and
-			// the next candidate is still considered.
-			logf("holding #%d: no area label", c.Number)
-			hold("no area label")
-			if o.NoAreaHeld != nil {
-				o.NoAreaHeld(c.Number)
-			}
-			continue
-		}
-		// Issue #136: the acceptance gate. An issue whose body has no
-		// "## Done when" bullets or no "## End-to-end check" text is held,
-		// not started, and blocks no one; the area half of the gate already
-		// ran above, so what is missing here is the body only.
+		// The acceptance gate (issue #132 for the area, #136 for the body),
+		// run as one check: an issue missing both the area and the sections
+		// is held with a reason - and a hold comment - that names everything
+		// it is missing, not just the first thing the gate noticed.
 		if missing := issueReady(c); len(missing) > 0 {
+			if slices.Equal(missing, []string{"area label"}) {
+				// An issue that names no area is held, not started, and
+				// blocks no one (issue #132): it is skipped like any other
+				// hold, and the next candidate is still considered.
+				logf("holding #%d: no area label", c.Number)
+				hold("no area label")
+				if o.NoAreaHeld != nil {
+					o.NoAreaHeld(c.Number)
+				}
+				continue
+			}
 			reason := "not ready: " + strings.Join(missing, ", ")
 			logf("holding #%d: %s", c.Number, reason)
 			hold(reason)
@@ -303,28 +303,58 @@ func issueAreas(it item) []string {
 // issueReady reports what an issue still needs before the queue may start it
 // (issue #136): an area label or a body path naming one, a "## Done when"
 // section with at least one "- " bullet under it, and a "## End-to-end
-// check" section with some text. The names are the gate's own fixed
+// check" section with some real text. The names are the gate's own fixed
 // strings — never issue text — so they are safe to log and to post as a
 // comment. Headings match case-insensitively at levels 1 to 3, and the body
-// is scanned only up to maxBodyScan. Issues whose bodies are generated —
-// ref updates and model experiments — are exempt from the body checks, not
-// from the area check: their body is written by the harness, and the
-// acceptance sections they do need are in refIssueBody.
+// is scanned only up to maxBodyScan.
 func issueReady(it item) (missing []string) {
 	if len(issueAreas(it)) == 0 {
 		missing = append(missing, "area label")
 	}
+	return append(missing, issueBodyReady(it)...)
+}
+
+// issueBodyReady is the body half of the acceptance gate (issue #136): the
+// two section checks of issueReady without the area check, so Next can name
+// the area and the sections in one hold. Issues whose bodies are generated
+// — ref updates and model experiments — are exempt from it, not from the
+// area check: their body is written by the harness, and refIssueBody
+// renders the same acceptance sections into it for the people who read the
+// issue. The queue never reads those sections on a generated body.
+func issueBodyReady(it item) (missing []string) {
 	if it.labelled(refUpdateLabel) || it.labelled(experimentLabel) {
-		return missing // generated body: the body checks do not apply
+		return nil // generated body: the body checks do not apply
 	}
 	body := cappedBody(it.Body)
 	if done, ok := issueSection(body, issueDoneWhenHeading); !ok || !issueHasBullet(done) {
 		missing = append(missing, "## Done when bullets")
 	}
-	if e2e, ok := issueSection(body, issueEndToEndHeading); !ok || strings.TrimSpace(e2e) == "" {
+	e2e, ok := issueSection(body, issueEndToEndHeading)
+	if !ok || strings.TrimSpace(e2e) == "" || holdsE2EPlaceholder(e2e) {
 		missing = append(missing, "## End-to-end check")
 	}
 	return missing
+}
+
+// e2ePlaceholderMarks are the fixed phrases that mark an "## End-to-end
+// check" section as not filled in (issue #136): the placeholder that
+// ProposalBody and issue-template.md render begins with the first phrase
+// and ends with the second, so a truncated or half-edited copy of it still
+// carries one of them. A section that carries any of them holds the issue,
+// so a promoted proposal or a fresh template issue is never queued
+// unfilled. They are the gate's own fixed strings — never issue text — so
+// they are safe to match against an arbitrary body.
+var e2ePlaceholderMarks = []string{"fill in before", "the seams work"}
+
+// holdsE2EPlaceholder reports whether the text of an "## End-to-end check"
+// section still carries part of the unfilled placeholder.
+func holdsE2EPlaceholder(e2e string) bool {
+	for _, mark := range e2ePlaceholderMarks {
+		if strings.Contains(e2e, mark) {
+			return true
+		}
+	}
+	return false
 }
 
 // issueAnyHeading is any markdown heading line, of any level: it ends the

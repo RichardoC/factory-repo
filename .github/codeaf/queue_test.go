@@ -897,6 +897,52 @@ func TestIssueReady(t *testing.T) {
 			}
 		})
 	}
+	// Headings at level 4 or deeper are not acceptance sections: a body
+	// whose "Done when" is only a #### heading misses its bullets, and the
+	// section the #### heading sits in still ends at the next real
+	// heading. Widening the heading regex to any level would pass the
+	// suite, so both halves are pinned.
+	if got := issueReady(withArea("#### Done when\n\n- bullet\n\n## End-to-end check\n\ntext\n")); !slices.Equal(got, []string{"## Done when bullets"}) {
+		t.Fatalf("level-4 Done when accepted: issueReady = %v; want [## Done when bullets]", got)
+	}
+	if got := issueReady(withArea("## Done when\n\n- bullet\n\n#### end-to-end check\n\ntext\n")); !slices.Equal(got, []string{"## End-to-end check"}) {
+		t.Fatalf("level-4 End-to-end check accepted: issueReady = %v; want [## End-to-end check]", got)
+	}
+	if got := issueReady(withArea("#### done when\n\n- bullet\n\n#### end-to-end check\n\ntext\n")); !slices.Equal(got, []string{"## Done when bullets", "## End-to-end check"}) {
+		t.Fatalf("both level-4 accepted: issueReady = %v; want both missing", got)
+	}
+	// The untouched issue template is rejected: its Done when has no
+	// bullet and its End-to-end check is still the placeholder (issue
+	// #136 review), so an issue opened from it and never filled in is
+	// held, not queued.
+	template, err := os.ReadFile("issue-template.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := issueReady(withArea(string(template))); !slices.Equal(got, []string{"## Done when bullets", "## End-to-end check"}) {
+		t.Fatalf("untouched template passes the gate: issueReady = %v; want both missing", got)
+	}
+	// The End-to-end check placeholder marks hold a body whose section is
+	// otherwise well-formed: the whole placeholder, a copy truncated after
+	// the first phrase ("(fill in before") and a half-edited copy that
+	// keeps only the tail phrase. The truncated probe is the review
+	// finding on the first fix round: holding on the full phrase alone let
+	// it through (issue #136).
+	e2eSection := "## Done when\n\n- bullet\n\n## End-to-end check\n\n"
+	for name, e2e := range map[string]string{
+		"whole placeholder":   proposalE2EPlaceholder,
+		"truncated head":      "(fill in before",
+		"half-edited tail":    "the seams work)",
+		"phrase plus command": e2ePlaceholderMarks[0] + " queueing; run: go test ./...",
+	} {
+		if got := issueReady(withArea(e2eSection + e2e + "\n")); !slices.Equal(got, []string{"## End-to-end check"}) {
+			t.Fatalf("%s placeholder accepted: issueReady = %v; want [## End-to-end check]", name, got)
+		}
+	}
+	// A real check with none of the placeholder's phrases passes.
+	if got := issueReady(withArea(e2eSection + "go test -race ./... in .github/codeaf is green\n")); len(got) != 0 {
+		t.Fatalf("real End-to-end check held: issueReady = %v", got)
+	}
 	// A body over 64 KiB is scanned only up to the cap: the sections past
 	// it are invisible to the gate, the ones inside it are found.
 	filler := strings.Repeat("filler line\n", 1)
@@ -930,6 +976,32 @@ func TestNextHoldsUnreadyIssue(t *testing.T) {
 	}
 	if !slices.Contains(lines, "holding #117: not ready: ## Done when bullets, ## End-to-end check") {
 		t.Fatalf("log lines = %v; want the not-ready hold", lines)
+	}
+}
+
+// TestNextHoldsUnreadyIssueWithNoArea pins the combined hold (issue #136
+// review): an issue missing the area label and both sections is held with a
+// reason that names all three, not just the area the earlier check saw
+// first, and the hold comment the queue posts names them too.
+func TestNextHoldsUnreadyIssueWithNoArea(t *testing.T) {
+	o := nextOpts()
+	var lines []string
+	o.Logf = func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
+	held := map[int][]string{}
+	o.NotReadyHeld = func(n int, missing []string) { held[n] = missing }
+	it := queuedIssue(42, "2024-01-01T00:00:00Z", "codeaf-queued")
+	it.Body = "## Problem\n\np\n"
+	if n, _, reason := Next([]item{it}, nil, o); n != 0 || reason != "not ready: area label, ## Done when bullets, ## End-to-end check" {
+		t.Fatalf("Next = %d, %q; want 0, not ready: area label, ## Done when bullets, ## End-to-end check", n, reason)
+	}
+	if want := []string{"area label", "## Done when bullets", "## End-to-end check"}; !slices.Equal(held[42], want) {
+		t.Fatalf("NotReadyHeld missing = %v; want %v", held[42], want)
+	}
+	if !slices.Contains(lines, "holding #42: not ready: area label, ## Done when bullets, ## End-to-end check") {
+		t.Fatalf("log lines = %v; want the combined hold", lines)
+	}
+	if body := notReadyHoldCommentBody(42, held[42]); !strings.Contains(body, "Missing: area label, ## Done when bullets, ## End-to-end check") {
+		t.Fatalf("hold comment = %q; want it to name all three", body)
 	}
 }
 
