@@ -145,7 +145,12 @@ Permissions **not** required (the sync does not write back to Snyk DAST):
 > shows findings. This is the API filtering out everything because the API key
 > has no target visibility — findings are scoped under targets. A token with
 > only `change_finding` + `correlation_viewer` (a common mistake) will see
-> zero findings for this reason. Add `view_target` to fix it.
+> zero findings for this reason. Because an empty snapshot is not a truthful
+> source, the sync now fails the run in this state — with managed tickets
+> present in Linear and a snapshot listing no targets, it returns an error and
+> makes no changes, instead of cancelling every managed ticket as if all
+> findings had gone away (`--dry-run` still reports the plan, logging the same
+> message at error level). Add `view_target` to fix it.
 
 See the Snyk docs on [roles and scopes by plan](https://docs.snyk.io/scan-fix-and-prevent/scan-with-snyk/snyk-api-web/managing-account/roles-and-scopes-by-plan) and [understanding permissions](https://docs.snyk.io/scan-fix-and-prevent/scan-with-snyk/snyk-api-web/managing-account/understanding-permissions).
 

@@ -83,6 +83,17 @@ still exists, move the Linear issue to the resolved (`Done`) state.
 When a previously tracked finding no longer exists because its Snyk DAST target
 no longer exists, cancel the Linear issue instead.
 
+An empty Snyk DAST snapshot is not trusted: if the snapshot lists no targets at
+all while managed issues exist in Linear, the run fails with an error instead of
+resolving anything, and makes no Linear write and no cache refresh. A silently
+empty target and finding list is the documented symptom of an API key without
+the `view_target` permission, of a `SNYK_DAST_TEAM` filter that matches no
+targets, or of an outage — acting on it would cancel every managed ticket in one
+run. In `--dry-run` the plan is still reported, with the same message logged at
+error level. A brand-new deployment with no managed issues yet is not affected.
+The guard covers the "nothing at all" case only; a partial listing is not a
+plausibility failure.
+
 ### Conflict
 
 If multiple Linear issues share the same fingerprint, the sync treats that as a
@@ -402,6 +413,10 @@ closed, even if its hashes are unchanged since the last run.
   never written, never deleted, and read live rather than from the snapshot.
 - Linear issue history matters, so deleting and recreating all issues is a last resort, not a normal repair path.
 - Cache bypass is the correct operator action when the rendering schema or compare logic changes.
+- An empty Snyk DAST snapshot alongside existing managed issues is treated as an
+  implausible source, not as "every finding went away": the run fails rather
+  than cancelling all managed tickets (see Resolve). Only the "nothing at all"
+  case is guarded; a partial listing is a separate concern.
 
 ## Operator Guidance
 
