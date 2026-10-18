@@ -403,9 +403,27 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		}
 
 		if matched {
+			// A fix arriving for an "ignored until fix available" finding: Snyk
+			// flips ignored=false, the issue comes back as open, and the sync
+			// must move the ticket it parked in Backlog out again. Computed
+			// once here because both the Backlog override below and the
+			// due-date recalculation further down depend on it.
+			//
+			// With LINEAR_AWAITING_FIX_LABEL=off the metadata records no
+			// awaiting-fix label, wasAwaitingFix is always false, and the sync
+			// cannot tell its own Backlog placement from a manual one: the
+			// ticket stays in Backlog as it did before.
+			fixNowAvailable := finding.Status == model.FindingOpen && wasAwaitingFix(existing.ManagedLabels, s.cfg.Linear.Labels.AwaitingFix)
+			// The sync itself parked this ticket in Backlog while Snyk reported
+			// the ignore as "until fix available". That is not a manual triage
+			// decision, so neither override below may treat it as one.
+			syncParkedInBacklog := fixNowAvailable && isConfiguredBacklogState(existing.StateName, s.cfg.Linear.States.Backlog)
+
 			// Respect manual Backlog override: if a user moved an open ticket from
-			// Todo to Backlog, don't move it back on subsequent syncs.
-			if desired.State == model.StateTodo && isConfiguredBacklogState(existing.StateName, s.cfg.Linear.States.Backlog) {
+			// Todo to Backlog, don't move it back on subsequent syncs. A Backlog
+			// placement the sync itself made for an awaiting-fix finding is not a
+			// manual move, so it is skipped here and the ticket returns to Todo.
+			if desired.State == model.StateTodo && isConfiguredBacklogState(existing.StateName, s.cfg.Linear.States.Backlog) && !syncParkedInBacklog {
 				desired.State = model.StateBacklog
 			}
 			// Respect manual non-terminal state override: when both the desired
@@ -417,8 +435,16 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			// state already matches the configured state, avoiding false-positive
 			// state-change detection due to model state names ("todo") differing
 			// from configured Linear state names ("Triage").
-			if isNonTerminalModelState(desired.State) && isNonTerminalLinearState(existing, s.cfg.Linear.States) {
+			if isNonTerminalModelState(desired.State) && isNonTerminalLinearState(existing, s.cfg.Linear.States) && !syncParkedInBacklog {
 				desired.PreserveState = true
+			}
+
+			// Explain the move out of Backlog in the change comment. Only the
+			// state the sync itself chose is overridden: if a person moved the
+			// awaiting-fix ticket somewhere else (say In Progress), the general
+			// override above still preserves their choice.
+			if syncParkedInBacklog {
+				desired.StateReason = "Snyk reports a fix is now available; moved out of Backlog"
 			}
 
 			// Sticky due date for the updated_at re-detection fallback: Snyk
@@ -444,7 +470,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			// fresh SLA from fix-availability gives a meaningful triage
 			// deadline without the daily churn that the old floor-to-today
 			// caused for all overdue issues.
-			if finding.Status == model.FindingOpen && wasAwaitingFix(existing.ManagedLabels, s.cfg.Linear.Labels.AwaitingFix) {
+			if fixNowAvailable {
 				desired.DueDate, desired.DueDateBase, desired.DueDateReason = issueDueDateFromFixAvailability(s.cfg.Linear.Due, finding)
 			}
 
