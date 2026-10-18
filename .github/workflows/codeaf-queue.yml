@@ -57,6 +57,13 @@ permissions:
   contents: read
   issues: write # add `codeaf`, remove `codeaf-queued`
   actions: write # dispatch codeaf.yml
+  # Read: the issues endpoint lists pull requests only to a token that can
+  # read them, and the queue picks PRs labelled codeaf-review-needed /
+  # codeaf-continue-needed (issue #137) and reads their changed files (issue
+  # #132). Write: it removes those labels once the run is dispatched. Without
+  # this the PRs were silently missing from issues.json and no review ever
+  # started (PR #174). This job runs no agent.
+  pull-requests: write
 
 env:
   CODEAF_LABEL: codeaf

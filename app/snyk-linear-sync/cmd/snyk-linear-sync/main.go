@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 
 	"github.com/tesslio/snyk-linear-sync/internal/cache"
 	"github.com/tesslio/snyk-linear-sync/internal/config"
@@ -36,7 +38,17 @@ func main() {
 }
 
 func run(cfg config.Config, logger *slog.Logger) error {
-	ctx := context.Background()
+	// Ctrl-C and a scheduler's SIGTERM both cancel the context instead of
+	// killing the process outright. Calls in flight are cancelled (a write may
+	// or may not have reached Linear), no further jobs start, Run returns the
+	// context error, and the cache is left untouched, so the next run
+	// re-examines everything against Linear's live state.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		logger.Info("shutdown requested, cancelling in-flight calls and leaving the cache untouched")
+	}()
 
 	snyk, err := snykclient.New(ctx, cfg, logger.With("service", "snyk"))
 	if err != nil {

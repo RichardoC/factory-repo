@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/tesslio/snyk-linear-sync/internal/cache"
@@ -54,7 +56,10 @@ func main() {
 		slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}),
 	))
 
-	ctx := context.Background()
+	// Same signal handling as the sync command: Ctrl-C or SIGTERM cancels the
+	// context rather than killing the process mid-call.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	snyk, err := snykclient.New(ctx, cfg, logger.With("service", "snyk"))
 	if err != nil {
