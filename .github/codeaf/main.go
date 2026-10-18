@@ -66,7 +66,7 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("harness: ")
 	if len(os.Args) < 2 {
-		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|plan-check|plan-brief|plan-report|ref-check|merge-default|search|metrics")
+		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|plan-check|plan-brief|plan-report|ref-check|merge-default|search|metrics|gh-retry")
 	}
 	commands := map[string]func() error{
 		"proxy":         runProxy,
@@ -112,6 +112,10 @@ func main() {
 		// The deterministic gate on a workflow change published without a
 		// maintainer's approval (workflowpolicy.go).
 		"workflow-policy": runWorkflowPolicy,
+		// Retry a GitHub CLI write call on transient upstream failures --
+		// 5xx or a network error, never 4xx (issue #146). Meant for the
+		// publish job's write calls (gh-retry -- gh ...); not wired yet.
+		"gh-retry": runGhRetry,
 		// Splitting a patch the policy refused (patchsplit.go): the part
 		// under .github/ outside .github/codeaf/ goes to REFUSED for a
 		// maintainer; everything else still publishes.
@@ -125,6 +129,13 @@ func main() {
 		log.Fatalf("unknown command %q", os.Args[1])
 	}
 	if err := command(); err != nil {
+		// Only "harness gh-retry" ends here: its exit code is the wrapped
+		// command's own (ghRetryExitCodeError, gh-retry.go), and that
+		// command's output was already forwarded, so print nothing more.
+		var ghCode ghRetryExitCodeError
+		if errors.As(err, &ghCode) {
+			os.Exit(ghCode.code)
+		}
 		log.Fatal(err)
 	}
 }
@@ -1637,7 +1648,12 @@ type item struct {
 	CreatedAt   string          `json:"created_at"`
 	PullRequest json.RawMessage `json:"pull_request"` // present on issues that are PRs
 	Head        struct {
-		Ref  string `json:"ref"`
+		Ref string `json:"ref"`
+		// SHA is the head commit SHA, present on the JSON the pulls API
+		// returns (/pulls/N); the issues-list JSON does not carry it. The
+		// queue reads it for the stranded re-pick marker (issue #215), as
+		// untrusted data like every other API field.
+		SHA  string `json:"sha"`
 		Repo *struct {
 			FullName string `json:"full_name"`
 		} `json:"repo"`
