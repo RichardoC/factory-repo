@@ -190,6 +190,31 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		}
 	}
 
+	// An empty Snyk DAST snapshot is not evidence that every finding went
+	// away. The documented symptom of an API key without the view_target
+	// permission — and of a SNYK_DAST_TEAM filter that matches no targets, or
+	// of an outage that returns success with no results — is a silently empty
+	// target and finding list. Resolving on such a snapshot would cancel every
+	// managed ticket in one run, so refuse instead: the only safe reading of
+	// "no targets at all" alongside existing managed issues is that the
+	// snapshot is not a truthful source right now. A brand-new deployment with
+	// no managed issues yet is unaffected. This is deliberately not a
+	// percentage threshold: a partial listing is a separate concern.
+	if len(snykdastSnapshot.TargetIDs) == 0 && len(existingByFingerprint) > 0 {
+		message := "the Snyk DAST snapshot contains no targets while managed Linear issues exist; " +
+			"this is the documented symptom of an API key without the view_target permission " +
+			"(target and finding queries silently return empty results), or of " +
+			"SNYK_DAST_TEAM matching no targets; " +
+			"grant view_target to the API key, or fix SNYK_DAST_TEAM, before running the sync again"
+		if s.cfg.DryRun {
+			// A dry run must still show the plan it would have executed, but
+			// the operator has to see that a live run would refuse.
+			s.logger.Error(message)
+		} else {
+			return RunResult{}, fmt.Errorf("%s", message)
+		}
+	}
+
 	desiredByFingerprint := make(map[string]model.DesiredIssue, len(findings))
 	snykdastHashes := make(map[string]string, len(findings))
 	for _, finding := range findings {

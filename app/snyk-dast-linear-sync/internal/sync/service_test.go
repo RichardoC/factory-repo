@@ -6,7 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+<<<<<<< b4539e03895fa4fe914372d5c985251d0e25ed2e
 	"reflect"
+=======
+	"path/filepath"
+>>>>>>> ef15a7a752be8b88bd302f5bd39de5c8e4341321
 	"slices"
 	"strings"
 	"sync"
@@ -1323,6 +1327,236 @@ func minimalCfg() config.Config {
 			},
 		},
 		Sync: config.SyncConfig{Workers: 1},
+	}
+}
+
+// emptySnykDASTSnapshot is a snapshot whose target and finding lists came
+// back empty: the documented symptom of an API key without the view_target
+// permission, of a team filter matching no targets, or of an outage.
+func emptySnykDASTSnapshot() model.SnykDASTSnapshot {
+	return model.SnykDASTSnapshot{}
+}
+
+func openManagedIssues() []model.ExistingIssue {
+	return []model.ExistingIssue{
+		{
+			ID:          "existing-1",
+			Identifier:  "SEC-1",
+			Title:       "finding on project-a",
+			Description: "old description",
+			StateName:   "Todo",
+			Fingerprint: "snyk-dast:project-a:finding-1",
+		},
+		{
+			ID:          "existing-2",
+			Identifier:  "SEC-2",
+			Title:       "finding on project-b",
+			Description: "old description",
+			StateName:   "In Progress",
+			Fingerprint: "snyk-dast:project-b:finding-2",
+		},
+	}
+}
+
+func cacheSavedIsEmpty(saved cache.Snapshot) bool {
+	return saved.SchemaSignature == "" && len(saved.SnykDASTHashes) == 0 && len(saved.LinearHashes) == 0
+}
+
+func TestRunRefusesToResolveFromEmptySnapshot(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	snykdast := fakeSnykDAST{snapshot: emptySnykDASTSnapshot()}
+	cacheStore := &fakeCache{
+		// Pre-load a plausible cache so a stray save would be observable.
+		snapshot: cache.Snapshot{
+			SchemaSignature: managedSchemaSignature(),
+			SnykDASTHashes:  map[string]string{"snyk-dast:project-a:finding-1": "hash"},
+			LinearHashes:    map[string]string{"snyk-dast:project-a:finding-1": "hash"},
+		},
+	}
+	linear := &fakeLinear{snapshot: openManagedIssues()}
+
+	service := New(cfg, logger, snykdast, linear, cacheStore)
+
+	result, err := service.Run(context.Background())
+	if err == nil {
+		t.Fatal("Run() error = nil, want the empty-snapshot guard error")
+	}
+	if !strings.Contains(err.Error(), "view_target") {
+		t.Fatalf("Run() error = %q, want it to name the view_target remedy", err)
+	}
+	if len(linear.updated) != 0 {
+		t.Fatalf("updated = %d entries, want 0 (no Linear write)", len(linear.updated))
+	}
+	if !cacheSavedIsEmpty(cacheStore.saved) {
+		t.Fatalf("cache saved = %#v, want zero value (cache must not be refreshed)", cacheStore.saved)
+	}
+	if result.PlannedResolves != 0 {
+		t.Fatalf("PlannedResolves = %d, want 0", result.PlannedResolves)
+	}
+}
+
+func TestRunEmptySnapshotAndNoManagedIssuesSucceeds(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	snykdast := fakeSnykDAST{snapshot: emptySnykDASTSnapshot()}
+	linear := &fakeLinear{}
+
+	service := New(cfg, logger, snykdast, linear, nil)
+
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil for a brand-new deployment", err)
+	}
+	if result.PlannedResolves != 0 {
+		t.Fatalf("PlannedResolves = %d, want 0", result.PlannedResolves)
+	}
+	if len(linear.updated) != 0 || len(linear.created) != 0 {
+		t.Fatalf("writes made: updated=%d created=%d, want none", len(linear.updated), len(linear.created))
+	}
+}
+
+func TestRunEmptySnapshotDryRunReportsPlanWithoutError(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.DryRun = true
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	snykdast := fakeSnykDAST{snapshot: emptySnykDASTSnapshot()}
+	cacheStore := &fakeCache{}
+	linear := &fakeLinear{snapshot: openManagedIssues()}
+
+	service := New(cfg, logger, snykdast, linear, cacheStore)
+
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil in dry-run mode", err)
+	}
+	if result.PlannedResolves != 2 {
+		t.Fatalf("PlannedResolves = %d, want 2 (plan still reported)", result.PlannedResolves)
+	}
+	if len(linear.updated) != 0 {
+		t.Fatalf("updated = %d entries, want 0 (dry run must not write)", len(linear.updated))
+	}
+	if !cacheSavedIsEmpty(cacheStore.saved) {
+		t.Fatalf("cache saved = %#v, want zero value", cacheStore.saved)
+	}
+}
+
+func TestRunStillResolvesWhenOnlyOneTargetDisappears(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// project-a is still listed; its finding is still open. project-b is gone
+	// from the listing entirely, so only its ticket may be cancelled.
+	snykdast := fakeSnykDAST{
+		snapshot: model.SnykDASTSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint:       "snyk-dast:project-a:finding-1",
+					SnykDASTFindingID: "SNYK-100",
+					TargetID:          "project-a",
+					TargetName:        "Example App",
+					TargetHost:        "example.test",
+					IssueTitle:        "Reflected XSS",
+					Severity:          "high",
+					Status:            model.FindingOpen,
+					IssueURL:          "https://example.test/findings/1",
+				},
+			},
+			TargetIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{snapshot: openManagedIssues()}
+
+	service := New(cfg, logger, snykdast, linear, nil)
+
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.PlannedResolves != 1 {
+		t.Fatalf("PlannedResolves = %d, want 1", result.PlannedResolves)
+	}
+	cancelled := cancelledIdentifiers(linear.updates)
+	if len(cancelled) != 1 || cancelled[0] != "SEC-2" {
+		t.Fatalf("cancelled = %v, want only SEC-2 (project-b)", cancelled)
+	}
+	for _, update := range linear.updates {
+		if update.Existing.Identifier == "SEC-1" && update.Desired.State == model.StateCancelled {
+			t.Fatalf("SEC-1 (project-a) was cancelled, want its open state kept: %#v", update)
+		}
+	}
+}
+
+func TestRunEmptySnapshotWithRealCacheKeepsCachedRows(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "cache.db")
+	store, err := cache.Open(path)
+	if err != nil {
+		t.Fatalf("cache.Open() error = %v", err)
+	}
+	defer store.Close()
+
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fingerprint := "snyk-dast:project-a:finding-1"
+	snykdast := fakeSnykDAST{
+		snapshot: model.SnykDASTSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint:       fingerprint,
+					SnykDASTFindingID: "SNYK-100",
+					TargetID:          "project-a",
+					TargetName:        "Example App",
+					TargetHost:        "example.test",
+					IssueTitle:        "Reflected XSS",
+					Severity:          "high",
+					Status:            model.FindingOpen,
+					IssueURL:          "https://example.test/findings/1",
+				},
+			},
+			TargetIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	managedIssue := model.ExistingIssue{
+		ID:          "existing-1",
+		Identifier:  "SEC-1",
+		Title:       "finding on project-a",
+		Description: "old description",
+		StateName:   "Todo",
+		Fingerprint: fingerprint,
+	}
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{managedIssue}}
+
+	// First run: a healthy snapshot, seeded into the real SQLite cache.
+	first := New(cfg, logger, snykdast, linear, store)
+	if _, err := first.Run(ctx); err != nil {
+		t.Fatalf("first Run() error = %v", err)
+	}
+
+	// Second run: the snapshot comes back empty while the managed issue
+	// exists in Linear. The guard must refuse and leave the cache untouched.
+	second := New(cfg, logger, fakeSnykDAST{snapshot: emptySnykDASTSnapshot()}, &fakeLinear{
+		snapshot: []model.ExistingIssue{managedIssue},
+	}, store)
+	_, err = second.Run(ctx)
+	if err == nil {
+		t.Fatal("second Run() error = nil, want the empty-snapshot guard error")
+	}
+	if !strings.Contains(err.Error(), "view_target") {
+		t.Fatalf("second Run() error = %q, want it to name the view_target remedy", err)
+	}
+
+	cached, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("store.Load() error = %v", err)
+	}
+	if cached.SchemaSignature != managedSchemaSignature() {
+		t.Fatalf("cached schema signature = %q, want %q", cached.SchemaSignature, managedSchemaSignature())
+	}
+	if _, ok := cached.SnykDASTHashes[fingerprint]; !ok {
+		t.Fatalf("cached Snyk DAST hashes lost the first run row: %#v", cached.SnykDASTHashes)
+	}
+	if _, ok := cached.LinearHashes[fingerprint]; !ok {
+		t.Fatalf("cached Linear hashes lost the first run row: %#v", cached.LinearHashes)
 	}
 }
 

@@ -509,6 +509,35 @@ func TestPublishRecreatesConflictedMerge(t *testing.T) {
 	}
 }
 
+// main moving on between the run and publish is the common case on a busy
+// queue: the recorded base tip is then an ancestor of main (compare says
+// "ahead"), and publish still recreates the run's merge from the same parents.
+func TestPublishRecreatesMergeAfterMainMoved(t *testing.T) {
+	r, _, pr, mainTip := divergedConflict(t)
+	origin := r.withOrigin("pr", "main")
+	baseFile, infoFile, stateFile := artifactDir(t)
+
+	if _, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r)); err != nil {
+		t.Fatalf("runMerge: %v", err)
+	}
+	later := r.commit("later main change", map[string]string{"f.txt": "a\nb\nC\n", "g.txt": "x\n", "h.txt": "new\n", "i.txt": "later\n"}, mainTip)
+	r.setBranch("main", later)
+	gitTest(t, r.dir, "push", "-q", origin, "refs/heads/main:refs/heads/main")
+
+	pub := publishCheckout(t, origin, "pr")
+	got, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, dagCompare(r))
+	if err != nil {
+		t.Fatalf("publishMerge after main moved: %v", err)
+	}
+	if got.State != mergeKindConflicted {
+		t.Fatalf("state = %q, want conflicted", got.State)
+	}
+	head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD"))
+	if parents := gitTest(t, pub, "log", "--format=%P", "-1", head); strings.Fields(parents)[0] != pr || strings.Fields(parents)[1] != mainTip {
+		t.Fatalf("recreated merge parents = %s, want the recorded [%s %s]", parents, pr, mainTip)
+	}
+}
+
 // A behind-but-clean PR gets a merge commit even when the run merged nothing:
 // publish merges the base tip first, then the patch applies on top.
 func TestPublishMergesFirstWhenClean(t *testing.T) {
