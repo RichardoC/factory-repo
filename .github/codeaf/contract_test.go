@@ -280,7 +280,8 @@ func TestContract(t *testing.T) {
 		if code != 0 {
 			t.Fatalf("next: exit %d, stderr: %s", code, stderr)
 		}
-		if want := "number=3\nlane=0\n"; stdout != want {
+		// Issue #137: next names the kind of run it picked.
+		if want := "kind=issue\nnumber=3\nlane=0\n"; stdout != want {
 			t.Errorf("next stdout =\n%q\nwant\n%q", stdout, want)
 		}
 		// A missing week-spend total must fail the pick: fail closed, no
@@ -373,11 +374,16 @@ func TestContract(t *testing.T) {
 	t.Run("continue-plan", func(t *testing.T) {
 		needContractBin(t)
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/repos/o/r/issues/5/comments" {
+			switch r.URL.Path {
+			case "/repos/o/r/issues/5/comments":
+				w.Write([]byte("[]")) // no comments: no report, so 0 continuations used
+			case "/repos/o/r/pulls/5":
+				// Issue #137: after a done stop continue-plan reads the PR's
+				// merge state; a clean PR needs no continuation.
+				w.Write([]byte(`{"number":5,"mergeable_state":"clean"}`))
+			default:
 				http.NotFound(w, r)
-				return
 			}
-			w.Write([]byte("[]")) // no comments: no report, so 0 continuations used
 		}))
 		defer server.Close()
 		body := filepath.Join(t.TempDir(), "continue.md")
