@@ -440,7 +440,9 @@ On a normal run:
 2. Load the current Linear snapshot.
 3. Skip fingerprints whose source hash and Linear hash both match the last successful run.
 4. Apply creates, updates, and resolves for the rest.
-5. Refresh the cache from the live post-write Linear snapshot.
+5. Refresh the cache from the live post-write Linear snapshot. A fingerprint
+   whose Linear write failed in this run is left out of the refresh, so the next
+   run retries it instead of skipping it as unchanged.
 
 The cache fast-path never suppresses a pending move into a terminal state
 (`Done`/`Cancelled`). Use `--bypass-cache` to ignore the cache for a run and
