@@ -34,7 +34,11 @@ package main
 //     the key is piped to, pick the checkout ref, set $GITHUB_ENV);
 //   - every action is pinned to a full commit SHA and already used, at that
 //     SHA, somewhere in the default branch's workflows (no new actions);
-//   - no new `run:` script interpolates `github.event` (script injection).
+//   - no new `run:` script interpolates `github.event` (script injection);
+//   - a new or changed `run:` script does not install from a moving ref
+//     (`@main`, `@master`, `@latest`, `@release-*`) or pipe a download
+//     into a shell, and pins pip and npm installs and clone branches
+//     (heuristics for these, not a parser).
 //
 // What the rules cannot judge — whether a changed `run:` script is correct
 // or benign — is left to the independent review run on the PR, and the
@@ -253,6 +257,7 @@ func WorkflowPolicy(before, after map[string]map[string]any) []string {
 
 	knownUses := collectUses(before)
 	knownEventRuns := collectEventRuns(before)
+	knownJobRuns := collectJobRuns(before)
 
 	names := make([]string, 0, len(after))
 	for name := range after {
@@ -386,6 +391,9 @@ func WorkflowPolicy(before, after map[string]map[string]any) []string {
 				if r, ok := sm["run"].(string); ok && strings.Contains(r, "${{") && strings.Contains(r, "github.event") && !knownEventRuns[r] {
 					add("%s interpolates github.event into a run script; pass it through env instead", label)
 				}
+				if r, ok := sm["run"].(string); ok && !knownJobRuns[name+"\x1f"+id][r] && unpinnedInstall(r) {
+					add("%s installs from a moving ref or pipes a download into a shell; pin a version or SHA", label)
+				}
 			}
 		}
 	}
@@ -394,8 +402,8 @@ func WorkflowPolicy(before, after map[string]map[string]any) []string {
 }
 
 func runWorkflowPolicy() error {
-	if len(os.Args) != 4 {
-		return errors.New("usage: harness workflow-policy BEFORE_DIR AFTER_DIR")
+	if len(os.Args) != 4 && len(os.Args) != 5 {
+		return errors.New("usage: harness workflow-policy BEFORE_DIR AFTER_DIR [BASE_DIR]")
 	}
 	before, err := loadWorkflowDir(os.Args[2])
 	if err != nil {
@@ -409,6 +417,19 @@ func runWorkflowPolicy() error {
 		return errors.New("no default-branch workflows to compare against; refusing")
 	}
 	violations := WorkflowPolicy(before, after)
+	if len(os.Args) == 5 {
+		// A third directory means the patch's own base commit: judge the
+		// patch against what it was written on, not a default branch that
+		// may have moved under it, and name the workflows that moved.
+		base, err := loadWorkflowDir(os.Args[4])
+		if err != nil {
+			return fmt.Errorf("patch-base workflows: %w", err)
+		}
+		if len(base) == 0 {
+			return errors.New("no patch-base workflows to compare against; refusing")
+		}
+		violations = policyAgainstBase(before, after, base)
+	}
 	for _, line := range violations {
 		fmt.Println(line)
 	}
@@ -417,4 +438,156 @@ func runWorkflowPolicy() error {
 	}
 	fmt.Println("workflow policy: ok")
 	return nil
+}
+
+// unpinnedInstall is the moving-ref/piped-shell rule for run scripts. The
+// checks below are heuristics, not a parser: they catch the common
+// spellings of installing from a moving ref or piping a download into a
+// shell, and they may miss exotic ones; the shell's grammar is not parsed.
+// RE2 has no lookahead, so the pip and npm cases match the install line
+// first and then check the matched text for a pin.
+var (
+	// A ref/spec that moves: a branch, a tag-like release-*, or latest.
+	movingRef = `(main|master|latest|release-[^\s"',]*)`
+	// go install/go run something@moving.
+	movingRefInstall = regexp.MustCompile(`(go install|go run)\s+\S+@` + movingRef)
+	// A package specifier with no @version at its end, e.g. "pkg" or
+	// "@scope/pkg" in an npm/yarn global install.
+	npmPkgUnpinned = regexp.MustCompile(`^(@[^/\s]+/)?[^@\s]+/?$`)
+	// A specifier ending in a moving ref: pkg@latest, pkg@main, @sc/pkg@release-1.
+	specMovingRef = regexp.MustCompile(`@` + movingRef + `(?:[\s,;]|$)`)
+	// npm/yarn global installs, with or without the leading sub-command.
+	npmInstallLine = regexp.MustCompile(`(?:npm\s+(?:i|install)|yarn\s+(?:global\s+add|add\s+-g|global\s+install))\s+(?:-g\s+|--global\s+)?([^\n]+)`)
+	pipedShell     = regexp.MustCompile(`(curl|wget)\b[^\n]*\|\s*(sudo\s+)?(ba|z)?sh\b`)
+	pipInstallLine = regexp.MustCompile(`pip3?\s+install\s+([^\n]*)`)
+	gitCloneBranch = regexp.MustCompile(`git[[:space:]]+clone[^\n]*(-b|--branch)[[:space:]]+(main|master)\b`)
+)
+
+// stripShellComments drops a trailing `# ...` comment from every line, so a
+// commented-out install is not judged as one (and a `==` inside a comment
+// cannot pin a real install line). It is a heuristic: a `#` inside a quoted
+// string is treated as a comment too, which can only make the rule miss,
+// never refuse a pinned line.
+func stripShellComments(script string) string {
+	lines := strings.Split(script, "\n")
+	for i, line := range lines {
+		if j := strings.Index(line, "#"); j >= 0 {
+			lines[i] = line[:j]
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// specPinned reports whether a pip/npm package specifier carries a pin: an
+// exact `==`, a specific version via `@`, or any other version constraint
+// (`>=`, `~=`, `<=`). A bare `@latest`/`@main` is not a pin.
+func specPinned(spec string) bool {
+	spec = strings.TrimSpace(spec)
+	if i := strings.Index(spec, "#"); i >= 0 {
+		spec = strings.TrimSpace(spec[:i])
+	}
+	if spec == "" {
+		return true // nothing to judge
+	}
+	word := strings.Fields(spec)[0]
+	if strings.Contains(word, "==") {
+		return true
+	}
+	if at := strings.LastIndex(word, "@"); at > 0 {
+		// @main/@latest/@release-* is a moving ref, not a pin.
+		return !specMovingRef.MatchString(word)
+	}
+	for _, op := range []string{">=", "<=", "~=", "!=", ">", "<"} {
+		if strings.Contains(spec, op) {
+			return true
+		}
+	}
+	return false
+}
+
+// unpinnedInstall reports whether a run script installs from a moving ref
+// (a branch-like version: @main, @master, @latest, @release-*) or pipes a
+// download into a shell. Heuristics, not a parser: the checks below catch
+// the common spellings and may miss exotic ones; RE2 has no lookahead, so
+// the pip and npm cases match the install line first and then inspect the
+// matched specifiers. Commented-out lines are ignored.
+func unpinnedInstall(script string) bool {
+	// Comments are stripped first, so a commented-out install is judged by
+	// nothing: the rule is about what the script runs.
+	body := stripShellComments(script)
+	if movingRefInstall.MatchString(body) || pipedShell.MatchString(body) || gitCloneBranch.MatchString(body) {
+		return true
+	}
+	for _, m := range pipInstallLine.FindAllStringSubmatch(body, -1) {
+		args := strings.TrimSpace(m[1])
+		// -r/-c/requirement files and editable/local installs name no
+		// version here; they are not what this rule is about.
+		if args == "" || strings.HasPrefix(args, "-") || strings.HasPrefix(args, ".") {
+			continue
+		}
+		if !specPinned(args) {
+			return true
+		}
+	}
+	for _, m := range npmInstallLine.FindAllStringSubmatch(body, -1) {
+		for _, pkg := range strings.Fields(m[1]) {
+			if strings.HasPrefix(pkg, "-") {
+				continue
+			}
+			if npmPkgUnpinned.MatchString(pkg) || !specPinned(pkg) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// collectJobRuns gathers, per workflow and job id, every `run` script the
+// job already has on the default branch; a script in the set is unchanged
+// by the patch and so is judged by no new-script rule.
+func collectJobRuns(wfs map[string]map[string]any) map[string]map[string]bool {
+	runs := map[string]map[string]bool{}
+	for name, wf := range wfs {
+		for id, job := range asMap(wf["jobs"]) {
+			set := map[string]bool{}
+			for _, step := range asSlice(asMap(job)["steps"]) {
+				if r, ok := asMap(step)["run"].(string); ok {
+					set[r] = true
+				}
+			}
+			runs[name+"\x1f"+id] = set
+		}
+	}
+	return runs
+}
+
+// policyAgainstBase computes the patched workflows' violations against the
+// patch's own base commit instead of the moved default branch, and names
+// every workflow that changed on the default branch since that base: the
+// patch cannot rebase those away, so a GITHUB_TOKEN push cannot carry them
+// and the branch has to be rebased first.
+func policyAgainstBase(before, after, base map[string]map[string]any) []string {
+	violations := WorkflowPolicy(base, after)
+	// Both sides: a workflow added on the default branch since the base is
+	// a move too, and one the patch never saw.
+	seen := map[string]bool{}
+	names := make([]string, 0, len(base)+len(before))
+	for _, set := range []map[string]map[string]any{base, before} {
+		for name := range set {
+			if !seen[name] {
+				seen[name] = true
+				names = append(names, name)
+			}
+		}
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		bw, inBefore := before[name]
+		ow, inBase := base[name]
+		if inBefore != inBase || !reflect.DeepEqual(bw, ow) {
+			violations = append(violations, fmt.Sprintf("%s: changed on the default branch since the patch's base; rebase the branch before it can publish", name))
+		}
+	}
+	sort.Strings(violations)
+	return violations
 }

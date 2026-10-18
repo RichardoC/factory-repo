@@ -649,6 +649,11 @@ func runReviewBrief() error {
 			parts = append(parts, fmt.Sprintf("(the issue this PR closes, #%d, is unavailable: %s)\n", n, escapeMD(err.Error(), 200, true)))
 		} else {
 			parts = append(parts, fmt.Sprintf("## The issue this PR closes (#%d) — %s\n\n%s", n, escapeMD(closes.Title, 200, true), closes.Body))
+			// Issue #139: the app rules travel with the issue, exactly as
+			// runBrief embeds them for the worker.
+			if rules := appRulesSections(gh, issueAreas(closes)); rules != "" {
+				parts = append(parts, rules)
+			}
 		}
 	}
 	diff, err := gh.diff(number)

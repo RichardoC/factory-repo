@@ -66,7 +66,7 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("harness: ")
 	if len(os.Args) < 2 {
-		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|plan-check|plan-brief|plan-report|ref-check|merge-default|search")
+		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|plan-check|plan-brief|plan-report|ref-check|merge-default|search|metrics")
 	}
 	commands := map[string]func() error{
 		"proxy":         runProxy,
@@ -106,9 +106,19 @@ func main() {
 		// Web search through the proxy (issue #58): the CLI posts to the
 		// proxy on 127.0.0.1; the key never leaves the proxy.
 		"search": runSearch,
+		// Per-run records, summed (issue #140): a Markdown summary of the
+		// run records the shared state bundle carries.
+		"metrics": runMetrics,
 		// The deterministic gate on a workflow change published without a
 		// maintainer's approval (workflowpolicy.go).
 		"workflow-policy": runWorkflowPolicy,
+		// Splitting a patch the policy refused (patchsplit.go): the part
+		// under .github/ outside .github/codeaf/ goes to REFUSED for a
+		// maintainer; everything else still publishes.
+		"patch-split": runPatchSplit,
+		// The PR comment body for a refused part of a patch
+		// (refusedcomment.go): reason plus the refused diff in a fence.
+		"refused-comment": runRefusedComment,
 	}
 	command, ok := commands[os.Args[1]]
 	if !ok {
@@ -843,12 +853,28 @@ type LedgerLine struct {
 	// must not land in the ledger.
 	QueryLen int `json:"query_len,omitempty"`
 	Results  int `json:"results,omitempty"`
+	// Status is the upstream HTTP status when upstream answered with anything
+	// other than 200 (issue #140); 0 on a recorded call. The line is written
+	// as a marker (kind "status"), so every report figure that counts calls
+	// or timing skips it, the way it skips proxy_start and search lines.
+	Status int `json:"status,omitempty"`
 }
 
+<<<<<<< 551588be9ae03bf01220e9e892c4fa0bb2676e2f
 func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slotWait, headerWait time.Duration, chars charCounts, repaired int) {
+=======
+func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slotWait time.Duration, chars charCounts, repaired, status int) {
+>>>>>>> ef15a7a752be8b88bd302f5bd39de5c8e4341321
 	line := LedgerLine{Time: time.Now().UTC(), Model: m.ID, Upstream: m.Upstream, Stream: stream,
 		Start: start.UTC(), SlotWaitS: slotWait.Seconds(), HeaderMs: headerWait.Milliseconds(),
 		ReasoningChars: chars.reasoning, OutputChars: chars.output, RepairedToolArgs: repaired}
+	if status != 0 {
+		// A non-200 upstream answer is recorded as a status line (issue #140):
+		// it carries no usage and no cost, and the kind keeps it out of every
+		// call and timing figure the report computes.
+		line.Kind = "status"
+		line.Status = status
+	}
 	if usage != nil {
 		line.UsageSeen = true
 		line.PromptTokens, line.CachedTokens, line.CompletionTokens = usage.PromptTokens, usage.cached(), usage.CompletionTokens
@@ -857,7 +883,9 @@ func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slot
 		if n, ok := usage.reasoningTokens(); ok {
 			line.ReasoningTokens = &n
 		}
-	} else {
+	} else if status == 0 {
+		// A refused call has no usage by construction; only a 200 without
+		// usage is worth a warning.
 		log.Printf("warning: %s returned no usage; this call is unpriced", m.Upstream)
 	}
 	p.mu.Lock()
@@ -1291,6 +1319,10 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 	if response.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(response.Body)
 		log.Printf("upstream %d for %s: %.300s", response.StatusCode, m.Upstream, data)
+		// The refusal goes in the ledger too (issue #140): a run whose
+		// upstream kept answering 429 costs real time, and the record
+		// counts it. No usage, no cost.
+		p.record(m, nil, stream, started, slotWait, charCounts{}, repaired, response.StatusCode)
 		if out == nil {
 			w.Header().Set("Content-Type", response.Header.Get("Content-Type"))
 			w.WriteHeader(response.StatusCode)
@@ -1692,7 +1724,11 @@ func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, st
 		chars.addChoices(choices, "message")
 	}
 	payload["model"], _ = json.Marshal(m.ID)
+<<<<<<< 551588be9ae03bf01220e9e892c4fa0bb2676e2f
 	p.record(m, usage, false, started, slotWait, headerWait, chars, repaired)
+=======
+	p.record(m, usage, false, started, slotWait, chars, repaired, 0)
+>>>>>>> ef15a7a752be8b88bd302f5bd39de5c8e4341321
 	writeJSON(w, http.StatusOK, payload)
 }
 
@@ -1787,7 +1823,11 @@ func (p *proxy) relayStream(out *sseSink, upstream io.Reader, m Model, started t
 	}
 	close(stop)
 	done.Wait()
+<<<<<<< 551588be9ae03bf01220e9e892c4fa0bb2676e2f
 	p.record(m, usage, true, started, slotWait, headerWait, chars, repaired)
+=======
+	p.record(m, usage, true, started, slotWait, chars, repaired, 0)
+>>>>>>> ef15a7a752be8b88bd302f5bd39de5c8e4341321
 }
 
 // ---------------------------------------------------------------- GitHub
@@ -2827,6 +2867,11 @@ func runBrief() error {
 		// Issue #136: name the acceptance sections right after the issue
 		// body they live in, so the bar to clear is the worker's last read.
 		parts = append(parts, "The sections `## Done when` and `## End-to-end check` above are the acceptance criteria.")
+		// Issue #139: the app the issue names carries its own rules with
+		// the brief, so they are read with the task, not hunted in a README.
+		if rules := appRulesSections(gh, issueAreas(issue)); rules != "" {
+			parts = append(parts, rules)
+		}
 		if issue.Comments > 0 {
 			thread, err := gh.thread(number)
 			if err != nil {
@@ -2866,6 +2911,11 @@ func runBrief() error {
 				parts = append(parts, fmt.Sprintf("## The issue this PR closes (#%d) — %s\n\n%s", n, escapeMD(closes.Title, 200, true), closes.Body))
 				// Issue #136: the acceptance sections govern a continuation too.
 				parts = append(parts, "The sections `## Done when` and `## End-to-end check` above are the acceptance criteria.")
+				// Issue #139: the rules come from the issue the PR closes,
+				// the same way they would in issue mode.
+				if rules := appRulesSections(gh, issueAreas(closes)); rules != "" {
+					parts = append(parts, rules)
+				}
 			}
 		}
 		var reviews []reviewComment
@@ -3873,13 +3923,32 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 	// The ::error:: lines the publish steps collected: the two most recent are
 	// the cause of a failed publish. Read as data: the prefix is stripped and
 	// the line is escaped and capped, so a crafted error line stays a line.
+	// Workflow-policy refusals (issue #138) get their own heading so the rule
+	// is visible and not only its count, and not again in the table. They are
+	// escaped like any other publish error: a policy line embeds the patch's
+	// own step name (workflowpolicy.go), which can carry HTML, an @mention or
+	// a backtick, so it is untrusted data too.
 	if errs := in.PublishErrors; len(errs) > 0 {
-		if len(errs) > 2 {
-			errs = errs[len(errs)-2:]
-		}
+		var policy, other []string
 		for _, e := range errs {
 			e = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(e), "::error::"))
+			if strings.HasPrefix(e, "workflow policy: ") {
+				policy = append(policy, e)
+			} else {
+				other = append(other, e)
+			}
+		}
+		if len(other) > 2 {
+			other = other[len(other)-2:]
+		}
+		for _, e := range other {
 			fmt.Fprintf(&b, "| publish error | %s |\n", escapeMD(e, 200, true))
+		}
+		if len(policy) > 0 {
+			b.WriteString("\n### Workflow policy\n\n")
+			for _, e := range policy {
+				fmt.Fprintf(&b, "- %s\n", escapeMD(e, 2000, true))
+			}
 		}
 	}
 	b.WriteString("\n")

@@ -624,7 +624,10 @@ func recreateMerge(dir, branch, baseRef string, info *mergeInfo, baseCommit, hea
 	if err != nil {
 		return out, fmt.Errorf("could not compare the recorded merge's base tip with %s: %w", baseRef, err)
 	}
-	if rel.Status != "behind" && rel.Status != "identical" {
+	// compare(base, head) reports head relative to base: "ahead" means the
+	// base branch has moved on past the recorded tip, which it therefore
+	// contains; "behind" or "diverged" mean the tip is not in the branch.
+	if rel.Status != "ahead" && rel.Status != "identical" {
 		return out, fmt.Errorf("the recorded merge's base tip %s is not contained in %s (compare says %q); refusing the merge", shortSHA(info.Onto), baseRef, rel.Status)
 	}
 	// The merge base is the one the run used: the base of the two parents of

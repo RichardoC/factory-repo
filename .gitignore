@@ -36,3 +36,6 @@ go.work.sum
 __pycache__/
 *.py[cod]
 .github/codeaf/codeaf-harness
+
+# Built app binaries (issue #139: a 3.9 MB exp-int-seed binary sat committed for a day)
+app/exp-int-seed/exp-int-seed

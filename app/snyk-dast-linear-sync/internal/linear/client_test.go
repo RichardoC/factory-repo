@@ -8,14 +8,21 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	gqlclient "git.sr.ht/~emersion/gqlclient"
 
 	"github.com/tesslio/snyk-dast-linear-sync/internal/config"
 	"github.com/tesslio/snyk-dast-linear-sync/internal/model"
+	linSync "github.com/tesslio/snyk-dast-linear-sync/internal/sync"
 )
 
 func TestDesiredLabelIDsReplacesPreviousManagedLabel(t *testing.T) {
@@ -673,8 +680,11 @@ func andArms(t *testing.T, filter map[string]any) []any {
 	if !ok {
 		t.Fatalf("filter must carry an AND arm list, got: %#v", filter)
 	}
-	if len(arms) != 2 {
-		t.Fatalf("AND arms = %d, want 2 (archive window, identity)", len(arms))
+	// The snapshot filter has 2 (archive window, identity); the
+	// reconciliation filter has 1 (identity), so both are accepted here and
+	// each test asserts on the arm it cares about.
+	if len(arms) < 1 || len(arms) > 2 {
+		t.Fatalf("AND arms = %d, want 1 (identity) or 2 (archive window, identity)", len(arms))
 	}
 	return arms
 }
@@ -1131,6 +1141,368 @@ func TestExistingFingerprintsReportsOnlyLiveMatches(t *testing.T) {
 	}
 }
 
+// existingFingerprintsFilter runs ExistingFingerprints against a stub that
+// captures the filter variable, so a test can assert the query's shape.
+func existingFingerprintsFilter(t *testing.T, managedLabel string) map[string]any {
+	t.Helper()
+	var captured map[string]any
+
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID: "team-1",
+			Labels: config.LabelConfig{Managed: managedLabel},
+		},
+		resolvedTeam: "team-1",
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Variables map[string]any `json:"variables"`
+				}
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
+				}
+				if filter, ok := payload.Variables["filter"].(map[string]any); ok {
+					captured = filter
+				}
+				return jsonResponse(t, `{"data":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName:    map[string]string{},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+
+	if _, err := client.ExistingFingerprints(context.Background(), []string{"snyk-dast:project-a:100"}); err != nil {
+		t.Fatalf("ExistingFingerprints() error = %v", err)
+	}
+	if captured == nil {
+		t.Fatal("ExistingFingerprints() did not send a filter variable")
+	}
+	return captured
+}
+
+// TestExistingFingerprintsScopesQueryToManagedTickets pins the reconciliation
+// query to the sync's own tickets. The lookup runs inside the retry path for
+// an ambiguous batch create -- a moment when Linear has just failed a request
+// -- so a filter that does not bound the result set turns one failure on a
+// shared team into paging through every issue in the team.
+func TestExistingFingerprintsScopesQueryToManagedTickets(t *testing.T) {
+	filter := existingFingerprintsFilter(t, "snyk-dast-automation")
+
+	raw, err := json.Marshal(filter)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	// The old shape carried an Or of `description: { contains }` clauses, which
+	// Linear ignores; the fingerprint check belongs on the decoded description,
+	// not in the query predicate.
+	if strings.Contains(string(raw), "description") {
+		t.Fatalf("filter must not constrain description; it does not bound the result set: %s", raw)
+	}
+
+	team, ok := filter["team"].(map[string]any)
+	if !ok {
+		t.Fatalf("filter must constrain team: %#v", filter)
+	}
+	teamID, ok := team["id"].(map[string]any)
+	if !ok {
+		t.Fatalf("team filter must constrain id: %#v", team)
+	}
+	if got := teamID["eq"]; got != "team-1" {
+		t.Fatalf("team.id.eq = %#v, want the configured team", got)
+	}
+
+	clauses := identityArm(t, filter)
+	if len(clauses) != 2 {
+		t.Fatalf("identity clauses = %d, want 2 (title prefix, managed label)", len(clauses))
+	}
+
+	var sawTitle, sawLabel bool
+	for _, rawClause := range clauses {
+		clause, ok := rawClause.(map[string]any)
+		if !ok {
+			t.Fatalf("identity clause is not an object: %#v", rawClause)
+		}
+		if title, ok := clause["title"].(map[string]any); ok {
+			if got := title["startsWith"]; got != titlePrefix {
+				t.Fatalf("title.startsWith = %#v, want %q", got, titlePrefix)
+			}
+			sawTitle = true
+			continue
+		}
+		if labels, ok := clause["labels"].(map[string]any); ok {
+			some, ok := labels["some"].(map[string]any)
+			if !ok {
+				t.Fatalf("labels filter must use `some`, got: %#v", labels)
+			}
+			name, ok := some["name"].(map[string]any)
+			if !ok {
+				t.Fatalf("labels.some must constrain name, got: %#v", some)
+			}
+			if got := name["eqIgnoreCase"]; got != "snyk-dast-automation" {
+				t.Fatalf("labels.some.name.eqIgnoreCase = %#v, want the managed label", got)
+			}
+			sawLabel = true
+			continue
+		}
+		t.Fatalf("identity clause is neither a title nor a labels predicate: %#v", clause)
+	}
+	if !sawTitle {
+		t.Fatal("identity arm lost the title-prefix clause; a retitled ticket is the only thing the label clause misses")
+	}
+	if !sawLabel {
+		t.Fatal("identity arm is missing the managed-label clause")
+	}
+}
+
+// TestExistingFingerprintsOmitsLabelArmWhenLabelManagementDisabled mirrors
+// TestLoadIssuesOmitsLabelClauseWhenLabelManagementDisabled: with
+// LINEAR_MANAGED_LABEL=off there is no label to match, and an arm matching
+// nothing would narrow the reconciliation query rather than widen it.
+func TestExistingFingerprintsOmitsLabelArmWhenLabelManagementDisabled(t *testing.T) {
+	filter := existingFingerprintsFilter(t, "")
+
+	clauses := identityArm(t, filter)
+	if len(clauses) != 1 {
+		t.Fatalf("identity clauses = %d, want 1 (title prefix only)", len(clauses))
+	}
+	clause, ok := clauses[0].(map[string]any)
+	if !ok {
+		t.Fatalf("identity clause is not an object: %#v", clauses[0])
+	}
+	if _, hasLabels := clause["labels"]; hasLabels {
+		t.Fatalf("identity clause must not constrain labels with label management off: %#v", clause)
+	}
+	if _, hasTitle := clause["title"]; !hasTitle {
+		t.Fatalf("identity clause must keep the title prefix: %#v", clause)
+	}
+}
+
+// TestLoadIssuesAndExistingFingerprintsShareIdentityScope pins the shared
+// scope: if one of the two queries drifts, a shared team excludes the other
+// sync's tickets in one read and not the other.
+func TestLoadIssuesAndExistingFingerprintsShareIdentityScope(t *testing.T) {
+	snapshot := identityArm(t, loadIssuesFilter(t, "snyk-dast-automation"))
+	reconciliation := identityArm(t, existingFingerprintsFilter(t, "snyk-dast-automation"))
+
+	if !reflect.DeepEqual(snapshot, reconciliation) {
+		t.Fatalf("identity scopes differ:\nsnapshot:      %#v\nreconciliation: %#v", snapshot, reconciliation)
+	}
+}
+
+// e2eSnykDAST is the Snyk DAST side of the end-to-end Run test: two open
+// findings for one target, so the run plans exactly one create batch.
+type e2eSnykDAST struct{}
+
+func (e2eSnykDAST) LoadSnapshot(context.Context) (model.SnykDASTSnapshot, error) {
+	return model.SnykDASTSnapshot{
+		Findings: []model.Finding{
+			{
+				Fingerprint:       "snyk-dast:project-a:100",
+				SnykDASTFindingID: "SNYK-100",
+				TargetID:          "target-project-a",
+				TargetName:        "Example App",
+				TargetHost:        "example.test",
+				IssueTitle:        "Reflected XSS",
+				Severity:          "high",
+				Status:            model.FindingOpen,
+				IssueURL:          "https://example.test/findings/100",
+				CreatedAt:         time.Date(2026, time.October, 1, 9, 0, 0, 0, time.UTC),
+			},
+			{
+				Fingerprint:       "snyk-dast:project-a:101",
+				SnykDASTFindingID: "SNYK-101",
+				TargetID:          "target-project-a",
+				TargetName:        "Example App",
+				TargetHost:        "example.test",
+				IssueTitle:        "SQL Injection",
+				Severity:          "high",
+				Status:            model.FindingOpen,
+				IssueURL:          "https://example.test/findings/101",
+				CreatedAt:         time.Date(2026, time.October, 1, 9, 30, 0, 0, time.UTC),
+			},
+		},
+		TargetIDs: map[string]struct{}{"target-project-a": {}},
+	}, nil
+}
+
+// hasTitlePrefixArm reports whether the decoded IssueFilter carries the
+// title-prefix identity arm inside its AND/OR structure.
+func hasTitlePrefixArm(filterValue any) bool {
+	filter, ok := filterValue.(map[string]any)
+	if !ok {
+		return false
+	}
+	ands, ok := filter["and"].([]any)
+	if !ok {
+		return false
+	}
+	for _, rawArm := range ands {
+		arm, ok := rawArm.(map[string]any)
+		if !ok {
+			continue
+		}
+		ors, ok := arm["or"].([]any)
+		if !ok {
+			continue
+		}
+		for _, rawClause := range ors {
+			clause, ok := rawClause.(map[string]any)
+			if !ok {
+				continue
+			}
+			if title, ok := clause["title"].(map[string]any); ok {
+				if startsWith, _ := title["startsWith"].(string); startsWith == titlePrefix {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// TestRunReconcilesAmbiguousBatchCreateThroughRealClientScope drives the
+// ambiguous-create reconciliation end to end through sync.Service.Run with the
+// real linear.Client. The first issueCreateBatch dies with a 502 (ambiguous:
+// the mutation may or may not have landed), and the issuesByFingerprint
+// reconciliation is only answered when its filter carries the title-prefix
+// identity arm -- an unscoped query, like the `description contains` shape it
+// replaces, gets an error, which would fail the whole batch instead of
+// reconciling it.
+func TestRunReconcilesAmbiguousBatchCreateThroughRealClientScope(t *testing.T) {
+	var (
+		mu                 sync.Mutex
+		ambiguousLeft      = 1
+		ambiguousSeen      int
+		reconcileCalls     int
+		createDescriptions []string
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		var payload struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			http.Error(w, "unmarshal: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(payload.Query, "query resolveTeam"):
+			_, _ = io.WriteString(w, `{"data":{"teams":{"nodes":[{"id":"team-1","key":"team-1","name":"Team A"}]}}}`)
+		case strings.Contains(payload.Query, "query teamStates"):
+			_, _ = io.WriteString(w, `{"data":{"team":{"states":{"nodes":[{"id":"state-todo","name":"Todo","type":"started"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}`)
+		case strings.Contains(payload.Query, "query existingIssues"):
+			_, _ = io.WriteString(w, `{"data":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`)
+		case strings.Contains(payload.Query, "query managedIssueLabels"):
+			_, _ = io.WriteString(w, `{"data":{"issueLabels":{"nodes":[{"id":"label-managed","name":"snyk-dast-automation","team":{"id":"team-1"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`)
+		case strings.Contains(payload.Query, "query issuesByFingerprint"):
+			mu.Lock()
+			reconcileCalls++
+			mu.Unlock()
+			if !hasTitlePrefixArm(payload.Variables["filter"]) {
+				http.Error(w, "issuesByFingerprint: query is not scoped to managed tickets", http.StatusBadRequest)
+				return
+			}
+			// One of the batch's two creates landed before the response was
+			// lost: fingerprint 100 exists live, 101 does not.
+			_, _ = io.WriteString(w, `{"data":{"issues":{"nodes":[{"id":"i-100","identifier":"SEC-100","description":"body\n<!-- snyk-dast-linear-sync\nfingerprint: snyk-dast:project-a:100\n-->"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`)
+		case strings.Contains(payload.Query, "mutation issueCreateBatch"):
+			mu.Lock()
+			if ambiguousLeft > 0 {
+				ambiguousLeft--
+				ambiguousSeen++
+				mu.Unlock()
+				http.Error(w, "batch create transport failure", http.StatusBadGateway)
+				return
+			}
+			// The retry: record every input, answer success for each alias.
+			for i := 0; ; i++ {
+				input, ok := payload.Variables[fmt.Sprintf("input%d", i)].(map[string]any)
+				if !ok {
+					break
+				}
+				description, _ := input["description"].(string)
+				createDescriptions = append(createDescriptions, description)
+			}
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{"data":{"issueCreate0":{"success":true,"issue":{"id":"i-101","identifier":"SEC-101"}}}}`)
+		default:
+			http.Error(w, "unhandled operation: "+payload.Query, http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	client := New(config.LinearConfig{
+		TeamID: "team-1",
+		APIKey: "test-key",
+		Labels: config.LabelConfig{Managed: "snyk-dast-automation"},
+		States: config.StateConfig{Todo: "Todo"},
+		Due: config.DueDateConfig{
+			CriticalDays: 15,
+			HighDays:     30,
+			MediumDays:   45,
+			LowDays:      90,
+		},
+	}, 1, logger)
+	// New hardcodes the real Linear endpoint; point the client at the stub, as
+	// the other real-client tests above do.
+	client.gql = gqlclient.New(server.URL, &http.Client{})
+
+	cfg := config.Config{
+		Linear: config.LinearConfig{
+			TeamID: "team-1",
+			Labels: config.LabelConfig{Managed: "snyk-dast-automation"},
+			States: config.StateConfig{Todo: "Todo"},
+		},
+		Sync: config.SyncConfig{Workers: 1},
+	}
+	service := linSync.New(cfg, logger, e2eSnykDAST{}, client, nil)
+
+	// The fixed server returns immediately; the deadline only bounds a
+	// regression that would wait out a backoff.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	result, err := service.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.FailedOps != 0 {
+		t.Fatalf("FailedOps = %d, want 0: reconciliation and the retry must both succeed", result.FailedOps)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if ambiguousSeen != 1 {
+		t.Fatalf("ambiguous 502 responses served = %d, want exactly the first batch attempt", ambiguousSeen)
+	}
+	if reconcileCalls != 1 {
+		t.Fatalf("issuesByFingerprint calls = %d, want exactly one reconciliation query", reconcileCalls)
+	}
+	if len(createDescriptions) != 1 {
+		t.Fatalf("successful creates = %d, want exactly one retry (for the unlanded fingerprint)", len(createDescriptions))
+	}
+	if !strings.Contains(createDescriptions[0], "snyk-dast:project-a:101") {
+		t.Fatalf("retried create is not for fingerprint %q, got description:\n%s", "snyk-dast:project-a:101", createDescriptions[0])
+	}
+	if strings.Contains(createDescriptions[0], "snyk-dast:project-a:100") {
+		t.Fatalf("the landed fingerprint snyk-dast:project-a:100 was retried; got description:\n%s", createDescriptions[0])
+	}
+}
+
 // protectedTestLabels is a representative protected set: control labels owned by
 // another actor (a triage/dispatch bot) that this sync must never add or remove.
 var protectedTestLabels = []string{"df:dispatch", "df:dispatch-complete"}
@@ -1495,5 +1867,152 @@ func TestFetchLabelsByIssueIDRequestsLabelPageInfo(t *testing.T) {
 	}
 	if !strings.Contains(capturedQuery, fmt.Sprintf("labels(first: %d)", maxLiveLabelPage)) {
 		t.Fatalf("live label query must request %d labels per issue, got:\n%s", maxLiveLabelPage, capturedQuery)
+	}
+}
+
+// TestCreateIssuesSendsOneMutationWhenRateLimitBudgetExhausted is the
+// end-to-end regression test for the duplicate-ticket bug: Linear sends
+// `X-RateLimit-Requests-Remaining: 0` on every response, including the 200 to
+// the mutation that consumed the last unit of the window. A transport that
+// treated that header as "rate limited" would discard the successful response
+// and re-send the same mutation, so one batch of ten issues would create up to
+// fifty tickets. The transport must return the successful response and only
+// delay the *next* request.
+func TestCreateIssuesSendsOneMutationWhenRateLimitBudgetExhausted(t *testing.T) {
+	// Both counters are written by the httptest handler goroutine while the
+	// test goroutine reads them, so they are atomic (this test runs under
+	// -race).
+	var createBatches atomic.Int32
+	var unsubscribes atomic.Int32
+	var otherRequests atomic.Int32
+	handlerReturned := make(chan struct{}, 8)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			select {
+			case handlerReturned <- struct{}{}:
+			default:
+			}
+		}()
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll() error = %v", err)
+			return
+		}
+		query := string(body)
+
+		// Linear sends the budget header on every response, successful or
+		// not. The reset instant is already in the past so a "0 remaining"
+		// header cannot park the next request on a real multi-second wait.
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-RateLimit-Requests-Remaining", "0")
+		w.Header().Set("X-RateLimit-Requests-Reset",
+			strconv.FormatInt(time.Now().Add(-time.Second).Unix(), 10))
+
+		switch {
+		case strings.Contains(query, "issueCreateBatch"):
+			createBatches.Add(1)
+			_, _ = io.WriteString(w, `{"data":{"issueCreate0":{"success":true,"issue":{"id":"issue-1","identifier":"SNYK-100"}}}}`)
+		case strings.Contains(query, "issueUnsubscribe"):
+			unsubscribes.Add(1)
+			_, _ = io.WriteString(w, `{"data":{"issueUnsubscribe0":{"success":true}}}`)
+		default:
+			// Any other operation gets a valid (empty-data) success body so
+			// the test never fails for an unrelated reason, but it is counted
+			// so an unexpected round trip is visible.
+			otherRequests.Add(1)
+			_, _ = io.WriteString(w, `{"data":{}}`)
+		}
+	}))
+	defer server.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	client := New(config.LinearConfig{
+		TeamID:           "team-1",
+		APIKey:           "test-key",
+		UnsubscribeActor: true,
+		States:           config.StateConfig{Todo: "Todo"},
+	}, 1, logger)
+	// New hardcodes the real Linear endpoint; point the client at the stub,
+	// exactly as the CreateIssues tests above do. The AdaptiveTransport and
+	// HeaderTransport built by New stay in place, which is the point here.
+	client.gql = gqlclient.New(server.URL, &http.Client{})
+
+	// Pre-seed the client so the batch needs no team/state/label round trips.
+	client.mu.Lock()
+	client.resolvedTeam = "team-1"
+	client.statesByName = map[string]string{"todo": "state-todo"}
+	client.statesByType = map[string]string{}
+	client.managedLabelIDs = map[string]string{}
+	client.mu.Unlock()
+
+	desired := []model.DesiredIssue{
+		{
+			Fingerprint: "snyk-dast:project-a:100",
+			Title:       "t",
+			Description: "",
+			State:       model.StateTodo,
+			Priority:    0,
+		},
+	}
+
+	// The fixed client returns immediately; the deadline only bounds a
+	// regression that would wait on the rate-limit window.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	failed, err := client.CreateIssues(ctx, desired)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("CreateIssues() error = %v, want nil", err)
+	}
+	if len(failed) != 0 {
+		t.Fatalf("failed = %#v, want no failed indices", failed)
+	}
+	// The real fix returns at once instead of sleeping out a backoff.
+	if elapsed > 2*time.Second {
+		t.Fatalf("CreateIssues() took %v, want it to return immediately without re-sending", elapsed)
+	}
+
+	// Let any (buggy) re-send reach the server before counting: the handler
+	// acknowledges every request it serves, so this is a bounded wait, not a
+	// policy sleep.
+	waitForRequests := time.NewTimer(500 * time.Millisecond)
+	defer waitForRequests.Stop()
+	deadline := time.After(500 * time.Millisecond)
+	for createBatches.Load() == 0 {
+		select {
+		case <-handlerReturned:
+		case <-deadline:
+			t.Fatalf("server saw no issueCreateBatch request, want exactly 1")
+		}
+	}
+	select {
+	case <-handlerReturned:
+	case <-waitForRequests.C:
+	}
+
+	gotCreate := createBatches.Load()
+	gotUnsubscribe := unsubscribes.Load()
+	gotOther := otherRequests.Load()
+	t.Logf("recorded requests: issueCreateBatch=%d issueUnsubscribe=%d other=%d", gotCreate, gotUnsubscribe, gotOther)
+
+	if gotCreate != 1 {
+		t.Fatalf("issueCreateBatch requests = %d, want exactly 1: a successful mutation must not be re-sent "+
+			"when X-RateLimit-Requests-Remaining is 0 (a re-send duplicates every ticket in the batch)",
+			gotCreate)
+	}
+	if gotUnsubscribe > 1 {
+		t.Fatalf("issueUnsubscribe requests = %d, want at most 1", gotUnsubscribe)
+	}
+	if gotOther != 0 {
+		t.Fatalf("other requests = %d, want 0: the batch must need no extra lookups", gotOther)
+	}
+	if gotCreate >= 2 || gotUnsubscribe >= 2 {
+		t.Fatalf("server saw %d issueCreateBatch and %d issueUnsubscribe requests, want never 2+ per operation",
+			gotCreate, gotUnsubscribe)
 	}
 }

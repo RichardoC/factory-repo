@@ -3,6 +3,7 @@ package snykdast
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -35,15 +36,6 @@ type targetRef struct {
 	Host string
 }
 
-// paginatedTargets is the shape of GET /targets/.
-type paginatedTargets struct {
-	Count     int          `json:"count"`
-	Page      int          `json:"page"`
-	PageTotal int          `json:"page_total"`
-	Length    int          `json:"length"`
-	Results   []targetNode `json:"results"`
-}
-
 type targetNode struct {
 	ID   string `json:"id"`
 	Type string `json:"type"`
@@ -52,15 +44,6 @@ type targetNode struct {
 		URL  string `json:"url"`
 		Host string `json:"host"`
 	} `json:"site"`
-}
-
-// paginatedFindings is the shape of GET /findings/.
-type paginatedFindings struct {
-	Count     int           `json:"count"`
-	Page      int           `json:"page"`
-	PageTotal int           `json:"page_total"`
-	Length    int           `json:"length"`
-	Results   []findingNode `json:"results"`
 }
 
 type findingNode struct {
@@ -115,14 +98,6 @@ type definitionNode struct {
 	ID      string `json:"id"`
 	Name    string `json:"name"`
 	Passive *bool  `json:"passive"`
-}
-
-type paginatedDefinitions struct {
-	Count     int              `json:"count"`
-	Page      int              `json:"page"`
-	PageTotal int              `json:"page_total"`
-	Length    int              `json:"length"`
-	Results   []definitionNode `json:"results"`
 }
 
 func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykDASTSnapshot, error) {
@@ -229,39 +204,130 @@ func (c *Client) ListFindings(ctx context.Context) ([]model.Finding, error) {
 	return snapshot.Findings, nil
 }
 
-func (c *Client) listTargets(ctx context.Context) ([]targetRef, error) {
-	targets := make([]targetRef, 0, 128)
+// pageEnvelope is the shared shape of every paginated Snyk DAST listing:
+// count is the server total number of records, page_total the total number of
+// pages, and results the current page. The node type behind results differs
+// per endpoint, so it stays raw until the caller decodes it.
+type pageEnvelope struct {
+	Count     int             `json:"count"`
+	PageTotal int             `json:"page_total"`
+	Results   json.RawMessage `json:"results"`
+}
 
+// listPages walks one paginated Snyk DAST listing. It GETs path (relative to
+// the API base) once per page, adding length and page to query (callers may
+// pass other filters such as team) and hands each page's raw results array to
+// onPage.
+//
+// The loop stops when page_total says the listing has ended. Two conditions
+// are truncation rather than the end, and return an error:
+//
+//   - a page that comes back empty before page_total is reached: records the
+//     count promised were never served;
+//   - fewer results accumulated in total than the count the last page
+//     reported. This catches page_total absent or 0 (a schema change, a proxy
+//     that strips it, an error page that decodes as an empty struct), which
+//     would otherwise stop after page 1 and silently accept a partial listing.
+//
+// A total above count (records added between pages) is fine. The error
+// message names the path and the two numbers, nothing else.
+func (c *Client) listPages(ctx context.Context, path string, query url.Values, onPage func(results json.RawMessage) error) error {
+	got := 0
+	count := 0
 	page := 1
 	for {
-		endpoint, err := c.apiBase.Parse("targets/")
+		endpoint, err := c.apiBase.Parse(path)
 		if err != nil {
-			return nil, fmt.Errorf("build targets URL: %w", err)
+			return fmt.Errorf("build %s URL: %w", path, err)
 		}
-		query := endpoint.Query()
-		query.Set("length", strconv.Itoa(pageLength))
-		query.Set("page", strconv.Itoa(page))
-		if team := strings.TrimSpace(c.cfg.Team); team != "" {
-			query.Set("team", team)
+		q := endpoint.Query()
+		for key, values := range query {
+			for _, value := range values {
+				q.Add(key, value)
+			}
 		}
-		endpoint.RawQuery = query.Encode()
+		q.Set("length", strconv.Itoa(pageLength))
+		q.Set("page", strconv.Itoa(page))
+		endpoint.RawQuery = q.Encode()
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		req.Header.Set("Accept", "application/json")
 
-		var payload paginatedTargets
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
-			return nil, err
+			return err
 		}
+		var payload pageEnvelope
 		if err := c.decodeJSON(resp, &payload); err != nil {
-			return nil, err
+			return err
 		}
 
-		for _, node := range payload.Results {
+		rows, err := countResults(path, payload.Results)
+		if err != nil {
+			return err
+		}
+		if err := onPage(payload.Results); err != nil {
+			return err
+		}
+
+		got += len(rows)
+		count = payload.Count
+
+		if len(rows) == 0 && payload.PageTotal > page {
+			return fmt.Errorf("Snyk DAST GET %s returned %d of %d results", path, got, count)
+		}
+		if payload.PageTotal <= page {
+			break
+		}
+		page++
+	}
+	if got < count {
+		return fmt.Errorf("Snyk DAST GET %s returned %d of %d results", path, got, count)
+	}
+	return nil
+}
+
+// countResults decodes a page's raw results array far enough to count its
+// entries. An absent or null results field counts as zero entries.
+func countResults(path string, raw json.RawMessage) ([]json.RawMessage, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var rows []json.RawMessage
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		return nil, fmt.Errorf("decode Snyk DAST %s results: %w", path, err)
+	}
+	return rows, nil
+}
+
+// decodeResults unmarshals a page's raw results array into out. An absent or
+// null results field leaves out untouched.
+func decodeResults(path string, raw json.RawMessage, out any) error {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	if err := json.Unmarshal(raw, out); err != nil {
+		return fmt.Errorf("decode Snyk DAST %s results: %w", path, err)
+	}
+	return nil
+}
+
+func (c *Client) listTargets(ctx context.Context) ([]targetRef, error) {
+	targets := make([]targetRef, 0, 128)
+
+	query := url.Values{}
+	if team := strings.TrimSpace(c.cfg.Team); team != "" {
+		query.Set("team", team)
+	}
+	err := c.listPages(ctx, "targets/", query, func(results json.RawMessage) error {
+		var nodes []targetNode
+		if err := decodeResults("targets/", results, &nodes); err != nil {
+			return err
+		}
+		for _, node := range nodes {
 			name := strings.TrimSpace(node.Site.Name)
 			if name == "" {
 				name = node.Site.Host
@@ -274,11 +340,10 @@ func (c *Client) listTargets(ctx context.Context) ([]targetRef, error) {
 				Host: node.Site.Host,
 			})
 		}
-
-		if payload.PageTotal <= page || len(payload.Results) == 0 {
-			break
-		}
-		page++
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	c.logger.Info("loaded Snyk DAST targets", slog.Int("count", len(targets)))
@@ -290,32 +355,12 @@ func (c *Client) listTargets(ctx context.Context) ([]targetRef, error) {
 // is the Snyk DAST equivalent of Snyk's multi-product "tool" dimension.
 func (c *Client) listDefinitions(ctx context.Context) (map[string]string, error) {
 	out := make(map[string]string)
-	page := 1
-	for {
-		endpoint, err := c.apiBase.Parse("definitions/")
-		if err != nil {
-			return nil, fmt.Errorf("build definitions URL: %w", err)
+	err := c.listPages(ctx, "definitions/", nil, func(results json.RawMessage) error {
+		var nodes []definitionNode
+		if err := decodeResults("definitions/", results, &nodes); err != nil {
+			return err
 		}
-		query := endpoint.Query()
-		query.Set("length", strconv.Itoa(pageLength))
-		query.Set("page", strconv.Itoa(page))
-		endpoint.RawQuery = query.Encode()
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Accept", "application/json")
-
-		var payload paginatedDefinitions
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		if err := c.decodeJSON(resp, &payload); err != nil {
-			return nil, err
-		}
-		for _, def := range payload.Results {
+		for _, def := range nodes {
 			if def.ID == "" {
 				continue
 			}
@@ -325,10 +370,10 @@ func (c *Client) listDefinitions(ctx context.Context) (map[string]string, error)
 				out[def.ID] = "active"
 			}
 		}
-		if payload.PageTotal <= page || len(payload.Results) == 0 {
-			break
-		}
-		page++
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	c.logger.Info("loaded Snyk DAST definitions", slog.Int("count", len(out)))
 	return out, nil
@@ -347,43 +392,22 @@ func checkTypeForDefinition(definitions map[string]string, defID string) string 
 func (c *Client) listFindings(ctx context.Context) ([]findingNode, error) {
 	findings := make([]findingNode, 0, 256)
 
-	page := 1
-	for {
-		endpoint, err := c.apiBase.Parse("findings/")
-		if err != nil {
-			return nil, fmt.Errorf("build findings URL: %w", err)
+	// Restrict to targets in the configured team (if any) so a multi-team
+	// API key does not pull findings from unrelated targets.
+	query := url.Values{}
+	if team := strings.TrimSpace(c.cfg.Team); team != "" {
+		query.Set("team", team)
+	}
+	err := c.listPages(ctx, "findings/", query, func(results json.RawMessage) error {
+		var nodes []findingNode
+		if err := decodeResults("findings/", results, &nodes); err != nil {
+			return err
 		}
-		query := endpoint.Query()
-		query.Set("length", strconv.Itoa(pageLength))
-		query.Set("page", strconv.Itoa(page))
-		// Restrict to targets in the configured team (if any) so a multi-team
-		// API key does not pull findings from unrelated targets.
-		if team := strings.TrimSpace(c.cfg.Team); team != "" {
-			query.Set("team", team)
-		}
-		endpoint.RawQuery = query.Encode()
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Accept", "application/json")
-
-		var payload paginatedFindings
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		if err := c.decodeJSON(resp, &payload); err != nil {
-			return nil, err
-		}
-
-		findings = append(findings, payload.Results...)
-
-		if payload.PageTotal <= page || len(payload.Results) == 0 {
-			break
-		}
-		page++
+		findings = append(findings, nodes...)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	c.logger.Info("loaded Snyk DAST findings", slog.Int("count", len(findings)))
@@ -454,11 +478,18 @@ func (c *Client) enrichCorrelations(ctx context.Context, findings []model.Findin
 		}
 		pos := i
 		compositeID := findings[i].SnykDASTFindingID
+		fingerprint := findings[i].Fingerprint
 		sem <- struct{}{}
 		g.Go(func() error {
 			defer func() { <-sem }()
-			blocks, err := c.fetchCorrelationMarkdown(gctx, targetID, numeric)
+			blocks, err := c.fetchCorrelationMarkdown(gctx, targetID, numeric, fingerprint)
 			if err != nil {
+				// The missing-permission error describes the whole fetch, not
+				// one finding: return it unchanged so the run fails fast with
+				// the message naming correlation_viewer.
+				if errors.Is(err, ErrCorrelationForbidden) {
+					return err
+				}
 				return fmt.Errorf("fetch snyk code correlations for finding %s: %w", compositeID, err)
 			}
 			findings[pos].CorrelationMarkdown = blocks
@@ -469,47 +500,54 @@ func (c *Client) enrichCorrelations(ctx context.Context, findings []model.Findin
 	return g.Wait()
 }
 
+// ErrCorrelationForbidden reports that the Snyk DAST API key cannot read the
+// Snyk Code correlation endpoint. It aborts the run: without the permission
+// every correlated finding would lose its description block. The message
+// names the missing permission and deliberately omits the target and finding
+// URL, so it is safe to paste into an issue.
+var ErrCorrelationForbidden = errors.New("Snyk DAST API GET correlations failed with 401/403: the API key is missing the correlation_viewer permission; add it to the custom role (see README, Snyk DAST (Probely) API Permissions)")
+
 // fetchCorrelationMarkdown returns the pre-rendered markdown blocks for the
 // Snyk Code correlations of a single finding. The endpoint is
 // /targets/{target_id}/findings/{finding_id}/integrations/snyk-sast/correlations/
 // where finding_id is the numeric finding id (suffix of the composite id).
-func (c *Client) fetchCorrelationMarkdown(ctx context.Context, targetID, numericFindingID string) ([]string, error) {
+//
+// Two statuses are handled specially, everything else fails the snapshot:
+//
+//   - 401/403 maps to ErrCorrelationForbidden (the API key lacks the
+//     correlation_viewer permission) so the run fails with a diagnosable
+//     message instead of a URL;
+//   - 404 for one finding is tolerated as "no correlations" (warn log, no
+//     block): a correlation removed between the findings listing and this
+//     fetch produces the same description as one that never existed, so
+//     degrading it does not churn the description on the next run.
+func (c *Client) fetchCorrelationMarkdown(ctx context.Context, targetID, numericFindingID, fingerprint string) ([]string, error) {
 	var blocks []string
-	page := 1
-	for {
-		path := fmt.Sprintf("targets/%s/findings/%s/integrations/snyk-sast/correlations/", targetID, numericFindingID)
-		endpoint, err := c.apiBase.Parse(path)
-		if err != nil {
-			return nil, fmt.Errorf("build correlations URL: %w", err)
+	path := fmt.Sprintf("targets/%s/findings/%s/integrations/snyk-sast/correlations/", targetID, numericFindingID)
+	err := c.listPages(ctx, path, nil, func(results json.RawMessage) error {
+		var nodes []correlationNode
+		if err := decodeResults(path, results, &nodes); err != nil {
+			return err
 		}
-		query := endpoint.Query()
-		query.Set("length", strconv.Itoa(pageLength))
-		query.Set("page", strconv.Itoa(page))
-		endpoint.RawQuery = query.Encode()
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Accept", "application/json")
-
-		var payload paginatedCorrelations
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		if err := c.decodeJSON(resp, &payload); err != nil {
-			return nil, err
-		}
-		for _, node := range payload.Results {
+		for _, node := range nodes {
 			if md := strings.TrimSpace(node.Markdown); md != "" {
 				blocks = append(blocks, md)
 			}
 		}
-		if payload.PageTotal <= page || len(payload.Results) == 0 {
-			break
+		return nil
+	})
+	if err != nil {
+		if apiErr, ok := errors.AsType[*apiError](err); ok {
+			switch apiErr.Status {
+			case http.StatusUnauthorized, http.StatusForbidden:
+				return nil, ErrCorrelationForbidden
+			case http.StatusNotFound:
+				c.logger.Warn("Snyk DAST Code correlations disappeared for finding, continuing without the description block",
+					slog.String("fingerprint", fingerprint))
+				return nil, nil
+			}
 		}
-		page++
+		return nil, err
 	}
 	return blocks, nil
 }

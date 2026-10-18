@@ -25,6 +25,7 @@ import (
 // bounds the result besides.
 const (
 	maxPlanReadmeBytes   = 15000 // README.md and AGENTS.md, each
+	maxPlanAppRulesBytes = 8192  // each app's AGENTS.md in the per-app rules
 	maxPlanIssueBody     = 200   // runes of body shown per open issue
 	maxPlanOpenIssues    = 60    // open issues listed at most
 	maxPlanClosedBody    = 3000  // runes of a closed issue's body (the Out-of-scope notes live there)
@@ -70,6 +71,11 @@ func runPlanBrief() error {
 	gh := newGitHub()
 	parts := []string{budgetLine(), string(standing)}
 	parts = append(parts, planRepoFiles())
+	// Issue #139: the planner grounds its proposals in every app's rules,
+	// not in the areas of one issue.
+	if rules := planAppRules(); rules != "" {
+		parts = append(parts, rules)
+	}
 	parts = append(parts, planOpenIssues(gh))
 	parts = append(parts, planClosedIssues(gh))
 	parts = append(parts, planClosedPulls(gh))
@@ -97,6 +103,34 @@ func planRepoFiles() string {
 			continue
 		}
 		b.WriteString(capBrief(string(data), maxPlanReadmeBytes))
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// planAppRules embeds every app's AGENTS.md (issue #139): the planner has no
+// single issue, so it gets the file of every directory under app/, each
+// capped at maxPlanAppRulesBytes. An app without the file, or an unreadable
+// one, is a note — never a failure of the brief. No app/ directory in the
+// working directory adds nothing.
+func planAppRules() string {
+	entries, err := os.ReadDir("app")
+	if err != nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, e := range entries { // ReadDir returns the entries sorted by name
+		if !e.IsDir() || !appNameRe.MatchString(e.Name()) {
+			continue
+		}
+		name := e.Name()
+		data, err := os.ReadFile(filepath.Join("app", name, "AGENTS.md"))
+		if err != nil {
+			fmt.Fprintf(&b, "(app/%s/AGENTS.md is unavailable: %s)\n", name, escapeMD(err.Error(), 200, true))
+			continue
+		}
+		fmt.Fprintf(&b, "## Rules for app/%s (app/%s/AGENTS.md)\n\n", name, name)
+		b.WriteString(capAppFile(string(data), maxPlanAppRulesBytes, "app/"+name+"/AGENTS.md"))
 		b.WriteString("\n")
 	}
 	return strings.TrimRight(b.String(), "\n")

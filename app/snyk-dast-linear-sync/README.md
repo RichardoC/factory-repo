@@ -118,8 +118,9 @@ CI enforces this: the `go fix` check runs `go fix ./...` and then
 - Keeps the Snyk DAST REST API link as a secondary reference.
 - Includes target, vulnerable URL, HTTP method, path, parameter, insertion point, CWE, and CVSS details when Snyk DAST provides them.
 - Batches Linear create and update mutations to reduce request pressure.
-- Retries and backs off on Linear rate limiting.
+- Retries and backs off on Linear rate limiting, but only for retryable statuses (429, 502, 503, 504); a response that exhausts the request budget (`X-RateLimit-Requests-Remaining <= 0`), including a successful `200`, is delivered to the caller and delays the next request rather than re-sending the current one.
 - Normalizes common Linear markdown rewrites when comparing descriptions so steady-state runs do not churn.
+- Fails the run when a paginated Snyk DAST listing returns fewer results than the `count` the API reported for it (for example when `page_total` is missing from the response or a page comes back empty early), so the sync never plans against a partial snapshot.
 
 ## Snyk DAST (Probely) API Permissions
 
@@ -145,7 +146,24 @@ Permissions **not** required (the sync does not write back to Snyk DAST):
 > shows findings. This is the API filtering out everything because the API key
 > has no target visibility — findings are scoped under targets. A token with
 > only `change_finding` + `correlation_viewer` (a common mistake) will see
-> zero findings for this reason. Add `view_target` to fix it.
+> zero findings for this reason. Because an empty snapshot is not a truthful
+> source, the sync now fails the run in this state — with managed tickets
+> present in Linear and a snapshot listing no targets, it returns an error and
+> makes no changes, instead of cancelling every managed ticket as if all
+> findings had gone away (`--dry-run` still reports the plan, logging the same
+> message at error level). Add `view_target` to fix it.
+
+> **Symptom of missing `correlation_viewer`:** every target and finding
+> loads, then the run fails with an error naming the missing
+> `correlation_viewer` permission (the error does not include the target or
+> finding URL). The sync cannot build the Snyk Code correlation block without
+> it, so the whole run fails instead of silently dropping the block from every
+> description. Add `correlation_viewer` to the custom role to fix it.
+
+The per-finding correlation endpoint is also tolerated to answer `404` for a
+single finding: that finding is logged at warn and synced without its
+correlation block, the same as a finding that never had one. Any other error
+from the endpoint (for example a `500`) still fails the run.
 
 See the Snyk docs on [roles and scopes by plan](https://docs.snyk.io/scan-fix-and-prevent/scan-with-snyk/snyk-api-web/managing-account/roles-and-scopes-by-plan) and [understanding permissions](https://docs.snyk.io/scan-fix-and-prevent/scan-with-snyk/snyk-api-web/managing-account/understanding-permissions).
 
@@ -346,6 +364,11 @@ supporting the string comparators at all. The metadata block remains the
 authority for identity once an issue is loaded; it just cannot be trusted to
 select which issues to load.
 
+The same scope bounds the ambiguous-create reconciliation query
+(`ExistingFingerprints`), which runs in the retry path right after a failed
+batch create: scoped this way it pages only through this sync's own tickets,
+instead of every non-archived issue in the team.
+
 ### Archived Linear Issues
 
 Linear auto-archives closed issues after the team's configured inactivity
@@ -440,7 +463,9 @@ On a normal run:
 2. Load the current Linear snapshot.
 3. Skip fingerprints whose source hash and Linear hash both match the last successful run.
 4. Apply creates, updates, and resolves for the rest.
-5. Refresh the cache from the live post-write Linear snapshot.
+5. Refresh the cache from the live post-write Linear snapshot. A fingerprint
+   whose Linear write failed in this run is left out of the refresh, so the next
+   run retries it instead of skipping it as unchanged.
 
 The cache fast-path never suppresses a pending move into a terminal state
 (`Done`/`Cancelled`). Use `--bypass-cache` to ignore the cache for a run and
@@ -482,6 +507,12 @@ Optional:
 - `LINEAR_HTTP_CONCURRENCY`
 - `ERROR_LOG_FILE`
 - `CACHE_DB_FILE`
+
+Integer variables must be plain integers, and boolean variables must be
+`true`/`false` (or another form `strconv.ParseBool` accepts: `1`, `0`, `t`,
+`f`, `T`, `F`; spelling is case-insensitive). A malformed value stops the run
+at startup with an error naming the variable and quoting the value it could
+not parse; it is never silently replaced by the default.
 
 See [.env.example](/.env.example).
 

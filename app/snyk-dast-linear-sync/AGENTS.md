@@ -27,6 +27,17 @@ Never include:
 Describe behavior in general terms and build tests from neutral fixtures:
 `project-a`, `issue-1`, `SNYK-100`, `example.test` hosts, made-up IDs.
 
+A few real-looking identifiers and incident figures predate these rules in the
+upstream code and docs. Leave them as they are: don't copy them into new code,
+tests, docs, commits or issues, and don't add more like them.
+
+## Decisions to keep
+
+- `SNYK_DAST_TEAM` scopes the sync on purpose. A target the team filter
+  excludes is treated like a target that no longer exists, so its existing
+  tickets are cancelled. That is intended (owner's decision, 2026-10-18); don't
+  change it or propose changing it.
+
 ## Checks
 
 Run these in this directory before pushing:

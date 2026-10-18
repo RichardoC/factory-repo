@@ -1366,6 +1366,63 @@ func TestReportFailedPublish(t *testing.T) {
 	}
 }
 
+// Workflow-policy refusals reach the issue comment under their own heading,
+// so the rule itself reaches the reader and not only the number of rules
+// broken (issue #138). The lines are patch-influenced (they embed a step
+// name), so they render like every other publish error: escaped, never raw.
+func TestReportShowsPolicyRule(t *testing.T) {
+	ok := false
+	result := Result{Stop: "done", OK: &ok}
+	in := ReportInputs{
+		PublishErrors: []string{
+			"::error::patch touches .github/ outside .github/codeaf/; refusing it",
+			"workflow policy: codeaf.yml: triggers (`on`) changed",
+			"workflow policy: integration.yml: new workflow files are not allowed without a maintainer",
+		},
+	}
+	env := map[string]string{"GITHUB_REPOSITORY": "RichardoC/factory-repo", "GITHUB_RUN_ID": "42"}
+	cfg := Config{Limits: Limits{Plan: "big", WeeklyCreditUSD: 20, RunCreditUSD: 5, OverageUSD: 0}, Models: testModels(t)}
+	report := Report(result, true, nil, cfg, nil, in, func(k string) string { return env[k] })
+	for _, want := range []string{
+		"### Workflow policy",
+		// The rule's text survives; the backtick around `on` is escaped,
+		// which is how it renders unchanged in Markdown.
+		"- workflow policy: codeaf.yml: triggers (\\`on\\`) changed",
+		"- workflow policy: integration.yml: new workflow files are not allowed without a maintainer",
+	} {
+		if !strings.Contains(report, want) {
+			t.Errorf("report lacks %q:\n%s", want, report)
+		}
+	}
+	// The heading is not a publish-error table row, and the table keeps only
+	// the non-policy lines.
+	if strings.Contains(report, "| publish error | workflow policy:") {
+		t.Errorf("policy rule shown as a publish error row:\n%s", report)
+	}
+	if !strings.Contains(report, "| publish error | patch touches .github/ outside .github/codeaf/; refusing it |") {
+		t.Errorf("non-policy publish error lost:\n%s", report)
+	}
+	// The rule is shown once, under the heading, not again as a table row.
+	if n := strings.Count(report, "triggers ("); n != 1 {
+		t.Errorf("policy rule appears %d times, want 1:\n%s", n, report)
+	}
+	// A policy line carries a patch-controlled step name; the report must
+	// neutralise it rather than render it raw (review finding, #138).
+	hostile := ReportInputs{PublishErrors: []string{
+		"workflow policy: codeaf.yml: job \"go\" step \"<img src=x onerror=alert(1)> @user\" installs from a moving ref; pin a version or SHA",
+	}}
+	got := Report(result, true, nil, cfg, nil, hostile, func(k string) string { return env[k] })
+	if strings.Contains(got, "<img src=x") {
+		t.Errorf("policy line rendered raw HTML:\n%s", got)
+	}
+	if strings.Contains(got, "@user") {
+		t.Errorf("policy line rendered a raw @mention:\n%s", got)
+	}
+	if !strings.Contains(got, "installs from a moving ref; pin a version or SHA") {
+		t.Errorf("policy line's own text lost:\n%s", got)
+	}
+}
+
 // CodeAF stopped without an answer (the deadline case): the report says why,
 // summarises the patch and the plan's tasks, and says plainly that the work
 // is unfinished and unverified.
