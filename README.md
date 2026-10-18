@@ -29,7 +29,8 @@ labeled “(chars)” from character counts when the model does not report them)
 run's timing figures (wall time, time with a call in flight, tokens/s, longest call).
 Three workflow artifacts are uploaded, none of them encrypted:
 - `codeaf-output-*` (14 days): the patch, its base commit, CodeAF's JSON result
-  and the call ledger (each call's start and duration, slot wait, reasoning tokens,
+  and the call ledger (each call's start and duration, slot wait, the wait for
+  upstream's response headers (`header_ms`, issue #145), reasoning tokens,
   and the reasoning/output character counts backing the estimate);
 - `codeaf-diagnostics-*` (30 days): the brief, CodeAF's stderr, its run records
   (prompts, replies, tool output), call log and usage, and the proxy log;

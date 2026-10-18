@@ -416,17 +416,19 @@ func envOr(name, fallback string) string {
 	return fallback
 }
 
-// upstreamClient builds the http.Client the proxy uses for upstream calls
-// (issue #145). The 15-minute total timeout is the whole-call budget: it does
-// NOT include a ResponseHeaderTimeout, on purpose. A client-side header
-// deadline is what broke infinite mode: the proxy sent the client nothing
-// until upstream's headers arrived, so CodeAF hedged a second arm on the 30s
-// of silence ("reason: no heartbeat") and gave up at 120s with "net/http:
-// timeout awaiting response headers". The proxy now commits its 200 and
-// heartbeats while it waits, and with no ResponseHeaderTimeout net/http has no
-// separate header deadline to fire: the call is bounded only by the whole-call
-// timeout above and by the client, which cancels the upstream request.
-// TestProductionProxyClientHasNoHeaderTimeout guards this.
+// upstreamClient builds the http.Client the proxy uses for upstream calls.
+// The 15-minute whole-call timeout is unchanged from before #145, and there
+// has never been a ResponseHeaderTimeout here -- the error that broke
+// infinite mode ("net/http: timeout awaiting response headers") was CodeAF's
+// own header deadline against this proxy, which went silent because
+// p.client.Do blocked until upstream's headers arrived and nothing reached
+// the client. The fix is not on this side: doWithHeartbeats (issue #145)
+// commits the 200 and heartbeats through that wait, so the client's header
+// deadline no longer fires, and keeping no ResponseHeaderTimeout here means
+// net/http adds no second, shorter deadline that would cut the mode's
+// 40-236s wait to first token. The call stays bounded only by the whole-call
+// timeout and by the client, which cancels the upstream request when it
+// leaves. TestProductionProxyClientHasNoHeaderTimeout guards this.
 func upstreamClient() *http.Client {
 	return &http.Client{Timeout: 15 * time.Minute}
 }
@@ -860,11 +862,7 @@ type LedgerLine struct {
 	Status int `json:"status,omitempty"`
 }
 
-<<<<<<< 551588be9ae03bf01220e9e892c4fa0bb2676e2f
-func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slotWait, headerWait time.Duration, chars charCounts, repaired int) {
-=======
-func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slotWait time.Duration, chars charCounts, repaired, status int) {
->>>>>>> ef15a7a752be8b88bd302f5bd39de5c8e4341321
+func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slotWait, headerWait time.Duration, chars charCounts, repaired, status int) {
 	line := LedgerLine{Time: time.Now().UTC(), Model: m.ID, Upstream: m.Upstream, Stream: stream,
 		Start: start.UTC(), SlotWaitS: slotWait.Seconds(), HeaderMs: headerWait.Milliseconds(),
 		ReasoningChars: chars.reasoning, OutputChars: chars.output, RepairedToolArgs: repaired}
@@ -1309,7 +1307,12 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 	headerWait = time.Since(started)
 	if err != nil {
 		if ctx.Err() != nil {
-			return // CodeAF gave up on the call; the upstream request is cancelled
+			// CodeAF gave up on the call; the upstream request is cancelled.
+			// A call that upstream refused or answered late enough to be
+			// buffered does not take this path: doWithHeartbeats hands it
+			// back as a result, so it still reaches the ledger and its body
+			// is still closed (review of #145).
+			return
 		}
 		p.fail(w, out, http.StatusBadGateway, "upstream unreachable: "+err.Error())
 		return
@@ -1322,7 +1325,7 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		// The refusal goes in the ledger too (issue #140): a run whose
 		// upstream kept answering 429 costs real time, and the record
 		// counts it. No usage, no cost.
-		p.record(m, nil, stream, started, slotWait, charCounts{}, repaired, response.StatusCode)
+		p.record(m, nil, stream, started, slotWait, headerWait, charCounts{}, repaired, response.StatusCode)
 		if out == nil {
 			w.Header().Set("Content-Type", response.Header.Get("Content-Type"))
 			w.WriteHeader(response.StatusCode)
@@ -1375,7 +1378,16 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 //     comment goes out every heartbeat interval.
 //   - The client going away cancels the upstream request and this handler
 //     returns with the context's error; no response is written to a client
-//     that is gone.
+//     that is gone. One exception (review of #145): a result the goroutine
+//     already buffered is never dropped -- even with the client gone it is
+//     returned to chat, which records the call in the ledger and closes the
+//     body, so an answer that raced the disconnect keeps its header_ms and
+//     its usage.
+//
+// The done channel is checked before the timers on every pass, so an
+// upstream answering right at the grace window's edge keeps its real status
+// code: the 200/heartbeat commit is never chosen over a response that is
+// already in hand (review of #145).
 //
 // headerWait is the time from issuing the request to upstream's response
 // headers -- the figure infinite mode needs and the ledger records as
@@ -1409,14 +1421,26 @@ func (p *proxy) doWithHeartbeats(ctx context.Context, request *http.Request, w h
 	headers := time.NewTimer(headerWaitGrace)
 	defer headers.Stop()
 	committed := *out != nil // an earlier slot wait already committed the 200
+	answer := func(r result) (*http.Response, time.Duration, error) {
+		wait := time.Since(start)
+		if r.err == nil && r.response != nil {
+			log.Printf("%s answered in %.1fs with %d", request.URL.Path, wait.Seconds(), r.response.StatusCode)
+		}
+		return r.response, wait, r.err
+	}
 	for {
+		// Prioritised (review of #145): a result that is already buffered
+		// goes before the timers, so an upstream answering right at the
+		// grace window's edge keeps its real status code instead of racing
+		// the 200/heartbeat commit into the select.
 		select {
 		case r := <-done:
-			wait := time.Since(start)
-			if r.err == nil && r.response != nil {
-				log.Printf("%s answered in %.1fs with %d", request.URL.Path, wait.Seconds(), r.response.StatusCode)
-			}
-			return r.response, wait, r.err
+			return answer(r)
+		default:
+		}
+		select {
+		case r := <-done:
+			return answer(r)
 		case <-headers.C:
 			// 1s with no headers: commit and heartbeat from here on.
 			if *out == nil {
@@ -1431,6 +1455,17 @@ func (p *proxy) doWithHeartbeats(ctx context.Context, request *http.Request, w h
 			}
 			(*out).comment(headerWaitComment)
 		case <-ctx.Done():
+			// The client is gone, but a result may already be buffered
+			// (review of #145): dropping it would leak the response body
+			// and keep the call out of the ledger. Hand it back -- chat
+			// records the answer and closes the body, or reports the Do
+			// error -- and only a still-empty channel returns silently
+			// to a client that is gone.
+			select {
+			case r := <-done:
+				return answer(r)
+			default:
+			}
 			return nil, time.Since(start), ctx.Err()
 		}
 	}
@@ -1724,11 +1759,7 @@ func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, st
 		chars.addChoices(choices, "message")
 	}
 	payload["model"], _ = json.Marshal(m.ID)
-<<<<<<< 551588be9ae03bf01220e9e892c4fa0bb2676e2f
-	p.record(m, usage, false, started, slotWait, headerWait, chars, repaired)
-=======
-	p.record(m, usage, false, started, slotWait, chars, repaired, 0)
->>>>>>> ef15a7a752be8b88bd302f5bd39de5c8e4341321
+	p.record(m, usage, false, started, slotWait, headerWait, chars, repaired, 0)
 	writeJSON(w, http.StatusOK, payload)
 }
 
@@ -1823,11 +1854,7 @@ func (p *proxy) relayStream(out *sseSink, upstream io.Reader, m Model, started t
 	}
 	close(stop)
 	done.Wait()
-<<<<<<< 551588be9ae03bf01220e9e892c4fa0bb2676e2f
-	p.record(m, usage, true, started, slotWait, headerWait, chars, repaired)
-=======
-	p.record(m, usage, true, started, slotWait, chars, repaired, 0)
->>>>>>> ef15a7a752be8b88bd302f5bd39de5c8e4341321
+	p.record(m, usage, true, started, slotWait, headerWait, chars, repaired, 0)
 }
 
 // ---------------------------------------------------------------- GitHub
