@@ -47,6 +47,10 @@ type fakeLinear struct {
 	// above but for PostComments.
 	commentCallBatches      [][]model.IssueUpdate
 	commentFailFingerprints map[string]int
+	// commentErr, when non-nil, makes every PostComments call fail — the
+	// batch call and each per-item retry — mirroring updateErr. It models a
+	// transport-level failure where no per-alias data comes back at all.
+	commentErr error
 
 	// lastOpenStates / lastOpenStatesErr are what LastOpenStates returns;
 	// lastOpenStatesCalls records the issue IDs of each call.
@@ -111,6 +115,9 @@ func (f *fakeLinear) UpdateIssues(_ context.Context, updates []model.IssueUpdate
 
 func (f *fakeLinear) PostComments(_ context.Context, updates []model.IssueUpdate) ([]int, error) {
 	f.commentCallBatches = append(f.commentCallBatches, append([]model.IssueUpdate(nil), updates...))
+	if f.commentErr != nil {
+		return nil, f.commentErr
+	}
 	var failed []int
 	for i, u := range updates {
 		if f.commentFailFingerprints[u.Desired.Fingerprint] > 0 {
@@ -6691,6 +6698,42 @@ func TestExecuteJobDryRunCountsWithoutCalling(t *testing.T) {
 				t.Fatalf("FailedOps = %d, want 0", result.FailedOps)
 			}
 		})
+	}
+}
+
+// TestPostCommentsWithFallbackRetriesAllWhenBatchCallFails: a wholesale
+// PostComments failure (no per-alias data at all, e.g. a transport failure)
+// must retry every comment individually, and stay a warning: no error escapes
+// and nothing is counted or recorded as a failed write.
+func TestPostCommentsWithFallbackRetriesAllWhenBatchCallFails(t *testing.T) {
+	batch := make([]model.IssueUpdate, 0, 2)
+	for _, ident := range []string{"SNYK-1", "SNYK-2"} {
+		existing := model.ExistingIssue{
+			ID:          "issue-" + ident,
+			Identifier:  ident,
+			StateName:   "Blog",
+			Fingerprint: "snyk:project-a:" + ident,
+		}
+		desired := model.DesiredIssue{Fingerprint: existing.Fingerprint, State: model.StateDone, PreserveState: true}
+		batch = append(batch, model.IssueUpdate{Existing: existing, Desired: desired})
+	}
+	linear := &fakeLinear{commentErr: errors.New("linear transport down")}
+	service := New(minimalCfg(), discardLogger(), fakeSnyk{}, linear, nil)
+	service.postCommentsWithFallback(context.Background(), batch)
+
+	if len(linear.commentCallBatches) != 3 {
+		t.Fatalf("PostComments calls = %d, want 3 (failed batch + one retry per item)", len(linear.commentCallBatches))
+	}
+	if got := len(linear.commentCallBatches[0]); got != 2 {
+		t.Fatalf("first PostComments call carried %d updates, want the whole batch of 2", got)
+	}
+	for i, retry := range linear.commentCallBatches[1:] {
+		if len(retry) != 1 {
+			t.Fatalf("retry call %d carried %d updates, want exactly 1", i, len(retry))
+		}
+	}
+	if len(linear.comments) != 0 {
+		t.Fatalf("comments = %d, want 0 (every attempt failed)", len(linear.comments))
 	}
 }
 
