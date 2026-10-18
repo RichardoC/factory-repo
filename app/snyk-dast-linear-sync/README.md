@@ -120,6 +120,7 @@ CI enforces this: the `go fix` check runs `go fix ./...` and then
 - Batches Linear create and update mutations to reduce request pressure.
 - Retries and backs off on Linear rate limiting, but only for retryable statuses (429, 502, 503, 504); a response that exhausts the request budget (`X-RateLimit-Requests-Remaining <= 0`), including a successful `200`, is delivered to the caller and delays the next request rather than re-sending the current one.
 - Normalizes common Linear markdown rewrites when comparing descriptions so steady-state runs do not churn.
+- Fails the run when a paginated Snyk DAST listing returns fewer results than the `count` the API reported for it (for example when `page_total` is missing from the response or a page comes back empty early), so the sync never plans against a partial snapshot.
 
 ## Snyk DAST (Probely) API Permissions
 

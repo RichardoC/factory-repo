@@ -418,10 +418,12 @@ closed, even if its hashes are unchanged since the last run.
   never written, never deleted, and read live rather than from the snapshot.
 - Linear issue history matters, so deleting and recreating all issues is a last resort, not a normal repair path.
 - Cache bypass is the correct operator action when the rendering schema or compare logic changes.
+- The Snyk DAST snapshot is verified complete against the API reported `count` before any resolve or cancel is planned: a paginated listing shorter than its reported `count` fails the run instead of being treated as the full target/finding set.
 - An empty Snyk DAST snapshot alongside existing managed issues is treated as an
   implausible source, not as "every finding went away": the run fails rather
   than cancelling all managed tickets (see Resolve). Only the "nothing at all"
-  case is guarded; a partial listing is a separate concern.
+  case is guarded here; a partial listing is caught by the completeness check
+  above.
 
 ## Operator Guidance
 
