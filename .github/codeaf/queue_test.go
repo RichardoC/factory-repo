@@ -943,6 +943,12 @@ func TestIssueReady(t *testing.T) {
 	if got := issueReady(withArea(e2eSection + "go test -race ./... in .github/codeaf is green\n")); len(got) != 0 {
 		t.Fatalf("real End-to-end check held: issueReady = %v", got)
 	}
+	// Ordinary prose that happens to echo the template's wording passes:
+	// only the placeholder's own tail, with its closing parenthesis, marks
+	// it unfilled (issue #136 review: "the seams work" held a real check).
+	if got := issueReady(withArea(e2eSection + "Re-run the #61 patch without its gate change: go test fails, which proves the seams work.\n")); len(got) != 0 {
+		t.Fatalf("real check echoing the template held: issueReady = %v", got)
+	}
 	// Text hidden in an HTML comment is not a check (issue #136 review): a
 	// section holding only a comment — the template's instructions, a
 	// reviewer's note — is unfilled, and an unclosed "<!--" comments out

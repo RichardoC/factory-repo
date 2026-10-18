@@ -377,7 +377,7 @@ func stripHTMLComments(s string) string {
 // so a promoted proposal or a fresh template issue is never queued
 // unfilled. They are the gate's own fixed strings — never issue text — so
 // they are safe to match against an arbitrary body.
-var e2ePlaceholderMarks = []string{"fill in before", "the seams work"}
+var e2ePlaceholderMarks = []string{"fill in before", "the seams work)"}
 
 // holdsE2EPlaceholder reports whether the text of an "## End-to-end check"
 // section still carries part of the unfilled placeholder.
