@@ -109,6 +109,13 @@ func main() {
 		// The deterministic gate on a workflow change published without a
 		// maintainer's approval (workflowpolicy.go).
 		"workflow-policy": runWorkflowPolicy,
+		// Splitting a patch the policy refused (patchsplit.go): the part
+		// under .github/ outside .github/codeaf/ goes to REFUSED for a
+		// maintainer; everything else still publishes.
+		"patch-split": runPatchSplit,
+		// The PR comment body for a refused part of a patch
+		// (refusedcomment.go): reason plus the refused diff in a fence.
+		"refused-comment": runRefusedComment,
 	}
 	command, ok := commands[os.Args[1]]
 	if !ok {
@@ -3666,13 +3673,32 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 	// The ::error:: lines the publish steps collected: the two most recent are
 	// the cause of a failed publish. Read as data: the prefix is stripped and
 	// the line is escaped and capped, so a crafted error line stays a line.
+	// Workflow-policy refusals (issue #138) get their own heading so the rule
+	// is visible and not only its count, and not again in the table. They are
+	// escaped like any other publish error: a policy line embeds the patch's
+	// own step name (workflowpolicy.go), which can carry HTML, an @mention or
+	// a backtick, so it is untrusted data too.
 	if errs := in.PublishErrors; len(errs) > 0 {
-		if len(errs) > 2 {
-			errs = errs[len(errs)-2:]
-		}
+		var policy, other []string
 		for _, e := range errs {
 			e = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(e), "::error::"))
+			if strings.HasPrefix(e, "workflow policy: ") {
+				policy = append(policy, e)
+			} else {
+				other = append(other, e)
+			}
+		}
+		if len(other) > 2 {
+			other = other[len(other)-2:]
+		}
+		for _, e := range other {
 			fmt.Fprintf(&b, "| publish error | %s |\n", escapeMD(e, 200, true))
+		}
+		if len(policy) > 0 {
+			b.WriteString("\n### Workflow policy\n\n")
+			for _, e := range policy {
+				fmt.Fprintf(&b, "- %s\n", escapeMD(e, 2000, true))
+			}
 		}
 	}
 	b.WriteString("\n")
