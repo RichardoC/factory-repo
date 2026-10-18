@@ -27,9 +27,12 @@ func nextOpts() queueOptions {
 	}
 }
 
-// queuedIssue builds an open issue carrying labels, in creation order.
+// queuedIssue builds an open issue carrying labels, in creation order. Its
+// body passes the acceptance gate (issue #136) by default — the sections are
+// not what most of these tests are about — and a test that cares sets Body
+// itself.
 func queuedIssue(n int, created string, labels ...string) item {
-	it := item{Number: n, State: "open", CreatedAt: created}
+	it := item{Number: n, State: "open", CreatedAt: created, Body: readyBody}
 	for _, name := range labels {
 		it.Labels = append(it.Labels, label{Name: name})
 	}
@@ -150,11 +153,11 @@ func TestNextDependsOn(t *testing.T) {
 	selfDep := queuedIssue(5, "2024-01-01T00:00:00Z", "codeaf-queued")
 	selfDep.Body = "Depends on #5"
 	blocked := candidate
-	blocked.Body = "Depends on #12\n"
+	blocked.Body = "Depends on #12\n" + readyBody
 	dependsOnPR := candidate
-	dependsOnPR.Body = "see #13; depends on #13"
+	dependsOnPR.Body = "see #13; depends on #13\n" + readyBody
 	unknownDep := candidate
-	unknownDep.Body = "Depends on #99"
+	unknownDep.Body = "Depends on #99\n" + readyBody
 	mixed := candidate
 	mixed.Body = "Depends on #12, #13"
 	other := queuedIssue(7, "2024-01-03T00:00:00Z", "codeaf-queued", "area:app/x")
@@ -316,7 +319,7 @@ func TestRunNext(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	issues := `[{"number":3,"state":"open","created_at":"2024-01-01T00:00:00Z","labels":[{"name":"codeaf-queued"},{"name":"area:app/x"}]},
+	issues := `[{"number":3,"state":"open","created_at":"2024-01-01T00:00:00Z","body":"## Done when\n\n- tests pass\n\n## End-to-end check\n\nharness next prints number=3\n","labels":[{"name":"codeaf-queued"},{"name":"area:app/x"}]},
 	            {"number":9,"state":"open","created_at":"2024-02-01T00:00:00Z","body":"Depends on #3","labels":[{"name":"codeaf"},{"name":"area:app/y"}]}]`
 	write(issuesPath, issues)
 	write(runsPath, `[{"status":"completed"}]`)
@@ -385,7 +388,7 @@ func TestNextAreas(t *testing.T) {
 	issue5 := areaIssue(5, "2024-01-01T00:00:00Z", "harness") // the in-flight run's issue
 	held := runStatus{Status: "in_progress", DatabaseId: 100, DisplayTitle: "CodeAF #5 (lane 0)"}
 	bodyHeld := withBody(queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued"), "touch .github/workflows/ci.yml")
-	bodyFree := withBody(queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued"), "paths app/x/main.go")
+	bodyFree := withBody(queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued"), "paths app/x/main.go\n"+readyBody)
 
 	cases := []struct {
 		name   string
@@ -857,5 +860,91 @@ func TestHoldCommentIsPostedOnce(t *testing.T) {
 	}
 	if posts != 1 {
 		t.Fatalf("second call posted again (%d posts); want the marker to stop it", posts)
+	}
+}
+
+// readyBody is a body that passes the acceptance gate: both sections, with
+// a bullet under Done when and text under End-to-end check, and no path in
+// it that would add an area.
+const readyBody = "## Problem\n\np\n\n## Done when\n\n- TestIssueReady passes\n\n## End-to-end check\n\nharness next holds #117\n"
+
+func TestIssueReady(t *testing.T) {
+	withArea := func(body string, labels ...string) item {
+		return queuedIssue(3, "2024-01-01T00:00:00Z", append([]string{"codeaf-queued", "area:harness"}, labels...)...).with(body)
+	}
+	cases := []struct {
+		name string
+		it   item
+		want []string
+	}{
+		{"both sections and an area", withArea(readyBody), nil},
+		{"no area label", queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued").with(readyBody), []string{"area label"}},
+		{"done when without bullets", withArea("## Done when\n\nno bullets here\n\n## End-to-end check\n\ntext\n"), []string{"## Done when bullets"}},
+		{"done when missing", withArea("## End-to-end check\n\ntext\n"), []string{"## Done when bullets"}},
+		{"end-to-end missing", withArea("## Done when\n\n- bullet\n"), []string{"## End-to-end check"}},
+		{"end-to-end empty", withArea("## Done when\n\n- bullet\n\n## End-to-end check\n\n   \n"), []string{"## End-to-end check"}},
+		{"headings in any case and level", withArea("# DONE WHEN\n\n- bullet\n\n### end-to-end check\n\ntext\n"), nil},
+		{"both missing", withArea("## Problem\n\np\n"), []string{"## Done when bullets", "## End-to-end check"}},
+		{"area and both missing", queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued").with("## Problem\n\np\n"), []string{"area label", "## Done when bullets", "## End-to-end check"}},
+		{"ref-update body is exempt", withArea("generated body, no sections\n", "codeaf-ref-update"), nil},
+		{"experiment body is exempt", withArea("generated body, no sections\n", "codeaf-experiment"), nil},
+		{"ref-update without an area still misses the area", queuedIssue(3, "2024-01-01T00:00:00Z", "codeaf-queued", "codeaf-ref-update").with("no sections\n"), []string{"area label"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := issueReady(c.it); !slices.Equal(got, c.want) {
+				t.Fatalf("issueReady = %v; want %v", got, c.want)
+			}
+		})
+	}
+	// A body over 64 KiB is scanned only up to the cap: the sections past
+	// it are invisible to the gate, the ones inside it are found.
+	filler := strings.Repeat("filler line\n", 1)
+	huge := strings.Repeat("filler line\n", 1<<16)
+	if got := issueReady(withArea(huge + readyBody)); !slices.Equal(got, []string{"## Done when bullets", "## End-to-end check"}) {
+		t.Fatalf("sections past the cap: issueReady = %v; want both missing", got)
+	}
+	if got := issueReady(withArea(filler + readyBody)); len(got) != 0 {
+		t.Fatalf("sections inside the cap: issueReady = %v; want none", got)
+	}
+}
+
+// with returns the item with a body; a small helper the gate tests read by.
+func (i item) with(body string) item { i.Body = body; return i }
+
+func TestNextHoldsUnreadyIssue(t *testing.T) {
+	o := nextOpts()
+	var lines []string
+	o.Logf = func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
+	unready := queuedIssue(117, "2024-01-01T00:00:00Z", "codeaf-queued", "area:harness")
+	unready.Body = "## Problem\n\nno acceptance sections\n"
+	ready := areaIssue(118, "2024-01-01T00:00:00Z", "app/x")
+	ready.Body = readyBody
+	// Alone, the unready issue is held with the not-ready reason.
+	if n, _, reason := Next([]item{unready}, nil, o); n != 0 || !strings.HasPrefix(reason, "not ready:") {
+		t.Fatalf("unready alone: Next = %d, %q; want 0, not ready: ...", n, reason)
+	}
+	// The next ready candidate still starts: the hold blocks no one.
+	if n, _, _ := Next([]item{unready, ready}, nil, o); n != 118 {
+		t.Fatalf("unready first: Next = %d; want 118", n)
+	}
+	if !slices.Contains(lines, "holding #117: not ready: ## Done when bullets, ## End-to-end check") {
+		t.Fatalf("log lines = %v; want the not-ready hold", lines)
+	}
+}
+
+func TestNextExemptsRefUpdate(t *testing.T) {
+	o := nextOpts()
+	it := queuedIssue(9, "2024-01-01T00:00:00Z", "codeaf-queued", "area:harness", "codeaf-ref-update")
+	it.Body = "Upstream head: abc\n\n## What CodeAF should do\n\n1. Report.\n"
+	if n, _, reason := Next([]item{it}, nil, o); n != 9 {
+		t.Fatalf("ref-update without the sections: Next = %d, %q; want 9", n, reason)
+	}
+	// Exempt from the body checks, not the area check: without an area the
+	// issue is still held.
+	bare := queuedIssue(11, "2024-01-01T00:00:00Z", "codeaf-queued", "codeaf-ref-update")
+	bare.Body = it.Body
+	if n, _, reason := Next([]item{bare}, nil, o); n != 0 || reason != "no area label" {
+		t.Fatalf("ref-update without an area: Next = %d, %q; want 0, no area label", n, reason)
 	}
 }

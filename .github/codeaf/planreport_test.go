@@ -390,7 +390,7 @@ func TestProposalBodyEscapesAndTemplate(t *testing.T) {
 		"### Proposal: Title with \\`backticks\\` and &lt;html&gt;",
 		"text &amp; more &lt;text&gt;",
 		"**What to do**",
-		"**Done when**",
+		"## Done when",
 		"**Area**: app/widgets",
 		"**Depends on**: #12, #34",
 	} {
@@ -659,4 +659,47 @@ func planJSONString(s string) string {
 		panic(err)
 	}
 	return string(data)
+}
+
+// TestProposalBodyHasAcceptanceSections pins the proposal body against the
+// queue's acceptance gate (issue #136): "## Done when" renders the field as
+// bullets, "## End-to-end check" the planner's field or the placeholder.
+func TestProposalBodyHasAcceptanceSections(t *testing.T) {
+	body := ProposalBody(Proposal{Title: "t", Problem: "p", What: "w", Done: "first bullet\nsecond bullet"})
+	done, ok := issueSection(body, issueDoneWhenHeading)
+	if !ok || !issueHasBullet(done) || !strings.Contains(done, "- first bullet") || !strings.Contains(done, "- second bullet") {
+		t.Fatalf("ProposalBody Done when missing or not bullets:\n%s", body)
+	}
+	e2e, ok := issueSection(body, issueEndToEndHeading)
+	if !ok || strings.TrimSpace(e2e) == "" || !strings.Contains(e2e, "fill in before queueing") {
+		t.Fatalf("ProposalBody End-to-end check missing or not the placeholder:\n%s", body)
+	}
+	// The planner's own End-to-end check is used when it gave one.
+	body = ProposalBody(Proposal{Title: "t", Problem: "p", What: "w", Done: "b", EndToEnd: "go test -race ./... is green"})
+	e2e, _ = issueSection(body, issueEndToEndHeading)
+	if !strings.Contains(e2e, "go test -race ./... is green") || strings.Contains(e2e, "fill in before queueing") {
+		t.Fatalf("planner End-to-end check not used:\n%s", body)
+	}
+}
+
+func TestParseProposalsEndToEndField(t *testing.T) {
+	answer := "### Proposal: Fix the gate\n" +
+		"- Problem: p\n- What to do: w\n- Done when: tests pass\n" +
+		"- End-to-end check: go test -race ./... is green\n- Area: harness\n"
+	props := ParseProposals(answer, 5)
+	if len(props) != 1 {
+		t.Fatalf("ParseProposals kept %d proposals; want 1", len(props))
+	}
+	if props[0].EndToEnd != "go test -race ./... is green" {
+		t.Fatalf("EndToEnd = %q", props[0].EndToEnd)
+	}
+	// The field is optional: without it, EndToEnd is empty and the body
+	// carries the placeholder.
+	props = ParseProposals("### Proposal: Fix the gate\n- Problem: p\n- What to do: w\n", 5)
+	if len(props) != 1 || props[0].EndToEnd != "" {
+		t.Fatalf("absent field: props = %+v", props)
+	}
+	if body := ProposalBody(props[0]); !strings.Contains(body, "fill in before queueing") {
+		t.Fatalf("placeholder missing from body:\n%s", body)
+	}
 }
