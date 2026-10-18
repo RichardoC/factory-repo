@@ -882,7 +882,6 @@ func TestHoldCommentIsPostedOnce(t *testing.T) {
 	}
 }
 
-<<<<<<< 4723da524cdda5d3a9f7719ab7753bf79dc715ed
 // TestNextPicksReviewBeforeIssues covers the queue's new head of the pass
 // (issue #137): a pull request labelled codeaf and codeaf-review-needed is
 // picked with kind review on the lowest free lane, ahead of any queued
@@ -1097,7 +1096,10 @@ func TestRunNextOutputShape(t *testing.T) {
 		runs   string
 		want   string
 	}{
-		{"issue", `[{"number":3,"state":"open","created_at":"2024-01-01T00:00:00Z","labels":[{"name":"codeaf-queued"},{"name":"area:app/x"}]}]`,
+		// The issue body must pass the acceptance gate (issue #132/#136):
+		// both sections, readyBody's, or the gate holds it and runNext
+		// prints nothing.
+		{"issue", fmt.Sprintf(`[{"number":3,"state":"open","created_at":"2024-01-01T00:00:00Z","body":%q,"labels":[{"name":"codeaf-queued"},{"name":"area:app/x"}]}]`, readyBody),
 			`[{"status":"completed"}]`, "kind=issue\nnumber=3\nlane=0\n"},
 		{"review", "[" + pr(124, `,{"name":"codeaf-review-needed"}`) + "]",
 			`[{"status":"completed"}]`, "kind=review\nnumber=124\nlane=0\n"},
@@ -1118,9 +1120,11 @@ func TestRunNextOutputShape(t *testing.T) {
 			}
 		})
 	}
-=======
+}
+
 // readyBody is a body that passes the acceptance gate: both sections, with
 // a bullet under Done when and text under End-to-end check, and no path in
+// it that would add an area. and text under End-to-end check, and no path in
 // it that would add an area.
 const readyBody = "## Problem\n\np\n\n## Done when\n\n- TestIssueReady passes\n\n## End-to-end check\n\nharness next holds #117\n"
 
@@ -1246,13 +1250,17 @@ func TestNextHoldsUnreadyIssue(t *testing.T) {
 	unready.Body = "## Problem\n\nno acceptance sections\n"
 	ready := areaIssue(118, "2024-01-01T00:00:00Z", "app/x")
 	ready.Body = readyBody
-	// Alone, the unready issue is held with the not-ready reason.
-	if n, _, reason := Next([]item{unready}, nil, o); n != 0 || !strings.HasPrefix(reason, "not ready:") {
-		t.Fatalf("unready alone: Next = %d, %q; want 0, not ready: ...", n, reason)
+	// Alone, the unready issue is held with the not-ready reason: no
+	// pick, and the hold logged (issue #137: the reason rides on Logf).
+	if p := Next([]item{unready}, nil, o); p.Kind != "" {
+		t.Fatalf("unready alone: Next = %+v; want no pick", p)
+	}
+	if !slices.Contains(lines, "holding #117: not ready: ## Done when bullets, ## End-to-end check") {
+		t.Fatalf("log lines = %v; want the not-ready hold", lines)
 	}
 	// The next ready candidate still starts: the hold blocks no one.
-	if n, _, _ := Next([]item{unready, ready}, nil, o); n != 118 {
-		t.Fatalf("unready first: Next = %d; want 118", n)
+	if p := Next([]item{unready, ready}, nil, o); p.Kind != kindIssue || p.Number != 118 {
+		t.Fatalf("unready first: Next = %+v; want issue 118", p)
 	}
 	if !slices.Contains(lines, "holding #117: not ready: ## Done when bullets, ## End-to-end check") {
 		t.Fatalf("log lines = %v; want the not-ready hold", lines)
@@ -1271,8 +1279,11 @@ func TestNextHoldsUnreadyIssueWithNoArea(t *testing.T) {
 	o.NotReadyHeld = func(n int, missing []string) { held[n] = missing }
 	it := queuedIssue(42, "2024-01-01T00:00:00Z", "codeaf-queued")
 	it.Body = "## Problem\n\np\n"
-	if n, _, reason := Next([]item{it}, nil, o); n != 0 || reason != "not ready: area label, ## Done when bullets, ## End-to-end check" {
-		t.Fatalf("Next = %d, %q; want 0, not ready: area label, ## Done when bullets, ## End-to-end check", n, reason)
+	if p := Next([]item{it}, nil, o); p.Kind != "" {
+		t.Fatalf("Next = %+v; want no pick", p)
+	}
+	if !slices.Contains(lines, "holding #42: not ready: area label, ## Done when bullets, ## End-to-end check") {
+		t.Fatalf("log lines = %v; want the combined hold", lines)
 	}
 	if want := []string{"area label", "## Done when bullets", "## End-to-end check"}; !slices.Equal(held[42], want) {
 		t.Fatalf("NotReadyHeld missing = %v; want %v", held[42], want)
@@ -1287,17 +1298,18 @@ func TestNextHoldsUnreadyIssueWithNoArea(t *testing.T) {
 
 func TestNextExemptsRefUpdate(t *testing.T) {
 	o := nextOpts()
+	var lines []string
+	o.Logf = func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
 	it := queuedIssue(9, "2024-01-01T00:00:00Z", "codeaf-queued", "area:harness", "codeaf-ref-update")
 	it.Body = "Upstream head: abc\n\n## What CodeAF should do\n\n1. Report.\n"
-	if n, _, reason := Next([]item{it}, nil, o); n != 9 {
-		t.Fatalf("ref-update without the sections: Next = %d, %q; want 9", n, reason)
+	if p := Next([]item{it}, nil, o); p.Kind != kindIssue || p.Number != 9 {
+		t.Fatalf("ref-update without the sections: Next = %+v; want issue 9", p)
 	}
 	// Exempt from the body checks, not the area check: without an area the
 	// issue is still held.
 	bare := queuedIssue(11, "2024-01-01T00:00:00Z", "codeaf-queued", "codeaf-ref-update")
 	bare.Body = it.Body
-	if n, _, reason := Next([]item{bare}, nil, o); n != 0 || reason != "no area label" {
-		t.Fatalf("ref-update without an area: Next = %d, %q; want 0, no area label", n, reason)
+	if p := Next([]item{bare}, nil, o); p.Kind != "" || !slices.Contains(lines, "holding #11: no area label") {
+		t.Fatalf("ref-update without an area: Next = %+v, lines = %v; want held: no area label", p, lines)
 	}
->>>>>>> fb304f1ece1a3b7b3d69dbbb59197ea7ecfb7f8b
 }

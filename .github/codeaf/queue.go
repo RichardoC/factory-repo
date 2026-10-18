@@ -215,7 +215,6 @@ func Next(issues []item, runs []runStatus, o queueOptions) pick {
 			hold("lane capacity full")
 			return pick{}
 		}
-<<<<<<< 4723da524cdda5d3a9f7719ab7753bf79dc715ed
 		areas := []string(nil)
 		switch kind {
 		case kindIssue:
@@ -223,35 +222,32 @@ func Next(issues []item, runs []runStatus, o queueOptions) pick {
 				logf("holding #%d: dependencies open for #%d", c.Number, n)
 				hold(fmt.Sprintf("dependencies open for #%d", n))
 				return pick{}
-=======
-		if n := openDep(depsFromBody(cappedBody(c.Body)), open); n > 0 {
-			logf("holding #%d: dependencies open for #%d", c.Number, n)
-			hold(fmt.Sprintf("dependencies open for #%d", n))
-			continue
-		}
-		areas := issueAreas(c)
-		// The acceptance gate (issue #132 for the area, #136 for the body),
-		// run as one check: an issue missing both the area and the sections
-		// is held with a reason - and a hold comment - that names everything
-		// it is missing, not just the first thing the gate noticed.
-		if missing := issueReady(c); len(missing) > 0 {
-			if slices.Equal(missing, []string{"area label"}) {
-				// An issue that names no area is held, not started, and
-				// blocks no one (issue #132): it is skipped like any other
-				// hold, and the next candidate is still considered.
-				logf("holding #%d: no area label", c.Number)
-				hold("no area label")
-				if o.NoAreaHeld != nil {
-					o.NoAreaHeld(c.Number)
-				}
-				continue
 			}
-			reason := "not ready: " + strings.Join(missing, ", ")
-			logf("holding #%d: %s", c.Number, reason)
-			hold(reason)
-			if o.NotReadyHeld != nil {
-				o.NotReadyHeld(c.Number, missing)
->>>>>>> fb304f1ece1a3b7b3d69dbbb59197ea7ecfb7f8b
+			// The acceptance gate (issue #132 for the area, #136 for the
+			// body), run as one check: an issue missing both the area and
+			// the sections is held with a reason - and a hold comment -
+			// that names everything it is missing, not just the first
+			// thing the gate noticed.
+			if missing := issueReady(c); len(missing) > 0 {
+				if slices.Equal(missing, []string{"area label"}) {
+					// An issue that names no area is held, not started,
+					// and blocks no one (issue #132): it is skipped like
+					// any other hold, and the next candidate is still
+					// considered.
+					logf("holding #%d: no area label", c.Number)
+					hold("no area label")
+					if o.NoAreaHeld != nil {
+						o.NoAreaHeld(c.Number)
+					}
+					return pick{}
+				}
+				reason := "not ready: " + strings.Join(missing, ", ")
+				logf("holding #%d: %s", c.Number, reason)
+				hold(reason)
+				if o.NotReadyHeld != nil {
+					o.NotReadyHeld(c.Number, missing)
+				}
+				return pick{}
 			}
 			areas = issueAreas(c)
 			if len(areas) == 0 {
@@ -876,12 +872,8 @@ func runNext() error {
 	gh := newGitHub()
 	prFiles := fetchPRFiles(gh, issues, runs, log.Printf)
 	var noArea []int
-<<<<<<< 4723da524cdda5d3a9f7719ab7753bf79dc715ed
-	p := Next(issues, runs, queueOptions{
-=======
 	notReady := map[int][]string{}
-	number, lane, reason := Next(issues, runs, queueOptions{
->>>>>>> fb304f1ece1a3b7b3d69dbbb59197ea7ecfb7f8b
+	p := Next(issues, runs, queueOptions{
 		Label:           envOr("CODEAF_LABEL", "codeaf"),
 		QueuedLabel:     envOr("CODEAF_QUEUED_LABEL", "codeaf-queued"),
 		PriorityLabel:   envOr("CODEAF_PRIORITY_LABEL", "codeaf-priority"),
