@@ -8,9 +8,13 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	gqlclient "git.sr.ht/~emersion/gqlclient"
 
@@ -1495,5 +1499,152 @@ func TestFetchLabelsByIssueIDRequestsLabelPageInfo(t *testing.T) {
 	}
 	if !strings.Contains(capturedQuery, fmt.Sprintf("labels(first: %d)", maxLiveLabelPage)) {
 		t.Fatalf("live label query must request %d labels per issue, got:\n%s", maxLiveLabelPage, capturedQuery)
+	}
+}
+
+// TestCreateIssuesSendsOneMutationWhenRateLimitBudgetExhausted is the
+// end-to-end regression test for the duplicate-ticket bug: Linear sends
+// `X-RateLimit-Requests-Remaining: 0` on every response, including the 200 to
+// the mutation that consumed the last unit of the window. A transport that
+// treated that header as "rate limited" would discard the successful response
+// and re-send the same mutation, so one batch of ten issues would create up to
+// fifty tickets. The transport must return the successful response and only
+// delay the *next* request.
+func TestCreateIssuesSendsOneMutationWhenRateLimitBudgetExhausted(t *testing.T) {
+	// Both counters are written by the httptest handler goroutine while the
+	// test goroutine reads them, so they are atomic (this test runs under
+	// -race).
+	var createBatches atomic.Int32
+	var unsubscribes atomic.Int32
+	var otherRequests atomic.Int32
+	handlerReturned := make(chan struct{}, 8)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			select {
+			case handlerReturned <- struct{}{}:
+			default:
+			}
+		}()
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll() error = %v", err)
+			return
+		}
+		query := string(body)
+
+		// Linear sends the budget header on every response, successful or
+		// not. The reset instant is already in the past so a "0 remaining"
+		// header cannot park the next request on a real multi-second wait.
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-RateLimit-Requests-Remaining", "0")
+		w.Header().Set("X-RateLimit-Requests-Reset",
+			strconv.FormatInt(time.Now().Add(-time.Second).Unix(), 10))
+
+		switch {
+		case strings.Contains(query, "issueCreateBatch"):
+			createBatches.Add(1)
+			_, _ = io.WriteString(w, `{"data":{"issueCreate0":{"success":true,"issue":{"id":"issue-1","identifier":"SNYK-100"}}}}`)
+		case strings.Contains(query, "issueUnsubscribe"):
+			unsubscribes.Add(1)
+			_, _ = io.WriteString(w, `{"data":{"issueUnsubscribe0":{"success":true}}}`)
+		default:
+			// Any other operation gets a valid (empty-data) success body so
+			// the test never fails for an unrelated reason, but it is counted
+			// so an unexpected round trip is visible.
+			otherRequests.Add(1)
+			_, _ = io.WriteString(w, `{"data":{}}`)
+		}
+	}))
+	defer server.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	client := New(config.LinearConfig{
+		TeamID:           "team-1",
+		APIKey:           "test-key",
+		UnsubscribeActor: true,
+		States:           config.StateConfig{Todo: "Todo"},
+	}, 1, logger)
+	// New hardcodes the real Linear endpoint; point the client at the stub,
+	// exactly as the CreateIssues tests above do. The AdaptiveTransport and
+	// HeaderTransport built by New stay in place, which is the point here.
+	client.gql = gqlclient.New(server.URL, &http.Client{})
+
+	// Pre-seed the client so the batch needs no team/state/label round trips.
+	client.mu.Lock()
+	client.resolvedTeam = "team-1"
+	client.statesByName = map[string]string{"todo": "state-todo"}
+	client.statesByType = map[string]string{}
+	client.managedLabelIDs = map[string]string{}
+	client.mu.Unlock()
+
+	desired := []model.DesiredIssue{
+		{
+			Fingerprint: "snyk-dast:project-a:100",
+			Title:       "t",
+			Description: "",
+			State:       model.StateTodo,
+			Priority:    0,
+		},
+	}
+
+	// The fixed client returns immediately; the deadline only bounds a
+	// regression that would wait on the rate-limit window.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	failed, err := client.CreateIssues(ctx, desired)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("CreateIssues() error = %v, want nil", err)
+	}
+	if len(failed) != 0 {
+		t.Fatalf("failed = %#v, want no failed indices", failed)
+	}
+	// The real fix returns at once instead of sleeping out a backoff.
+	if elapsed > 2*time.Second {
+		t.Fatalf("CreateIssues() took %v, want it to return immediately without re-sending", elapsed)
+	}
+
+	// Let any (buggy) re-send reach the server before counting: the handler
+	// acknowledges every request it serves, so this is a bounded wait, not a
+	// policy sleep.
+	waitForRequests := time.NewTimer(500 * time.Millisecond)
+	defer waitForRequests.Stop()
+	deadline := time.After(500 * time.Millisecond)
+	for createBatches.Load() == 0 {
+		select {
+		case <-handlerReturned:
+		case <-deadline:
+			t.Fatalf("server saw no issueCreateBatch request, want exactly 1")
+		}
+	}
+	select {
+	case <-handlerReturned:
+	case <-waitForRequests.C:
+	}
+
+	gotCreate := createBatches.Load()
+	gotUnsubscribe := unsubscribes.Load()
+	gotOther := otherRequests.Load()
+	t.Logf("recorded requests: issueCreateBatch=%d issueUnsubscribe=%d other=%d", gotCreate, gotUnsubscribe, gotOther)
+
+	if gotCreate != 1 {
+		t.Fatalf("issueCreateBatch requests = %d, want exactly 1: a successful mutation must not be re-sent "+
+			"when X-RateLimit-Requests-Remaining is 0 (a re-send duplicates every ticket in the batch)",
+			gotCreate)
+	}
+	if gotUnsubscribe > 1 {
+		t.Fatalf("issueUnsubscribe requests = %d, want at most 1", gotUnsubscribe)
+	}
+	if gotOther != 0 {
+		t.Fatalf("other requests = %d, want 0: the batch must need no extra lookups", gotOther)
+	}
+	if gotCreate >= 2 || gotUnsubscribe >= 2 {
+		t.Fatalf("server saw %d issueCreateBatch and %d issueUnsubscribe requests, want never 2+ per operation",
+			gotCreate, gotUnsubscribe)
 	}
 }

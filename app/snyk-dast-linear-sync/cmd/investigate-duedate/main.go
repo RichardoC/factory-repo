@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -127,9 +128,9 @@ func extractIdentifier(ref string) string {
 			}
 		}
 	}
-	for i := len(parts) - 1; i >= 0; i-- {
-		if parts[i] != "" {
-			return parts[i]
+	for _, part := range slices.Backward(parts) {
+		if part != "" {
+			return part
 		}
 	}
 	return ""
