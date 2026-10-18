@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/tesslio/snyk-dast-linear-sync/internal/cache"
@@ -54,7 +56,14 @@ func main() {
 		slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}),
 	))
 
-	ctx := context.Background()
+	// As in the sync binary: Ctrl-C or SIGTERM cancels in-flight calls instead
+	// of killing the process mid-write.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		logger.Info("shutdown requested, cancelling in-flight calls and exiting non-zero")
+	}()
 
 	snykdast, err := snykdastclient.New(ctx, cfg, logger.With("service", "snyk-dast"))
 	if err != nil {

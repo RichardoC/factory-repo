@@ -54,6 +54,13 @@ go run ./cmd/snyk-dast-linear-sync --env-file .env --dry-run
 
 That avoids shell-specific `source` behavior and is the recommended way to run the tool.
 
+Ctrl-C and SIGTERM do not kill the process mid-batch: the signal cancels the
+context, in-flight Snyk DAST and Linear calls are cancelled, the run logs
+`shutdown requested, cancelling in-flight calls and leaving the cache
+untouched`, the cache is left untouched, and the process exits non-zero. The
+next run re-examines everything against live data and retries whatever was not
+written.
+
 Dry run:
 
 ```bash
@@ -467,6 +474,10 @@ On a normal run:
    whose Linear write failed in this run is left out of the refresh, so the next
    run retries it instead of skipping it as unchanged.
 
+An interrupted run (Ctrl-C, SIGTERM, or any cancelled context) never refreshes
+the cache: its plan was only partly written, so the next run re-examines
+everything against live data.
+
 The cache fast-path never suppresses a pending move into a terminal state
 (`Done`/`Cancelled`). Use `--bypass-cache` to ignore the cache for a run and
 rebuild it from live data.
@@ -548,6 +559,17 @@ the outcome after that retry counts:
 
 Both counts appear in the `sync complete` summary log either way, and that
 summary is emitted before the exit status is decided.
+
+An interrupt is a non-zero exit too, with a different cause. Ctrl-C or SIGTERM
+cancels the context, so in-flight Snyk DAST and Linear calls are cancelled, no
+further jobs start, and the run logs `shutdown requested, cancelling in-flight
+calls and leaving the cache untouched`. The cache is **not** refreshed — the
+plan was only partly written, so a refresh would describe the fingerprints whose
+jobs never ran as reconciled (see [Cache Behavior](#cache-behavior) and
+PROJECT.md `## SQLite Cache`). `Run` returns an error wrapping
+`context.Canceled`/`context.DeadlineExceeded`, which becomes the process exit
+status, so a scheduler or CI job notices. A signal that arrives after a run has
+already finished changes nothing.
 
 ## Logs
 

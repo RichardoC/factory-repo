@@ -411,6 +411,11 @@ The cache fast-path never suppresses a pending move into a terminal state
 accepted/invalidated while its ticket sat in an open column must still be
 closed, even if its hashes are unchanged since the last run.
 
+An interrupted run (SIGINT/SIGTERM, or any cancelled context) never refreshes
+the cache. The run's plan was only partly written, so a refresh would describe
+the fingerprints whose jobs never ran as reconciled; the run returns an error
+instead, and the next run re-examines everything against live data.
+
 ## Safety Assumptions
 
 - The metadata block must remain intact.

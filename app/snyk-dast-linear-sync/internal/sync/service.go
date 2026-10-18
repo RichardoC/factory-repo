@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -46,6 +47,13 @@ type Service struct {
 	snykdast SnykDASTClient
 	linear   LinearClient
 	cache    CacheStore
+
+	// executeHook, when non-nil, runs at the entry of every executeJob call
+	// before any work starts, and a non-nil error stops the worker pool with
+	// that error. It exists only as a test seam: it lets a test inject an
+	// independent worker failure (one that is not a context cancellation) and
+	// so pin the g.Wait() guard in Run. It is nil in production.
+	executeHook func(job) error
 }
 
 const (
@@ -108,6 +116,12 @@ func New(cfg config.Config, logger *slog.Logger, snykdast SnykDASTClient, linear
 	}
 }
 
+// Run loads both snapshots, plans the sync and executes it with a pool of
+// workers. Its contract on interruption: when ctx is cancelled (a signal, a
+// deadline, a caller's cancellation), the run stops starting new jobs, returns
+// an error wrapping the context error, and the cache is left untouched — so
+// the next run re-examines everything against Linear's live state instead of
+// trusting a cache that describes work that was never written.
 func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	runCtx := ctx
 	var (
@@ -274,7 +288,9 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			if !ok {
 				createBatch = append(createBatch, desired)
 				if len(createBatch) == createBatchSize {
-					jobs <- job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)}
+					if err := s.enqueue(workerCtx, jobs, job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)}); err != nil {
+						return err
+					}
 					s.logQueueProgress(&queuedJobs, int64(len(createBatch)))
 					createBatch = createBatch[:0]
 				}
@@ -303,7 +319,9 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 					)
 					createBatch = append(createBatch, desired)
 					if len(createBatch) == createBatchSize {
-						jobs <- job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)}
+						if err := s.enqueue(workerCtx, jobs, job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)}); err != nil {
+							return err
+						}
 						s.logQueueProgress(&queuedJobs, int64(len(createBatch)))
 						createBatch = createBatch[:0]
 					}
@@ -323,18 +341,24 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				update.Diff = ComputeDiff(existing, desired)
 				updateBatch = append(updateBatch, update)
 				if len(updateBatch) == createBatchSize {
-					jobs <- job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)}
+					if err := s.enqueue(workerCtx, jobs, job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)}); err != nil {
+						return err
+					}
 					s.logQueueProgress(&queuedJobs, int64(len(updateBatch)))
 					updateBatch = updateBatch[:0]
 				}
 			}
 		}
 		if len(createBatch) > 0 {
-			jobs <- job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)}
+			if err := s.enqueue(workerCtx, jobs, job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)}); err != nil {
+				return err
+			}
 			s.logQueueProgress(&queuedJobs, int64(len(createBatch)))
 		}
 		if len(updateBatch) > 0 {
-			jobs <- job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)}
+			if err := s.enqueue(workerCtx, jobs, job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)}); err != nil {
+				return err
+			}
 			s.logQueueProgress(&queuedJobs, int64(len(updateBatch)))
 		}
 
@@ -364,14 +388,18 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				resolvedUpdate.Diff = ComputeDiff(existing, resolved)
 				resolveBatch = append(resolveBatch, resolvedUpdate)
 				if len(resolveBatch) == createBatchSize {
-					jobs <- job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)}
+					if err := s.enqueue(workerCtx, jobs, job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)}); err != nil {
+						return err
+					}
 					s.logQueueProgress(&queuedJobs, int64(len(resolveBatch)))
 					resolveBatch = resolveBatch[:0]
 				}
 			}
 		}
 		if len(resolveBatch) > 0 {
-			jobs <- job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)}
+			if err := s.enqueue(workerCtx, jobs, job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)}); err != nil {
+				return err
+			}
 			s.logQueueProgress(&queuedJobs, int64(len(resolveBatch)))
 		}
 
@@ -396,22 +424,43 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				cancelUpdate.Diff = ComputeDiff(duplicate, desired)
 				cancelBatch = append(cancelBatch, cancelUpdate)
 				if len(cancelBatch) == createBatchSize {
-					jobs <- job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)}
+					if err := s.enqueue(workerCtx, jobs, job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)}); err != nil {
+						return err
+					}
 					s.logQueueProgress(&queuedJobs, int64(len(cancelBatch)))
 					cancelBatch = cancelBatch[:0]
 				}
 			}
 		}
 		if len(cancelBatch) > 0 {
-			jobs <- job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)}
+			if err := s.enqueue(workerCtx, jobs, job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)}); err != nil {
+				return err
+			}
 			s.logQueueProgress(&queuedJobs, int64(len(cancelBatch)))
 		}
 
 		return nil
 	})
 
-	if err := g.Wait(); err != nil {
-		return result, err
+	waitErr := g.Wait()
+	// An interrupted run has written only part of its plan: the findings whose
+	// jobs never ran look reconciled in a refreshed cache simply because their
+	// ticket was untouched. Returning before the cache save below is what keeps
+	// such a run from hiding them from the next one.
+	//
+	// g.Wait() alone is not enough to notice an interruption. When the context
+	// was already cancelled before Run started, or the cancellation landed
+	// while no job was in flight, errgroup never sees an error and returns nil,
+	// so the wait error is checked alongside the run context's own error.
+	interruptionErr := waitErr
+	if interruptionErr == nil {
+		interruptionErr = runCtx.Err()
+	}
+	if errors.Is(interruptionErr, context.Canceled) || errors.Is(interruptionErr, context.DeadlineExceeded) {
+		return result, fmt.Errorf("sync interrupted before all work was written: %w", interruptionErr)
+	}
+	if waitErr != nil {
+		return result, waitErr
 	}
 
 	if !s.cfg.DryRun && s.cache != nil {
@@ -597,7 +646,37 @@ func inRange(idx, length int) bool {
 	return idx >= 0 && idx < length
 }
 
+// enqueue hands a job to the worker pool and reports the reason it could not
+// be queued. The context is the workers' own: when a worker fails, errgroup
+// cancels it and every worker returns. A plain send on the unbuffered jobs
+// channel would then block forever — nobody is left to receive — and Run
+// would never return. Waiting on the context instead lets the producer stop,
+// close the channel and unwind.
+func (s *Service) enqueue(ctx context.Context, jobs chan<- job, j job) error {
+	select {
+	case jobs <- j:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (s *Service) executeJob(ctx context.Context, job job, result *RunResult, failed *failedFingerprints) error {
+	// The test seam runs first, before any counter or client call, so an
+	// injected failure behaves exactly like a worker error that stopped the
+	// pool: the job leaves no trace and Run must notice it through g.Wait().
+	// Nil in production.
+	if s.executeHook != nil {
+		if err := s.executeHook(job); err != nil {
+			return err
+		}
+	}
+	// A cancelled context means the run is over: touch no counter and make no
+	// Linear call — every one of them would fail, and each item of the batch
+	// would be counted in FailedOps as if the write had been attempted.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	switch job.kind {
 	case jobCreateBatch:
 		creates := atomic.AddInt64(&result.PlannedCreates, int64(len(job.desiredBatch)))
@@ -658,7 +737,10 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult, fa
 				}
 			}
 		}
-		return nil
+		// Once the context is done the batch call and its fallback fail fast
+		// (their failures are counted, but an interrupted run's counts and
+		// cache are never saved). Stop the worker so no further job starts.
+		return ctx.Err()
 	case jobUpdate:
 		updates := atomic.AddInt64(&result.PlannedUpdates, int64(len(job.updateBatch)))
 		s.logExecutionProgress("update", updates)
@@ -740,7 +822,10 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult, fa
 				}
 			}
 		}
-		return nil
+		// Once the context is done the batch call and its fallback fail fast
+		// (their failures are counted, but an interrupted run's counts and
+		// cache are never saved). Stop the worker so no further job starts.
+		return ctx.Err()
 	case jobResolve:
 		resolves := atomic.AddInt64(&result.PlannedResolves, int64(len(job.updateBatch)))
 		s.logExecutionProgress("resolve", resolves)
@@ -778,7 +863,10 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult, fa
 				}
 			}
 		}
-		return nil
+		// Once the context is done the batch call and its fallback fail fast
+		// (their failures are counted, but an interrupted run's counts and
+		// cache are never saved). Stop the worker so no further job starts.
+		return ctx.Err()
 	case jobCancelDuplicate:
 		cancels := atomic.AddInt64(&result.CancelledDuplicates, int64(len(job.updateBatch)))
 		s.logExecutionProgress("cancel-duplicate", cancels)
@@ -814,7 +902,10 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult, fa
 				}
 			}
 		}
-		return nil
+		// Once the context is done the batch call and its fallback fail fast
+		// (their failures are counted, but an interrupted run's counts and
+		// cache are never saved). Stop the worker so no further job starts.
+		return ctx.Err()
 	default:
 		return fmt.Errorf("unknown job kind %q", job.kind)
 	}
