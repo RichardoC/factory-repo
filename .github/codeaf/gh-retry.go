@@ -12,8 +12,10 @@ package main
 //     ghRetryAttempts-1 retries), waiting ghRetryBackoffs between them;
 //   - only transient failures are retried: a 5xx status anywhere in the
 //     command's output, or a transport error (the request never got an HTTP
-//     response). An HTTP 4xx (or any other explicit status) is never
-//     retried: a 4xx is GitHub's answer, not a hiccup on the way to it;
+//     response). A lone HTTP 4xx is never retried: a 4xx is GitHub's
+//     answer, not a hiccup on the way to it. A genuine 5xx still wins over
+//     a stray 4xx in the same output: the 504 that failed the call is what
+//     is retried, not judged by an unrelated "HTTP 422" earlier in it;
 //   - the command's stdout and stderr are forwarded exactly once, from its
 //     final run only, so a command-substitution capturing the subcommand's
 //     stdout gets the URL and nothing the failed attempts printed;
@@ -44,33 +46,57 @@ var ghRetryBackoffs = []time.Duration{5 * time.Second, 15 * time.Second}
 // as the CLI prints it, e.g. "HTTP 504: 504 Gateway Timeout (url)".
 var ghRetryHTTPStatus = regexp.MustCompile(`HTTP ([0-9]{3})`)
 
-// ghRetryNetworkError matches the transport errors GitHub's CLI surfaces
-// verbatim from Go's net stack when a request never got an HTTP response at
-// all: name resolution, dialing, timeouts mid-request, TLS, cut connections.
+// ghRetryNetworkError matches the transport errors a GitHub call surfaces
+// when a request never got an HTTP response at all, in the wordings both
+// Go's net stack and curl-style CLIs print: name resolution (Go's "no such
+// host", curl's "could not resolve host", the resolver's "temporary failure
+// in name resolution"), dialing and routing, timeouts mid-request, TLS, and
+// cut connections.
 var ghRetryNetworkError = regexp.MustCompile(`(?i)(` + strings.Join([]string{
 	`connection refused`,
 	`connection reset`,
 	`connection timed out`,
+	`connection aborted`,
+	`could not resolve host`,
 	`dial tcp`,
+	`network is down`,
 	`network is unreachable`,
+	`no route to host`,
 	`no such host`,
+	`temporary failure in name resolution`,
+	`server misbehaving`,
 	`i/o timeout`,
 	`Client\.Timeout`,
 	`Client\.timeout exceeded`,
 	`context deadline exceeded`,
+	`request timed out`,
 	`TLS handshake`,
 	`unexpected EOF`,
 	`proxy error`,
 }, `|`) + `)`)
 
-// runGhRetry is the subcommand entry point ("harness gh-retry -- gh ...").
-// It exits itself rather than returning an error, because its exit code is
-// the wrapped command's own, not the harness's usual 1: publish's
+// ghRetryExitCodeError carries the wrapped command's exit code back to
+// main, which exits with it (the dispatch in main.go): gh-retry's exit code
+// is the wrapped command's own, not the harness's usual 1, and publish's
 // command-substitution checks and `|| true` handling both depend on that.
-// main never sees the return below.
+// Its message is never printed: the command's output was already forwarded
+// by ghRetryMain, and log.Fatal's "harness: " line would only confuse a
+// caller parsing the output.
+type ghRetryExitCodeError struct{ code int }
+
+func (e ghRetryExitCodeError) Error() string {
+	return fmt.Sprintf("gh-retry: exit code %d", e.code)
+}
+
+// runGhRetry is the subcommand entry point ("harness gh-retry -- gh ...").
+// Success returns nil -- main's usual path -- and every other exit code is
+// handed back as a ghRetryExitCodeError for main to exit with.
 func runGhRetry() error {
-	os.Exit(ghRetryMain(os.Args[2:], os.Stdout, os.Stderr, ghRetryBackoffs))
-	return nil
+	code := ghRetryMain(os.Args[2:], os.Stdout, os.Stderr, ghRetryBackoffs)
+	if code == 0 {
+		return nil
+	}
+	return ghRetryExitCodeError{code}
 }
 
 // ghRetryMain is runGhRetry's body, split out so tests can drive it against
@@ -119,23 +145,22 @@ func ghRetryMain(args []string, stdout, stderr io.Writer, backoffs []time.Durati
 
 // ghRetryTransient reports whether a failed command's combined output shows
 // a transient failure worth retrying: an HTTP 5xx, or a transport error when
-// no HTTP status was printed. A 4xx always wins against both: GitHub
-// answered, so asking again cannot change the answer.
+// no HTTP status was printed. The 5xx that failed the call is retried even
+// when an unrelated "HTTP 4xx" appears earlier in the same output (a stray
+// substring must not veto a genuine gateway timeout), while an output whose
+// only status is a 4xx -- or any other non-5xx -- is GitHub's answer, and
+// asking again cannot change it.
 func ghRetryTransient(output string) bool {
 	matches := ghRetryHTTPStatus.FindAllStringSubmatch(output, -1)
 	if len(matches) == 0 {
 		return ghRetryNetworkError.MatchString(output)
 	}
-	saw5xx, saw4xx := false, false
 	for _, match := range matches {
 		if strings.HasPrefix(match[1], "5") {
-			saw5xx = true
-		}
-		if strings.HasPrefix(match[1], "4") {
-			saw4xx = true
+			return true
 		}
 	}
-	return saw5xx && !saw4xx
+	return false
 }
 
 // writeBoth forwards one run's captured output to its streams, exactly once.

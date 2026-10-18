@@ -8,6 +8,7 @@ package main
 // configured exit code, and succeeds with a pull-request URL on stdout.
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -166,14 +167,21 @@ func TestGhRetryTransientClassification(t *testing.T) {
 		{"HTTP 500: Internal Server Error", true},
 		{`Post "https://api.github.com/graphql": dial tcp 1.2.3.4:443: connect: connection refused`, true},
 		{`Post "https://api.github.com/graphql": dial tcp: lookup api.github.com: no such host`, true},
+		{`curl: (6) Could not resolve host: api.github.com`, true},
+		{`dial tcp: lookup api.github.com: Temporary failure in name resolution`, true},
+		{`Post "https://api.github.com/graphql": dial tcp 1.2.3.4:443: connect: no route to host`, true},
+		{`The request timed out before we could contact GitHub`, true},
+		{`connection aborted: write tcp 1.2.3.4:443->5.6.7.8:1: broken pipe`, true},
 		{"gh: read tcp 1.2.3.4:443->5.6.7.8:1: i/o timeout: unexpected EOF: retrying", true},
 		{"HTTP 422: Unprocessable Entity", false},
 		{"HTTP 404: Not Found (https://api.github.com/repos)", false},
 		{"gh: HTTP 403: API rate limit exceeded", false},
 		{"", false},
 		{"gh: no git remotes found", false},
-		// A 4xx anywhere beats everything else: GitHub answered.
-		{"HTTP 422 first, then a later HTTP 504 from a fallback", false},
+		// A genuine 5xx is retried even when a stray 4xx appears in the
+		// same output; only a lone 4xx (or any other non-5xx) is final.
+		{"HTTP 422 first, then a later HTTP 504 from a fallback", true},
+		{"HTTP 504: 504 Gateway Timeout; rate-limit probe said HTTP 403", true},
 	} {
 		if got := ghRetryTransient(tc.output); got != tc.want {
 			t.Errorf("ghRetryTransient(%q) = %v, want %v", tc.output, got, tc.want)
@@ -200,5 +208,58 @@ func TestGhRetryWaitsTheBackoffs(t *testing.T) {
 	}
 	if elapsed < 35*time.Millisecond {
 		t.Errorf("elapsed %s, want at least the 35 ms of backoff between attempts", elapsed)
+	}
+}
+
+// TestGhRetryExitCode pins how the exit code reaches the process: runGhRetry
+// returns it as a ghRetryExitCodeError (it used to os.Exit itself after an
+// unreachable return), and main -- proved with the contract binary, the way
+// publish runs it -- exits with that code and nothing else, keeping the
+// wrapped command's own exit code and its output for the workflow's checks.
+func TestGhRetryExitCode(t *testing.T) {
+	runs := fakeGh(t)
+	t.Setenv("GHRETRY_TEST_FAILS", "3") // all three attempts fail
+	t.Setenv("GHRETRY_TEST_FAIL_CODE", "7")
+	// runGhRetry reads os.Args and the production backoffs; point both at
+	// this case without sleeping the real 5 s and 15 s between attempts.
+	savedArgs, savedBackoffs := os.Args, ghRetryBackoffs
+	os.Args = []string{"harness", "gh-retry", "--", "gh", "pr", "comment", "12", "--body", "hi"}
+	ghRetryBackoffs = zeroBackoffs
+	defer func() { os.Args, ghRetryBackoffs = savedArgs, savedBackoffs }()
+
+	var code ghRetryExitCodeError
+	if err := runGhRetry(); !errors.As(err, &code) || code.code != 7 {
+		t.Fatalf("runGhRetry() = %v, want the wrapped command's exit code 7", err)
+	}
+	if runs() != 3 {
+		t.Errorf("fake gh ran %d times, want 3 (the retry allowance)", runs())
+	}
+
+	t.Setenv("GHRETRY_TEST_FAILS", "0") // a clean run is no error at all
+	os.Args = []string{"harness", "gh-retry", "--", "gh", "pr", "view", "12"}
+	if err := runGhRetry(); err != nil {
+		t.Errorf("clean runGhRetry() = %v, want nil", err)
+	}
+
+	os.Args = []string{"harness", "gh-retry", "gh"} // bad usage: code 2, no run
+	if err := runGhRetry(); !errors.As(err, &code) || code.code != 2 {
+		t.Errorf("usage runGhRetry() = %v, want exit code 2", err)
+	}
+
+	// main exits with that code: the binary, run the way publish runs it,
+	// wraps a one-shot command that fails 5 with output on both streams --
+	// not transient, so exactly one attempt -- and the process ends 5.
+	needContractBin(t)
+	env := map[string]string{"GHRETRY_TEST_FAILS": "0"}
+	out, errOut, exit := runHarness(t, env, "gh-retry", "--", "sh", "-c", "echo pr-url; echo gh-said >&2; exit 5")
+	if exit != 5 {
+		t.Errorf("harness gh-retry exit = %d, want the wrapped command's 5 (stderr: %s)", exit, errOut)
+	}
+	if !strings.Contains(out, "pr-url") || !strings.Contains(errOut, "gh-said") {
+		t.Errorf("stdout %q / stderr %q lost the wrapped command's output", out, errOut)
+	}
+	_, _, exit = runHarness(t, env, "gh-retry", "no-dashes") // usage: never runs
+	if exit != 2 {
+		t.Errorf("harness gh-retry usage exit = %d, want 2", exit)
 	}
 }

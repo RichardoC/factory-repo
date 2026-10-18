@@ -66,11 +66,7 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("harness: ")
 	if len(os.Args) < 2 {
-<<<<<<< 8d83f5c6fc1ece349bce03a6068408b896ab9eae
-		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|plan-check|plan-brief|plan-report|ref-check|merge-default|search|gh-retry")
-=======
-		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|plan-check|plan-brief|plan-report|ref-check|merge-default|search|metrics")
->>>>>>> ef15a7a752be8b88bd302f5bd39de5c8e4341321
+		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|plan-check|plan-brief|plan-report|ref-check|merge-default|search|metrics|gh-retry")
 	}
 	commands := map[string]func() error{
 		"proxy":         runProxy,
@@ -116,12 +112,10 @@ func main() {
 		// The deterministic gate on a workflow change published without a
 		// maintainer's approval (workflowpolicy.go).
 		"workflow-policy": runWorkflowPolicy,
-<<<<<<< 8d83f5c6fc1ece349bce03a6068408b896ab9eae
 		// Retry a GitHub CLI write call on transient upstream failures --
 		// 5xx or a network error, never 4xx (issue #146). The workflow
 		// prefixes its publish write calls with it: gh-retry -- gh ...
 		"gh-retry": runGhRetry,
-=======
 		// Splitting a patch the policy refused (patchsplit.go): the part
 		// under .github/ outside .github/codeaf/ goes to REFUSED for a
 		// maintainer; everything else still publishes.
@@ -129,13 +123,19 @@ func main() {
 		// The PR comment body for a refused part of a patch
 		// (refusedcomment.go): reason plus the refused diff in a fence.
 		"refused-comment": runRefusedComment,
->>>>>>> ef15a7a752be8b88bd302f5bd39de5c8e4341321
 	}
 	command, ok := commands[os.Args[1]]
 	if !ok {
 		log.Fatalf("unknown command %q", os.Args[1])
 	}
 	if err := command(); err != nil {
+		// Only "harness gh-retry" ends here: its exit code is the wrapped
+		// command's own (ghRetryExitCodeError, gh-retry.go), and that
+		// command's output was already forwarded, so print nothing more.
+		var ghCode ghRetryExitCodeError
+		if errors.As(err, &ghCode) {
+			os.Exit(ghCode.code)
+		}
 		log.Fatal(err)
 	}
 }
