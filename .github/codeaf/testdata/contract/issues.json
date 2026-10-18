@@ -1,0 +1,14 @@
+[
+  {
+    "number": 3,
+    "title": "Harness: contract tests for every subcommand",
+    "body": "Work in .github/codeaf.\n\nDepends on #1, which is closed.",
+    "state": "open",
+    "labels": [
+      { "name": "codeaf-queued" },
+      { "name": "area:harness" }
+    ],
+    "comments": 0,
+    "created_at": "2026-10-16T10:00:00Z"
+  }
+]
