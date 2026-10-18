@@ -532,8 +532,9 @@ knowing*).
     refuses, such as an edit to a step that holds a secret, still waits for a
     maintainer.
 
-    The policy compares the patched workflows against the **patch's own base
-    commit**, not current `main`: when a branch has fallen behind and
+    `harness workflow-policy BEFORE AFTER BASE` (a third directory, not yet
+    passed by the publish job) compares the patched workflows against the
+    **patch's own base commit**, not current `main`: when a branch has fallen behind and
     `main`'s workflows moved (a trigger change, a new step), the policy
     reports `<workflow>: changed on the default branch since the patch's
     base; rebase the branch before it can publish` instead of blaming the patch
@@ -552,16 +553,16 @@ knowing*).
     spellings and deliberate spellings may still slip through, so pin the
     version or SHA anyway.
 
-    **When the policy refuses a patch**, the publish job splits it with
-    `harness patch-split` and keeps the rest: every file section outside
+    **Splitting a refused patch** (`harness patch-split`, not yet called by
+    the publish job, which still refuses the whole patch) keeps the rest: every file section outside
     `.github/` (except `.github/codeaf/`, which a maintainer never has to
     approve) is applied and published as before, and the refused workflow
-    diff is written out and posted as a PR comment labelled
-    `needs-maintainer` (`harness refused-comment`) instead of the whole
-    patch being dropped. A refused section that renames or copies a file,
+    diff is written out for a PR comment (`harness refused-comment`)
+    instead of the whole patch being dropped. A refused section that renames or copies a file,
     a patch over 50 MB, or a header that does not parse refuses the whole
-    patch (exit 2, nothing written) rather than publishing a partial one. To move forward, read the violated rule — the PR comment and
-    the run report both quote it under "Workflow policy" — then either
+    patch (exit 2, nothing written) rather than publishing a partial one.
+    To move forward, read the violated rule — the run report quotes it
+    under "Workflow policy" — then either
     approve the `codeaf-harness` environment deployment for that run, or
     fix the patch (pin the install, drop the refused workflow file, rebase
     onto the current default branch) and re-run.

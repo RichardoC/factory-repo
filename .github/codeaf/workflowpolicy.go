@@ -568,13 +568,23 @@ func collectJobRuns(wfs map[string]map[string]any) map[string]map[string]bool {
 // and the branch has to be rebased first.
 func policyAgainstBase(before, after, base map[string]map[string]any) []string {
 	violations := WorkflowPolicy(base, after)
-	names := make([]string, 0, len(base))
-	for name := range base {
-		names = append(names, name)
+	// Both sides: a workflow added on the default branch since the base is
+	// a move too, and one the patch never saw.
+	seen := map[string]bool{}
+	names := make([]string, 0, len(base)+len(before))
+	for _, set := range []map[string]map[string]any{base, before} {
+		for name := range set {
+			if !seen[name] {
+				seen[name] = true
+				names = append(names, name)
+			}
+		}
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		if bw, ok := before[name]; !ok || !reflect.DeepEqual(bw, base[name]) {
+		bw, inBefore := before[name]
+		ow, inBase := base[name]
+		if inBefore != inBase || !reflect.DeepEqual(bw, ow) {
 			violations = append(violations, fmt.Sprintf("%s: changed on the default branch since the patch's base; rebase the branch before it can publish", name))
 		}
 	}

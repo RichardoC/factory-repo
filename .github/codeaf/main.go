@@ -3076,18 +3076,6 @@ func escapeMD(s string, max int, oneLine bool) string {
 	return b.String()
 }
 
-// capPlain caps s at max runes without escaping it. It is for text the
-// workflow has already shaped and the report quotes verbatim, such as the
-// workflow-policy refusal lines (issue #138); everything untrusted still
-// passes through escapeMD instead.
-func capPlain(s string, max int) string {
-	r := []rune(s)
-	if len(r) > max {
-		return string(r[:max]) + "…"
-	}
-	return s
-}
-
 // plainToken reports whether s is the short lowercase word CodeAF's own stop,
 // verdict and task-state values are. Such a value renders as it is; anything
 // else is untrusted prose and renders escaped.

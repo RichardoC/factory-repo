@@ -414,3 +414,15 @@ func TestPolicyAgainstBase(t *testing.T) {
 		t.Errorf("a publish-job edit was not refused: %v", policyAgainstBase(baseWithPush, editPush, baseWithPush))
 	}
 }
+
+// A workflow added on the default branch after the patch's base is a move
+// the patch never saw, so it is named like a changed one.
+func TestPolicyAgainstBaseNamesWorkflowAddedSinceBase(t *testing.T) {
+	wf := map[string]any{"on": "push", "jobs": map[string]any{}}
+	base := map[string]map[string]any{"ci.yml": wf}
+	before := map[string]map[string]any{"ci.yml": wf, "new.yml": wf}
+	v := policyAgainstBase(before, base, base)
+	if len(v) != 1 || !strings.HasPrefix(v[0], "new.yml: changed on the default branch") {
+		t.Fatalf("violations = %v, want new.yml named as moved", v)
+	}
+}
