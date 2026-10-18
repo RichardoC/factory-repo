@@ -593,6 +593,10 @@ const clusterLookupAttempts = 3
 // linearly per attempt. A variable so tests can shorten it.
 var clusterLookupBackoff = 500 * time.Millisecond
 
+// ignoresRetryBackoff is the delay before the first v1 ignores retry; it
+// grows linearly per attempt. A variable so tests can shorten it.
+var ignoresRetryBackoff = time.Second
+
 // fetchProjectClusterWithRetry calls fetchProjectCluster up to maxAttempts
 // times with a short linear backoff, returning the last error if every
 // attempt fails. A failed lookup makes the project's findings lose their
@@ -683,7 +687,7 @@ func (c *Client) fetchProjectIgnoresWithRetry(ctx context.Context, projectID str
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(time.Duration(attempt) * time.Second):
+			case <-time.After(time.Duration(attempt) * ignoresRetryBackoff):
 			}
 		}
 

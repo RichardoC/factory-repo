@@ -17,6 +17,15 @@ import (
 	"github.com/tesslio/snyk-linear-sync/internal/model"
 )
 
+// shortenRetryBackoffs makes every retry in the package sleep a millisecond
+// for the duration of the test.
+func shortenRetryBackoffs(t *testing.T) {
+	t.Helper()
+	prevIgnores, prevCluster := ignoresRetryBackoff, clusterLookupBackoff
+	ignoresRetryBackoff, clusterLookupBackoff = time.Millisecond, time.Millisecond
+	t.Cleanup(func() { ignoresRetryBackoff, clusterLookupBackoff = prevIgnores, prevCluster })
+}
+
 func TestMapStatusTemporaryIgnoreOpen(t *testing.T) {
 	future := time.Now().Add(24 * time.Hour)
 	issue := issueAttributes{
@@ -838,6 +847,7 @@ func TestMergeIgnoresPicksLatestExpiry(t *testing.T) {
 }
 
 func TestFetchProjectIgnoresRetriesAndUsesMaxExpiry(t *testing.T) {
+	shortenRetryBackoffs(t)
 	var requestCount int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount++
@@ -902,6 +912,7 @@ func TestFetchProjectIgnoresRetriesAndUsesMaxExpiry(t *testing.T) {
 // runs all maxAttempts to find the max expiry, it doesn't stop at the first
 // success), so the retry must recover the data rather than returning empty.
 func TestFetchProjectIgnoresRetriesOn404(t *testing.T) {
+	shortenRetryBackoffs(t)
 	var requestCount int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount++
@@ -949,6 +960,7 @@ func TestFetchProjectIgnoresRetriesOn404(t *testing.T) {
 // existing non-fatal behavior is preserved: if an earlier attempt returned
 // real data and a later attempt 404s, the earlier data must not be erased.
 func TestFetchProjectIgnoresLater404KeepsEarlierAttemptsData(t *testing.T) {
+	shortenRetryBackoffs(t)
 	var requestCount int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount++
@@ -998,6 +1010,7 @@ func TestFetchProjectIgnoresLater404KeepsEarlierAttemptsData(t *testing.T) {
 // pre-existing behavior — it just now gets there after retrying instead of
 // accepting the first 404.
 func TestFetchProjectIgnoresPersistent404IsNonFatal(t *testing.T) {
+	shortenRetryBackoffs(t)
 	var requestCount int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount++
@@ -1034,6 +1047,7 @@ func TestFetchProjectIgnoresPersistent404IsNonFatal(t *testing.T) {
 // cached updated_at (so it eventually ages out past ignoreEntryTTL), while a
 // key the API does confirm this run gets its updated_at refreshed.
 func TestFetchProjectIgnoresPreservesUpdatedAtForUnconfirmedKeys(t *testing.T) {
+	shortenRetryBackoffs(t)
 	dir := t.TempDir()
 	store, err := cache.Open(filepath.Join(dir, "cache.db"))
 	if err != nil {
@@ -1392,9 +1406,7 @@ func TestLatestResolvedAt(t *testing.T) {
 }
 
 func TestFetchProjectClusterWithRetry(t *testing.T) {
-	previous := clusterLookupBackoff
-	clusterLookupBackoff = time.Millisecond
-	defer func() { clusterLookupBackoff = previous }()
+	shortenRetryBackoffs(t)
 
 	for _, tc := range []struct {
 		name         string
