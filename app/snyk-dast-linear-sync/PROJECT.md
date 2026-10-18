@@ -342,8 +342,10 @@ tickets:
   rejected the mutation, which may have been committed before the response was
   lost. Creates are therefore reconciled first: `ExistingFingerprints` asks Linear
   which of the batch's fingerprints now have a live issue, and only the rest are
-  re-created. If that lookup also fails, nothing is retried and the entries are
-  counted as failed. The finding remains in the next Snyk DAST snapshot either
+  re-created. That reconciliation query is scoped the same way as the snapshot
+  (team plus the identity arms), so a shared team cannot be paged through
+  during the retry path. If that lookup also fails, nothing is retried and the
+  entries are counted as failed. The finding remains in the next Snyk DAST snapshot either
   way; if its issue was never created it is absent from the next Linear snapshot
   and gets created on the next run. Missing a ticket for one cycle is recoverable;
   a duplicate is only undone later by the duplicate-cancellation pass.
