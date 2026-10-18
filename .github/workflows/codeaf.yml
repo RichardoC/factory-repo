@@ -388,7 +388,6 @@ jobs:
             > "$RESULT_PATH" 2> "$RUNNER_TEMP/codeaf.stderr"
           echo "codeaf exit code: $?"
           tail -n 80 "$RUNNER_TEMP/codeaf.stderr"
-          "$HARNESS" summary
           exit 0
 
       - name: Take the tree back
@@ -399,6 +398,16 @@ jobs:
         # either way (AGENTS.md, "Caches and carried state").
         if: always()
         run: sudo -n chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE" "$CODEAF_HOME"
+
+      - name: Summarise the run
+        # After "Take the tree back", not inside "Run CodeAF": summary ships
+        # the root task's run record (runs/*/tasks/root/trajectory.jsonl
+        # under $CODEAF_HOME) beside the result for the report commands'
+        # closing-result fallback. While the agent user still owns
+        # $CODEAF_HOME the runner user cannot read that directory, the glob
+        # finds nothing, and the fallback silently gets no record.
+        if: ${{ !cancelled() }}
+        run: '"$HARNESS" summary'
 
       # From here on, this job only packages results. Nothing it produces is
       # trusted by `publish`.
