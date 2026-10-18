@@ -893,7 +893,184 @@ func TestHoldCommentIsPostedOnce(t *testing.T) {
 	}
 }
 
-// TestNextPicksReviewBeforeIssues covers the queue's new head of the pass
+// TestNextRepicksStrandedPR covers the stranded re-pick (issue #215): an
+// open codeaf PR with no queue label and no run in progress is picked as a
+// review; the marker comment bounds the re-pick to once per head commit; a
+// review-passed PR, or one with a run in progress, is never re-picked; and
+// an unknown or non-hex head means no re-pick (the guard fails closed).
+func TestNextRepicksStrandedPR(t *testing.T) {
+	shaA := strings.Repeat("a", 40)
+	shaB := strings.Repeat("b", 40)
+	pr := queuedIssue(204, "2024-01-01T00:00:00Z", "codeaf")
+	pr.PullRequest = json.RawMessage(`{"number":204}`)
+
+	o := nextOpts()
+	o.PRHeads = map[int]string{204: shaA}
+	o.PRMarkers = map[int][]string{204: nil}
+	if p, lines := nextPick([]item{pr}, nil, o); p.Kind != kindReview || p.Number != 204 || p.Lane != 0 {
+		t.Fatalf("Next = %+v; want review #204 on lane 0", p)
+	} else if !slices.Contains(lines, "re-picking stranded PR #204 at "+shaA) {
+		t.Fatalf("log %v; want the re-pick line at %s", lines, shaA)
+	}
+
+	// The marker names the head the re-pick was for: the PR is skipped
+	// while its head still matches, and picked again once the head moves.
+	o.PRMarkers[204] = []string{shaA}
+	if p, lines := nextPick([]item{pr}, nil, o); p.Kind != "" || !strings.Contains(strings.Join(lines, "\n"), "stranded re-pick already recorded") {
+		t.Fatalf("Next with the marker = %+v, log %v; want held", p, lines)
+	}
+	o.PRHeads[204] = shaB
+	if p, _ := nextPick([]item{pr}, nil, o); p.Kind != kindReview || p.Number != 204 {
+		t.Fatalf("Next after the head moved = %+v; want review #204 again", p)
+	}
+
+	// A PR labelled codeaf-review-passed is never re-picked.
+	passed := queuedIssue(205, "2024-01-01T00:00:00Z", "codeaf", "codeaf-review-passed")
+	passed.PullRequest = json.RawMessage(`{"number":205}`)
+	o2 := nextOpts()
+	o2.PRHeads = map[int]string{205: shaA}
+	o2.PRMarkers = map[int][]string{205: nil}
+	if p, _ := nextPick([]item{passed}, nil, o2); p.Kind != "" {
+		t.Fatalf("Next on a review-passed PR = %+v; want nothing", p)
+	}
+
+	// A PR with a run in progress is never re-picked (issue #137's guard).
+	o3 := nextOpts()
+	o3.PRHeads = map[int]string{204: shaA}
+	o3.PRMarkers = map[int][]string{204: nil}
+	if p, _ := nextPick([]item{pr}, []runStatus{reviewRun(204, 0, 100)}, o3); p.Kind != "" {
+		t.Fatalf("Next with the review in flight = %+v; want nothing", p)
+	}
+
+	// An unknown or non-hex head means no re-pick: the re-pick could not be
+	// recorded, so it could repeat on every tick.
+	o4 := nextOpts()
+	o4.PRHeads = map[int]string{}
+	o4.PRMarkers = map[int][]string{}
+	if p, _ := nextPick([]item{pr}, nil, o4); p.Kind != "" {
+		t.Fatalf("Next with no head SHA = %+v; want nothing", p)
+	}
+	o4.PRHeads[204] = "not-a-sha"
+	if p, _ := nextPick([]item{pr}, nil, o4); p.Kind != "" {
+		t.Fatalf("Next with a non-hex head = %+v; want nothing", p)
+	}
+}
+
+// TestRepickMarkers covers the marker parse (issue #215): only a full
+// 40-hex SHA after the marker is kept, everything else — a truncated SHA,
+// prose, a comment without the marker — is ignored as if absent.
+func TestRepickMarkers(t *testing.T) {
+	sha := strings.Repeat("c", 40)
+	got := repickMarkers(bodyComments{
+		{"a person's note"},
+		{"<!-- codeaf-queue-repick " + sha[:39] + " -->"},
+		{"<!-- codeaf-queue-repick " + sha + " -->"},
+		{"quote: the queue posts <!-- codeaf-queue-repick zzz --> on stranded PRs"},
+	})
+	if len(got) != 1 || got[0] != sha {
+		t.Fatalf("repickMarkers = %v; want [%s]", got, sha)
+	}
+	if !fullSHARx.MatchString(sha) || fullSHARx.MatchString(sha[:39]) || fullSHARx.MatchString("zzz") {
+		t.Fatal("fullSHARx accepted a SHA it should not")
+	}
+}
+
+// TestRunNextRepicksStrandedPR is the end-to-end check of issue #215, on the
+// fake GitHub server: an open PR labelled only codeaf, with no in-progress
+// runs and no comments, is picked (kind=review) and gets one marker comment
+// naming its head SHA; with that comment served the PR is not picked again;
+// a moved head is picked again, with a second marker for the new commit.
+func TestRunNextRepicksStrandedPR(t *testing.T) {
+	shaA := strings.Repeat("a", 40)
+	shaB := strings.Repeat("b", 40)
+	sha := shaA
+	var comments []string
+	posts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/issues" && r.URL.Query().Get("state") == "open":
+			fmt.Fprint(w, `[{"number":204,"state":"open","created_at":"2024-01-01T00:00:00Z","pull_request":{"number":204},"labels":[{"name":"codeaf"}]}]`)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/pulls/204":
+			fmt.Fprintf(w, `{"number":204,"head":{"ref":"branch","sha":%q}}`, sha)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/issues/204/comments":
+			if len(comments) == 0 {
+				fmt.Fprint(w, `[]`)
+				return
+			}
+			var items []string
+			for _, c := range comments {
+				items = append(items, fmt.Sprintf(`{"body":%q}`, c))
+			}
+			fmt.Fprint(w, "["+strings.Join(items, ",")+"]")
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/RichardoC/factory-repo/issues/204/comments":
+			posts++
+			var body struct {
+				Body string `json:"body"`
+			}
+			data, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(data, &body)
+			comments = append(comments, body.Body)
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/contents/app":
+			fmt.Fprint(w, `[]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	t.Setenv("GITHUB_API_URL", server.URL)
+	t.Setenv("GITHUB_REPOSITORY", "RichardoC/factory-repo")
+	t.Setenv("GH_TOKEN", "tok")
+	t.Setenv("PROXY_MODELS", "models.json")
+	t.Setenv("CODEAF_WEEK_SPENT_USD", "1")
+	if _, err := loadConfig("models.json"); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	issuesPath := filepath.Join(dir, "issues.json")
+	runsPath := filepath.Join(dir, "runs.json")
+	write := func(path, data string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The issues list the queue job hands `harness next` on the command
+	// line: the PR, labelled only codeaf. The fake server serves the calls
+	// runNext itself makes: the PR's head, its comments, the app listing.
+	write(issuesPath, `[{"number":204,"state":"open","created_at":"2024-01-01T00:00:00Z","pull_request":{"number":204},"labels":[{"name":"codeaf"}]}]`)
+	write(runsPath, `[{"status":"completed"}]`)
+
+	// First tick: the stranded PR is picked, one marker comment names the
+	// head SHA.
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "kind=review\nnumber=204\nlane=0\n" {
+		t.Fatalf("runNext printed %q, %v", out, err)
+	}
+	if posts != 1 || len(comments) != 1 || !strings.Contains(comments[0], shaA) || !strings.Contains(comments[0], queueRepickMarker) {
+		t.Fatalf("marker comments = %q (posts %d); want one naming %s", comments, posts, shaA)
+	}
+
+	// Second tick, the comment served: nothing is printed for the PR.
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "" {
+		t.Fatalf("runNext with the marker served printed %q, %v; wanted nothing", out, err)
+	}
+	if posts != 1 {
+		t.Fatalf("runNext posted again (%d posts); want the marker to stop it", posts)
+	}
+
+	// The head moves: the PR is picked again, with a second marker naming
+	// the new commit.
+	sha = shaB
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "kind=review\nnumber=204\nlane=0\n" {
+		t.Fatalf("runNext after the head moved printed %q, %v", out, err)
+	}
+	if posts != 2 || len(comments) != 2 || !strings.Contains(comments[1], shaB) {
+		t.Fatalf("marker comments after the move = %q (posts %d); want one naming %s", comments, posts, shaB)
+	}
+} // TestNextPicksReviewBeforeIssues covers the queue's new head of the pass
 // (issue #137): a pull request labelled codeaf and codeaf-review-needed is
 // picked with kind review on the lowest free lane, ahead of any queued
 // issue — and, once the review is in flight as a mirrored run, it does not
