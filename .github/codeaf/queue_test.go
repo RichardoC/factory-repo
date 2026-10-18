@@ -943,6 +943,24 @@ func TestIssueReady(t *testing.T) {
 	if got := issueReady(withArea(e2eSection + "go test -race ./... in .github/codeaf is green\n")); len(got) != 0 {
 		t.Fatalf("real End-to-end check held: issueReady = %v", got)
 	}
+	// Text hidden in an HTML comment is not a check (issue #136 review): a
+	// section holding only a comment — the template's instructions, a
+	// reviewer's note — is unfilled, and an unclosed "<!--" comments out
+	// the rest of the section. A real check next to a commented-out
+	// placeholder passes: the marks are read on the visible text.
+	for name, e2e := range map[string]string{
+		"comment only":        "<!-- note -->",
+		"comment and blanks":  "<!-- instructions -->\n\n   \n",
+		"unclosed comment":    "<!-- note\n",
+		"commented-out check": "<!-- go test ./... is green -->",
+	} {
+		if got := issueReady(withArea(e2eSection + e2e + "\n")); !slices.Equal(got, []string{"## End-to-end check"}) {
+			t.Fatalf("%s accepted as a check: issueReady = %v; want [## End-to-end check]", name, got)
+		}
+	}
+	if got := issueReady(withArea(e2eSection + "<!-- " + proposalE2EPlaceholder + " -->\n\ngo test -race ./... is green\n")); len(got) != 0 {
+		t.Fatalf("real check beside a commented-out placeholder held: issueReady = %v", got)
+	}
 	// A body over 64 KiB is scanned only up to the cap: the sections past
 	// it are invisible to the gate, the ones inside it are found.
 	filler := strings.Repeat("filler line\n", 1)

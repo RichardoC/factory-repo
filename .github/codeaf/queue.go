@@ -330,10 +330,43 @@ func issueBodyReady(it item) (missing []string) {
 		missing = append(missing, "## Done when bullets")
 	}
 	e2e, ok := issueSection(body, issueEndToEndHeading)
-	if !ok || strings.TrimSpace(e2e) == "" || holdsE2EPlaceholder(e2e) {
+	if !ok || e2eUnfilled(e2e) {
 		missing = append(missing, "## End-to-end check")
 	}
 	return missing
+}
+
+// e2eUnfilled reports whether the text of an "## End-to-end check" section
+// is not a filled-in check (issue #136): empty once HTML comments are
+// stripped, or still carrying part of the unfilled placeholder. A check
+// hidden in a comment — the template's instructions, a reviewer's note —
+// is not a check (issue #136 review): the comment is stripped before the
+// text is judged. An unclosed "<!--" comments out the rest of the section,
+// so everything from it on is comment too. The placeholder marks are read
+// on the visible text, so a filled-in check that quotes the placeholder
+// inside a comment still passes.
+func e2eUnfilled(e2e string) bool {
+	visible := stripHTMLComments(e2e)
+	if strings.TrimSpace(visible) == "" {
+		return true
+	}
+	return holdsE2EPlaceholder(visible)
+}
+
+// stripHTMLComments removes whole HTML comments — "<!--" through the first
+// "-->" — and, when a comment is never closed, everything from the "<!--"
+// to the end, which is how markdown reads it. What is left is the text a
+// reader sees.
+func stripHTMLComments(s string) string {
+	i := strings.Index(s, "<!--")
+	if i < 0 {
+		return s
+	}
+	j := strings.Index(s[i:], "-->")
+	if j < 0 {
+		return s[:i] // unclosed: the rest of the section is comment
+	}
+	return stripHTMLComments(s[:i] + s[i+j+len("-->"):])
 }
 
 // e2ePlaceholderMarks are the fixed phrases that mark an "## End-to-end
