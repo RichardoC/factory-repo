@@ -1637,7 +1637,12 @@ type item struct {
 	CreatedAt   string          `json:"created_at"`
 	PullRequest json.RawMessage `json:"pull_request"` // present on issues that are PRs
 	Head        struct {
-		Ref  string `json:"ref"`
+		Ref string `json:"ref"`
+		// SHA is the head commit SHA, present on the JSON the pulls API
+		// returns (/pulls/N); the issues-list JSON does not carry it. The
+		// queue reads it for the stranded re-pick marker (issue #215), as
+		// untrusted data like every other API field.
+		SHA  string `json:"sha"`
 		Repo *struct {
 			FullName string `json:"full_name"`
 		} `json:"repo"`

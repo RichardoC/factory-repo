@@ -53,6 +53,19 @@ type queueOptions struct {
 	// maps each through pathArea. runNext fills the map from the API, and a
 	// fetch failure leaves the entry absent; Next itself only reads it.
 	PRFiles map[int][]string
+	// PRHeads holds, by open pull request number, the pull request's
+	// current head SHA, fetched by the caller from /pulls (issue #215). A
+	// stranded re-pick is recorded against this SHA, so Next re-picks a PR
+	// only when its SHA is here: without it the re-pick could be neither
+	// recorded nor bounded, and the PR waits for a later tick. An absent or
+	// non-hex entry means unknown — no re-pick.
+	PRHeads map[int]string
+	// PRMarkers holds, by pull request number, every head SHA a re-pick
+	// marker comment on the PR already names (issue #215). The comments are
+	// untrusted data: the caller keeps only full 40-hex SHAs. A PR whose
+	// current head is in the set has already been re-picked at that commit
+	// and is skipped until its head moves.
+	PRMarkers map[int][]string
 	// NoAreaHeld, when non-nil, is called once per candidate held because it
 	// names no area (reason "no area label", issue #132). Like Logf, it is
 	// the caller's side effect; Next's pick never depends on it.
@@ -118,10 +131,14 @@ func startReason(kind string) string {
 // Candidates, in this order per pass (issue #137): open pull requests
 // labelled codeaf and codeaf-review-needed (kind review), then open pull
 // requests labelled codeaf and codeaf-continue-needed (kind continue), then
-// the queued issues as before (kind issue). A pull request is a candidate
-// only while it is open and no in-flight run already has its number as its
-// subject; pull request candidates keep the queue's usual sort (oldest
-// first). Next returns a zero pick when nothing should run: fewer than
+// the queued issues as before (kind issue). A pull request stranded by a
+// failed publish — open, labelled codeaf, none of the queue labels, no run
+// in progress for it — joins the reviews (issue #215), once per head commit:
+// the caller fetches its head SHA and the SHA any re-pick marker comment
+// names, and a PR whose head still matches its marker is skipped. A pull
+// request is a candidate only while it is open and no in-flight run already
+// has its number as its subject; pull request candidates keep the queue's
+// usual sort (oldest first). Next returns a zero pick when nothing should run: fewer than
 // MaxParallelRuns CodeAF runs may be queued or in progress (they count
 // alike, every kind against the same lanes), the rolling week's credit spend
 // must stay under the threshold, and the pick is the first candidate whose
@@ -171,8 +188,12 @@ func Next(issues []item, runs []runStatus, o queueOptions) pick {
 		}
 	}
 	// The candidates of one pass, in the fixed order: reviews, then
-	// continuations, then queued issues.
+	// continuations, then queued issues. A PR stranded by a failed publish
+	// (issue #215) joins the reviews: it carries the codeaf label, none of
+	// the queue labels, and no run is in progress for it, so the review run
+	// decides whether a continuation is needed.
 	var reviews, continuations, queued []item
+	repicks := map[int]string{} // stranded re-picks, by PR number: its head SHA
 	for _, i := range issues {
 		switch {
 		case i.State != "open":
@@ -187,6 +208,24 @@ func Next(issues []item, runs []runStatus, o queueOptions) pick {
 				reviews = append(reviews, i)
 			case i.labelled(labelContinueNeeded):
 				continuations = append(continuations, i)
+			case strandedPR(i, o, inflight):
+				// The re-pick is bounded to once per head commit: the
+				// marker comment on the PR names the SHA the last re-pick
+				// was for, and the PR is skipped while its head still
+				// matches. Both sides are untrusted data, and the guard
+				// fails closed: an unknown head or an unreadable set of
+				// comments means no re-pick this tick — an unrecorded
+				// re-pick could repeat on every tick.
+				head := strings.ToLower(o.PRHeads[i.Number])
+				if !fullSHARx.MatchString(head) || o.PRMarkers == nil {
+					continue
+				}
+				if slices.Contains(o.PRMarkers[i.Number], head) {
+					logf("holding #%d: stranded re-pick already recorded at %s", i.Number, head)
+					continue
+				}
+				reviews = append(reviews, i)
+				repicks[i.Number] = head
 			}
 		case !i.labelled(o.QueuedLabel):
 		case i.labelled(o.Label): // already picked up
@@ -285,6 +324,11 @@ func Next(issues []item, runs []runStatus, o queueOptions) pick {
 		lane := 0
 		for ; lane < mpr && lanes[lane]; lane++ {
 		}
+		if sha, ok := repicks[c.Number]; ok {
+			// Issue #215: the re-pick logs its own line, naming the commit
+			// it was for.
+			logf("re-picking stranded PR #%d at %s", c.Number, sha)
+		}
 		logf("starting #%d (lane %d): kind=%s, %s", c.Number, lane, kind, startReason(kind))
 		return pick{Kind: kind, Number: c.Number, Lane: lane}
 	}
@@ -321,6 +365,23 @@ func prInFlight(n int, inflight []runStatus) bool {
 		}
 	}
 	return false
+}
+
+// strandedPR reports whether an open pull request is a stranded re-pick
+// candidate (issue #215): it carries the codeaf label, none of the queue
+// labels — review-needed, continue-needed, review-passed — and no CodeAF run
+// is in progress for it. A run that failed at publish leaves a PR exactly
+// there: the queue removed continue-needed when it dispatched, and nothing
+// put a label back, so without this the PR would drop out of the factory.
+func strandedPR(i item, o queueOptions, inflight []runStatus) bool {
+	if i.State != "open" || len(i.PullRequest) == 0 {
+		return false
+	}
+	if !i.labelled(o.Label) || prInFlight(i.Number, inflight) {
+		return false
+	}
+	return !i.labelled(labelReviewNeeded) && !i.labelled(labelContinueNeeded) &&
+		!i.labelled(reviewPassedLabel)
 }
 
 // runTitleRe matches the display title a queued dispatch writes: "CodeAF #3"
@@ -881,7 +942,7 @@ func runNext() error {
 	prFiles := fetchPRFiles(gh, issues, runs, log.Printf)
 	var noArea []int
 	notReady := map[int][]string{}
-	p := Next(issues, runs, queueOptions{
+	opts := queueOptions{
 		Label:           envOr("CODEAF_LABEL", "codeaf"),
 		QueuedLabel:     envOr("CODEAF_QUEUED_LABEL", "codeaf-queued"),
 		PriorityLabel:   envOr("CODEAF_PRIORITY_LABEL", "codeaf-priority"),
@@ -892,7 +953,14 @@ func runNext() error {
 		NoAreaHeld:      func(n int) { noArea = append(noArea, n) },
 		NotReadyHeld:    func(n int, missing []string) { notReady[n] = missing },
 		Logf:            log.Printf,
-	})
+	}
+	// The stranded re-pick (issue #215) reads each candidate's head SHA and
+	// marker comments here, so Next stays pure. With no token the maps stay
+	// empty and no stranded PR is re-picked.
+	if gh.token != "" {
+		opts.PRHeads, opts.PRMarkers = fetchStrandedPRs(gh, issues, runs, opts.Label, log.Printf)
+	}
+	p := Next(issues, runs, opts)
 	// One comment per held issue, posted once: the marker check keeps a
 	// repeat tick from stacking copies (issue #132, #136). Best effort: a
 	// failed comment never fails the pick.
@@ -905,6 +973,16 @@ func runNext() error {
 		for n, missing := range notReady {
 			if err := ensureHoldCommentBody(gh, n, notReadyHoldCommentBody(n, missing)); err != nil {
 				log.Printf("hold comment on #%d: %v", n, err)
+			}
+		}
+	}
+	// The re-pick marker (issue #215): record the head SHA the re-pick was
+	// for, so the next tick skips the PR until its head moves. Best effort:
+	// a failed comment never fails the pick.
+	if gh.token != "" && p.Kind == kindReview {
+		if sha, ok := opts.PRHeads[p.Number]; ok {
+			if err := ensureRepickMarker(gh, p.Number, sha); err != nil {
+				log.Printf("re-pick marker on #%d: %v", p.Number, err)
 			}
 		}
 	}
@@ -1046,6 +1124,103 @@ func holdCommentBody(n int) string {
 // comments holds here too.
 func notReadyHoldCommentBody(n int, missing []string) string {
 	return fmt.Sprintf("%s\nCodeAF's queue is holding this issue (#%d): it is not ready to run. Missing: %s. Add what is missing — a `## Done when` section with bullets, a `## End-to-end check` section, an `area:` label (see the issue template) — and the next queue tick will start it.", queueHoldMarker, n, strings.Join(missing, ", "))
+}
+
+// queueRepickMarker begins the hidden comment the queue posts when it
+// re-picks a stranded pull request (issue #215): the comment names the head
+// SHA the re-pick was for, and keeps the re-pick to once per commit.
+const queueRepickMarker = "<!-- codeaf-queue-repick "
+
+// repickSHARe finds the head SHA inside a re-pick marker comment. Comments
+// are untrusted data: only a full 40-hex SHA is accepted, and a comment
+// whose marker carries anything else — truncated, upper prose, someone
+// quoting the marker — is ignored as if it were absent.
+var repickSHARe = regexp.MustCompile(`codeaf-queue-repick[ \t]+([0-9a-fA-F]{40})`)
+
+// fullSHARx matches a full 40-character hex git SHA. Both sides of the
+// re-pick guard are untrusted data — the marker comment and the API's own
+// head field — so each must prove its shape before it is compared.
+var fullSHARx = regexp.MustCompile(`^[0-9a-fA-F]{40}$`)
+
+// bodyComments is what /issues/N/comments decodes into when only the comment
+// bodies are read.
+type bodyComments []struct {
+	Body string `json:"body"`
+}
+
+// repickMarkers collects the head SHAs the re-pick marker comments name, in
+// comment order, lowercased. A malformed marker is ignored as if absent
+// (issue #215).
+func repickMarkers(comments bodyComments) []string {
+	var shas []string
+	for _, c := range comments {
+		if m := repickSHARe.FindStringSubmatch(c.Body); m != nil {
+			shas = append(shas, strings.ToLower(m[1]))
+		}
+	}
+	return shas
+}
+
+// repickMarkerBody is the re-pick marker comment's fixed text (issue #215):
+// the marker with the SHA, then text built from the PR number alone — no PR
+// or issue text, untrusted data, goes into these comments.
+func repickMarkerBody(n int, sha string) string {
+	return fmt.Sprintf("%s%s -->\nCodeAF's queue re-picked this stranded pull request (#%d) for review at commit %s: it carried no queue label and no CodeAF run was in progress for it. The re-pick runs once per commit; push new commits and the queue picks the pull request again.", queueRepickMarker, sha, n, sha)
+}
+
+// ensureRepickMarker posts the re-pick marker comment on pull request n
+// unless a marker naming sha is already there (issue #215); the marker keeps
+// repeat ticks from posting the comment twice for the same commit.
+func ensureRepickMarker(g github, n int, sha string) error {
+	var comments bodyComments
+	if err := g.get(fmt.Sprintf("/issues/%d/comments?per_page=100", n), &comments); err != nil {
+		return err
+	}
+	if slices.Contains(repickMarkers(comments), sha) {
+		return nil
+	}
+	return g.post(fmt.Sprintf("/issues/%d/comments", n), map[string]string{"body": repickMarkerBody(n, sha)}, nil)
+}
+
+// fetchStrandedPRs fetches what the stranded re-pick (issue #215) needs for
+// every candidate the issues list names: the pull request's current head SHA
+// from /pulls, and the head SHAs any marker comment on it already names. The
+// maps feed Next through queueOptions, so the pick stays pure. A candidate
+// whose head cannot be read, or whose comments cannot be, gets no entries
+// and is not re-picked this tick: the guard fails closed, since a re-pick
+// that cannot be recorded could repeat on every tick.
+func fetchStrandedPRs(g github, issues []item, runs []runStatus, lbl string, logf func(string, ...any)) (heads map[int]string, markers map[int][]string) {
+	heads = map[int]string{}
+	markers = map[int][]string{}
+	var inflight []runStatus
+	for _, r := range runs {
+		if r.Status == "queued" || r.Status == "in_progress" {
+			inflight = append(inflight, r)
+		}
+	}
+	for _, i := range issues {
+		if !strandedPR(i, queueOptions{Label: lbl}, inflight) {
+			continue
+		}
+		var pr item
+		if err := g.get(fmt.Sprintf("/pulls/%d", i.Number), &pr); err != nil {
+			logf("stranded PR #%d head: %v", i.Number, err)
+			continue
+		}
+		head := strings.ToLower(pr.Head.SHA)
+		if !fullSHARx.MatchString(head) {
+			logf("stranded PR #%d: head %q is not a 40-hex SHA", i.Number, pr.Head.SHA)
+			continue
+		}
+		var comments bodyComments
+		if err := g.get(fmt.Sprintf("/issues/%d/comments?per_page=100", i.Number), &comments); err != nil {
+			logf("stranded PR #%d comments: %v", i.Number, err)
+			continue
+		}
+		heads[i.Number] = head
+		markers[i.Number] = repickMarkers(comments)
+	}
+	return heads, markers
 }
 
 // ensureHoldComment posts the area hold comment on issue n unless a comment
