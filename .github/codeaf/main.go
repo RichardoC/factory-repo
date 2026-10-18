@@ -2622,7 +2622,7 @@ func runBrief() error {
 		parts = append(parts, "The sections `## Done when` and `## End-to-end check` above are the acceptance criteria.")
 		// Issue #139: the app the issue names carries its own rules with
 		// the brief, so they are read with the task, not hunted in a README.
-		if rules := appRulesSections(issueAreas(issue)); rules != "" {
+		if rules := appRulesSections(gh, issueAreas(issue)); rules != "" {
 			parts = append(parts, rules)
 		}
 		if issue.Comments > 0 {
@@ -2666,7 +2666,7 @@ func runBrief() error {
 				parts = append(parts, "The sections `## Done when` and `## End-to-end check` above are the acceptance criteria.")
 				// Issue #139: the rules come from the issue the PR closes,
 				// the same way they would in issue mode.
-				if rules := appRulesSections(issueAreas(closes)); rules != "" {
+				if rules := appRulesSections(gh, issueAreas(closes)); rules != "" {
 					parts = append(parts, rules)
 				}
 			}

@@ -217,7 +217,8 @@ module. To onboard one:
   automatically from the directories under `app/`, colour `cccccc`) and must
   be on **every issue** for the app — an issue without an area label is held
   by the queue until it has one;
-- the worker, reviewer and planner briefs embed the app's `AGENTS.md`
+- the worker, reviewer and planner briefs embed the app's `AGENTS.md` (the
+  worker and reviewer read it from the default branch, never the PR head)
   automatically, so app-specific rules (build flags, build tags, benchmark
   conventions, invariants) belong there, not in the issue. See
   [app/kube-sqlite3-vfs/AGENTS.md](app/kube-sqlite3-vfs/AGENTS.md) for an

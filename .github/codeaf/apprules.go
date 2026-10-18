@@ -1,16 +1,17 @@
 // apprules.go embeds per-app rules in the briefs (issue #139): for every
-// area of the form app/<name>, the app's AGENTS.md in the working directory
+// area of the form app/<name>, the app's AGENTS.md on the default branch
 // travels with the brief, so the worker reads the app's own rules without
-// hunting a large README. The planner, which serves no single issue, gets
-// every app's file instead. A missing, unreadable or non-regular file adds
-// nothing — the file is documentation, not an installation error. Standard
-// library only.
+// hunting a large README. It is read through the API, not the working tree:
+// a pr or review run's tree is the PR head, and a PR must not be able to
+// write the rules its own review is judged by. The planner, which serves no
+// single issue and runs on the default branch, gets every app's file from
+// its tree instead. A missing or unreadable file adds nothing — the file is
+// documentation, not an installation error. Standard library only.
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -29,34 +30,39 @@ var appNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 // appRulesSection renders one app's section — the heading and the file's
 // contents capped at max bytes — or ok=false when app/<name>/AGENTS.md is
-// absent, unreadable, or not a regular file.
-func appRulesSection(name string, max int) (string, bool) {
-	path := filepath.Join("app", name, "AGENTS.md")
-	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() {
+// absent on the default branch, unreadable, or not a file.
+func appRulesSection(g github, name string, max int) (string, bool) {
+	path := "app/" + name + "/AGENTS.md"
+	var file struct {
+		Type     string `json:"type"`
+		Encoding string `json:"encoding"`
+		Content  string `json:"content"`
+	}
+	// No ref: the contents API reads the default branch.
+	if err := g.get("/contents/"+path, &file); err != nil || file.Type != "file" || file.Encoding != "base64" {
 		return "", false
 	}
-	data, err := os.ReadFile(path)
+	data, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(file.Content, "\n", ""))
 	if err != nil {
 		return "", false
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "## Rules for app/%s (app/%s/AGENTS.md)\n\n", name, name)
-	b.WriteString(capAppFile(string(data), max, filepath.ToSlash(path)))
+	fmt.Fprintf(&b, "## Rules for app/%s (%s)\n\n", name, path)
+	b.WriteString(capAppFile(string(data), max, path))
 	return b.String(), true
 }
 
 // appRulesSections renders the per-app rule sections for an area set
 // (issueAreas), in the set's order. Areas of any other shape — the harness,
 // or an app name that cannot be one — add nothing.
-func appRulesSections(areas []string) string {
+func appRulesSections(g github, areas []string) string {
 	var b strings.Builder
 	for _, area := range areas {
 		name, ok := strings.CutPrefix(area, "app/")
 		if !ok || !appNameRe.MatchString(name) {
 			continue
 		}
-		if section, ok := appRulesSection(name, maxAppRulesBytes); ok {
+		if section, ok := appRulesSection(g, name, maxAppRulesBytes); ok {
 			b.WriteString(section + "\n")
 		}
 	}
