@@ -394,6 +394,8 @@ type proxy struct {
 	// proxy proves the path with an SSE comment line; 0 means the 10s
 	// default (shorter in tests).
 	heartbeatEvery time.Duration
+	// headerGrace overrides headerWaitGrace when set (tests shorten it).
+	headerGrace time.Duration
 	// Web search (issue #58): where forwarded searches go and this run's
 	// cap; searches counts this run's forwarded attempts under p.mu.
 	searchURL      string
@@ -427,12 +429,29 @@ func envOr(name, fallback string) string {
 	return fallback
 }
 
+// upstreamClient builds the http.Client the proxy uses for upstream calls.
+// The 15-minute whole-call timeout is unchanged from before #145, and there
+// has never been a ResponseHeaderTimeout here -- the error that broke
+// infinite mode ("net/http: timeout awaiting response headers") was CodeAF's
+// own header deadline against this proxy, which went silent because
+// p.client.Do blocked until upstream's headers arrived and nothing reached
+// the client. The fix is not on this side: doWithHeartbeats (issue #145)
+// commits the 200 and heartbeats through that wait, so the client's header
+// deadline no longer fires, and keeping no ResponseHeaderTimeout here means
+// net/http adds no second, shorter deadline that would cut the mode's
+// 40-236s wait to first token. The call stays bounded only by the whole-call
+// timeout and by the client, which cancels the upstream request when it
+// leaves. TestProductionProxyClientHasNoHeaderTimeout guards this.
+func upstreamClient() *http.Client {
+	return &http.Client{Timeout: 15 * time.Minute}
+}
+
 func runProxy() error {
 	p := &proxy{
 		upstream: strings.TrimRight(envOr("PROXY_UPSTREAM", "https://api.synthetic.new/openai/v1"), "/"),
 		apiKey:   os.Getenv("SYNTHETIC_API_KEY"),
 		ledger:   envOr("PROXY_LEDGER", "codeaf-ledger.jsonl"),
-		client:   &http.Client{Timeout: 15 * time.Minute},
+		client:   upstreamClient(),
 	}
 	cfg, err := loadConfig(configPath())
 	if err != nil {
@@ -834,7 +853,13 @@ type LedgerLine struct {
 	// for a model slot. Old ledgers carry neither.
 	Start     time.Time `json:"start,omitzero"`
 	SlotWaitS float64   `json:"slot_wait_s,omitempty"`
-	Kind      string    `json:"kind,omitempty"`
+	// HeaderMs is how long the proxy waited for upstream response headers:
+	// the time from issuing the call to the headers arriving (issue #145).
+	// An uncommitted streaming call shows nothing else; in infinite mode this
+	// is the 40-236s wait, so it is the figure that makes the mode readable.
+	// Old ledgers carry no field and parse back as 0.
+	HeaderMs int64  `json:"header_ms,omitempty"`
+	Kind     string `json:"kind,omitempty"`
 	// Quotas carries the raw GET /v2/quotas response body on the "quotas"
 	// marker line, capped (recordQuotas); the report re-parses it from here.
 	Quotas string `json:"quotas,omitempty"`
@@ -850,9 +875,9 @@ type LedgerLine struct {
 	Status int `json:"status,omitempty"`
 }
 
-func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slotWait time.Duration, chars charCounts, repaired, status int) {
+func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slotWait, headerWait time.Duration, chars charCounts, repaired, status int) {
 	line := LedgerLine{Time: time.Now().UTC(), Model: m.ID, Upstream: m.Upstream, Stream: stream,
-		Start: start.UTC(), SlotWaitS: slotWait.Seconds(),
+		Start: start.UTC(), SlotWaitS: slotWait.Seconds(), HeaderMs: headerWait.Milliseconds(),
 		ReasoningChars: chars.reasoning, OutputChars: chars.output, RepairedToolArgs: repaired}
 	if status != 0 {
 		// A non-200 upstream answer is recorded as a status line (issue #140):
@@ -1279,8 +1304,29 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 	// The call starts here, after any wait for a slot; the ledger reads the
 	// duration from this moment to when the call is recorded.
 	started := time.Now()
-	response, err := p.client.Do(request)
+	// Issue #145: infinite mode takes 40-236s to its response headers, and
+	// p.client.Do blocked all of it in silence, so CodeAF hedged a second arm
+	// at 30s ("no heartbeat") and timed the turn out at 120s ("timeout
+	// awaiting response headers"). For a streaming call the upstream request
+	// is therefore issued in a goroutine and this handler waits on it with a
+	// heartbeat: the response is committed -- 200, text/event-stream -- and a
+	// comment line goes out at every heartbeat interval until upstream's
+	// headers arrive. A non-streaming call keeps blocking: its answer is a
+	// status and a body, and a comment line on it would mean nothing.
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	request = request.WithContext(ctx)
+	response, headerWait, err := p.doWithHeartbeats(ctx, request, w, &out, stream, wantsStream(body))
+	headerWait = time.Since(started)
 	if err != nil {
+		if ctx.Err() != nil {
+			// CodeAF gave up on the call; the upstream request is cancelled.
+			// A call that upstream refused or answered late enough to be
+			// buffered does not take this path: doWithHeartbeats hands it
+			// back as a result, so it still reaches the ledger and its body
+			// is still closed (review of #145).
+			return
+		}
 		p.fail(w, out, http.StatusBadGateway, "upstream unreachable: "+err.Error())
 		return
 	}
@@ -1292,7 +1338,7 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		// The refusal goes in the ledger too (issue #140): a run whose
 		// upstream kept answering 429 costs real time, and the record
 		// counts it. No usage, no cost.
-		p.record(m, nil, stream, started, slotWait, charCounts{}, repaired, response.StatusCode)
+		p.record(m, nil, stream, started, slotWait, headerWait, charCounts{}, repaired, response.StatusCode)
 		if out == nil {
 			w.Header().Set("Content-Type", response.Header.Get("Content-Type"))
 			w.WriteHeader(response.StatusCode)
@@ -1305,13 +1351,173 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !stream {
-		p.relayJSON(w, response.Body, m, started, slotWait, repaired)
+		p.relayJSON(w, response.Body, m, started, slotWait, headerWait, repaired)
 		return
 	}
 	if out == nil {
 		out = newSSESink(w, p.heartbeatInterval())
 	}
-	p.relayStream(out, response.Body, m, started, slotWait, repaired)
+	// Issue #145: the headers are in, but the wait is not over until the first
+	// data line. The heartbeat covers the gap between the two, and stands
+	// down at that first line, after which relayStream's quiet beat covers
+	// any further silence.
+	stop := p.headerBeats(out)
+	// The whole call lives and dies with the client: a CodeAF that has given up
+	// on the turn must not leave the upstream request running (issue #145 --
+	// during the header wait the wait above cancels it, and from here the
+	// relay watches the same context and cancels when the client leaves).
+	go func() {
+		<-ctx.Done()
+		response.Body.Close()
+	}()
+	p.relayStream(out, response.Body, m, started, slotWait, headerWait, repaired)
+	stop()
+	cancel()
+}
+
+// doWithHeartbeats issues the upstream request (issue #145).
+//
+// For a non-streaming call it is p.client.Do, and the ledger's header wait is
+// the whole of it. For a streaming call the request runs in a goroutine while
+// this handler selects on its result, a heartbeat ticker and the client's
+// context:
+//
+//   - Nothing is written for the first headerWaitGrace(): an upstream that
+//     answers within it keeps today's fast path, so an immediate 402/429/4xx
+//     still reaches CodeAF as a real status code.
+//   - After that, the 200 is committed (out is set, and stays set, so every
+//     later failure goes out as the existing SSE error event, exactly as #95
+//     does after a slot wait) and a `: codeaf-proxy waiting for upstream`
+//     comment goes out every heartbeat interval.
+//   - The client going away cancels the upstream request and this handler
+//     returns with the context's error; no response is written to a client
+//     that is gone. One exception (review of #145): a result the goroutine
+//     already buffered is never dropped -- even with the client gone it is
+//     returned to chat, which records the call in the ledger and closes the
+//     body, so an answer that raced the disconnect keeps its header_ms and
+//     its usage.
+//
+// The done channel is checked before the timers on every pass, so an
+// upstream answering right at the grace window's edge keeps its real status
+// code: the 200/heartbeat commit is never chosen over a response that is
+// already in hand (review of #145).
+//
+// headerWait is the time from issuing the request to upstream's response
+// headers -- the figure infinite mode needs and the ledger records as
+// header_ms.
+func (p *proxy) doWithHeartbeats(ctx context.Context, request *http.Request, w http.ResponseWriter, out **sseSink, stream, streaming bool) (*http.Response, time.Duration, error) {
+	start := time.Now()
+	if !stream || !streaming {
+		response, err := p.client.Do(request)
+		return response, time.Since(start), err
+	}
+	type result struct {
+		response *http.Response
+		err      error
+	}
+	// Buffered: the goroutine must never block on a handler that has already
+	// returned because the client left.
+	done := make(chan result, 1)
+	go func() {
+		response, err := p.client.Do(request)
+		done <- result{response, err}
+	}()
+	every := p.heartbeatInterval()
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	// The ticker keeps beating while the headers are awaited and, past them,
+	// until the first content data line -- relayStream's quiet beat covers
+	// the silence after that (issue #145). The header wait proper is a
+	// separate timer: the 200 is committed only once headerWaitGrace() is out
+	// with no headers, so an upstream that answers at once keeps today's real
+	// status codes.
+	headers := time.NewTimer(p.headerWaitGrace())
+	defer headers.Stop()
+	committed := *out != nil // an earlier slot wait already committed the 200
+	answer := func(r result) (*http.Response, time.Duration, error) {
+		wait := time.Since(start)
+		if r.err == nil && r.response != nil {
+			log.Printf("%s answered in %.1fs with %d", request.URL.Path, wait.Seconds(), r.response.StatusCode)
+		}
+		return r.response, wait, r.err
+	}
+	for {
+		// Prioritised (review of #145): a result that is already buffered
+		// goes before the timers, so an upstream answering right at the
+		// grace window's edge keeps its real status code instead of racing
+		// the 200/heartbeat commit into the select.
+		select {
+		case r := <-done:
+			return answer(r)
+		default:
+		}
+		select {
+		case r := <-done:
+			return answer(r)
+		case <-headers.C:
+			// The grace is out with no headers: commit and heartbeat from here on.
+			if *out == nil {
+				*out = newSSESink(w, every)
+				(*out).commit()
+			}
+			committed = true
+			(*out).comment(headerWaitComment)
+		case <-ticker.C:
+			if !committed {
+				continue // inside the grace window: nothing is written yet
+			}
+			(*out).comment(headerWaitComment)
+		case <-ctx.Done():
+			// The client is gone, but a result may already be buffered
+			// (review of #145): dropping it would leak the response body
+			// and keep the call out of the ledger. Hand it back -- chat
+			// records the answer and closes the body, or reports the Do
+			// error -- and only a still-empty channel returns silently
+			// to a client that is gone.
+			select {
+			case r := <-done:
+				return answer(r)
+			default:
+			}
+			return nil, time.Since(start), ctx.Err()
+		}
+	}
+}
+
+// headerBeats keeps the header-wait heartbeat going past upstream's headers
+// (issue #145): the wait that matters is to the first data line, not to the
+// headers, and a client that hears nothing between the two still reads it as
+// a dead path. It beats every interval while no content data line has reached
+// the client, and returns when one has -- at which point relayStream's quiet
+// beat covers any later silence. close() ends it and waits for the goroutine,
+// so nothing writes after the stream is done.
+func (p *proxy) headerBeats(out *sseSink) (stop func()) {
+	every := p.heartbeatInterval()
+	ticker := time.NewTicker(every)
+	done := make(chan struct{})
+	quit := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-quit:
+				return
+			case <-ticker.C:
+				if out.seenData() {
+					return
+				}
+				out.comment(headerWaitComment)
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			ticker.Stop()
+			close(quit)
+			<-done
+		})
+	}
 }
 
 // wantsStream reports whether the request asked for a streamed response, from
@@ -1342,8 +1548,26 @@ func (p *proxy) fail(w http.ResponseWriter, out *sseSink, status int, message st
 // OpenRouter sends `: OPENROUTER PROCESSING` lines for the same reason.
 const (
 	slotWaitComment      = "codeaf-proxy waiting for a model slot"
+	headerWaitComment    = "codeaf-proxy waiting for upstream"
 	upstreamQuietComment = "codeaf-proxy upstream quiet"
 )
+
+// defaultHeaderWaitGrace is how long a streaming call may sit without
+// upstream headers before the proxy commits its 200 and heartbeats (issue
+// #145). Below it the response is still uncommitted, so an upstream that
+// answers with a real status (402, 429, any 4xx) still reaches CodeAF as that
+// status, which CodeAF's 429 retry depends on, rather than as an SSE event.
+// An ordinary call's headers arrive well inside it even under load; past it
+// the wait is the long one -- infinite mode's 40-236s to first token -- and
+// committing then still beats CodeAF's 30s hedge and 120s header deadline.
+const defaultHeaderWaitGrace = 15 * time.Second
+
+func (p *proxy) headerWaitGrace() time.Duration {
+	if p.headerGrace > 0 {
+		return p.headerGrace
+	}
+	return defaultHeaderWaitGrace
+}
 
 // defaultHeartbeat is how long a streaming client may hear nothing before the
 // proxy proves the path with a comment line (issue #90).
@@ -1369,6 +1593,10 @@ type sseSink struct {
 	committed bool      // the 200 is out: failures go as SSE events now
 	lastWrite time.Time // the last line or comment, for the quiet beat
 	beats     int       // comment lines sent, for the per-call log
+	// data counts the relayed data lines that carry content. Issue #145: the
+	// wait for upstream headers ends at the first such line, not at the
+	// headers, so the header-wait heartbeat keeps going until then.
+	data int
 }
 
 // newSSESink wraps w without committing it: real status codes stay possible
@@ -1414,6 +1642,30 @@ func (s *sseSink) line(b []byte) {
 	if s.flusher != nil {
 		s.flusher.Flush()
 	}
+}
+
+// isCommitted reports whether the 200 has gone out, so callers know whether a
+// later failure is an SSE event or still a real status code.
+func (s *sseSink) isCommitted() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.committed
+}
+
+// seenData reports whether a content data line has reached the client yet
+// (issue #145). Until one has, the header-wait heartbeat keeps running, so a
+// client never reads the wait for the first token as a dead path.
+func (s *sseSink) seenData() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.data > 0
+}
+
+// noteData records one relayed content data line (not a comment, not [DONE]).
+func (s *sseSink) noteData() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data++
 }
 
 // quietBeat sends the upstream-quiet heartbeat when nothing has gone to the
@@ -1504,7 +1756,7 @@ func (p *proxy) acquire(ctx context.Context, m Model, beat func()) (func(), time
 	}
 }
 
-func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, started time.Time, slotWait time.Duration, repaired int) {
+func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, started time.Time, slotWait, headerWait time.Duration, repaired int) {
 	var payload map[string]json.RawMessage
 	if err := json.NewDecoder(upstream).Decode(&payload); err != nil {
 		writeError(w, http.StatusBadGateway, "upstream body: "+err.Error())
@@ -1528,7 +1780,7 @@ func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, st
 		chars.addChoices(choices, "message")
 	}
 	payload["model"], _ = json.Marshal(m.ID)
-	p.record(m, usage, false, started, slotWait, chars, repaired, 0)
+	p.record(m, usage, false, started, slotWait, headerWait, chars, repaired, 0)
 	writeJSON(w, http.StatusOK, payload)
 }
 
@@ -1573,7 +1825,7 @@ func RewriteChunk(data []byte, m Model, chars *charCounts) ([]byte, *Usage) {
 // token. Comment and relayed lines share the sink's mutex, so they never
 // interleave mid-line, and the ticker goroutine is stopped and joined before
 // the call is recorded, so nothing is written after the stream ends.
-func (p *proxy) relayStream(out *sseSink, upstream io.Reader, m Model, started time.Time, slotWait time.Duration, repaired int) {
+func (p *proxy) relayStream(out *sseSink, upstream io.Reader, m Model, started time.Time, slotWait, headerWait time.Duration, repaired int) {
 	out.commit()
 	var usage *Usage
 	var chars charCounts
@@ -1606,6 +1858,10 @@ func (p *proxy) relayStream(out *sseSink, upstream io.Reader, m Model, started t
 						usage = found
 					}
 					trimmed = append([]byte("data: "), rewritten...)
+					// Issue #145: this is the first data line the wait for
+					// upstream was really about; the header-wait heartbeat
+					// stands down from here.
+					out.noteData()
 				}
 			}
 			out.line(append(trimmed, '\n'))
@@ -1619,7 +1875,7 @@ func (p *proxy) relayStream(out *sseSink, upstream io.Reader, m Model, started t
 	}
 	close(stop)
 	done.Wait()
-	p.record(m, usage, true, started, slotWait, chars, repaired, 0)
+	p.record(m, usage, true, started, slotWait, headerWait, chars, repaired, 0)
 }
 
 // ---------------------------------------------------------------- GitHub

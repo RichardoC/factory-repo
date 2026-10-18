@@ -3624,3 +3624,568 @@ func splitUnescapedPipes(row string) []string {
 	}
 	return append(parts, cell.String())
 }
+
+// ---------------------------------------------------------------------------
+// Issue #145: a streaming call whose upstream takes its time over the response
+// headers. Before this change the proxy wrote nothing until those headers
+// arrived, so CodeAF read the silence as a dead path, hedged a second arm and
+// then timed the turn out with "timeout awaiting response headers" (infinite
+// mode's 40-236s to first token).
+
+// proxyFor145 builds a proxy around an upstream handler, with the heartbeat
+// interval shortened to the test's.
+func proxyFor145(t *testing.T, modelID string, interval time.Duration, upstream *httptest.Server) *proxy {
+	t.Helper()
+	models := []Model{mustResolve(t, testModels(t), modelID)}
+	return &proxy{upstream: upstream.URL, apiKey: "k", ledger: filepath.Join(t.TempDir(), "l.jsonl"),
+		runCap: 5, weekCap: 20, models: models, client: upstream.Client(),
+		slots: newSlots(models, 1), heartbeatEvery: interval, headerGrace: time.Second}
+}
+
+// TestProxyHeartbeatsWhileWaitingForUpstreamHeaders (issue #145): an upstream
+// that sleeps 3x the heartbeat interval before writing its headers. The client
+// must see `: codeaf-proxy waiting for upstream` comment lines before the first
+// data line, and then the intact stream and [DONE].
+func TestProxyHeartbeatsWhileWaitingForUpstreamHeaders(t *testing.T) {
+	const interval = 20 * time.Millisecond
+	headers := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-headers:
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	p := proxyFor145(t, "zai-org/glm-5.3-flash", interval, upstream)
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"zai-org/glm-5.3-flash","stream":true,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK || response.Header.Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("long header wait: %d %s, want a committed 200 text/event-stream", response.StatusCode, response.Header.Get("Content-Type"))
+	}
+	// Nothing has been written by upstream yet, so any comment that arrives
+	// now proves the heartbeat, not the relay.
+	reader := bufio.NewReader(response.Body)
+	comments := 0
+	for comments < 3 {
+		line := mustLine(t, reader)
+		if strings.HasPrefix(line, ": "+headerWaitComment) {
+			comments++
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			t.Fatalf("a data line arrived after %d heartbeat(s), before upstream's headers:\n%s", comments, line)
+		}
+	}
+	close(headers)
+	rest, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(rest)
+	if !strings.Contains(got, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]") || !strings.Contains(got, "data: [DONE]") {
+		t.Errorf("the stream after the wait is not intact:\n%s", got)
+	}
+	if !strings.Contains(got, `"model":"zai-org/glm-5.3-flash"`) {
+		t.Errorf("model id not rewritten back to CodeAF's:\n%s", got)
+	}
+}
+
+// TestProxyFastUpstreamErrorKeepsStatus (issue #145): an upstream that answers
+// 429 at once is still the client's status code, not an SSE event. The 1s
+// grace window is what keeps the no-wait fast path intact.
+func TestProxyFastUpstreamErrorKeepsStatus(t *testing.T) {
+	const interval = 20 * time.Millisecond
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"message":"rate limited"}}`)
+	}))
+	defer upstream.Close()
+
+	p := proxyFor145(t, "zai-org/glm-5.3-flash", interval, upstream)
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"zai-org/glm-5.3-flash","stream":true,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("an upstream 429 within the grace window became %d (%s), want 429", response.StatusCode, body)
+	}
+	if strings.Contains(string(body), "data:") {
+		t.Errorf("the fast 429 was turned into an SSE event:\n%s", body)
+	}
+}
+
+// TestProxySlowUpstreamErrorBecomesSSEEvent (issue #145): an upstream that
+// answers 500 after 2s -- past the 1s grace, so the client already has its 200
+// -- gets that failure as the SSE error event #95 uses after a slot wait.
+func TestProxySlowUpstreamErrorBecomesSSEEvent(t *testing.T) {
+	const interval = 20 * time.Millisecond
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(2 * time.Second):
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":{"message":"upstream broke"}}`)
+	}))
+	defer upstream.Close()
+
+	p := proxyFor145(t, "zai-org/glm-5.3-flash", interval, upstream)
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"zai-org/glm-5.3-flash","stream":true,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("slow failure: %d, want the committed 200", response.StatusCode)
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(body)
+	if !strings.Contains(got, ": "+headerWaitComment) {
+		t.Errorf("no heartbeat while waiting 2s for the headers:\n%s", got)
+	}
+	if !strings.Contains(got, `data: {"error":{"code":500`) || !strings.Contains(got, "upstream 500") {
+		t.Errorf("the upstream 500 did not arrive as an SSE error event:\n%s", got)
+	}
+	if !strings.Contains(got, "data: [DONE]") {
+		t.Errorf("the error event is not followed by [DONE]:\n%s", got)
+	}
+}
+
+// TestProxyCancelsUpstreamWhenClientLeaves (issue #145): a client that goes
+// away during the wait for upstream's headers must cancel the upstream
+// request, rather than leave it running to the 120s turn timeout. The call's
+// context is observed at the transport, which is where "the upstream request
+// was cancelled" is true or false; the goroutine count then shows nothing was
+// left behind.
+func TestProxyCancelsUpstreamWhenClientLeaves(t *testing.T) {
+	const interval = 20 * time.Millisecond
+	// roundTrip records the request context and blocks until it is cancelled,
+	// like an upstream that never answers.
+	type seen struct {
+		ctx    context.Context
+		closed chan struct{}
+	}
+	reached := make(chan seen, 1)
+	cancelled := make(chan struct{})
+	p := proxyFor145(t, "zai-org/glm-5.3-flash", interval, httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) { t.Error("the stub transport should have been used") })))
+	defer p.client.CloseIdleConnections()
+	p.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Context().Err() != nil {
+			return nil, r.Context().Err()
+		}
+		reached <- seen{ctx: r.Context()}
+		// Like an upstream that never answers: block until the call is
+		// abandoned, then report that as the transport's error.
+		<-r.Context().Done()
+		close(cancelled)
+		return nil, r.Context().Err()
+	})}
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	before := runtime.NumGoroutine()
+	ctx, cancel := context.WithCancel(context.Background())
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"zai-org/glm-5.3-flash","stream":true,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The heartbeat proves the handler is committed and waiting on upstream.
+	reader := bufio.NewReader(response.Body)
+	for line := mustLine(t, reader); !strings.HasPrefix(line, ": "+headerWaitComment); line = mustLine(t, reader) {
+	}
+	got := <-reached
+	if got.ctx.Err() != nil {
+		t.Fatalf("the upstream request was already cancelled when it was issued: %v", got.ctx.Err())
+	}
+	cancel() // the client leaves mid-wait
+	_, _ = io.Copy(io.Discard, response.Body)
+	response.Body.Close()
+
+	select {
+	case <-cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the upstream request's context was not cancelled when the client left")
+	}
+	// The handler returns once its wait is over; no relay goroutine may be
+	// left writing to a client that is gone.
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.NumGoroutine() > before {
+		if time.Now().After(deadline) {
+			t.Errorf("goroutines still alive after the client left: %d, before the call: %d", runtime.NumGoroutine(), before)
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// roundTripFunc adapts a function to a RoundTripper, so a test can stand in
+// for the network and watch a request's context.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestLedgerRecordsHeaderWait (issue #145): every call's ledger line carries
+// the milliseconds spent waiting for upstream's headers.
+func TestLedgerRecordsHeaderWait(t *testing.T) {
+	const interval = 20 * time.Millisecond
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Stream bool `json:"stream"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		time.Sleep(150 * time.Millisecond)
+		if body.Stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"hi"}}]}`)
+	}))
+	defer upstream.Close()
+
+	p := proxyFor145(t, "zai-org/glm-5.3-flash", interval, upstream)
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	streamed, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"zai-org/glm-5.3-flash","stream":true,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, streamed.Body)
+	streamed.Body.Close()
+	plain, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"zai-org/glm-5.3-flash","messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, plain.Body)
+	plain.Body.Close()
+
+	lines, err := readLedger(p.ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[bool]bool{}
+	for _, l := range lines {
+		if l.Kind != "" {
+			continue
+		}
+		seen[l.Stream] = true
+		if l.HeaderMs <= 0 {
+			t.Errorf("stream=%v: header_ms = %d, want the 150ms wait recorded", l.Stream, l.HeaderMs)
+		}
+		if l.HeaderMs > 5000 {
+			t.Errorf("stream=%v: header_ms = %d, implausible for a 150ms upstream", l.Stream, l.HeaderMs)
+		}
+	}
+	if !seen[true] || !seen[false] {
+		t.Errorf("header_ms must be recorded for streaming and non-streaming calls; saw %v", seen)
+	}
+	raw, err := os.ReadFile(p.ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"header_ms":`) {
+		t.Errorf("the ledger line does not carry the header_ms key:\n%s", raw)
+	}
+}
+
+// --- Issue #145 end-to-end stand-in ---------------------------------------
+//
+// The issue's own end-to-end check re-dispatches the baseline-infinite profile
+// on a fresh copy of the jobq experiment issue and greps the run's
+// logs/calls.jsonl for "timeout awaiting response headers" and for hedges with
+// "reason: no heartbeat". That needs a GitHub Actions dispatch against the
+// merged harness, so it cannot run from this working tree. The two tests below
+// are the closest runner-local equivalent: the first drives the real proxy
+// handler over a real TCP connection against an upstream shaped like
+// infinite:small:vision (a long wait for headers, then a sparse stream), and
+// checks, all at once, the exact consequences the end-to-end check looks for --
+// the client sees a live, committed, beating stream the whole time instead of
+// the silence that made CodeAF hedge and gave net/http a header deadline to
+// fire; the second pins the production client so no header timeout can return.
+
+// TestProxyEndToEndInfiniteModeSlowHeaders (issue #145) is the in-repo
+// stand-in for the issue's end-to-end check. It builds the real proxy handler
+// (httptest.NewServer(&proxy{...})) against a fake upstream that mimics
+// infinite:small:vision: it sleeps 3x the heartbeat interval -- scaled from the
+// 236s the mode has taken -- before writing its headers, then streams data
+// lines slowly, with gaps longer than the heartbeat interval in between. It
+// asserts, all at once, that:
+//
+//   - the client sees HTTP 200 + text/event-stream (the proxy commits rather
+//     than leaving the client in silence);
+//   - at least one ": codeaf-proxy waiting for upstream" comment arrives
+//     before the first data line (the header-wait beat: no 30s silence window,
+//     so CodeAF never hedges on "reason: no heartbeat" and no net/http
+//     CallTimeout can fire);
+//   - upstream-quiet comments arrive during the gaps (the stream is provably
+//     alive between data lines);
+//   - the stream is intact and ends with [DONE];
+//   - the ledger line for the call carries a non-zero header_ms close to the
+//     header sleep (infinite-mode latency is measurable from the ledger).
+func TestProxyEndToEndInfiniteModeSlowHeaders(t *testing.T) {
+	const interval = 20 * time.Millisecond
+	// Scaled from the 236s the mode has really taken: long enough that the
+	// proxy must commit and beat while it waits, short enough to test.
+	const headerSleep = 1500 * time.Millisecond
+
+	// The upstream waits headerSleep before its headers, then writes three
+	// data lines with an upstream-quiet-length gap between them -- the "long
+	// pauses mid-stream" the mode is known for -- and finally [DONE].
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(headerSleep)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		for i, chunk := range []string{
+			`data: {"choices":[{"delta":{"content":"one"}}]}`,
+			`data: {"choices":[{"delta":{"content":"two"}}]}`,
+			`data: {"choices":[{"delta":{"content":"three"}}]}`,
+		} {
+			if i > 0 {
+				// A gap longer than the heartbeat interval: the client must
+				// hear an upstream-quiet comment here, not silence.
+				select {
+				case <-time.After(3 * interval):
+				case <-r.Context().Done():
+					return
+				}
+			}
+			_, _ = io.WriteString(w, chunk+"\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	// The production model id and upstream: the experiment's profile.
+	p := proxyFor145(t, "synthetic/deepseek-v4.1-flash-infinite", interval, upstream)
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	// Client bound mirrors production: the proxy's 15-minute whole-call
+	// timeout, with NO ResponseHeaderTimeout (the point of #145).
+	client := &http.Client{Timeout: 15 * time.Minute}
+	startedAt := time.Now()
+	resp, err := client.Post(server.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"synthetic/deepseek-v4.1-flash-infinite","stream":true,"messages":[]}`))
+	if err != nil {
+		t.Fatalf("the call failed the way infinite mode used to: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// 1. Committed response, not silence.
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want the committed 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", ct)
+	}
+
+	// 2/3/4. Walk the stream line by line, counting what arrives before the
+	// first data line. The upstream has written nothing yet at the moment the
+	// first comments load, so any comment before the first data line is the
+	// header-wait beat.
+	reader := bufio.NewReader(resp.Body)
+	var headerBeats, quietBeats int
+	var sawFirstData bool
+	var body strings.Builder
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out reading the stream; saw so far:\n%s", body.String())
+		}
+		line, err := reader.ReadString('\n')
+		body.WriteString(line)
+		trimmed := strings.TrimRight(line, "\r\n")
+		switch {
+		case strings.HasPrefix(trimmed, ": "+headerWaitComment):
+			if !sawFirstData {
+				headerBeats++
+			} else {
+				// After the first data line the same text only arrives from
+				// headerBeats if a data gap reopened -- count it either way.
+				headerBeats++
+			}
+		case strings.HasPrefix(trimmed, ": "+upstreamQuietComment):
+			quietBeats++
+		case strings.HasPrefix(trimmed, "data:"):
+			sawFirstData = true
+		}
+		if trimmed == "data: [DONE]" {
+			break
+		}
+		if err != nil {
+			t.Fatalf("stream ended before [DONE] after %v: %v\n%s", time.Since(startedAt), err, body.String())
+		}
+	}
+	got := body.String()
+	if headerBeats < 1 {
+		t.Errorf("no %q beat before the first data line: with headerSleep %v the client sat in silence, which is what made CodeAF hedge and net/http time out\n%s",
+			headerWaitComment, headerSleep, got)
+	}
+	if quietBeats < 1 {
+		t.Errorf("no %q beat during the 3x-interval gaps; the stream was silent between data lines\n%s", upstreamQuietComment, got)
+	}
+	// The relay rewrites each chunk -- it adds the model id CodeAF asked for --
+	// so match the content, not the whole line.
+	for _, want := range []string{`"content":"one"`, `"content":"two"`, `"content":"three"`, "data: [DONE]"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("stream is not intact: missing %q\n%s", want, got)
+		}
+	}
+	// The model id must come back as CodeAF's, not the upstream's.
+	if !strings.Contains(got, `"model":"synthetic/deepseek-v4.1-flash-infinite"`) {
+		t.Errorf("model id not rewritten back to CodeAF's:\n%s", got)
+	}
+
+	// 5. The ledger records the header wait, close to the header sleep. The
+	// proxy records the call only after the relay drains upstream, which can
+	// land just after the client has read [DONE], so poll briefly.
+	var lines []LedgerLine
+	var err2 error
+	ledgerDeadline := time.Now().Add(5 * time.Second)
+	for {
+		lines, err2 = readLedger(p.ledger)
+		if err2 == nil {
+			any := false
+			for _, l := range lines {
+				if l.Kind == "" && l.Stream {
+					any = true
+				}
+			}
+			if any {
+				break
+			}
+		}
+		if time.Now().After(ledgerDeadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err2 != nil {
+		t.Fatal(err2)
+	}
+	var sawCall bool
+	for _, l := range lines {
+		if l.Kind != "" || !l.Stream {
+			continue
+		}
+		sawCall = true
+		t.Logf("issue #145 stand-in: streamed call for %s recorded header_ms=%d (upstream slept %v for headers)",
+			l.Model, l.HeaderMs, headerSleep)
+		if l.HeaderMs <= 0 {
+			t.Errorf("header_ms = %d, want the header wait recorded", l.HeaderMs)
+		}
+		// header_ms measures to upstream's headers, so it should be at least
+		// the sleep and not wildly more (generous upper bound for CI).
+		if want := headerSleep.Milliseconds(); l.HeaderMs < want {
+			t.Errorf("header_ms = %d, want >= %d (the header sleep)", l.HeaderMs, want)
+		}
+		if l.HeaderMs > 10_000 {
+			t.Errorf("header_ms = %d is implausible for a %v header sleep", l.HeaderMs, headerSleep)
+		}
+	}
+	if !sawCall {
+		t.Errorf("no streamed call in the ledger:\n%v", lines)
+	}
+}
+
+// TestProductionProxyClientHasNoHeaderTimeout (issue #145) is the cheaper,
+// second proof, aimed at the production numbers rather than the shape of the
+// stream. The same client-side silence that let CodeAF hedge also gave
+// net/http a header deadline to fire; the fix removes that silence by
+// committing and heartbeat-beating instead, and this test pins the other half:
+// the PROXY's http.Client carries no ResponseHeaderTimeout, so no header
+// deadline can fire before the heartbeat cadence. It reads the real
+// upstreamClient() the proxy uses (runProxy builds p.client from it), not a
+// copy.
+func TestProductionProxyClientHasNoHeaderTimeout(t *testing.T) {
+	c := upstreamClient()
+	if c == nil {
+		t.Fatal("upstreamClient() returned nil")
+	}
+	// The whole-call budget: an upper bound must exist, and it must be far
+	// beyond infinite mode's 40-236s wait for headers, or the call would time
+	// out on the whole-call deadline instead. 15 minutes is the production
+	// figure.
+	if c.Timeout < 5*time.Minute {
+		t.Errorf("client whole-call Timeout = %v, want at least 5m so infinite mode's 236s header wait fits", c.Timeout)
+	}
+	// ResponseHeaderTimeout lives on http.Transport. The proxy client must be
+	// left on the default transport (Transport == nil), which has no
+	// ResponseHeaderTimeout; a custom transport is exactly how the header
+	// deadline that broke infinite mode would come back.
+	if c.Transport != nil {
+		if tr, ok := c.Transport.(*http.Transport); ok {
+			if tr.ResponseHeaderTimeout != 0 {
+				t.Errorf("proxy Transport.ResponseHeaderTimeout = %v, want 0: a header deadline is the client-side silence #145 removes", tr.ResponseHeaderTimeout)
+			}
+			t.Errorf("proxy client carries a custom *http.Transport; keep Transport nil so the default (no ResponseHeaderTimeout) is used")
+		} else {
+			t.Errorf("proxy client carries a custom Transport (%T); a ResponseHeaderTimeout there would reintroduce the header deadline #145 removes", c.Transport)
+		}
+	}
+	// A plain http.Client has no ResponseHeaderTimeout field at all: this is
+	// the shape assertion. If someone wraps the client behind a type that
+	// exposes one, this catches it.
+	if h, ok := interface{}(c).(interface{ HeaderTimeout() time.Duration }); ok {
+		t.Errorf("proxy client exposes a header timeout (%v); #145 removes the client-side silence that caused \"net/http: timeout awaiting response headers\"", h.HeaderTimeout())
+	}
+}
+
+// The production grace before the proxy commits a 200 must stay well above an
+// ordinary call's time to headers, so upstream refusals keep their real status
+// (CodeAF retries a 429), and below CodeAF's 30s hedge.
+func TestProductionHeaderWaitGrace(t *testing.T) {
+	if g := (&proxy{}).headerWaitGrace(); g < 10*time.Second || g >= 30*time.Second {
+		t.Fatalf("default header wait grace = %v, want in [10s, 30s)", g)
+	}
+}
