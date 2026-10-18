@@ -532,6 +532,29 @@ knowing*).
     refuses, such as an edit to a step that holds a secret, still waits for a
     maintainer.
 
+    The policy compares the patched workflows against the **patch's own base
+    commit**, not current `main`: when a branch has fallen behind and
+    `main`'s workflows moved (a trigger change, a new step), the policy
+    reports `<workflow>: changed on the default branch since the patch's
+    base; rebase the branch before it can publish` instead of blaming the patch
+    for a change it did not make. Rebase the branch and re-run.
+
+    New or changed `run:` scripts must not **install from moving refs**. The
+    policy refuses `go install`/`go run` of `@main`, `@master`, `@latest` or
+    a `@release-*` ref, `curl | sh` (or `wget` piped into `sh`, `bash`,
+    `zsh`), `pip install` without a `==` version, `npm install -g` without a
+    `@version`, and `git clone -b main`/`-b master`. Pin a version or SHA.
+
+    **When the policy refuses a patch**, the publish job now splits it: the
+    parts outside `.github/workflows/` (and outside the refused workflow
+    files) still publish, and the refused workflow diff is posted as a PR
+    comment labelled `needs-maintainer` instead of the whole patch being
+    dropped. To move forward, read the violated rule — the PR comment and
+    the run report both quote it under "Workflow policy" — then either
+    approve the `codeaf-harness` environment deployment for that run, or
+    fix the patch (pin the install, drop the refused workflow file, rebase
+    onto the current default branch) and re-run.
+
   One-off setup:
   - *Settings → Environments → New environment* `codeaf-harness`:
     - **Required reviewers**: yourself. Leave *Prevent self-review* off, since

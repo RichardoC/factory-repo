@@ -109,6 +109,13 @@ func main() {
 		// The deterministic gate on a workflow change published without a
 		// maintainer's approval (workflowpolicy.go).
 		"workflow-policy": runWorkflowPolicy,
+		// Splitting a patch the policy refused (patchsplit.go): the part
+		// under .github/ outside .github/codeaf/ goes to REFUSED for a
+		// maintainer; everything else still publishes.
+		"patch-split": runPatchSplit,
+		// The PR comment body for a refused part of a patch
+		// (refusedcomment.go): reason plus the refused diff in a fence.
+		"refused-comment": runRefusedComment,
 	}
 	command, ok := commands[os.Args[1]]
 	if !ok {
@@ -3069,6 +3076,18 @@ func escapeMD(s string, max int, oneLine bool) string {
 	return b.String()
 }
 
+// capPlain caps s at max runes without escaping it. It is for text the
+// workflow has already shaped and the report quotes verbatim, such as the
+// workflow-policy refusal lines (issue #138); everything untrusted still
+// passes through escapeMD instead.
+func capPlain(s string, max int) string {
+	r := []rune(s)
+	if len(r) > max {
+		return string(r[:max]) + "…"
+	}
+	return s
+}
+
 // plainToken reports whether s is the short lowercase word CodeAF's own stop,
 // verdict and task-state values are. Such a value renders as it is; anything
 // else is untrusted prose and renders escaped.
@@ -3666,13 +3685,30 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 	// The ::error:: lines the publish steps collected: the two most recent are
 	// the cause of a failed publish. Read as data: the prefix is stripped and
 	// the line is escaped and capped, so a crafted error line stays a line.
+	// Workflow-policy refusals (issue #138) are the exception: the workflow
+	// shapes them and the PR comment quotes them, so the report shows them
+	// verbatim under their own heading, and not again in the table.
 	if errs := in.PublishErrors; len(errs) > 0 {
-		if len(errs) > 2 {
-			errs = errs[len(errs)-2:]
-		}
+		var policy, other []string
 		for _, e := range errs {
 			e = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(e), "::error::"))
+			if strings.HasPrefix(e, "workflow policy: ") {
+				policy = append(policy, e)
+			} else {
+				other = append(other, e)
+			}
+		}
+		if len(other) > 2 {
+			other = other[len(other)-2:]
+		}
+		for _, e := range other {
 			fmt.Fprintf(&b, "| publish error | %s |\n", escapeMD(e, 200, true))
+		}
+		if len(policy) > 0 {
+			b.WriteString("\n### Workflow policy\n\n")
+			for _, e := range policy {
+				fmt.Fprintf(&b, "- %s\n", capPlain(e, 2000))
+			}
 		}
 	}
 	b.WriteString("\n")
