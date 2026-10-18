@@ -79,6 +79,8 @@ func main() {
 		"pr-mode":       prMode,
 		"continue-plan": runContinuePlan,
 		"seat-config":   runSeatConfig, // the lane's CodeAF config (issue #60)
+		// The dispatch inputs and run title, one source of truth (issue #133).
+		"dispatch-args": runDispatchArgs,
 		// The independent review pass (issue #32): brief, model config and
 		// report of a read-only review run on a pull request.
 		"review-brief":  runReviewBrief,

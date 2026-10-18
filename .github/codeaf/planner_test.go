@@ -433,9 +433,10 @@ func TestRunPlanCheck(t *testing.T) {
 	})
 	lane0 := writePlanRuns(t, []runStatus{planRun("in_progress", "CodeAF #7 (lane 0)", stampAgo(1), 101)})
 
-	// The default models.json sets min_backlog 3 and max_parallel_runs 2:
-	// two queued issues is below the backlog, one run in flight puts the
-	// plan run on lane 1.
+	// The committed models.json sets min_backlog 3 (read from the file, not
+	// a constant): two queued issues is below the backlog, and one run in
+	// flight puts the plan run on the next lane, whatever max_parallel_runs
+	// commits.
 	out, err := planCheckStdout(t, low, lane0)
 	if err != nil || out != "plan=1\nlane=1\n" {
 		t.Fatalf("planCheckStdout = %q, %v; want plan=1, lane=1", out, err)

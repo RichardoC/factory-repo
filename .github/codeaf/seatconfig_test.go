@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -137,10 +139,16 @@ func TestSeatConfigCommittedConfig(t *testing.T) {
 		if worker, _ := config["models.tiers.worker"].(string); worker != c.worker {
 			t.Fatalf("lane %q: worker = %q; want %q", c.lane, worker, c.worker)
 		}
-		// Every committed model has max_concurrent 8, so the per-run slice
-		// at max_parallel_runs 4 is 2.
-		if parallel, ok := config["task.parallel"].(float64); !ok || parallel != 2 {
-			t.Fatalf("lane %q: task.parallel = %v; want 2", c.lane, config["task.parallel"])
+		// task.parallel is the per-run slice, whatever the committed files
+		// say: the smallest max_concurrent sliced by max_parallel_runs.
+		cfg, err := loadConfig("models.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := minPerRunSlots(cfg.Models, cfg.Queue.MaxParallelRuns)
+		if parallel, ok := config["task.parallel"].(float64); !ok || int(parallel) != want {
+			t.Fatalf("lane %q: task.parallel = %v; want %d, the per-run slice at max_parallel_runs %d",
+				c.lane, config["task.parallel"], want, cfg.Queue.MaxParallelRuns)
 		}
 		if _, ok := config["models.crew.task_cap"]; !ok {
 			t.Fatalf("lane %q: the config lost keys: %v", c.lane, config)
@@ -176,4 +184,175 @@ func TestSeatConfigErrors(t *testing.T) {
 	if err := runSeatConfig(); err == nil {
 		t.Fatal("seat-config accepted a missing LANE argument")
 	}
+}
+
+// configInvariants loads the four committed config files from dir (never
+// constants) and returns every invariant between them, so a config change
+// that would break a run fails here instead of in a workflow (issue #133).
+// The errors carry the file and the key, not just the numbers.
+func configInvariants(dir string) []error {
+	var errs []error
+	errf := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
+	cfg, err := loadConfig(filepath.Join(dir, "models.json"))
+	if err != nil {
+		return []error{err}
+	}
+	ids := map[string]bool{}
+	for _, m := range cfg.Models {
+		ids[m.ID] = true
+		if len(m.Efforts) == 0 {
+			errf("models.json: model %q lists no efforts", m.ID)
+		}
+	}
+
+	// codeaf-config.json: the seats are models.json ids, the worker and the
+	// mastermind are different models, and task.parallel stays within the
+	// smallest per-run slice any limited model gives at max_parallel_runs.
+	cc, err := os.ReadFile(filepath.Join(dir, "codeaf-config.json"))
+	if err != nil {
+		return append(errs, err)
+	}
+	var config map[string]any
+	if err := json.Unmarshal(cc, &config); err != nil {
+		return append(errs, fmt.Errorf("codeaf-config.json: %w", err))
+	}
+	seat := func(key string) Model {
+		id, _ := config[key].(string)
+		m, ok := Resolve(cfg.Models, id)
+		if !ok {
+			errf("codeaf-config.json: %s = %q, which models.json does not allow", key, id)
+			return Model{}
+		}
+		return m
+	}
+	worker := seat("models.tiers.worker")
+	mastermind := seat("models.tiers.mastermind")
+	seat("models.tiers.high")
+	if worker.ID != "" && mastermind.ID != "" && worker.ID == mastermind.ID {
+		errf("codeaf-config.json: the worker is the same model as the mastermind (%s)", worker.ID)
+	}
+	if parallel, _ := config["task.parallel"].(float64); int(parallel) > minPerRunSlots(cfg.Models, cfg.Queue.MaxParallelRuns) {
+		errf("codeaf-config.json: task.parallel %d is past the per-run slice %d (max_parallel_runs %d)",
+			int(parallel), minPerRunSlots(cfg.Models, cfg.Queue.MaxParallelRuns), cfg.Queue.MaxParallelRuns)
+	}
+
+	// experiments.json: every profile names only models.json ids.
+	ex, err := os.ReadFile(filepath.Join(dir, "experiments.json"))
+	if err != nil {
+		return append(errs, err)
+	}
+	var experiments struct {
+		Profiles map[string]Profile `json:"profiles"`
+	}
+	if err := json.Unmarshal(ex, &experiments); err != nil {
+		return append(errs, fmt.Errorf("experiments.json: %w", err))
+	}
+	for name, p := range experiments.Profiles {
+		for _, seat := range []string{p.Worker, p.Planner, p.Checker} {
+			if _, ok := Resolve(cfg.Models, seat); !ok {
+				errf("experiments.json: profile %q names %q, which models.json does not allow", name, seat)
+			}
+		}
+	}
+
+	// panel.json: its catalog entries are models.json ids too.
+	panel, err := os.ReadFile(filepath.Join(dir, "panel.json"))
+	if err != nil {
+		return append(errs, err)
+	}
+	var panelCfg struct {
+		Models []struct {
+			Slug string `json:"slug"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(panel, &panelCfg); err != nil {
+		return append(errs, fmt.Errorf("panel.json: %w", err))
+	}
+	for _, m := range panelCfg.Models {
+		if !ids[m.Slug] {
+			errf("panel.json: model %q, which models.json does not allow", m.Slug)
+		}
+	}
+
+	// The lane pool must give every lane a worker seat, distinct-or-rotating:
+	// either at least max_parallel_runs models, one seat per lane, or fewer
+	// that rotate (seat-config picks pool[lane % len(pool)]); and at least
+	// one pool model must have role base or mid, the roles concurrent runs
+	// share — a pool with none would put every lane on a seat meant for
+	// one-off experiments.
+	pool := laneModels(cfg.Models)
+	baseMid := 0
+	for _, m := range pool {
+		if m.Role == "base" || m.Role == "mid" {
+			baseMid++
+		}
+	}
+	switch {
+	case len(pool) == 0:
+		errf("models.json: laneModels is empty; no lane gets a worker seat")
+	case len(pool) >= cfg.Queue.MaxParallelRuns:
+		// Distinct: every lane gets its own model. The base-or-mid clause
+		// below still applies.
+	case baseMid < 1:
+		errf("models.json: laneModels has %d models for %d lanes and rotates; none of them has role base or mid, which concurrent runs share",
+			len(pool), cfg.Queue.MaxParallelRuns)
+	}
+	if len(pool) > 0 && baseMid < 1 {
+		errf("models.json: no lane model has role base or mid")
+	}
+
+	// limits and queue: the per-run cap fits inside the week's, and at
+	// least one run may go at once.
+	if cfg.Limits.RunCreditUSD > cfg.Limits.WeeklyCreditUSD {
+		errf("models.json: run_credit_usd %v is past weekly_credit_usd %v",
+			cfg.Limits.RunCreditUSD, cfg.Limits.WeeklyCreditUSD)
+	}
+	if cfg.Queue.MaxParallelRuns < 1 {
+		errf("models.json: queue.max_parallel_runs %d is below 1", cfg.Queue.MaxParallelRuns)
+	}
+	return errs
+}
+
+// TestConfigInvariants: the committed config files agree with each other,
+// and a config that breaks an invariant fails the test. The second subtest
+// runs the checks against a temp copy with task.parallel past the per-run
+// slice, so the failure path itself stays tested as the config drifts.
+func TestConfigInvariants(t *testing.T) {
+	t.Run("committed config", func(t *testing.T) {
+		for _, err := range configInvariants(".") {
+			t.Error(err)
+		}
+	})
+
+	t.Run("task.parallel past the per-run slice fails", func(t *testing.T) {
+		dir := t.TempDir()
+		for _, name := range []string{"models.json", "codeaf-config.json", "experiments.json", "panel.json"} {
+			data, err := os.ReadFile(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		path := filepath.Join(dir, "codeaf-config.json")
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		broken := strings.Replace(string(data), `"task.parallel": 2`, `"task.parallel": 9`, 1)
+		if broken == string(data) {
+			t.Fatal("codeaf-config.json no longer sets task.parallel 2; update this test")
+		}
+		if err := os.WriteFile(path, []byte(broken), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		errs := configInvariants(dir)
+		if len(errs) == 0 {
+			t.Fatal("task.parallel 9 passed the invariants")
+		}
+		if !strings.Contains(errs[0].Error(), "task.parallel") {
+			t.Fatalf("errs[0] = %v; want one naming task.parallel", errs[0])
+		}
+	})
 }
