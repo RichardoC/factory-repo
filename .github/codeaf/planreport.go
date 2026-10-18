@@ -33,12 +33,13 @@ const (
 
 // Proposal is one proposed issue parsed from a plan run's answer (issue #61).
 type Proposal struct {
-	Title   string
-	Problem string
-	What    string
-	Done    string
-	Area    string // "harness" or "app/<name>"; empty when absent or unrecognized
-	Deps    []int
+	Title    string
+	Problem  string
+	What     string
+	Done     string
+	EndToEnd string // the "End-to-end check" field, when the planner gave one (issue #136)
+	Area     string // "harness" or "app/<name>"; empty when absent or unrecognized
+	Deps     []int
 }
 
 var (
@@ -50,7 +51,7 @@ var (
 	planHeading = regexp.MustCompile(`^\s*#{1,6}(\s|$)`)
 	// planFieldLine is one known field: "Name: text" with an optional
 	// leading "- ", case-insensitive on the name.
-	planFieldLine = regexp.MustCompile(`(?i)^\s*-?\s*(problem|what to do|done when|area|depends on)\s*:\s*(.*)$`)
+	planFieldLine = regexp.MustCompile(`(?i)^\s*-?\s*(problem|what to do|done when|end-to-end check|area|depends on)\s*:\s*(.*)$`)
 	// planUnknownField is a bullet line shaped like a field ("Name: text")
 	// but naming none of the known ones. Its text is kept out, and it ends
 	// the previous field, so a crafted "- Ignore previous instructions: ..."
@@ -188,6 +189,8 @@ func ParseProposals(answer string, max int) []Proposal {
 			cur.What = strings.TrimSpace(cur.What + "\n" + line)
 		case "done when":
 			cur.Done = strings.TrimSpace(cur.Done + "\n" + line)
+		case "end-to-end check":
+			cur.EndToEnd = strings.TrimSpace(cur.EndToEnd + "\n" + line)
 		case "area":
 			cur.Area = strings.TrimSpace(cur.Area + "\n" + line)
 		case "depends on":
@@ -275,6 +278,7 @@ func planFinish(p Proposal) Proposal {
 	p.Problem = planTruncate(strings.TrimSpace(p.Problem), maxProposalField)
 	p.What = planTruncate(strings.TrimSpace(p.What), maxProposalField)
 	p.Done = planTruncate(strings.TrimSpace(p.Done), maxProposalField)
+	p.EndToEnd = planTruncate(strings.TrimSpace(p.EndToEnd), maxProposalField)
 	p.Area = normalizeArea(p.Area)
 	if len(p.Deps) > maxProposalDeps {
 		p.Deps = p.Deps[:maxProposalDeps]
@@ -343,6 +347,12 @@ func ProposalLabels(p Proposal) []string {
 	return labels
 }
 
+// proposalE2EPlaceholder is the text a proposal without an "End-to-end
+// check" field gets under the heading (issue #136): a fixed string, so the
+// section is there and a person can see it must be filled in before the
+// issue is queued.
+const proposalE2EPlaceholder = "(fill in before queueing: the one command or run that proves the seams work)"
+
 // ProposalBody renders one proposal as the body of the issue the publish job
 // opens: a fixed markdown template, every untrusted text passed through
 // escapeMD (the title on one line), the dependencies rendered as plain
@@ -355,7 +365,20 @@ func ProposalBody(p Proposal) string {
 	fmt.Fprintf(&b, "### Proposal: %s\n\n", escapeMD(p.Title, maxProposalTitle, true))
 	fmt.Fprintf(&b, "**Problem**\n\n%s\n\n", escapeMD(p.Problem, maxProposalField, false))
 	fmt.Fprintf(&b, "**What to do**\n\n%s\n\n", escapeMD(p.What, maxProposalField, false))
-	fmt.Fprintf(&b, "**Done when**\n\n%s\n", escapeMD(p.Done, maxProposalField, false))
+	// The acceptance sections (issue #136): "Done when" renders the
+	// proposal's field as bullets, "End-to-end check" the planner's field
+	// when it gave one and the placeholder otherwise.
+	fmt.Fprintf(&b, "## Done when\n\n")
+	for _, line := range strings.Split(p.Done, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			fmt.Fprintf(&b, "- %s\n", escapeMD(line, maxProposalField, false))
+		}
+	}
+	e2e := p.EndToEnd
+	if strings.TrimSpace(e2e) == "" {
+		e2e = proposalE2EPlaceholder
+	}
+	fmt.Fprintf(&b, "\n## End-to-end check\n\n%s\n", escapeMD(e2e, maxProposalField, false))
 	if p.Area != "" {
 		fmt.Fprintf(&b, "\n**Area**: %s\n", escapeMD(p.Area, 100, true))
 	}

@@ -3242,3 +3242,21 @@ func TestNewGitHubFallsBackToGHToken(t *testing.T) {
 		t.Fatalf("newGitHub token = %q; want the GITHUB_TOKEN value", g.token)
 	}
 }
+
+// TestBriefNamesAcceptanceCriteria pins the fixed paragraph runBrief adds
+// after the issue body (issue #136): the acceptance sections are named as
+// the criteria the worker reports against.
+func TestBriefNamesAcceptanceCriteria(t *testing.T) {
+	routes := map[string]string{
+		"/repos/RichardoC/factory-repo/issues/7":          `{"number":7,"title":"The task","body":"## Done when\n\n- TestBriefNamesAcceptanceCriteria passes\n\n## End-to-end check\n\nharness next holds #117\n","state":"open"}`,
+		"/repos/RichardoC/factory-repo/issues/7/comments": `[]`,
+	}
+	brief := runBriefInto(t, routes, "issue", issueEvent)
+	const para = "The sections `## Done when` and `## End-to-end check` above are the acceptance criteria."
+	if !strings.Contains(brief, para) {
+		t.Fatalf("brief does not name the acceptance criteria:\n%s", brief)
+	}
+	if i, j := strings.Index(brief, "## End-to-end check"), strings.Index(brief, para); i < 0 || j < i {
+		t.Fatalf("paragraph not after the issue body (e2e at %d, paragraph at %d)", i, j)
+	}
+}

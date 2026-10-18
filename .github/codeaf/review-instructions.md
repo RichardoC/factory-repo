@@ -22,6 +22,10 @@ Review the embedded diff against the issue the pull request closes:
   request claims (`go test -bench`) and compare with the claimed numbers.
   AGENTS.md requires before and after numbers for a performance claim; a
   claim without them is a finding.
+- **Acceptance criteria** — for every bullet of the issue's `## Done when`,
+  run the named test or command yourself; run the `## End-to-end check`. An
+  unmet bullet or a failing end-to-end check is a **high** finding, quoted as
+  `[high] done-when: <bullet>`.
 - **Workflow security** — when the diff touches `.github/workflows/`, it was
   published without a maintainer, on the deterministic workflow policy
   alone, and your review is what stands between it and the default branch.
