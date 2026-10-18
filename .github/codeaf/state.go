@@ -698,10 +698,17 @@ func stateMerge(bundle, out string, runDirs []string, cfg Config, now time.Time)
 		// The run record (issue #140) is appended to the bundle's
 		// records.jsonl. A record that cannot be believed is left out; the
 		// run itself still merges.
+		// A run contributes its own one record and nothing else: a
+		// records.jsonl in its artifact could otherwise push the bundle's
+		// real history past the 2000-line cap, and a record naming another
+		// run could stand in for it.
+		files.Records = nil
 		if rec, err := readRunRecord(r.dir); err != nil {
 			log.Printf("warning: run %s: run record left out: %v", r.meta.key(), err)
+		} else if rec.RunID != "" && rec.key() != r.meta.key() {
+			log.Printf("warning: run %s: run record names run %s; left out", r.meta.key(), rec.key())
 		} else if rec.RunID != "" {
-			files.Records = append(files.Records, rec)
+			files.Records = []RunRecord{rec}
 		}
 		var how string
 		shared, how = mergeRun(shared, m.Generation, r.meta, files)

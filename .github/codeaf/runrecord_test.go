@@ -415,3 +415,40 @@ func TestLedgerRecordsUpstreamStatus(t *testing.T) {
 		t.Errorf("500 line = status %d", lines[2].Status)
 	}
 }
+
+// A run contributes only its own record: a records.jsonl packed in its
+// artifact, or a record naming another run, never reaches the bundle.
+func TestStateMergeTakesOnlyTheRunsOwnRecord(t *testing.T) {
+	cfg, err := loadConfig("models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	empty := filepath.Join(t.TempDir(), "no-bundle")
+	out := filepath.Join(t.TempDir(), "out")
+	t.Setenv("GITHUB_OUTPUT", filepath.Join(t.TempDir(), "output"))
+
+	flood := filepath.Join(t.TempDir(), "flood")
+	writeRecordRun(t, flood, "1", RunRecord{RunID: "1", Attempt: "1", Mode: "issue", Stop: stopDone, Date: "2026-10-16"}, true)
+	var lines []byte
+	for i := 100; i < 110; i++ {
+		data, _ := json.Marshal(RunRecord{RunID: strconv.Itoa(i), Attempt: "1", Mode: "issue", Stop: stopDone, Date: "2026-10-16"})
+		lines = append(append(lines, data...), '\n')
+	}
+	writeTestFile(t, filepath.Join(flood, recordsFile), lines)
+
+	impostor := filepath.Join(t.TempDir(), "impostor")
+	writeRecordRun(t, impostor, "2", RunRecord{RunID: "3", Attempt: "1", Mode: "issue", Stop: stopDone, Date: "2026-10-16"}, true)
+
+	if err := stateMerge(empty, out, []string{flood, impostor}, cfg, now); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(out, recordsFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, _ := CleanRecords(data)
+	if len(records) != 1 || records[0].RunID != "1" {
+		t.Errorf("records = %+v, want only run 1's own", records)
+	}
+}
