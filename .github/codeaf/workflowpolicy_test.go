@@ -368,4 +368,49 @@ func TestPolicyAgainstBase(t *testing.T) {
 	if v := policyAgainstBase(base, after, base); len(v) != 0 {
 		t.Errorf("base == default branch: want no violations, got %v", v)
 	}
+
+	// A privileged job is judged against the patch's own base too: with
+	// BEFORE (current main) equal to the patch's base, a patch that touches
+	// neither the privileged workflow's jobs nor top-level keys draws no
+	// violation, while one that edits the publish job is refused. This path
+	// — a workflow with privileged jobs as the compared file — was never
+	// exercised before, which is how the base comparison's behaviour here
+	// went unchecked (review finding, #138).
+	baseWithPush := mutate(t, "codeaf.yml", func(wf map[string]any) {
+		asMap(jobOf(wf, "publish")["steps"].([]any)[0])["run"] = "git push origin HEAD:refs/heads/old"
+	})
+	// The patch edits only ci.yml's unprivileged job; codeaf.yml is
+	// byte-identical to the base, so its privileged jobs are not "changed".
+	harmless := mutate(t, "ci.yml", func(wf map[string]any) {
+		asMap(asSlice(jobOf(wf, "go")["steps"])[1])["run"] = "go test -race ./..."
+	})
+	patched := map[string]map[string]any{}
+	for k, v := range harmless {
+		patched[k] = v
+	}
+	raw, err := json.Marshal(baseWithPush["codeaf.yml"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var copy1 map[string]any
+	if err := json.Unmarshal(raw, &copy1); err != nil {
+		t.Fatal(err)
+	}
+	patched["codeaf.yml"] = copy1
+	if v := policyAgainstBase(baseWithPush, patched, baseWithPush); len(v) != 0 {
+		t.Errorf("untouched privileged jobs judged as changed: %v", v)
+	}
+	// The patch edits the publish job itself: refused, and not only as drift.
+	editPush := mutate(t, "codeaf.yml", func(wf map[string]any) {
+		asMap(jobOf(wf, "publish")["steps"].([]any)[0])["run"] = "git push origin HEAD:refs/heads/new"
+	})
+	var froze bool
+	for _, line := range policyAgainstBase(baseWithPush, editPush, baseWithPush) {
+		if strings.Contains(line, `job "publish"`) {
+			froze = true
+		}
+	}
+	if !froze {
+		t.Errorf("a publish-job edit was not refused: %v", policyAgainstBase(baseWithPush, editPush, baseWithPush))
+	}
 }

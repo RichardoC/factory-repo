@@ -542,14 +542,25 @@ knowing*).
     New or changed `run:` scripts must not **install from moving refs**. The
     policy refuses `go install`/`go run` of `@main`, `@master`, `@latest` or
     a `@release-*` ref, `curl | sh` (or `wget` piped into `sh`, `bash`,
-    `zsh`), `pip install` without a `==` version, `npm install -g` without a
-    `@version`, and `git clone -b main`/`-b master`. Pin a version or SHA.
+    `zsh`), a `pip install` whose specifier names no version, a global
+    `npm`/`yarn` install of a package that is unpinned or pinned to a
+    moving ref (`npm install -g pkg`, `npm install -g pkg@latest`,
+    `npm i -g @scope/pkg`, `yarn global add pkg`), and `git clone -b
+    main`/`-b master`. A version pin of any kind passes — `==`, `>=`,
+    `~=`, or a tag via `@` — and so does a commented-out line. These are
+    heuristics over the script text, not a parser: they catch the common
+    spellings and deliberate spellings may still slip through, so pin the
+    version or SHA anyway.
 
-    **When the policy refuses a patch**, the publish job now splits it: the
-    parts outside `.github/workflows/` (and outside the refused workflow
-    files) still publish, and the refused workflow diff is posted as a PR
-    comment labelled `needs-maintainer` instead of the whole patch being
-    dropped. To move forward, read the violated rule — the PR comment and
+    **When the policy refuses a patch**, the publish job splits it with
+    `harness patch-split` and keeps the rest: every file section outside
+    `.github/` (except `.github/codeaf/`, which a maintainer never has to
+    approve) is applied and published as before, and the refused workflow
+    diff is written out and posted as a PR comment labelled
+    `needs-maintainer` (`harness refused-comment`) instead of the whole
+    patch being dropped. A refused section that renames or copies a file,
+    a patch over 50 MB, or a header that does not parse refuses the whole
+    patch (exit 2, nothing written) rather than publishing a partial one. To move forward, read the violated rule — the PR comment and
     the run report both quote it under "Workflow policy" — then either
     approve the `codeaf-harness` environment deployment for that run, or
     fix the patch (pin the install, drop the refused workflow file, rebase

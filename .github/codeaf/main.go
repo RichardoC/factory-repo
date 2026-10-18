@@ -3685,9 +3685,11 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 	// The ::error:: lines the publish steps collected: the two most recent are
 	// the cause of a failed publish. Read as data: the prefix is stripped and
 	// the line is escaped and capped, so a crafted error line stays a line.
-	// Workflow-policy refusals (issue #138) are the exception: the workflow
-	// shapes them and the PR comment quotes them, so the report shows them
-	// verbatim under their own heading, and not again in the table.
+	// Workflow-policy refusals (issue #138) get their own heading so the rule
+	// is visible and not only its count, and not again in the table. They are
+	// escaped like any other publish error: a policy line embeds the patch's
+	// own step name (workflowpolicy.go), which can carry HTML, an @mention or
+	// a backtick, so it is untrusted data too.
 	if errs := in.PublishErrors; len(errs) > 0 {
 		var policy, other []string
 		for _, e := range errs {
@@ -3707,7 +3709,7 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 		if len(policy) > 0 {
 			b.WriteString("\n### Workflow policy\n\n")
 			for _, e := range policy {
-				fmt.Fprintf(&b, "- %s\n", capPlain(e, 2000))
+				fmt.Fprintf(&b, "- %s\n", escapeMD(e, 2000, true))
 			}
 		}
 	}

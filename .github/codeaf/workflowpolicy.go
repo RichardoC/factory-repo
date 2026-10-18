@@ -447,30 +447,96 @@ func runWorkflowPolicy() error {
 // RE2 has no lookahead, so the pip and npm cases match the install line
 // first and then check the matched text for a pin.
 var (
-	movingRefInstall = regexp.MustCompile(`(go install|go run)\s+\S+@(main|master|latest|release-[^\s"']*)`)
-	pipedShell       = regexp.MustCompile(`(curl|wget)\b[^\n]*\|\s*(sudo\s+)?(ba|z)?sh\b`)
-	pipInstallLine   = regexp.MustCompile(`pip3?\s+install\s+[^\n]*`)
-	npmInstallLine   = regexp.MustCompile(`npm\s+install\s+-g\s+([^\n]+)`)
-	gitCloneBranch   = regexp.MustCompile(`git[[:space:]]+clone[^\n]*(-b|--branch)[[:space:]]+(main|master)\b`)
+	// A ref/spec that moves: a branch, a tag-like release-*, or latest.
+	movingRef = `(main|master|latest|release-[^\s"',]*)`
+	// go install/go run something@moving.
+	movingRefInstall = regexp.MustCompile(`(go install|go run)\s+\S+@` + movingRef)
+	// A package specifier with no @version at its end, e.g. "pkg" or
+	// "@scope/pkg" in an npm/yarn global install.
+	npmPkgUnpinned = regexp.MustCompile(`^(@[^/\s]+/)?[^@\s]+/?$`)
+	// A specifier ending in a moving ref: pkg@latest, pkg@main, @sc/pkg@release-1.
+	specMovingRef = regexp.MustCompile(`@` + movingRef + `(?:[\s,;]|$)`)
+	// npm/yarn global installs, with or without the leading sub-command.
+	npmInstallLine = regexp.MustCompile(`(?:npm\s+(?:i|install)|yarn\s+(?:global\s+add|add\s+-g|global\s+install))\s+(?:-g\s+|--global\s+)?([^\n]+)`)
+	pipedShell     = regexp.MustCompile(`(curl|wget)\b[^\n]*\|\s*(sudo\s+)?(ba|z)?sh\b`)
+	pipInstallLine = regexp.MustCompile(`pip3?\s+install\s+([^\n]*)`)
+	gitCloneBranch = regexp.MustCompile(`git[[:space:]]+clone[^\n]*(-b|--branch)[[:space:]]+(main|master)\b`)
 )
 
-// unpinnedInstall reports whether a run script installs from a moving ref
-// (a branch-like version: @main, @master, @latest, @release-*) or pipes a
-// download into a shell. Heuristics, not a parser.
-func unpinnedInstall(script string) bool {
-	if movingRefInstall.MatchString(script) || pipedShell.MatchString(script) || gitCloneBranch.MatchString(script) {
+// stripShellComments drops a trailing `# ...` comment from every line, so a
+// commented-out install is not judged as one (and a `==` inside a comment
+// cannot pin a real install line). It is a heuristic: a `#` inside a quoted
+// string is treated as a comment too, which can only make the rule miss,
+// never refuse a pinned line.
+func stripShellComments(script string) string {
+	lines := strings.Split(script, "\n")
+	for i, line := range lines {
+		if j := strings.Index(line, "#"); j >= 0 {
+			lines[i] = line[:j]
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// specPinned reports whether a pip/npm package specifier carries a pin: an
+// exact `==`, a specific version via `@`, or any other version constraint
+// (`>=`, `~=`, `<=`). A bare `@latest`/`@main` is not a pin.
+func specPinned(spec string) bool {
+	spec = strings.TrimSpace(spec)
+	if i := strings.Index(spec, "#"); i >= 0 {
+		spec = strings.TrimSpace(spec[:i])
+	}
+	if spec == "" {
+		return true // nothing to judge
+	}
+	word := strings.Fields(spec)[0]
+	if strings.Contains(word, "==") {
 		return true
 	}
-	// pip without any `==` pin anywhere on the install line.
-	for _, m := range pipInstallLine.FindAllString(script, -1) {
-		if !strings.Contains(m, "==") {
+	if at := strings.LastIndex(word, "@"); at > 0 {
+		// @main/@latest/@release-* is a moving ref, not a pin.
+		return !specMovingRef.MatchString(word)
+	}
+	for _, op := range []string{">=", "<=", "~=", "!=", ">", "<"} {
+		if strings.Contains(spec, op) {
 			return true
 		}
 	}
-	// npm install -g with no @version on the package.
-	for _, m := range npmInstallLine.FindAllStringSubmatch(script, -1) {
-		if !strings.Contains(m[1], "@") {
+	return false
+}
+
+// unpinnedInstall reports whether a run script installs from a moving ref
+// (a branch-like version: @main, @master, @latest, @release-*) or pipes a
+// download into a shell. Heuristics, not a parser: the checks below catch
+// the common spellings and may miss exotic ones; RE2 has no lookahead, so
+// the pip and npm cases match the install line first and then inspect the
+// matched specifiers. Commented-out lines are ignored.
+func unpinnedInstall(script string) bool {
+	// Comments are stripped first, so a commented-out install is judged by
+	// nothing: the rule is about what the script runs.
+	body := stripShellComments(script)
+	if movingRefInstall.MatchString(body) || pipedShell.MatchString(body) || gitCloneBranch.MatchString(body) {
+		return true
+	}
+	for _, m := range pipInstallLine.FindAllStringSubmatch(body, -1) {
+		args := strings.TrimSpace(m[1])
+		// -r/-c/requirement files and editable/local installs name no
+		// version here; they are not what this rule is about.
+		if args == "" || strings.HasPrefix(args, "-") || strings.HasPrefix(args, ".") {
+			continue
+		}
+		if !specPinned(args) {
 			return true
+		}
+	}
+	for _, m := range npmInstallLine.FindAllStringSubmatch(body, -1) {
+		for _, pkg := range strings.Fields(m[1]) {
+			if strings.HasPrefix(pkg, "-") {
+				continue
+			}
+			if npmPkgUnpinned.MatchString(pkg) || !specPinned(pkg) {
+				return true
+			}
 		}
 	}
 	return false
