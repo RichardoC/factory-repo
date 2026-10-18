@@ -1,0 +1,9 @@
+{
+  "inputs": {
+    "issue": "3",
+    "lane": "2"
+  },
+  "repository": {
+    "default_branch": "main"
+  }
+}

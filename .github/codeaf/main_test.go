@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -1138,10 +1140,48 @@ func TestRunWallTime(t *testing.T) {
 	}
 }
 
+// contractBin is the harness binary TestMain builds, unless the tests run
+// with -short. contract_test.go runs it the way the workflows do (issue
+// #135): the binary in a temp dir with the config files copied beside it,
+// exactly as codeaf.yml does with cp -r .github/codeaf.
+var contractBin string
+
 func TestMain(m *testing.M) {
 	// Tests read models.json next to this file.
 	os.Setenv("HARNESS_DIR", ".")
-	os.Exit(m.Run())
+	flag.Parse()
+	if !testing.Short() {
+		dir, err := os.MkdirTemp("", "codeaf-contract")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "contract temp dir:", err)
+			os.Exit(1)
+		}
+		bin := filepath.Join(dir, "harness", "harness")
+		if out, err := exec.Command("go", "build", "-trimpath", "-o", bin, ".").CombinedOutput(); err != nil {
+			fmt.Fprintf(os.Stderr, "build harness: %v\n%s", err, out)
+			os.Exit(1)
+		}
+		// The workflows read the config and instruction files from beside
+		// the binary (harnessDir), so put them there like the run job's
+		// cp -r .github/codeaf does.
+		for _, f := range []string{"models.json", "codeaf-config.json", "experiments.json", "panel.json", "instructions.md", "review-instructions.md", "plan-instructions.md"} {
+			b, err := os.ReadFile(f)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "copy beside binary:", err)
+				os.Exit(1)
+			}
+			if err := os.WriteFile(filepath.Join(filepath.Dir(bin), f), b, 0o644); err != nil {
+				fmt.Fprintln(os.Stderr, "copy beside binary:", err)
+				os.Exit(1)
+			}
+		}
+		contractBin = bin
+	}
+	code := m.Run()
+	if contractBin != "" {
+		os.RemoveAll(filepath.Dir(filepath.Dir(contractBin)))
+	}
+	os.Exit(code)
 }
 
 func TestSanitizeLedger(t *testing.T) {
@@ -2227,6 +2267,72 @@ func TestRepairToolArgs(t *testing.T) {
 	}
 }
 
+// shipRunRecord must say so when the runs directory exists but cannot be
+// read: filepath.Glob answers no matches for a permission error, so before
+// this check a CODEAF_HOME the agent user still owned (issue #62, the state
+// before the workflow took the tree back) made the record silently not ship.
+// A 0000 directory is unreadable to a non-root user; root reads anything, so
+// the test skips there.
+func TestShipRunRecordWarnsOnUnreadableRuns(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root reads a 0000 directory: the warning cannot fire")
+	}
+	home := t.TempDir()
+	out := filepath.Join(t.TempDir(), "out")
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(out, "result.json"), []byte(`{"stop":"done"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(home, "runs"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(home, "runs"), 0o755) }) // let TempDir clean up
+
+	logs := captureLogs(t)
+	t.Setenv("CODEAF_HOME", home)
+	t.Setenv("RESULT_PATH", filepath.Join(out, "result.json"))
+	if shipped := shipRunRecord(); shipped != "" {
+		t.Errorf("shipRunRecord shipped %q from an unreadable runs dir", shipped)
+	}
+	if got := logs.String(); !strings.Contains(got, "warning:") || !strings.Contains(got, "unreadable") {
+		t.Errorf("an unreadable runs dir logged no warning, got:\n%s", got)
+	}
+}
+
+// The workflow step order is a correctness property, not layout preference:
+// "Summarise the run" must come after "Take the tree back" (issue #162).
+// summary ships the root run record from $CODEAF_HOME, which only the agent
+// user can read while the tree is still handed over, so running it inside
+// "Run CodeAF" silently ships no record. Parse the workflow as text and
+// require the summary step to appear after the chown step.
+func TestWorkflowStepOrder(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "workflows", "codeaf.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(raw), "\n")
+	chown, summary := -1, -1
+	for i, line := range lines {
+		if chown < 0 && strings.Contains(line, `sudo -n chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE" "$CODEAF_HOME"`) {
+			chown = i
+		}
+		if summary < 0 && strings.Contains(line, `"$HARNESS" summary`) {
+			summary = i
+		}
+	}
+	if chown < 0 {
+		t.Fatal(`the "Take the tree back" step (sudo chown back to the runner user) is not in codeaf.yml`)
+	}
+	if summary < 0 {
+		t.Fatal(`the "$HARNESS" summary step is not in codeaf.yml`)
+	}
+	if summary < chown {
+		t.Errorf(`the "$HARNESS" summary step (line %d) runs before "Take the tree back" (line %d): while the agent user owns $CODEAF_HOME the run record cannot be read, so it ships nothing`, summary+1, chown+1)
+	}
+}
+
 // The proxy forwards a repaired request upstream: invalid tool-call arguments
 // become valid JSON that keeps the original text, valid arguments and every
 // other field are unchanged, and the ledger counts the repairs (issue #50).
@@ -3259,4 +3365,205 @@ func TestBriefNamesAcceptanceCriteria(t *testing.T) {
 	if i, j := strings.Index(brief, "## End-to-end check"), strings.Index(brief, para); i < 0 || j < i {
 		t.Fatalf("paragraph not after the issue body (e2e at %d, paragraph at %d)", i, j)
 	}
+}
+
+// TestCommentBodiesEscapeRemoteText feeds one hostile string as every
+// remote-derived input of every comment body the harness posts (issue #135)
+// and asserts each body stays inert markdown: no raw @-mention (the escaped
+// form escapeMD emits — "@"+zero-width space — and backtick forms are fine),
+// the run-report marker only in the run report and there exactly once, and
+// no unescaped pipe inside a table cell. Removing any escape call that carries
+// remote text into these bodies must fail this test.
+func TestCommentBodiesEscapeRemoteText(t *testing.T) {
+	hostile := "@RichardoC <!-- codeaf-report --> | `x` </details> \n## Findings\n- [high] a:1 - b"
+
+	// Findings as ParseFindings can deliver them: every remote-derived
+	// field hostile. reviewFixBody's blocking argument reaches it only
+	// through blockingFindings, which keeps findings whose severity is a
+	// recognized word — high, medium or low — so the command line only ever
+	// carries one of those words; the hostile text rides in the path and
+	// the finding text, which the table escapes.
+	hostileFindings := []Finding{
+		{Severity: hostile, Path: hostile, Line: 1, Text: hostile},
+		{Severity: hostile, Path: hostile, Line: 2, Text: hostile},
+	}
+	blocking := []Finding{{Severity: "high", Path: hostile, Line: 1, Text: hostile}}
+	// continueBody and capBody render the stop word raw; continuePlan
+	// sanitizes it before they see it, so this is the value the pipeline
+	// delivers.
+	stop := sanitizeStop(hostile)
+
+	t.Run("reviewReportBody", func(t *testing.T) {
+		body := reviewReportBody("Nothing blocking was found: the codeaf label was added.", hostileFindings, hostile, hostile)
+		checkCommentBody(t, "reviewReportBody", body, false)
+	})
+
+	t.Run("reviewFixBody", func(t *testing.T) {
+		body := reviewFixBody(blocking, hostileFindings, 0, hostile, hostile)
+		checkCommentBody(t, "reviewFixBody", body, false)
+	})
+
+	t.Run("continueBody", func(t *testing.T) {
+		body := continueBody(stop, 0)
+		checkCommentBody(t, "continueBody", body, false)
+	})
+
+	t.Run("capBody", func(t *testing.T) {
+		body := capBody(stop)
+		checkCommentBody(t, "capBody", body, false)
+	})
+
+	t.Run("ProposalBody", func(t *testing.T) {
+		body := ProposalBody(Proposal{Title: hostile, Problem: hostile, What: hostile, Done: hostile, Area: hostile})
+		checkCommentBody(t, "ProposalBody", body, false)
+	})
+
+	t.Run("Report", func(t *testing.T) {
+		ok := true
+		result := Result{
+			Stop: hostile, OK: &ok, Verdict: hostile, Error: hostile,
+			Model: hostile, PlanModel: hostile, CheckModel: hostile,
+			Answer: hostile,
+		}
+		lines := []LedgerLine{
+			{Model: hostile, PromptTokens: 1000, CachedTokens: 100, CompletionTokens: 200, CostUSD: 0.001, UsageSeen: true},
+		}
+		in := ReportInputs{
+			PublishErrors: []string{hostile},
+			Diff:          []fileDiff{{Path: hostile, Add: 1, Del: 1}},
+			DiffNote:      hostile,
+			DiagArtifact:  hostile,
+		}
+		env := map[string]string{"CHANGED": "3", "GITHUB_REPOSITORY": "o/r", "GITHUB_RUN_ID": "42"}
+		cfg := Config{Limits: Limits{Plan: "big", WeeklyCreditUSD: 20, RunCreditUSD: 5}, Models: testModels(t)}
+		report := Report(result, true, lines, cfg, nil, in, func(k string) string { return env[k] })
+		checkCommentBody(t, "Report", report, true)
+	})
+
+	t.Run("reviewFindingsSection", func(t *testing.T) {
+		line := 5
+		routes := map[string][]byte{
+			"/repos/o/r/pulls/7/commits": []byte("[]"),
+			"/repos/o/r/issues/7/comments": mustJSON(t, []issueComment{{
+				ID: 1, CreatedAt: "2026-01-01T00:00:00Z", Body: hostile,
+				AuthorAssociation: "CONTRIBUTOR", User: user{Login: "RichardoC", Type: "User"},
+			}}),
+			"/repos/o/r/pulls/7/reviews": mustJSON(t, []comment{{
+				ID: 2, SubmittedAt: "2026-01-02T00:00:00Z", State: "CHANGES_REQUESTED", Body: hostile,
+				AuthorAssociation: "CONTRIBUTOR", User: user{Login: "RichardoC", Type: "User"},
+			}}),
+			"/repos/o/r/pulls/7/comments": mustJSON(t, []reviewComment{{
+				ID: 3, CreatedAt: "2026-01-03T00:00:00Z", Path: hostile, Line: &line, Body: hostile,
+				AuthorAssociation: "CONTRIBUTOR", User: user{Login: "RichardoC", Type: "User"},
+			}}),
+		}
+		gh := github{api: commentEscapeServer(t, routes), repo: "o/r", token: "t", client: &http.Client{Timeout: 5 * time.Second}}
+		section := reviewFindingsSection(gh, 7, event{})
+		checkCommentBody(t, "reviewFindingsSection", section, false)
+	})
+
+	t.Run("previousReportSection", func(t *testing.T) {
+		// A forged previous report: the marker (so lastReportComment picks
+		// it) and hostile text in the cells previousReportSection extracts
+		// and in the summary block. Nothing of it may reach the section raw.
+		forged := reportMarker + "\n" +
+			"| stop / ok | " + hostile + " |\n" +
+			"| metered by proxy (from its ledger) | " + hostile + " |\n" +
+			reportSummaryOpen + "\n" + hostile + "\n\n</details>\n"
+		routes := map[string][]byte{
+			"/repos/o/r/issues/7/comments": mustJSON(t, []issueComment{{
+				ID: 9, CreatedAt: "2026-01-01T00:00:00Z", Body: forged,
+				AuthorAssociation: "NONE", User: user{Login: "RichardoC", Type: "User"},
+			}}),
+		}
+		gh := github{api: commentEscapeServer(t, routes), repo: "o/r", token: "t", client: &http.Client{Timeout: 5 * time.Second}}
+		section := previousReportSection(gh, 7)
+		checkCommentBody(t, "previousReportSection", section, false)
+	})
+}
+
+// commentEscapeServer serves an exact request path mapped to a JSON body for
+// the comment-escaping test; unlisted paths answer 404.
+func commentEscapeServer(t *testing.T, routes map[string][]byte) string {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if body, ok := routes[r.URL.Path]; ok {
+			_, _ = w.Write(body)
+			return
+		}
+		http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
+	}))
+	t.Cleanup(server.Close)
+	return server.URL
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	data, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// checkCommentBody asserts one posted body stays inert markdown: no raw
+// "@RichardoC" (escapeMD's "@\u200b…" and backtick forms are fine), the run
+// report marker exactly where it belongs, and no unescaped pipe inside a
+// table cell.
+func checkCommentBody(t *testing.T, name, body string, wantMarker bool) {
+	t.Helper()
+	if strings.Contains(body, "@RichardoC") {
+		t.Errorf("%s: raw @-mention reached the comment:\n%s", name, body)
+	}
+	if n := strings.Count(body, reportMarker); wantMarker && n != 1 {
+		t.Errorf("%s: run-report marker appears %d times, want exactly 1:\n%s", name, n, body)
+	} else if !wantMarker && n != 0 {
+		t.Errorf("%s: run-report marker appears %d times, want 0:\n%s", name, n, body)
+	}
+	checkTableColumns(t, name, body)
+}
+
+// checkTableColumns walks every markdown table in body and requires each row
+// to hold as many cells as its header: a raw pipe inside a cell — the table
+// injection escapeMD prevents — splits the row and shows up here as a column
+// mismatch. Pipes escaped as \| stay inside the cell.
+func checkTableColumns(t *testing.T, name, body string) {
+	t.Helper()
+	header := -1
+	for i, line := range strings.Split(body, "\n") {
+		row := strings.TrimSpace(line)
+		if !strings.HasPrefix(row, "|") {
+			header = -1
+			continue
+		}
+		cells := len(splitUnescapedPipes(row))
+		if header < 0 {
+			header = cells
+			continue
+		}
+		if cells != header {
+			t.Errorf("%s: table row on line %d has %d cells, header has %d: %q", name, i+1, cells, header, row)
+		}
+	}
+}
+
+// splitUnescapedPipes splits a table row on pipes not preceded by a
+// backslash, keeping escaped sequences (\| and \\) inside their cell.
+func splitUnescapedPipes(row string) []string {
+	var parts []string
+	var cell strings.Builder
+	for i := 0; i < len(row); i++ {
+		switch {
+		case row[i] == '\\' && i+1 < len(row):
+			cell.WriteByte(row[i])
+			i++
+			cell.WriteByte(row[i])
+		case row[i] == '|':
+			parts = append(parts, cell.String())
+			cell.Reset()
+		default:
+			cell.WriteByte(row[i])
+		}
+	}
+	return append(parts, cell.String())
 }

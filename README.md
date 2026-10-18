@@ -128,6 +128,21 @@ maintainer's approval, like any other change under `.github/`.
   - [`codeaf.yml`](.github/workflows/codeaf.yml) explains how to turn it back on
     once CodeAF is fixed.
 
+- Tests: `go test -race ./...` in [`.github/codeaf`](.github/codeaf) (what
+  [ci.yml](.github/workflows/ci.yml) runs) covers the harness two ways. The
+  unit tests call its Go functions directly; the contract tests
+  ([`contract_test.go`](.github/codeaf/contract_test.go), issue #135) build the
+  binary and run it the way the workflows do — the same `go build -trimpath`,
+  with `models.json`, `codeaf-config.json`, `experiments.json`, `panel.json`
+  and the instruction files copied beside it, and each subcommand invoked with
+  only the environment the workflow would set, against fixture events in
+  `testdata/contract/` and a stub GitHub API — so a subcommand that reads the
+  wrong variable or prints the wrong output lines fails in CI, not in a live
+  run. Run them with `go -C .github/codeaf test -race -run TestContract .`
+  (under 60 s; `-short` skips the build). A shellcheck test
+  (`TestWorkflowShellcheck`) lints the workflows' `run:` blocks when `yq` and
+  `shellcheck` are installed.
+
 ### Web search through the proxy (issue #58)
 
 The proxy also serves CodeAF's web searches: `POST /v2/search` on `127.0.0.1`,

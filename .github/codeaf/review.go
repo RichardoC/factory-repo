@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -820,7 +821,16 @@ func shipRunRecord() string {
 	if home == "" || out == "" {
 		return ""
 	}
-	records, err := filepath.Glob(filepath.Join(home, "runs", "*", "tasks", "root", "trajectory.jsonl"))
+	// filepath.Glob below stays silent on an unreadable directory: it
+	// answers no matches for a permission error, so a runs dir the harness
+	// cannot read — the agent user still owned CODEAF_HOME before the
+	// workflow took the tree back (issue #62) — would ship no record and
+	// say nothing. Check the directory directly so that failure is loud.
+	runs := filepath.Join(home, "runs")
+	if _, err := os.ReadDir(runs); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		log.Printf("warning: %s is unreadable, the run record cannot ship: %v", runs, err)
+	}
+	records, err := filepath.Glob(filepath.Join(runs, "*", "tasks", "root", "trajectory.jsonl"))
 	if err != nil || len(records) == 0 {
 		return ""
 	}
