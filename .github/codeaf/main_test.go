@@ -1129,6 +1129,7 @@ func TestRunWallTime(t *testing.T) {
 	auth = ""
 	setEnv("42")
 	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "")
 	if wall := runWallTime(); wall != nil {
 		t.Errorf("runWallTime without a token = %v, want nil", wall)
 	}
@@ -2078,6 +2079,24 @@ func TestRunSummaryShipsRunRecord(t *testing.T) {
 		}
 	})
 
+	t.Run("plan mode ships the record too (issue #119)", func(t *testing.T) {
+		_ = os.Remove(shipped)
+		mkRecord("planrun", `{"kind":"end","result":"1. harness — Title. Verified: body"}`+"\n", time.Now().Add(time.Hour))
+		t.Setenv("CODEAF_HOME", home)
+		t.Setenv("RESULT_PATH", resultPath)
+		t.Setenv("MODE", "plan")
+		if _, err := captureStdout(t, runSummary); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(shipped)
+		if err != nil {
+			t.Fatalf("the run record was not shipped in plan mode: %v", err)
+		}
+		if !strings.Contains(string(data), `"result":"1. harness — Title. Verified: body"`) {
+			t.Errorf("shipped record = %q, want the plan run's record", data)
+		}
+	})
+
 	t.Run("every mode ships, review mode included", func(t *testing.T) {
 		_ = os.Remove(shipped)
 		t.Setenv("CODEAF_HOME", home)
@@ -2637,43 +2656,44 @@ func writePlannerModels(t *testing.T, planner string) string {
 // explicit value is kept, and a negative value is an error naming the field
 // — the same handling queue.max_parallel_runs gets.
 func TestLoadConfigPlanner(t *testing.T) {
-	for _, planner := range []string{"", `{"min_backlog":0,"min_hours":0,"max_proposals":0}`} {
+	for _, planner := range []string{"", `{"min_backlog":0,"min_hours":0,"max_proposals":0,"retry_min_hours":0}`} {
 		cfg, err := loadConfig(writePlannerModels(t, planner))
 		if err != nil {
 			t.Fatalf("planner %q: %v", planner, err)
 		}
-		if cfg.Planner.MinBacklog != 3 || cfg.Planner.MinHours != 12 || cfg.Planner.MaxProposals != 5 {
-			t.Fatalf("planner %q: got %+v; want defaults 3, 12, 5", planner, cfg.Planner)
+		if cfg.Planner.MinBacklog != 3 || cfg.Planner.MinHours != 12 || cfg.Planner.MaxProposals != 5 || cfg.Planner.RetryMinHours != 2 {
+			t.Fatalf("planner %q: got %+v; want defaults 3, 12, 5, retry 2", planner, cfg.Planner)
 		}
 	}
 	// An explicit value is kept.
-	cfg, err := loadConfig(writePlannerModels(t, `{"min_backlog":7,"min_hours":24,"max_proposals":1}`))
-	if err != nil || cfg.Planner.MinBacklog != 7 || cfg.Planner.MinHours != 24 || cfg.Planner.MaxProposals != 1 {
-		t.Fatalf("explicit planner: %d/%d/%d, %v; want 7/24/1", cfg.Planner.MinBacklog, cfg.Planner.MinHours, cfg.Planner.MaxProposals, err)
+	cfg, err := loadConfig(writePlannerModels(t, `{"min_backlog":7,"min_hours":24,"max_proposals":1,"retry_min_hours":5}`))
+	if err != nil || cfg.Planner.MinBacklog != 7 || cfg.Planner.MinHours != 24 || cfg.Planner.MaxProposals != 1 || cfg.Planner.RetryMinHours != 5 {
+		t.Fatalf("explicit planner: %d/%d/%d/retry %d, %v; want 7/24/1/5", cfg.Planner.MinBacklog, cfg.Planner.MinHours, cfg.Planner.MaxProposals, cfg.Planner.RetryMinHours, err)
 	}
 	// A partially set block defaults only what is missing.
 	cfg, err = loadConfig(writePlannerModels(t, `{"min_hours":6}`))
-	if err != nil || cfg.Planner.MinBacklog != 3 || cfg.Planner.MinHours != 6 || cfg.Planner.MaxProposals != 5 {
-		t.Fatalf("partial planner: %d/%d/%d, %v; want 3/6/5", cfg.Planner.MinBacklog, cfg.Planner.MinHours, cfg.Planner.MaxProposals, err)
+	if err != nil || cfg.Planner.MinBacklog != 3 || cfg.Planner.MinHours != 6 || cfg.Planner.MaxProposals != 5 || cfg.Planner.RetryMinHours != 2 {
+		t.Fatalf("partial planner: %d/%d/%d/retry %d, %v; want 3/6/5/2", cfg.Planner.MinBacklog, cfg.Planner.MinHours, cfg.Planner.MaxProposals, cfg.Planner.RetryMinHours, err)
 	}
 	// Negative values are refused, each naming its field.
 	for _, bad := range []struct{ block, field string }{
 		{`{"min_backlog":-1}`, "planner.min_backlog"},
 		{`{"min_hours":-1}`, "planner.min_hours"},
 		{`{"max_proposals":-1}`, "planner.max_proposals"},
+		{`{"retry_min_hours":-1}`, "planner.retry_min_hours"},
 	} {
 		if _, err := loadConfig(writePlannerModels(t, bad.block)); err == nil || !strings.Contains(err.Error(), bad.field) || !strings.Contains(err.Error(), "must not be negative") {
 			t.Fatalf("planner %q: err=%v; want a negative-value error naming %s", bad.block, err, bad.field)
 		}
 	}
 	// The committed models.json parses, and its planner block is the
-	// documented example: 3, 12, 5.
+	// documented example: 3, 12, 5, retry 2.
 	cfg, err = loadConfig("models.json")
 	if err != nil {
 		t.Fatalf("committed models.json: %v", err)
 	}
-	if cfg.Planner.MinBacklog != 3 || cfg.Planner.MinHours != 12 || cfg.Planner.MaxProposals != 5 {
-		t.Fatalf("committed models.json planner: got %+v; want 3, 12, 5", cfg.Planner)
+	if cfg.Planner.MinBacklog != 3 || cfg.Planner.MinHours != 12 || cfg.Planner.MaxProposals != 5 || cfg.Planner.RetryMinHours != 2 {
+		t.Fatalf("committed models.json planner: got %+v; want 3, 12, 5, retry 2", cfg.Planner)
 	}
 }
 
@@ -3204,5 +3224,21 @@ func TestProxyCommittedStreamCarriesUpstreamFailureAsAnSSEEvent(t *testing.T) {
 	}
 	if !strings.Contains(got, "data: [DONE]") {
 		t.Errorf("the error event is not followed by [DONE]:\n%s", got)
+	}
+}
+
+// TestNewGitHubFallsBackToGHToken pins the token fallback (issue #132): the
+// queue job's step sets only GH_TOKEN, the run jobs set GITHUB_TOKEN, and
+// either alone must do; GITHUB_TOKEN wins when both are set.
+func TestNewGitHubFallsBackToGHToken(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "")
+	t.Setenv("GH_TOKEN", "ght")
+	if g := newGitHub(); g.token != "ght" {
+		t.Fatalf("newGitHub token = %q; want the GH_TOKEN value", g.token)
+	}
+	t.Setenv("GITHUB_TOKEN", "git")
+	if g := newGitHub(); g.token != "git" {
+		t.Fatalf("newGitHub token = %q; want the GITHUB_TOKEN value", g.token)
 	}
 }

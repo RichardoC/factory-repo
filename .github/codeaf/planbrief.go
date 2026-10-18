@@ -286,6 +286,9 @@ func planOutputContract() string {
 		"- `Area` is either `harness` or `app/<name>` (the app's directory name); anything\n"+
 		"  else is dropped, and the proposal then carries no area label.\n"+
 		"- `Depends on` lists issue numbers as `#N`; other text on that line is ignored.\n"+
-		"- A proposal with an empty `Problem` and an empty `What to do` is dropped.\n",
+		"- A proposal with an empty `Problem` and an empty `What to do` is dropped.\n"+
+		"- Put every proposal in your FINAL ANSWER — the result you close the root task\n"+
+		"  with — in exactly this format. The plan report reads that answer, not the task\n"+
+		"  store; a run whose proposals never reach the final answer opens no issues.\n",
 		planMaxProposals())
 }

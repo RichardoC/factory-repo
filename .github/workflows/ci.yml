@@ -107,6 +107,11 @@ jobs:
         run: |
           unformatted=$(gofmt -l .)
           if [ -n "$unformatted" ]; then echo "Not gofmt'd:"; echo "$unformatted"; exit 1; fi
+      - name: go mod tidy
+        # go.sum may be absent in a module with no dependencies.
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
       - name: go vet
         run: go vet ./...
       - name: go build
