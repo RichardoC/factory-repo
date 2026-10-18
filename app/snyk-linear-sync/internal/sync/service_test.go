@@ -47,6 +47,10 @@ type fakeLinear struct {
 	// above but for PostComments.
 	commentCallBatches      [][]model.IssueUpdate
 	commentFailFingerprints map[string]int
+	// commentErr, when non-nil, makes every PostComments call fail — the
+	// batch call and each per-item retry — mirroring updateErr. It models a
+	// transport-level failure where no per-alias data comes back at all.
+	commentErr error
 
 	// lastOpenStates / lastOpenStatesErr are what LastOpenStates returns;
 	// lastOpenStatesCalls records the issue IDs of each call.
@@ -60,6 +64,15 @@ type fakeLinear struct {
 	// call and the per-item retries fail.
 	updateErr error
 	createErr error
+	// batchErrAbove, when > 0, makes an UpdateIssues call carrying more than
+	// that many updates fail. It models the batch-with-fallback contract: the
+	// multi-item batch call fails while every single-item retry succeeds.
+	batchErrAbove int
+	// updateCallBatches records the batch passed to each UpdateIssues call, in
+	// order, so a test can prove the per-item fallback actually happened (every
+	// call after the failed batch carries exactly one update) rather than
+	// inferring it from the recorded writes alone.
+	updateCallBatches [][]model.IssueUpdate
 }
 
 type fakeCache struct {
@@ -89,6 +102,10 @@ func (f *fakeLinear) CreateIssues(_ context.Context, desired []model.DesiredIssu
 }
 
 func (f *fakeLinear) UpdateIssues(_ context.Context, updates []model.IssueUpdate) error {
+	f.updateCallBatches = append(f.updateCallBatches, append([]model.IssueUpdate(nil), updates...))
+	if f.batchErrAbove > 0 && len(updates) > f.batchErrAbove {
+		return errors.New("batch update failed")
+	}
 	for _, update := range updates {
 		f.updated = append(f.updated, update.Desired)
 		f.updates = append(f.updates, update)
@@ -98,6 +115,9 @@ func (f *fakeLinear) UpdateIssues(_ context.Context, updates []model.IssueUpdate
 
 func (f *fakeLinear) PostComments(_ context.Context, updates []model.IssueUpdate) ([]int, error) {
 	f.commentCallBatches = append(f.commentCallBatches, append([]model.IssueUpdate(nil), updates...))
+	if f.commentErr != nil {
+		return nil, f.commentErr
+	}
 	var failed []int
 	for i, u := range updates {
 		if f.commentFailFingerprints[u.Desired.Fingerprint] > 0 {
@@ -6522,5 +6542,380 @@ func TestRunCachesHashOfMatchedTicketForDuplicateFingerprint(t *testing.T) {
 	}
 	if got, want := store.saved.LinearHashes[finding.Fingerprint], existingIssueHash(canonical); got != want {
 		t.Fatalf("cached Linear hash is not the matched ticket's: got %s, want %s (older copy %s)", got, want, existingIssueHash(olderCopy))
+	}
+}
+
+// updateCallSizes renders the per-call batch sizes of an UpdateIssues
+// sequence, for assertion failure messages.
+func updateCallSizes(batches [][]model.IssueUpdate) []int {
+	sizes := make([]int, 0, len(batches))
+	for _, batch := range batches {
+		sizes = append(sizes, len(batch))
+	}
+	return sizes
+}
+
+// executeJobUpdateScenario drives Service.executeJob directly for one
+// update-kind job and returns the result and the fake Linear client, so the
+// three update kinds can share one table.
+func executeJobUpdateScenario(t *testing.T, kind jobKind, cfg config.Config) (RunResult, *fakeLinear) {
+	t.Helper()
+	batch := make([]model.IssueUpdate, 0, 3)
+	for _, ident := range []string{"SNYK-1", "SNYK-2", "SNYK-3"} {
+		existing := model.ExistingIssue{
+			ID:          "issue-" + ident,
+			Identifier:  ident,
+			Title:       "stale title",
+			Description: "old description",
+			StateName:   "Blog",
+			Fingerprint: "snyk:project-a:" + ident,
+		}
+		desired := desiredIssue(cfg, model.Finding{
+			Fingerprint: existing.Fingerprint,
+			SnykIssueID: ident,
+			ProjectID:   "project-a",
+			ProjectName: "Project A",
+			IssueTitle:  "Outdated package",
+			Severity:    "high",
+			Status:      model.FindingOpen,
+			IssueURL:    "https://example.test/" + ident,
+			CreatedAt:   time.Date(2026, time.August, 1, 14, 0, 0, 0, time.UTC),
+		})
+		desired.PreserveState = true
+		batch = append(batch, model.IssueUpdate{Existing: existing, Desired: desired})
+	}
+
+	linear := &fakeLinear{batchErrAbove: 1}
+	service := New(cfg, discardLogger(), fakeSnyk{}, linear, nil)
+	var result RunResult
+	var failed failedFingerprints
+	if err := service.executeJob(context.Background(), job{kind: kind, updateBatch: batch}, &result, &failed); err != nil {
+		t.Fatalf("executeJob(%s) error = %v", kind, err)
+	}
+	return result, linear
+}
+
+// TestExecuteJobFallsBackPerItemForEveryUpdateKind pins the batch-with-
+// fallback contract for all three update kinds: a failing multi-item batch
+// call must be retried item by item, and the retries that succeed are not
+// failures. The per-kind counter still counts the whole batch.
+func TestExecuteJobFallsBackPerItemForEveryUpdateKind(t *testing.T) {
+	cases := []struct {
+		kind    jobKind
+		counter func(RunResult) int64
+	}{
+		{jobUpdate, func(r RunResult) int64 { return r.PlannedUpdates }},
+		{jobResolve, func(r RunResult) int64 { return r.PlannedResolves }},
+		{jobCancelDuplicate, func(r RunResult) int64 { return r.CancelledDuplicates }},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.kind), func(t *testing.T) {
+			cfg := minimalCfg()
+			cfg.Linear.CommentsEnabled = true
+			result, linear := executeJobUpdateScenario(t, tc.kind, cfg)
+
+			if got := tc.counter(result); got != 3 {
+				t.Fatalf("counter = %d, want 3 (the whole batch is counted)", got)
+			}
+			if result.FailedOps != 0 {
+				t.Fatalf("FailedOps = %d, want 0 (every single-item retry succeeded)", result.FailedOps)
+			}
+			if len(linear.updated) != 3 {
+				t.Fatalf("updated = %d, want 3 (batch failure must fall back to per-item retries)", len(linear.updated))
+			}
+			// Comments are deliberately posted only when the batch update call
+			// itself succeeded, so the fallback path must not post any.
+			if len(linear.comments) != 0 {
+				t.Fatalf("comments = %d, want 0 (no comments on the per-item fallback)", len(linear.comments))
+			}
+		})
+	}
+}
+
+// TestExecuteJobCountsEveryItemThatFailsIndividually: when the per-item retry
+// fails too, every item counts as one FailedOps and both of its fingerprints
+// are recorded in the failed set, so the next run retries them.
+func TestExecuteJobCountsEveryItemThatFailsIndividually(t *testing.T) {
+	for _, kind := range []jobKind{jobUpdate, jobResolve, jobCancelDuplicate} {
+		t.Run(string(kind), func(t *testing.T) {
+			cfg := minimalCfg()
+			batch := make([]model.IssueUpdate, 0, 3)
+			var fingerprints []string
+			for _, ident := range []string{"SNYK-1", "SNYK-2", "SNYK-3"} {
+				existing := model.ExistingIssue{
+					ID:          "issue-" + ident,
+					Identifier:  ident,
+					StateName:   "Blog",
+					Fingerprint: "snyk:project-a:" + ident,
+				}
+				desired := model.DesiredIssue{Fingerprint: existing.Fingerprint, State: model.StateDone, PreserveState: true}
+				fingerprints = append(fingerprints, existing.Fingerprint)
+				batch = append(batch, model.IssueUpdate{Existing: existing, Desired: desired})
+			}
+			linear := &fakeLinear{updateErr: errors.New("linear unavailable")}
+			service := New(cfg, discardLogger(), fakeSnyk{}, linear, nil)
+			var failed failedFingerprints
+			var failing RunResult
+			if err := service.executeJob(context.Background(), job{kind: kind, updateBatch: batch}, &failing, &failed); err != nil {
+				t.Fatalf("executeJob(%s) error = %v", kind, err)
+			}
+			if failing.FailedOps != 3 {
+				t.Fatalf("FailedOps = %d, want 3 (every item of the batch failed individually)", failing.FailedOps)
+			}
+			for _, fingerprint := range fingerprints {
+				if !failed.has(fingerprint) {
+					t.Fatalf("failed fingerprint set does not hold %q", fingerprint)
+				}
+			}
+		})
+	}
+}
+
+// TestExecuteJobDryRunCountsWithoutCalling: a dry run counts the work it would
+// have done and must not touch Linear at all.
+func TestExecuteJobDryRunCountsWithoutCalling(t *testing.T) {
+	cases := []struct {
+		kind    jobKind
+		counter func(RunResult) int64
+	}{
+		{jobUpdate, func(r RunResult) int64 { return r.PlannedUpdates }},
+		{jobResolve, func(r RunResult) int64 { return r.PlannedResolves }},
+		{jobCancelDuplicate, func(r RunResult) int64 { return r.CancelledDuplicates }},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.kind), func(t *testing.T) {
+			cfg := minimalCfg()
+			cfg.DryRun = true
+			result, linear := executeJobUpdateScenario(t, tc.kind, cfg)
+
+			if got := tc.counter(result); got != 3 {
+				t.Fatalf("counter = %d, want 3 (dry run still counts the planned work)", got)
+			}
+			if len(linear.updated) != 0 {
+				t.Fatalf("updated = %d, want 0 (dry run must not call Linear)", len(linear.updated))
+			}
+			if result.FailedOps != 0 {
+				t.Fatalf("FailedOps = %d, want 0", result.FailedOps)
+			}
+		})
+	}
+}
+
+// TestPostCommentsWithFallbackRetriesAllWhenBatchCallFails: a wholesale
+// PostComments failure (no per-alias data at all, e.g. a transport failure)
+// must retry every comment individually, and stay a warning: no error escapes
+// and nothing is counted or recorded as a failed write.
+func TestPostCommentsWithFallbackRetriesAllWhenBatchCallFails(t *testing.T) {
+	batch := make([]model.IssueUpdate, 0, 2)
+	for _, ident := range []string{"SNYK-1", "SNYK-2"} {
+		existing := model.ExistingIssue{
+			ID:          "issue-" + ident,
+			Identifier:  ident,
+			StateName:   "Blog",
+			Fingerprint: "snyk:project-a:" + ident,
+		}
+		desired := model.DesiredIssue{Fingerprint: existing.Fingerprint, State: model.StateDone, PreserveState: true}
+		batch = append(batch, model.IssueUpdate{Existing: existing, Desired: desired})
+	}
+	linear := &fakeLinear{commentErr: errors.New("linear transport down")}
+	service := New(minimalCfg(), discardLogger(), fakeSnyk{}, linear, nil)
+	service.postCommentsWithFallback(context.Background(), batch)
+
+	if len(linear.commentCallBatches) != 3 {
+		t.Fatalf("PostComments calls = %d, want 3 (failed batch + one retry per item)", len(linear.commentCallBatches))
+	}
+	if got := len(linear.commentCallBatches[0]); got != 2 {
+		t.Fatalf("first PostComments call carried %d updates, want the whole batch of 2", got)
+	}
+	for i, retry := range linear.commentCallBatches[1:] {
+		if len(retry) != 1 {
+			t.Fatalf("retry call %d carried %d updates, want exactly 1", i, len(retry))
+		}
+	}
+	if len(linear.comments) != 0 {
+		t.Fatalf("comments = %d, want 0 (every attempt failed)", len(linear.comments))
+	}
+}
+
+// TestRunUpdatesResolvesAndCancelsWithBatchFallback drives the real Run entry
+// point over inputs that produce all three update kinds at once — an update
+// (changed title), a resolve (finding gone from an active project) and a
+// duplicate cancel (two open tickets sharing one fingerprint) — with an
+// UpdateIssues that fails for every multi-item batch. Every kind must still
+// land its planned mutations through the per-item fallback, with no failures.
+func TestRunUpdatesResolvesAndCancelsWithBatchFallback(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.CommentsEnabled = true
+	logger := discardLogger()
+
+	openFindings := func() []model.Finding {
+		return []model.Finding{
+			{
+				Fingerprint: "snyk:project-a:issue-1",
+				SnykIssueID: "issue-1",
+				ProjectID:   "project-a",
+				ProjectName: "Project A",
+				IssueTitle:  "First finding",
+				Severity:    "high",
+				Status:      model.FindingOpen,
+				CreatedAt:   time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+			},
+			{
+				Fingerprint: "snyk:project-a:issue-2",
+				SnykIssueID: "issue-2",
+				ProjectID:   "project-a",
+				ProjectName: "Project A",
+				IssueTitle:  "Second finding",
+				Severity:    "high",
+				Status:      model.FindingOpen,
+				CreatedAt:   time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+			},
+		}
+	}
+
+	build := func() (fakeSnyk, *fakeLinear) {
+		findings := openFindings()
+		snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+			Findings:   findings,
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		}}
+
+		// The first finding's ticket is stale, so it is the update.
+		updates := make([]model.ExistingIssue, 0, 1)
+		firstDesired := desiredIssue(cfg, findings[0])
+		firstStale := firstDesired
+		// A stale title differs from the desired one, so needsUpdate is true;
+		// the state stays non-terminal, so the update preserves it.
+		firstStale.Title = "stale title"
+		update := storedIssue("existing-1", "SNYK-1", "Blog", firstStale)
+		updates = append(updates, update)
+		// Two tickets whose findings are gone from an active project: the
+		// resolve loop closes both (done), never the duplicate-cancel loop.
+		// Two of them also make the resolve batch two items long, so the
+		// multi-item batch call is the one that fails and the per-item
+		// fallback is exercised for resolves exactly as for updates.
+		resolved := model.ExistingIssue{
+			ID:          "existing-9",
+			Identifier:  "SNYK-19",
+			Title:       "resolved issue",
+			Description: "old description",
+			StateName:   "Blog",
+			Fingerprint: "snyk:project-a:issue-gone",
+		}
+		orphan := model.ExistingIssue{
+			ID:          "existing-8",
+			Identifier:  "SNYK-28",
+			Title:       "another resolved issue",
+			Description: "old description",
+			StateName:   "Blog",
+			Fingerprint: "snyk:project-a:issue-also-gone",
+		}
+		// Two open tickets sharing one fingerprint of their own (no finding
+		// claims it, so they cannot collide with the update or resolve
+		// tickets); the higher identifier is the duplicate the sync cancels.
+		// The live finding's ticket must be one of the two copies: the
+		// resolve loop skips fingerprints a finding claims, so the pair
+		// contributes the duplicate cancel and nothing to the resolve batch,
+		// which is exactly what run 158 pins.
+		pairDesired := desiredIssue(cfg, findings[1])
+		pairStale := pairDesired
+		// A stale title on both copies keeps them non-terminal and unequal to
+		// the desired issue, so the canonical copy could update; the sync
+		// cancels the higher-identifier copy instead.
+		pairStale.Title = "stale title"
+		canonical := storedIssue("existing-3", "SNYK-3", "Blog", pairStale)
+		duplicate := storedIssue("existing-4", "SNYK-4", "Blog", pairStale)
+
+		linear := &fakeLinear{snapshot: append(updates, resolved, orphan, canonical, duplicate), batchErrAbove: 1}
+		return snyk, linear
+	}
+
+	snyk, linear := build()
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.PlannedUpdates != 2 {
+		t.Fatalf("PlannedUpdates = %d, want 2", result.PlannedUpdates)
+	}
+	if result.PlannedResolves != 2 {
+		t.Fatalf("PlannedResolves = %d, want 2 (states %v)", result.PlannedResolves, desiredStates(linear.updated))
+	}
+	if result.Conflicts != 1 || result.CancelledDuplicates != 1 {
+		t.Fatalf("Conflicts = %d, CancelledDuplicates = %d, want 1 and 1 (identifiers %v)", result.Conflicts, result.CancelledDuplicates, updatedIdentifiers(linear.updates))
+	}
+	if result.FailedOps != 0 {
+		t.Fatalf("FailedOps = %d, want 0 (per-item fallback must succeed for every kind)", result.FailedOps)
+	}
+	if len(linear.updated) != 5 {
+		t.Fatalf("updated = %d, want 5 (2 updates + 2 resolves + 1 duplicate cancel), states %v", len(linear.updated), desiredStates(linear.updated))
+	}
+
+	states := make([]model.IssueState, 0, len(linear.updates))
+	for _, update := range linear.updates {
+		states = append(states, update.Desired.State)
+	}
+	// The whole run lands in one order: the two updates (both keeping their
+	// non-terminal state), then the two resolves (done, because the project is
+	// still active), then the single duplicate cancel (cancelled).
+	wantStates := []model.IssueState{
+		model.StateTodo, model.StateTodo,
+		model.StateDone, model.StateDone,
+		model.StateCancelled,
+	}
+	if !slices.Equal(states, wantStates) {
+		t.Fatalf("states in order = %v, want %v (identifiers %v)", states, wantStates, updatedIdentifiers(linear.updates))
+	}
+	// The two updates are state preserves: the state written is the ticket's
+	// own, not one the run computed.
+	preserved := 0
+	for _, update := range linear.updates {
+		if update.Desired.State == model.StateTodo && !update.Desired.PreserveState {
+			t.Fatalf("update for %s must preserve state, got PreserveState = false", update.Existing.Identifier)
+		}
+		if update.Desired.PreserveState {
+			preserved++
+		}
+	}
+	if preserved != 2 {
+		t.Fatalf("PreserveState updates = %d, want 2 (identifiers %v)", preserved, updatedIdentifiers(linear.updates))
+	}
+
+	// Prove the fallback path actually ran, rather than only that the plan was
+	// right: every batch larger than one fails against this fake, so a run that
+	// lands five writes with FailedOps == 0 can only have done it through
+	// single-item calls. A multi-item call that reached Linear would have been
+	// counted as a failure, so this pins the shape of the traffic too.
+	// Prove the per-item fallback actually ran, not merely that the plan was
+	// right. On this fixture a batch larger than one always fails, so a run
+	// that lands exactly five writes with FailedOps == 0 can only have landed
+	// them through single-item calls. The recorded traffic is the update batch
+	// (2) failing, then its two single-item retries, the same for the resolve
+	// batch, and finally the duplicate cancel — a single-item call, the only
+	// size that kind produces here, which is why the recorded sizes are
+	// [2 1 1 2 1 1 1]. The assertion below pins the successful calls, so a
+	// regression that batched the writes (or that skipped the fallback and left
+	// them unwritten) fails here; the multi-item calls are exactly the two the
+	// fake is built to reject.
+	wantCallSizes := []int{2, 1, 1, 2, 1, 1, 1}
+	if got := updateCallSizes(linear.updateCallBatches); !slices.Equal(got, wantCallSizes) {
+		t.Fatalf("UpdateIssues call sizes = %v, want %v (identifiers %v)", got, wantCallSizes, updatedIdentifiers(linear.updates))
+	}
+	singleItem := 0
+	for i, batch := range linear.updateCallBatches {
+		if len(batch) == 1 {
+			singleItem++
+			continue
+		}
+		// Only the two batch attempts, which the fake rejects, may be
+		// multi-item; anything else multi-item would have failed.
+		if i != 0 && i != 3 {
+			t.Fatalf("UpdateIssues call %d carried %d updates, want 1", i, len(batch))
+		}
+	}
+	if singleItem != 5 {
+		t.Fatalf("single-item UpdateIssues calls = %d, want 5 (every write the run landed)", singleItem)
 	}
 }

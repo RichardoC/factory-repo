@@ -822,6 +822,75 @@ func (f *failedFingerprints) has(fp string) bool {
 	return ok
 }
 
+// updateBatchWithFallback sends batch to Linear in one call and, when the
+// call fails, retries every item on its own. It reports whether the batch call
+// itself succeeded, counts each item that still fails in FailedOps, and records
+// its fingerprints as failed (see failedFingerprints).
+func (s *Service) updateBatchWithFallback(ctx context.Context, kind jobKind, verb string, batch []model.IssueUpdate, result *RunResult, failed *failedFingerprints) bool {
+	if err := s.linear.UpdateIssues(ctx, batch); err == nil {
+		return true
+	} else {
+		s.logger.Warn("batch "+string(kind)+" failed, retrying issues individually",
+			slog.Int("batch_size", len(batch)),
+			slog.Any("error", err),
+		)
+	}
+	for _, update := range batch {
+		if err := s.linear.UpdateIssues(ctx, []model.IssueUpdate{update}); err != nil {
+			atomic.AddInt64(&result.FailedOps, 1)
+			// Record both fingerprints: they differ for a
+			// coarse-fingerprint migration or an identity rebind, and the
+			// cache is keyed by the desired fingerprint at write time and by
+			// the ticket's own fingerprint on later runs.
+			failed.add(update.Desired.Fingerprint, update.Existing.Fingerprint)
+			s.logger.Error("failed to "+verb+" issue",
+				slog.String("issue", update.Existing.Identifier),
+				slog.String("fingerprint", update.Desired.Fingerprint),
+				slog.Any("error", err),
+			)
+		}
+	}
+	return false
+}
+
+// postCommentsWithFallback posts the change comments for batch in one call and,
+// when the call fails, retries every item on its own. A comment failure is not
+// a job failure: it is logged as a warning, not counted in FailedOps.
+func (s *Service) postCommentsWithFallback(ctx context.Context, batch []model.IssueUpdate) {
+	retryComment := func(update model.IssueUpdate) {
+		if _, err := s.linear.PostComments(ctx, []model.IssueUpdate{update}); err != nil {
+			s.logger.Warn("failed to post change comment",
+				slog.String("issue", update.Existing.Identifier),
+				slog.String("fingerprint", update.Desired.Fingerprint),
+				slog.Any("error", err),
+			)
+		}
+	}
+	failedIdx, err := s.linear.PostComments(ctx, batch)
+	if err != nil {
+		// No per-alias data at all (e.g. a transport failure): fall back to
+		// retrying every update individually, same as before.
+		s.logger.Warn("batch comment post failed, retrying individually",
+			slog.Int("batch_size", len(batch)),
+			slog.Any("error", err),
+		)
+		for _, update := range batch {
+			retryComment(update)
+		}
+	} else if len(failedIdx) > 0 {
+		// Partial failure: only retry the comments that actually failed - the
+		// rest already posted, and retrying them too would leave duplicate
+		// notification comments on the issue.
+		s.logger.Warn("batch comment post had partial failures, retrying only the failed comments",
+			slog.Int("failed_count", len(failedIdx)),
+			slog.Int("batch_size", len(batch)),
+		)
+		for _, idx := range failedIdx {
+			retryComment(batch[idx])
+		}
+	}
+}
+
 func (s *Service) executeJob(ctx context.Context, job job, result *RunResult, failed *failedFingerprints) error {
 	switch job.kind {
 	case jobCreateBatch:
@@ -870,117 +939,30 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult, fa
 		}
 		return nil
 	case jobUpdate:
-		updates := atomic.AddInt64(&result.PlannedUpdates, int64(len(job.updateBatch)))
-		s.logExecutionProgress("update", updates)
+		n := atomic.AddInt64(&result.PlannedUpdates, int64(len(job.updateBatch)))
+		s.logExecutionProgress("update", n)
 		if s.cfg.DryRun {
 			return nil
 		}
-		if err := s.linear.UpdateIssues(ctx, job.updateBatch); err != nil {
-			s.logger.Warn("batch update failed, retrying issues individually",
-				slog.Int("batch_size", len(job.updateBatch)),
-				slog.Any("error", err),
-			)
-			for _, update := range job.updateBatch {
-				if err := s.linear.UpdateIssues(ctx, []model.IssueUpdate{update}); err != nil {
-					atomic.AddInt64(&result.FailedOps, 1)
-					// Record both fingerprints: they differ for a
-					// coarse-fingerprint migration or an identity rebind, and
-					// the cache is keyed by the desired fingerprint at write
-					// time and by the ticket's own fingerprint on later runs.
-					failed.add(update.Desired.Fingerprint, update.Existing.Fingerprint)
-					s.logger.Error("failed to update issue",
-						slog.String("issue", update.Existing.Identifier),
-						slog.String("fingerprint", update.Desired.Fingerprint),
-						slog.Any("error", err),
-					)
-				}
-			}
-		} else if s.cfg.Linear.CommentsEnabled {
-			failedIdx, err := s.linear.PostComments(ctx, job.updateBatch)
-			if err != nil {
-				// No per-alias data at all (e.g. a transport failure): fall
-				// back to retrying every update individually, same as before.
-				s.logger.Warn("batch comment post failed, retrying individually",
-					slog.Int("batch_size", len(job.updateBatch)),
-					slog.Any("error", err),
-				)
-				for _, update := range job.updateBatch {
-					if _, err := s.linear.PostComments(ctx, []model.IssueUpdate{update}); err != nil {
-						s.logger.Warn("failed to post change comment",
-							slog.String("issue", update.Existing.Identifier),
-							slog.String("fingerprint", update.Desired.Fingerprint),
-							slog.Any("error", err),
-						)
-					}
-				}
-			} else if len(failedIdx) > 0 {
-				// Partial failure: only retry the comments that actually
-				// failed — the rest already posted, and retrying them too
-				// would leave duplicate notification comments on the issue.
-				s.logger.Warn("batch comment post had partial failures, retrying only the failed comments",
-					slog.Int("failed_count", len(failedIdx)),
-					slog.Int("batch_size", len(job.updateBatch)),
-				)
-				for _, idx := range failedIdx {
-					update := job.updateBatch[idx]
-					if _, err := s.linear.PostComments(ctx, []model.IssueUpdate{update}); err != nil {
-						s.logger.Warn("failed to post change comment",
-							slog.String("issue", update.Existing.Identifier),
-							slog.String("fingerprint", update.Desired.Fingerprint),
-							slog.Any("error", err),
-						)
-					}
-				}
-			}
+		if s.updateBatchWithFallback(ctx, jobUpdate, "update", job.updateBatch, result, failed) && s.cfg.Linear.CommentsEnabled {
+			s.postCommentsWithFallback(ctx, job.updateBatch)
 		}
 		return nil
 	case jobResolve:
-		resolves := atomic.AddInt64(&result.PlannedResolves, int64(len(job.updateBatch)))
-		s.logExecutionProgress("resolve", resolves)
+		n := atomic.AddInt64(&result.PlannedResolves, int64(len(job.updateBatch)))
+		s.logExecutionProgress("resolve", n)
 		if s.cfg.DryRun {
 			return nil
 		}
-		if err := s.linear.UpdateIssues(ctx, job.updateBatch); err != nil {
-			s.logger.Warn("batch resolve failed, retrying issues individually",
-				slog.Int("batch_size", len(job.updateBatch)),
-				slog.Any("error", err),
-			)
-			for _, update := range job.updateBatch {
-				if err := s.linear.UpdateIssues(ctx, []model.IssueUpdate{update}); err != nil {
-					atomic.AddInt64(&result.FailedOps, 1)
-					failed.add(update.Desired.Fingerprint, update.Existing.Fingerprint)
-					s.logger.Error("failed to resolve issue",
-						slog.String("issue", update.Existing.Identifier),
-						slog.String("fingerprint", update.Desired.Fingerprint),
-						slog.Any("error", err),
-					)
-				}
-			}
-		}
+		s.updateBatchWithFallback(ctx, jobResolve, "resolve", job.updateBatch, result, failed)
 		return nil
 	case jobCancelDuplicate:
-		cancels := atomic.AddInt64(&result.CancelledDuplicates, int64(len(job.updateBatch)))
-		s.logExecutionProgress("cancel-duplicate", cancels)
+		n := atomic.AddInt64(&result.CancelledDuplicates, int64(len(job.updateBatch)))
+		s.logExecutionProgress("cancel-duplicate", n)
 		if s.cfg.DryRun {
 			return nil
 		}
-		if err := s.linear.UpdateIssues(ctx, job.updateBatch); err != nil {
-			s.logger.Warn("batch cancel-duplicate failed, retrying issues individually",
-				slog.Int("batch_size", len(job.updateBatch)),
-				slog.Any("error", err),
-			)
-			for _, update := range job.updateBatch {
-				if err := s.linear.UpdateIssues(ctx, []model.IssueUpdate{update}); err != nil {
-					atomic.AddInt64(&result.FailedOps, 1)
-					failed.add(update.Desired.Fingerprint, update.Existing.Fingerprint)
-					s.logger.Error("failed to cancel duplicate issue",
-						slog.String("issue", update.Existing.Identifier),
-						slog.String("fingerprint", update.Desired.Fingerprint),
-						slog.Any("error", err),
-					)
-				}
-			}
-		}
+		s.updateBatchWithFallback(ctx, jobCancelDuplicate, "cancel duplicate", job.updateBatch, result, failed)
 		return nil
 	default:
 		return fmt.Errorf("unknown job kind %q", job.kind)
