@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -126,6 +127,17 @@ func New(cfg config.Config, logger *slog.Logger, snyk SnykClient, linear LinearC
 	}
 }
 
+// Run loads both the Snyk and the Linear snapshot, plans the work that brings
+// the tickets in line with the findings and executes that plan over a pool of
+// cfg.Sync.Workers workers.
+//
+// An error means the run did not complete: either the source data could not be
+// loaded, a worker failed or ctx was cancelled (see below). The cache is
+// refreshed only by a run that completed. An interrupted run returns a wrapped
+// context error and leaves the cache exactly as it was, so the next run
+// re-examines every finding this one did not write; saving the refresh after a
+// partial plan would mark never-attempted findings as reconciled and the next
+// run would skip them through the cache fast-path.
 func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	runCtx := ctx
 	var (
@@ -546,7 +558,9 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			if !ok {
 				createBatch = append(createBatch, desired)
 				if len(createBatch) == createBatchSize {
-					jobs <- job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)}
+					if err := s.enqueue(workerCtx, jobs, job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)}); err != nil {
+						return err
+					}
 					s.logQueueProgress(&queuedJobs, int64(len(createBatch)))
 					createBatch = createBatch[:0]
 				}
@@ -576,18 +590,24 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				update.Diff = ComputeDiff(existing, desired, s.cfg.Linear.States)
 				updateBatch = append(updateBatch, update)
 				if len(updateBatch) == createBatchSize {
-					jobs <- job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)}
+					if err := s.enqueue(workerCtx, jobs, job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)}); err != nil {
+						return err
+					}
 					s.logQueueProgress(&queuedJobs, int64(len(updateBatch)))
 					updateBatch = updateBatch[:0]
 				}
 			}
 		}
 		if len(createBatch) > 0 {
-			jobs <- job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)}
+			if err := s.enqueue(workerCtx, jobs, job{kind: jobCreateBatch, desiredBatch: append([]model.DesiredIssue(nil), createBatch...)}); err != nil {
+				return err
+			}
 			s.logQueueProgress(&queuedJobs, int64(len(createBatch)))
 		}
 		if len(updateBatch) > 0 {
-			jobs <- job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)}
+			if err := s.enqueue(workerCtx, jobs, job{kind: jobUpdate, updateBatch: append([]model.IssueUpdate(nil), updateBatch...)}); err != nil {
+				return err
+			}
 			s.logQueueProgress(&queuedJobs, int64(len(updateBatch)))
 		}
 
@@ -640,14 +660,18 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				resolvedUpdate.Diff = ComputeDiff(existing, resolved, s.cfg.Linear.States)
 				resolveBatch = append(resolveBatch, resolvedUpdate)
 				if len(resolveBatch) == createBatchSize {
-					jobs <- job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)}
+					if err := s.enqueue(workerCtx, jobs, job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)}); err != nil {
+						return err
+					}
 					s.logQueueProgress(&queuedJobs, int64(len(resolveBatch)))
 					resolveBatch = resolveBatch[:0]
 				}
 			}
 		}
 		if len(resolveBatch) > 0 {
-			jobs <- job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)}
+			if err := s.enqueue(workerCtx, jobs, job{kind: jobResolve, updateBatch: append([]model.IssueUpdate(nil), resolveBatch...)}); err != nil {
+				return err
+			}
 			s.logQueueProgress(&queuedJobs, int64(len(resolveBatch)))
 		}
 
@@ -677,14 +701,18 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 				cancelUpdate.Diff = ComputeDiff(duplicate, desired, s.cfg.Linear.States)
 				cancelBatch = append(cancelBatch, cancelUpdate)
 				if len(cancelBatch) == createBatchSize {
-					jobs <- job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)}
+					if err := s.enqueue(workerCtx, jobs, job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)}); err != nil {
+						return err
+					}
 					s.logQueueProgress(&queuedJobs, int64(len(cancelBatch)))
 					cancelBatch = cancelBatch[:0]
 				}
 			}
 		}
 		if len(cancelBatch) > 0 {
-			jobs <- job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)}
+			if err := s.enqueue(workerCtx, jobs, job{kind: jobCancelDuplicate, updateBatch: append([]model.IssueUpdate(nil), cancelBatch...)}); err != nil {
+				return err
+			}
 			s.logQueueProgress(&queuedJobs, int64(len(cancelBatch)))
 		}
 
@@ -692,6 +720,13 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	})
 
 	if err := g.Wait(); err != nil {
+		// An interrupted run has written only part of its plan: the findings
+		// whose jobs never ran look reconciled in the refreshed cache simply
+		// because their ticket was untouched. Returning before the cache save
+		// below is what keeps such a run from hiding them from the next one.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return result, fmt.Errorf("sync interrupted before all work was written: %w", err)
+		}
 		return result, err
 	}
 
@@ -891,7 +926,28 @@ func (s *Service) postCommentsWithFallback(ctx context.Context, batch []model.Is
 	}
 }
 
+// enqueue hands a job to the worker pool and reports the reason it could not be
+// queued. The context is the workers' own: when a worker fails, errgroup
+// cancels it and every worker returns. A plain send on the unbuffered jobs
+// channel would then block forever — nobody is left to receive — and Run would
+// never return. Waiting on the context instead lets the producer stop, close
+// the channel and unwind.
+func (s *Service) enqueue(ctx context.Context, jobs chan<- job, j job) error {
+	select {
+	case jobs <- j:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (s *Service) executeJob(ctx context.Context, job job, result *RunResult, failed *failedFingerprints) error {
+	// A cancelled context means the run is over: touch no counter and make no
+	// Linear call — every one of them would fail, and each item of the batch
+	// would be counted in FailedOps as if the write had been attempted.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	switch job.kind {
 	case jobCreateBatch:
 		creates := atomic.AddInt64(&result.PlannedCreates, int64(len(job.desiredBatch)))
@@ -937,7 +993,10 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult, fa
 				}
 			}
 		}
-		return nil
+		// The batch call fails fast once the context is done, so the fallback
+		// loop above would count every item as a failed write. Stop the worker
+		// instead: nothing was attempted for the ones left in the plan.
+		return ctx.Err()
 	case jobUpdate:
 		n := atomic.AddInt64(&result.PlannedUpdates, int64(len(job.updateBatch)))
 		s.logExecutionProgress("update", n)
@@ -947,7 +1006,9 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult, fa
 		if s.updateBatchWithFallback(ctx, jobUpdate, "update", job.updateBatch, result, failed) && s.cfg.Linear.CommentsEnabled {
 			s.postCommentsWithFallback(ctx, job.updateBatch)
 		}
-		return nil
+		// A batch that failed because the context ended must stop the worker,
+		// not be retried item by item: see the jobCreateBatch case.
+		return ctx.Err()
 	case jobResolve:
 		n := atomic.AddInt64(&result.PlannedResolves, int64(len(job.updateBatch)))
 		s.logExecutionProgress("resolve", n)
@@ -955,7 +1016,8 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult, fa
 			return nil
 		}
 		s.updateBatchWithFallback(ctx, jobResolve, "resolve", job.updateBatch, result, failed)
-		return nil
+		// See the jobCreateBatch case: a cancelled batch stops the worker.
+		return ctx.Err()
 	case jobCancelDuplicate:
 		n := atomic.AddInt64(&result.CancelledDuplicates, int64(len(job.updateBatch)))
 		s.logExecutionProgress("cancel-duplicate", n)
@@ -963,7 +1025,8 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult, fa
 			return nil
 		}
 		s.updateBatchWithFallback(ctx, jobCancelDuplicate, "cancel duplicate", job.updateBatch, result, failed)
-		return nil
+		// See the jobCreateBatch case: a cancelled batch stops the worker.
+		return ctx.Err()
 	default:
 		return fmt.Errorf("unknown job kind %q", job.kind)
 	}

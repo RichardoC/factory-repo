@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 
 	"github.com/tesslio/snyk-linear-sync/internal/cache"
 	"github.com/tesslio/snyk-linear-sync/internal/config"
@@ -36,7 +38,17 @@ func main() {
 }
 
 func run(cfg config.Config, logger *slog.Logger) error {
-	ctx := context.Background()
+	// Ctrl-C and a scheduler's SIGTERM both cancel the context instead of
+	// killing the process mid-batch. The sync then stops after the Linear
+	// batch already in flight, Run returns the context error, and the cache is
+	// left untouched, so the next run re-examines everything that was not
+	// written.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		logger.Info("shutdown requested, stopping after the in-flight Linear batch")
+	}()
 
 	snyk, err := snykclient.New(ctx, cfg, logger.With("service", "snyk"))
 	if err != nil {
