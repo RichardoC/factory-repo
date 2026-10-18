@@ -269,6 +269,8 @@ The `ignored until fix available` state is distinct from other ignored states be
 
 When a user manually moves a managed open ticket from `Todo` to `Backlog` in Linear, subsequent syncs preserve the `Backlog` state instead of overriding it back to `Todo`. This prevents the automation from fighting intentional user triage decisions. The override matches the configured `LINEAR_STATE_BACKLOG` value with case-insensitive normalization.
 
+The override does not apply to a ticket the sync itself parked in `Backlog` for an `ignored until fix available` finding: that placement is the sync's own, not a manual move. When the fix becomes available Snyk flips `ignored=false`, the next run moves the ticket to `Todo` with a recalculated due date, and the change comment says why. Only the `Backlog` state the sync chose is overridden this way — if a person moved the awaiting-fix ticket to some other non-terminal state (for example `In Progress`), the general manual non-terminal state override below still preserves their choice. This detection needs the awaiting-fix label recorded in the metadata block: with `LINEAR_AWAITING_FIX_LABEL=off` there is no label, the sync cannot tell its own `Backlog` placement from a manual one, and the ticket stays in `Backlog` as before.
+
 ### Manual Non-Terminal State Override
 
 When a user manually moves a managed issue to any non-terminal Linear workflow state that differs from what the sync would set, subsequent syncs preserve the user's chosen state. This generalises the previous Backlog-only and hardcoded "Todo" overrides.
