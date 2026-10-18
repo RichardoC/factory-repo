@@ -119,6 +119,10 @@ It includes:
 - Snyk DAST REST API link
 - the fix description when Snyk DAST provides one
 - target and finding identifiers
+- the Snyk Code correlation block when the API key has the
+  `correlation_viewer` permission; without it the run fails with an error
+  naming the missing permission, and a `404` for a single finding's
+  correlations only drops that finding's block
 - metadata block
 
 The synced title is also structured for scanability. It leads with the scanned
