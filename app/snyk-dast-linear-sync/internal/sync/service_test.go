@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -39,6 +41,16 @@ type fakeLinear struct {
 	// createAlwaysFailIdx makes every create call report a per-entry failure,
 	// including single-entry retries.
 	createAlwaysFailIdx bool
+
+	// createCallBatches records the batch of every CreateIssues call, so tests
+	// can assert how much work was started before a cancellation landed.
+	createCallBatches [][]model.DesiredIssue
+	// cancelCreate, when set, cancels the run's context on the first
+	// CreateIssues call, modelling a run interrupted mid-write.
+	cancelCreate context.CancelFunc
+	// mu guards the fields CreateIssues records, which workers may write
+	// concurrently when the pool has more than one worker.
+	mu sync.Mutex
 
 	// createBatchErr makes the first (batch) create call fail with an error,
 	// simulating an ambiguous transport failure. landedFingerprints is what
@@ -94,7 +106,16 @@ func (f *fakeLinear) ExistingFingerprints(_ context.Context, fingerprints []stri
 	return found, nil
 }
 
-func (f *fakeLinear) CreateIssues(_ context.Context, desired []model.DesiredIssue) ([]int, error) {
+func (f *fakeLinear) CreateIssues(ctx context.Context, desired []model.DesiredIssue) ([]int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.createCallBatches = append(f.createCallBatches, append([]model.DesiredIssue(nil), desired...))
+	if f.cancelCreate != nil {
+		// Simulate a run interrupted while this batch was in flight.
+		cancel := f.cancelCreate
+		f.cancelCreate = nil
+		cancel()
+	}
 	if f.createBatchErr != nil && len(desired) > 1 {
 		// Only the multi-entry batch call fails; single-entry retries succeed.
 		err := f.createBatchErr
@@ -2577,4 +2598,196 @@ func TestRunWithSQLiteCacheRetriesFailedUpdate(t *testing.T) {
 	if _, ok := loaded.LinearHashes[finding.Fingerprint]; !ok {
 		t.Fatalf("loaded LinearHashes[%q] missing after a successful write", finding.Fingerprint)
 	}
+}
+
+// interruptionCfg returns the minimal config the cancellation tests run with:
+// no cache bypass, no dry run, and the worker count the test asks for.
+func interruptionCfg(workers int) config.Config {
+	return config.Config{
+		Linear: config.LinearConfig{
+			Due: config.DueDateConfig{
+				CriticalDays: 15,
+				HighDays:     30,
+				MediumDays:   45,
+				LowDays:      90,
+			},
+		},
+		Sync: config.SyncConfig{
+			Workers: workers,
+		},
+	}
+}
+
+// interruptionFindings returns n neutral open findings on one target, so the
+// plan is exactly n creates in batches of createBatchSize.
+func interruptionFindings(n int) []model.Finding {
+	findings := make([]model.Finding, 0, n)
+	for i := range n {
+		findings = append(findings, model.Finding{
+			Fingerprint:       fmt.Sprintf("snyk-dast:target-a:finding-%d", i),
+			SnykDASTFindingID: fmt.Sprintf("find-%d", i),
+			TargetID:          "target-a",
+			TargetName:        "Example App",
+			TargetHost:        "app.example.test",
+			IssueTitle:        fmt.Sprintf("Reflected XSS %d", i),
+			Severity:          "high",
+			Status:            model.FindingOpen,
+			IssueURL:          fmt.Sprintf("https://dast.example.test/targets/target-a/findings/%d", i),
+			CreatedAt:         time.Date(2026, time.August, 1, 14, 0, 0, 0, time.UTC),
+		})
+	}
+	return findings
+}
+
+func interruptionSnapshot(findings []model.Finding) model.SnykDASTSnapshot {
+	targetIDs := map[string]struct{}{"target-a": {}}
+	return model.SnykDASTSnapshot{Findings: findings, TargetIDs: targetIDs}
+}
+
+// TestRunReturnsContextErrorAndLeavesCacheUntouched: a run whose context is
+// already cancelled must not start any work, must return the context error and
+// must not refresh the cache — a cache written by an interrupted run would
+// describe fingerprints as reconciled whose jobs never ran.
+func TestRunReturnsContextErrorAndLeavesCacheUntouched(t *testing.T) {
+	cfg := interruptionCfg(1)
+	snykdast := fakeSnykDAST{snapshot: interruptionSnapshot(interruptionFindings(1))}
+	linear := &fakeLinear{}
+	store := &fakeCache{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := New(cfg, discardLogger(), snykdast, linear, store).Run(ctx)
+	if err == nil {
+		t.Fatal("Run() error = nil, want the context error of an interrupted run")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want errors.Is(err, context.Canceled)", err)
+	}
+	if !reflect.DeepEqual(store.saved, cache.Snapshot{}) {
+		t.Fatalf("saved cache = %+v, want the zero cache.Snapshot (an interrupted run must not refresh the cache)", store.saved)
+	}
+}
+
+// TestRunStopsStartingJobsAfterCancellation: the first create batch is
+// interrupted; the producer must stop queueing the remaining batches, so
+// Linear sees at most one CreateIssues call, and the run reports the context
+// error.
+func TestRunStopsStartingJobsAfterCancellation(t *testing.T) {
+	cfg := interruptionCfg(1) // Workers: 1
+	findings := interruptionFindings(30)
+	snykdast := fakeSnykDAST{snapshot: interruptionSnapshot(findings)}
+	ctx, cancel := context.WithCancel(context.Background())
+	linear := &fakeLinear{cancelCreate: cancel}
+	store := &fakeCache{}
+
+	_, err := New(cfg, discardLogger(), snykdast, linear, store).Run(ctx)
+	if err == nil {
+		t.Fatal("Run() error = nil, want the context error of an interrupted run")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want errors.Is(err, context.Canceled)", err)
+	}
+	if len(linear.createCallBatches) > 1 {
+		t.Fatalf("CreateIssues calls = %d, want at most 1 (sizes %v); the producer must stop queueing once the context is done",
+			len(linear.createCallBatches), createCallSizes(linear.createCallBatches))
+	}
+	if !reflect.DeepEqual(store.saved, cache.Snapshot{}) {
+		t.Fatalf("saved cache = %+v, want the zero cache.Snapshot (an interrupted run must not refresh the cache)", store.saved)
+	}
+}
+
+// TestRunDoesNotDeadlockWhenWorkerFails: a worker that returns an error (here:
+// an interrupted run, which makes executeJob report the context error) stops
+// the whole pool while the producer may still hold batches to queue. Run must
+// return with an error within the test's timeout instead of blocking forever
+// on a jobs channel nobody reads any more.
+func TestRunDoesNotDeadlockWhenWorkerFails(t *testing.T) {
+	cfg := interruptionCfg(2) // two workers: both can die while batches are pending
+	findings := interruptionFindings(35)
+	snykdast := fakeSnykDAST{snapshot: interruptionSnapshot(findings)}
+	ctx, cancel := context.WithCancel(context.Background())
+	linear := &fakeLinear{cancelCreate: cancel}
+	defer cancel()
+
+	done := make(chan struct{})
+	var err error
+	go func() {
+		defer close(done)
+		_, err = New(cfg, discardLogger(), snykdast, linear, &fakeCache{}).Run(ctx)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return within 5s; a worker error deadlocked the producer on the jobs channel")
+	}
+	if err == nil {
+		t.Fatal("Run() error = nil, want the error that stopped the worker pool")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want errors.Is(err, context.Canceled)", err)
+	}
+}
+
+// TestRunNormalRunStillRefreshesCache is the control for the interruption
+// tests above: the same fixtures with a context that is never cancelled must
+// run to the end and refresh the cache.
+func TestRunNormalRunStillRefreshesCache(t *testing.T) {
+	cfg := interruptionCfg(1)
+	findings := interruptionFindings(30)
+	snykdast := fakeSnykDAST{snapshot: interruptionSnapshot(findings)}
+	linear := &fakeLinear{}
+	store := &fakeCache{}
+
+	result, err := New(cfg, discardLogger(), snykdast, linear, store).Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.PlannedCreates != 30 {
+		t.Fatalf("PlannedCreates = %d, want 30", result.PlannedCreates)
+	}
+	if len(linear.created) != 30 {
+		t.Fatalf("created = %d, want 30", len(linear.created))
+	}
+	if store.saved.SchemaSignature == "" {
+		t.Fatalf("saved cache = %+v, want a refreshed snapshot with a schema signature", store.saved)
+	}
+	if len(store.saved.SnykDASTHashes) != 30 {
+		t.Fatalf("saved snyk hashes = %d, want 30", len(store.saved.SnykDASTHashes))
+	}
+}
+
+// TestExecuteJobReturnsContextErrorWithoutCounting: a job that reaches
+// executeJob with the run already cancelled must report the context error
+// without counting the work as planned or failed — counting it would report
+// batches that were never attempted, and an interrupted run's counters and
+// cache are never saved anyway.
+func TestExecuteJobReturnsContextErrorWithoutCounting(t *testing.T) {
+	cfg := interruptionCfg(1)
+	desired := desiredIssue(cfg, interruptionFindings(1)[0])
+	linear := &fakeLinear{}
+	service := New(cfg, discardLogger(), fakeSnykDAST{}, linear, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var result RunResult
+	var failed failedFingerprints
+	err := service.executeJob(ctx, job{kind: jobCreateBatch, desiredBatch: []model.DesiredIssue{desired}}, &result, &failed)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("executeJob() error = %v, want errors.Is(err, context.Canceled)", err)
+	}
+	if result.FailedOps != 0 || result.PlannedCreates != 0 {
+		t.Fatalf("FailedOps = %d, PlannedCreates = %d, want 0 and 0 (no counter may be touched)", result.FailedOps, result.PlannedCreates)
+	}
+	if len(linear.created) != 0 {
+		t.Fatalf("created = %d, want 0 (Linear must not be called)", len(linear.created))
+	}
+}
+
+// createCallSizes reports the item count of every recorded CreateIssues call.
+func createCallSizes(batches [][]model.DesiredIssue) []int {
+	sizes := make([]int, 0, len(batches))
+	for _, batch := range batches {
+		sizes = append(sizes, len(batch))
+	}
+	return sizes
 }

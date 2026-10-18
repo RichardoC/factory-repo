@@ -54,6 +54,9 @@ go run ./cmd/snyk-dast-linear-sync --env-file .env --dry-run
 
 That avoids shell-specific `source` behavior and is the recommended way to run the tool.
 
+Ctrl-C and SIGTERM cancel the in-flight Linear calls and exit non-zero; the
+cache is left untouched, so the next run retries whatever was not written.
+
 Dry run:
 
 ```bash
@@ -443,6 +446,10 @@ On a normal run:
 5. Refresh the cache from the live post-write Linear snapshot. A fingerprint
    whose Linear write failed in this run is left out of the refresh, so the next
    run retries it instead of skipping it as unchanged.
+
+An interrupted run (Ctrl-C, SIGTERM, or any cancelled context) never refreshes
+the cache: its plan was only partly written, so the next run re-examines
+everything against live data.
 
 The cache fast-path never suppresses a pending move into a terminal state
 (`Done`/`Cancelled`). Use `--bypass-cache` to ignore the cache for a run and
