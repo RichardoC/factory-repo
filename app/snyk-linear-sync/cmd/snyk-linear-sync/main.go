@@ -39,15 +39,15 @@ func main() {
 
 func run(cfg config.Config, logger *slog.Logger) error {
 	// Ctrl-C and a scheduler's SIGTERM both cancel the context instead of
-	// killing the process mid-batch. The sync then stops after the Linear
-	// batch already in flight, Run returns the context error, and the cache is
-	// left untouched, so the next run re-examines everything that was not
-	// written.
+	// killing the process outright. Calls in flight are cancelled (a write may
+	// or may not have reached Linear), no further jobs start, Run returns the
+	// context error, and the cache is left untouched, so the next run
+	// re-examines everything against Linear's live state.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go func() {
 		<-ctx.Done()
-		logger.Info("shutdown requested, stopping after the in-flight Linear batch")
+		logger.Info("shutdown requested, cancelling in-flight calls and leaving the cache untouched")
 	}()
 
 	snyk, err := snykclient.New(ctx, cfg, logger.With("service", "snyk"))

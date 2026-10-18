@@ -993,9 +993,9 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult, fa
 				}
 			}
 		}
-		// The batch call fails fast once the context is done, so the fallback
-		// loop above would count every item as a failed write. Stop the worker
-		// instead: nothing was attempted for the ones left in the plan.
+		// Once the context is done the batch call and its fallback fail fast
+		// (their failures are counted, but an interrupted run's counts and
+		// cache are never saved). Stop the worker so no further job starts.
 		return ctx.Err()
 	case jobUpdate:
 		n := atomic.AddInt64(&result.PlannedUpdates, int64(len(job.updateBatch)))
