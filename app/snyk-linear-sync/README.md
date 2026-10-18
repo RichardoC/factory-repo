@@ -452,6 +452,8 @@ Optional:
 - `LINEAR_STATE_BACKLOG`
 - `LINEAR_STATE_DONE`
 - `LINEAR_STATE_CANCELLED`
+- `LINEAR_UNSUBSCRIBE_ACTOR`
+- `LINEAR_COMMENTS`
 - `LINEAR_MANAGED_LABEL`
 - `LINEAR_TOOL_LABELS`
 - `LINEAR_TOOL_LABEL_DEFAULT`
@@ -471,7 +473,22 @@ Optional:
 - `ERROR_LOG_FILE`
 - `CACHE_DB_FILE`
 
+Integer variables must be plain integers, and boolean variables must be
+`true`/`false` (or another form `strconv.ParseBool` accepts: `1`, `0`, `t`,
+`f`, `T`, `F`). A malformed value stops the run at startup with an error naming
+the variable and quoting the value it could not parse; it is never silently
+replaced by the default.
+
 See [.env.example](/workspace/.env.example).
+
+### Change comments
+
+`LINEAR_COMMENTS` defaults to `false`. When it is `true`, the sync posts one
+comment on each issue it updates, listing the managed fields it changed and why
+(state, due date, description, title, priority, labels). No comment is posted
+for creates, for tickets moved to `Done`/`Cancelled` by the resolve loop, or for
+duplicate cancellations; a description change confined to the hidden metadata
+block posts no comment either.
 
 
 ## Logs
