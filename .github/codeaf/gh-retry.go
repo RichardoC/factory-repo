@@ -4,9 +4,14 @@ package main
 // retries for transient upstream failures. Run 39072735041 (#128) lost its
 // pull request to a single `HTTP 504` from the pull-request-create call:
 // the branch was pushed, but a one-off gateway timeout made publish report
-// "could not open the pull request". The workflow now prefixes its GitHub
-// write calls with `harness gh-retry --`, so the whole change there is a
-// one-word prefix and this command owns the retry policy:
+// "could not open the pull request". The intent is for the workflow to
+// prefix its GitHub write calls with `harness gh-retry --`, a one-word change
+// there, with this command owning the retry policy. The publish job is
+// frozen by the workflow policy, so that wiring is a maintainer's edit and
+// is not in place yet. Before wiring `gh pr create`: a 504 there usually
+// means the pull request was created, so the retry gets a 422 "already
+// exists" (not retried); the caller must then look the pull request up
+// rather than fail. The policy:
 //
 //   - up to ghRetryAttempts runs of the command (one attempt plus at most
 //     ghRetryAttempts-1 retries), waiting ghRetryBackoffs between them;

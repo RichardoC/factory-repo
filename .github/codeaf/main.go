@@ -113,8 +113,8 @@ func main() {
 		// maintainer's approval (workflowpolicy.go).
 		"workflow-policy": runWorkflowPolicy,
 		// Retry a GitHub CLI write call on transient upstream failures --
-		// 5xx or a network error, never 4xx (issue #146). The workflow
-		// prefixes its publish write calls with it: gh-retry -- gh ...
+		// 5xx or a network error, never 4xx (issue #146). Meant for the
+		// publish job's write calls (gh-retry -- gh ...); not wired yet.
 		"gh-retry": runGhRetry,
 		// Splitting a patch the policy refused (patchsplit.go): the part
 		// under .github/ outside .github/codeaf/ goes to REFUSED for a
