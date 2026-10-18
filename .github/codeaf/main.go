@@ -2620,6 +2620,11 @@ func runBrief() error {
 		// Issue #136: name the acceptance sections right after the issue
 		// body they live in, so the bar to clear is the worker's last read.
 		parts = append(parts, "The sections `## Done when` and `## End-to-end check` above are the acceptance criteria.")
+		// Issue #139: the app the issue names carries its own rules with
+		// the brief, so they are read with the task, not hunted in a README.
+		if rules := appRulesSections(issueAreas(issue)); rules != "" {
+			parts = append(parts, rules)
+		}
 		if issue.Comments > 0 {
 			thread, err := gh.thread(number)
 			if err != nil {
@@ -2659,6 +2664,11 @@ func runBrief() error {
 				parts = append(parts, fmt.Sprintf("## The issue this PR closes (#%d) — %s\n\n%s", n, escapeMD(closes.Title, 200, true), closes.Body))
 				// Issue #136: the acceptance sections govern a continuation too.
 				parts = append(parts, "The sections `## Done when` and `## End-to-end check` above are the acceptance criteria.")
+				// Issue #139: the rules come from the issue the PR closes,
+				// the same way they would in issue mode.
+				if rules := appRulesSections(issueAreas(closes)); rules != "" {
+					parts = append(parts, rules)
+				}
 			}
 		}
 		var reviews []reviewComment

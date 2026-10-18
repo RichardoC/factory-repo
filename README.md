@@ -205,6 +205,24 @@ sending the model as the `infinite:` alias (`infinite:small:vision` resolves to
 DeepSeek-V4.1-Flash), which requires `stream: true` and a Big plan. The `:flex`
 model suffix suggested in the issue is not documented anywhere reachable.
 
+## Adding an app
+
+More applications live side by side under `app/<name>/`, each its own Go
+module. To onboard one:
+
+- the app directory must have four files: `go.mod`, `README.md`, `LICENSE`
+  and `AGENTS.md` (an app-specific rules file; `TestAppLayout` in the
+  harness checks all four);
+- an **`area:app/<name>`** label must exist (the queue job creates it
+  automatically from the directories under `app/`, colour `cccccc`) and must
+  be on **every issue** for the app — an issue without an area label is held
+  by the queue until it has one;
+- the worker, reviewer and planner briefs embed the app's `AGENTS.md`
+  automatically, so app-specific rules (build flags, build tags, benchmark
+  conventions, invariants) belong there, not in the issue. See
+  [app/kube-sqlite3-vfs/AGENTS.md](app/kube-sqlite3-vfs/AGENTS.md) for an
+  example.
+
 ## The queue
 
 Issues labelled **`codeaf-queued`** are the backlog. Every 10 minutes (and on

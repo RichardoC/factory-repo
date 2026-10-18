@@ -46,7 +46,7 @@ This is a monorepo: several independent applications live side by side, and
 more will be added.
 
 - `app/<name>/` holds one application each. Each is its own Go module with its own
-  `go.mod` (and its own Go version), README and licence. Treat an app's
+  `go.mod` (and its own Go version), README, licence and AGENTS.md. Treat an app's
   directory as its boundary: a change for one app shouldn't touch another
   app's files unless the task says so.
 - `.github/` holds the CodeAF harness and CI. CodeAF may change it when a task asks
