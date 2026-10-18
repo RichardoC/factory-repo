@@ -275,9 +275,11 @@ func configInvariants(dir string) []error {
 	}
 
 	// The lane pool must give every lane a worker seat, distinct-or-rotating:
-	// either at least max_parallel_runs models (one per lane) or fewer that
-	// rotate (seat-config picks pool[lane % len(pool)]), and at least one of
-	// them a base or mid model, the roles concurrent runs share.
+	// either at least max_parallel_runs models, one seat per lane, or fewer
+	// that rotate (seat-config picks pool[lane % len(pool)]); and at least
+	// one pool model must have role base or mid, the roles concurrent runs
+	// share — a pool with none would put every lane on a seat meant for
+	// one-off experiments.
 	pool := laneModels(cfg.Models)
 	baseMid := 0
 	for _, m := range pool {
@@ -285,10 +287,17 @@ func configInvariants(dir string) []error {
 			baseMid++
 		}
 	}
-	if len(pool) == 0 {
+	switch {
+	case len(pool) == 0:
 		errf("models.json: laneModels is empty; no lane gets a worker seat")
+	case len(pool) >= cfg.Queue.MaxParallelRuns:
+		// Distinct: every lane gets its own model. The base-or-mid clause
+		// below still applies.
+	case baseMid < 1:
+		errf("models.json: laneModels has %d models for %d lanes and rotates; none of them has role base or mid, which concurrent runs share",
+			len(pool), cfg.Queue.MaxParallelRuns)
 	}
-	if baseMid < 1 {
+	if len(pool) > 0 && baseMid < 1 {
 		errf("models.json: no lane model has role base or mid")
 	}
 

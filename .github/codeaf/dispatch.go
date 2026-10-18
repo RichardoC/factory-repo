@@ -32,7 +32,10 @@ var dispatchKinds = []string{"issue", "pr", "review", "plan"}
 
 // newDispatch validates a dispatch the way Decide reads it: the kind is one
 // of the four, and the three numeric kinds carry a positive number. Plan
-// takes no number: its target is the repository itself.
+// takes no target at all: its target is the repository itself, so no number
+// and no profile — the gate refuses any issue, pr, review or profile input
+// beside plan=true, and a combination it refuses must be unbuildable here,
+// so inputs() can never emit one (the #61 failure mode).
 func newDispatch(kind string, number, lane int, profile string) (dispatch, error) {
 	switch kind {
 	case "issue", "pr", "review":
@@ -40,8 +43,11 @@ func newDispatch(kind string, number, lane int, profile string) (dispatch, error
 			return dispatch{}, fmt.Errorf("%s dispatch needs a positive number, got %d", kind, number)
 		}
 	case "plan":
-		if number != 0 {
+		switch {
+		case number != 0:
 			return dispatch{}, fmt.Errorf("a plan dispatch takes no number, got %d", number)
+		case profile != "":
+			return dispatch{}, fmt.Errorf("a plan dispatch takes no profile input, got %q", profile)
 		}
 	default:
 		return dispatch{}, fmt.Errorf("dispatch kind %q is not one of issue, pr, review, plan", kind)
@@ -95,17 +101,27 @@ func runDispatchArgs() error {
 		return fmt.Errorf("usage: harness dispatch-args KIND NUMBER LANE [PROFILE]")
 	}
 	kind, numberArg, laneArg := os.Args[2], os.Args[3], os.Args[4]
-	lane := 0
-	if digitsOnly(laneArg) {
-		if n, err := strconv.Atoi(laneArg); err == nil {
-			lane = n
+	// A lane or number that is not a plain decimal, or that overflows an
+	// int, is refused rather than silently coerced to 0: a caller copying
+	// the printed lines would dispatch `-f lane=0`, which the gate reads as
+	// no lane at all.
+	parse := func(name, arg string) (int, error) {
+		if !digitsOnly(arg) {
+			return 0, fmt.Errorf("dispatch-args: %s must be a plain decimal number, got %q", name, arg)
 		}
+		n, err := strconv.Atoi(arg)
+		if err != nil {
+			return 0, fmt.Errorf("dispatch-args: %s %q overflows an int", name, arg)
+		}
+		return n, nil
 	}
-	number := 0
-	if digitsOnly(numberArg) {
-		if n, err := strconv.Atoi(numberArg); err == nil {
-			number = n
-		}
+	lane, err := parse("lane", laneArg)
+	if err != nil {
+		return err
+	}
+	number, err := parse("number", numberArg)
+	if err != nil {
+		return err
 	}
 	profile := ""
 	if len(os.Args) == 6 {
