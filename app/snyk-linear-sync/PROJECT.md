@@ -324,7 +324,7 @@ Normal behavior:
 2. Read live Linear data.
 3. Compare both against the last successful cached hashes.
 4. Skip unchanged fingerprints.
-5. After successful writes, refresh the cache from the live post-write Linear snapshot. When several tickets share a fingerprint, the cached Linear hash is that of the ticket the finding was matched to, so the next run's comparison against the same ticket can hit.
+5. After successful writes, refresh the cache from the live post-write Linear snapshot. When several tickets share a fingerprint, the cached Linear hash is that of the ticket the finding was matched to, so the next run's comparison against the same ticket can hit. A fingerprint whose Linear write failed in this run is left out of the cache, so the next run compares it against live data again.
 
 The post-write refresh matters because Linear may rewrite markdown bodies after mutation.
 
