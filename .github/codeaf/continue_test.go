@@ -127,6 +127,7 @@ func TestContinuationAccounting(t *testing.T) {
 }
 
 func TestCountReports(t *testing.T) {
+	bot := user{Login: planReportBotLogin}
 	ordinary := []issueComment{
 		{ID: 1, Body: "just a comment, no marker"},
 		{ID: 2, Body: continueBody(stopDeadline, 0)}, // a continue comment is not a report
@@ -137,22 +138,54 @@ func TestCountReports(t *testing.T) {
 		t.Errorf("countReports(ordinary) = %d, want 0", got)
 	}
 	mixed := append(ordinary,
-		issueComment{ID: 5, Body: reportMarker + "\n### CodeAF run — done"},
-		issueComment{ID: 6, Body: "text " + reportMarker + " more text"},
-		issueComment{ID: 7, Body: reportMarker},
+		issueComment{ID: 5, User: bot, Body: reportMarker + "\n### CodeAF run — done"},
+		issueComment{ID: 6, User: bot, Body: "text " + reportMarker + " more text"},
+		issueComment{ID: 7, User: bot, Body: reportMarker},
 	)
 	if got := countReports(mixed); got != 3 {
 		t.Errorf("countReports(mixed) = %d, want 3", got)
+	}
+
+	// The same marker on a comment by anyone but the workflow bot is not a
+	// report (issue #219): a forged marker can neither inflate the count
+	// (spending the cap early) nor suppress it (a comment that reads like a
+	// failed publish is still not counted either way).
+	forged := append(mixed,
+		issueComment{ID: 8, User: user{Login: "someone"}, Body: reportMarker + "\n### CodeAF run — done"},
+		issueComment{ID: 9, User: user{Login: "github-actions[bot]-fan"}, Body: failedPublishHeading},
+	)
+	if got := countReports(forged); got != 3 {
+		t.Errorf("countReports(forged) = %d, want 3", got)
+	}
+
+	// A bot report whose publish failed did not land its patch: it does not
+	// spend a continuation slot.
+	failed := append(mixed,
+		issueComment{ID: 10, User: bot, Body: failedPublishHeading + "\n| stop / ok | done / `true` |\n"},
+	)
+	if got := countReports(failed); got != 3 {
+		t.Errorf("countReports(failed publish) = %d, want 3", got)
+	}
+	// A near miss of the heading is an ordinary report: the match is an
+	// exact prefix, and the heading names only publishing failed.
+	nearMiss := append(mixed,
+		issueComment{ID: 11, User: bot, Body: reportMarker + "\n### CodeAF run — publishing failed badly\n"},
+		issueComment{ID: 12, User: bot, Body: reportMarker + "\n### CodeAF run — run job failed\n"},
+	)
+	if got := countReports(nearMiss); got != 5 {
+		t.Errorf("countReports(near miss) = %d, want 5", got)
 	}
 }
 
 // reportComments builds a comment list of n run reports plus one ordinary
 // comment whose body is hostile remote text.
 func reportComments(n int) []issueComment {
-	comments := []issueComment{{ID: 999, Body: "untrusted prose that must never reach a comment we post <!-- -->"}}
+	comments := []issueComment{{ID: 999, User: user{Login: "stranger"},
+		Body: "untrusted prose that must never reach a comment we post <!-- -->"}}
 	for i := 0; i < n; i++ {
 		comments = append(comments, issueComment{
 			ID:   int64(i + 1),
+			User: user{Login: planReportBotLogin},
 			Body: fmt.Sprintf("%s\n### CodeAF run — done\n\n| stop / ok | done / `true` |\n", reportMarker),
 		})
 	}
@@ -172,7 +205,7 @@ func commentsServer(t *testing.T, comments []issueComment, status int) *httptest
 		if i > 0 {
 			b.WriteString(",")
 		}
-		fmt.Fprintf(&b, `{"id":%d,"body":%q}`, c.ID, c.Body)
+		fmt.Fprintf(&b, `{"id":%d,"body":%q,"user":{"login":%q}}`, c.ID, c.Body, c.User.Login)
 	}
 	b.WriteString("]")
 	if status != http.StatusOK {
@@ -196,8 +229,12 @@ func commentsServer(t *testing.T, comments []issueComment, status int) *httptest
 }
 
 func TestContinuePlan(t *testing.T) {
+	// Issue #219: continue-plan runs before the stopping run has posted its
+	// own report, so every report comment is a run that came before and
+	// used is the plain report count. Two reports (the opener and one
+	// continuation) have spent the cap of 2.
 	stop := stopDeadline
-	for reports, wantAction := range map[int]string{1: "continue", 2: "continue", 3: "cap", 4: "cap"} {
+	for reports, wantAction := range map[int]string{0: "continue", 1: "continue", 2: "cap", 3: "cap", 4: "cap"} {
 		t.Run(fmt.Sprintf("reports=%d", reports), func(t *testing.T) {
 			server := commentsServer(t, reportComments(reports), http.StatusOK)
 			ghEnv(t, server)
@@ -209,8 +246,8 @@ func TestContinuePlan(t *testing.T) {
 			if action != wantAction {
 				t.Fatalf("continuePlan(reports=%d) action = %q, want %q", reports, action, wantAction)
 			}
-			if want := continuationsUsed(reports); used != want {
-				t.Fatalf("used = %d, want %d", used, want)
+			if used != reports {
+				t.Fatalf("used = %d, want %d (issue #219: the count includes the opener's report)", used, reports)
 			}
 			if action == "continue" {
 				if want := continueBody(stop, used); body != want {
@@ -390,7 +427,7 @@ func TestRunContinuePlan(t *testing.T) {
 		if err != nil {
 			t.Fatalf("comment not written: %v", err)
 		}
-		if want := continueBody(stopDeadline, 0); string(data) != want {
+		if want := continueBody(stopDeadline, 1); string(data) != want {
 			t.Errorf("comment = %q, want %q", data, want)
 		}
 	})
@@ -649,7 +686,7 @@ func prStateServer(t *testing.T, state string, comments []issueComment) *httptes
 		if i > 0 {
 			b.WriteString(",")
 		}
-		fmt.Fprintf(&b, `{"id":%d,"body":%q}`, c.ID, c.Body)
+		fmt.Fprintf(&b, `{"id":%d,"body":%q,"user":{"login":%q}}`, c.ID, c.Body, c.User.Login)
 	}
 	b.WriteString("]")
 	commentBody := b.String()
@@ -715,8 +752,8 @@ func TestContinuePlanContinuesADirtyPR(t *testing.T) {
 		if want := "The branch conflicts with its base branch; a continuation brings the base in and resolves the conflicts\n"; body != want {
 			t.Errorf("body = %q, want the exact fixed text %q", body, want)
 		}
-		if used != 0 {
-			t.Errorf("used = %d, want 0", used)
+		if used != 1 {
+			t.Errorf("used = %d, want 1 (issue #219)", used)
 		}
 		if len(*sleeps) != 0 {
 			t.Errorf("a dirty PR must not sleep, got %v", *sleeps)
@@ -737,8 +774,8 @@ func TestContinuePlanContinuesADirtyPR(t *testing.T) {
 		if want := conflictCapBody(); body != want {
 			t.Errorf("body = %q, want the fixed cap body %q", body, want)
 		}
-		if used != 2 {
-			t.Errorf("used = %d, want 2", used)
+		if used != 3 {
+			t.Errorf("used = %d, want 3 (issue #219)", used)
 		}
 		if len(*sleeps) != 0 {
 			t.Errorf("unexpected sleeps: %v", *sleeps)
@@ -800,7 +837,7 @@ func TestContinuePlanContinuesADirtyPR(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if action != "continue" || body != continueBody(stopDeadline, 0) || used != 0 {
+		if action != "continue" || body != continueBody(stopDeadline, 1) || used != 1 {
 			t.Errorf("continuePlan(deadline) = (%q, %q, %d), want the early-stop continuation", action, body, used)
 		}
 		if len(*sleeps) != 0 {
@@ -934,4 +971,124 @@ func TestRunContinuePlanDirtyPR(t *testing.T) {
 	if want := conflictBody; string(data) != want {
 		t.Errorf("comment = %q, want %q", data, want)
 	}
+}
+
+// ---------------------------------------------------------------- issue #219
+
+// The stub PR carries the opener's report and continuation 1's report: two
+// report comments, both already posted, while the stopping run's own report
+// is not posted yet. The cap of 2 is spent, so the plan must hand over with
+// a cap comment instead of dispatching a third continuation.
+func TestContinuePlanCountsOwnReport(t *testing.T) {
+	server := commentsServer(t, reportComments(2), http.StatusOK)
+	ghEnv(t, server)
+	action, body, used, err := continuePlan(newGitHub(), 7, stopDeadline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "cap" {
+		t.Fatalf("action = %q, want cap (2 reports, cap 2)", action)
+	}
+	if used != 2 {
+		t.Errorf("used = %d, want 2", used)
+	}
+	if want := capBody(stopDeadline); body != want {
+		t.Errorf("body = %q, want the fixed cap body %q", body, want)
+	}
+}
+
+// The 16:11Z run of PR #209 failed at publish: its report says so, and its
+// patch never landed, so its report must not spend a continuation slot. The
+// stub PR carries the opener's report plus one publishing-failed report;
+// the plan continues and labels the next run "Continuation 2 of 2".
+func TestContinuePlanIgnoresFailedPublish(t *testing.T) {
+	comments := append(reportComments(1), issueComment{
+		ID:   500,
+		User: user{Login: planReportBotLogin},
+		Body: failedPublishHeading + "\n| stop / ok | done / `true` |\n",
+	})
+	server := commentsServer(t, comments, http.StatusOK)
+	ghEnv(t, server)
+	action, body, used, err := continuePlan(newGitHub(), 7, stopDeadline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "continue" {
+		t.Fatalf("action = %q, want continue", action)
+	}
+	if used != 1 {
+		t.Errorf("used = %d, want 1 (the publishing-failed report is not counted)", used)
+	}
+	if !strings.Contains(body, "Continuation 2 of 2") {
+		t.Errorf("body does not label the continuation 2 of 2: %q", body)
+	}
+}
+
+// A comment by another login that carries the marker and the heading is not
+// a report, in either direction: added to real reports it must not push the
+// plan past the cap, and on its own it must not reach the cap either.
+func TestContinuePlanIgnoresForgedReports(t *testing.T) {
+	forge := func(login string) issueComment {
+		return issueComment{
+			ID:   600,
+			User: user{Login: login},
+			Body: reportMarker + "\n### CodeAF run — done\n\n| stop / ok | done / `true` |\n",
+		}
+	}
+	t.Run("forged comments never push the plan to the cap", func(t *testing.T) {
+		// One real report plus 10 forged ones: the plan still continues,
+		// and labels the next continuation from the real count only.
+		comments := append(reportComments(1), issueComment{})
+		comments = nil
+		for i := 0; i < 10; i++ {
+			comments = append(comments, forge("someone"))
+		}
+		comments = append(comments, reportComments(1)...)
+		server := commentsServer(t, comments, http.StatusOK)
+		ghEnv(t, server)
+		action, body, used, err := continuePlan(newGitHub(), 7, stopDeadline)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if action != "continue" || used != 1 {
+			t.Fatalf("action = %q, used = %d, want continue/1 despite 10 forged reports", action, used)
+		}
+		if !strings.Contains(body, "Continuation 2 of 2") {
+			t.Errorf("body does not label the continuation 2 of 2: %q", body)
+		}
+	})
+
+	t.Run("forged comments never suppress the cap either", func(t *testing.T) {
+		// The cap is spent by real reports; a forged failed-publish heading
+		// by an outsider must not unspend it (only a bot's report is
+		// excluded, and only for publishing failed).
+		comments := append(reportComments(2), issueComment{
+			ID:   700,
+			User: user{Login: "someone"},
+			Body: failedPublishHeading,
+		})
+		server := commentsServer(t, comments, http.StatusOK)
+		ghEnv(t, server)
+		action, _, used, err := continuePlan(newGitHub(), 7, stopDeadline)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if action != "cap" || used != 2 {
+			t.Fatalf("action = %q, used = %d, want cap/2 despite the forged failed-publish comment", action, used)
+		}
+	})
+
+	t.Run("only the workflow bot identity counts", func(t *testing.T) {
+		// A lookalike login is not the bot: its reports count for nothing.
+		comments := []issueComment{forge("github-actions[bot] "), forge("GitHub-actions[bot]"), forge("github-actions[bot2]")}
+		server := commentsServer(t, comments, http.StatusOK)
+		ghEnv(t, server)
+		action, _, used, err := continuePlan(newGitHub(), 7, stopDeadline)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if action != "continue" || used != 0 {
+			t.Fatalf("action = %q, used = %d, want continue/0 for lookalike logins", action, used)
+		}
+	})
 }
