@@ -23,23 +23,28 @@ var dispatchCases = []struct {
 	number  int
 	lane    int
 	profile string
+	routine string
 }{
-	{"issue", "issue", 3, 0, ""},
-	{"issue lane", "issue", 133, 2, ""},
-	{"pr", "pr", 7, 1, ""},
-	{"review", "review", 7, 3, ""},
-	{"plan", "plan", 0, 0, ""},
-	{"plan lane", "plan", 0, 2, ""},
-	{"issue profile", "issue", 5, 1, "baseline"},
+	{"issue", "issue", 3, 0, "", ""},
+	{"issue lane", "issue", 133, 2, "", ""},
+	{"pr", "pr", 7, 1, "", ""},
+	{"review", "review", 7, 3, "", ""},
+	{"plan", "plan", 0, 0, "", ""},
+	{"plan lane", "plan", 0, 2, "", ""},
+	{"issue profile", "issue", 5, 1, "baseline", ""},
+	// The name is one of the committed routines.json entries; the gate
+	// reads the same file in Decide, so the round trip holds.
+	{"routine", "routine", 0, 0, "", "model-prices"},
+	{"routine lane", "routine", 0, 2, "", "model-prices"},
 }
 
-// newDispatchError checks newDispatch accepts what it should and returns
-// the dispatch.
-func dispatchOf(t *testing.T, kind string, number, lane int, profile string) dispatch {
+// dispatchOf checks newDispatch accepts what it should and returns the
+// dispatch.
+func dispatchOf(t *testing.T, kind string, number, lane int, profile, routine string) dispatch {
 	t.Helper()
-	d, err := newDispatch(kind, number, lane, profile)
+	d, err := newDispatch(kind, number, lane, profile, routine)
 	if err != nil {
-		t.Fatalf("newDispatch(%s, %d, %d, %q): %v", kind, number, lane, profile, err)
+		t.Fatalf("newDispatch(%s, %d, %d, %q, %q): %v", kind, number, lane, profile, routine, err)
 	}
 	return d
 }
@@ -81,7 +86,7 @@ func TestDispatchRoundTrip(t *testing.T) {
 			if c.profile != "" {
 				t.Setenv("HARNESS_DIR", ".")
 			}
-			d := dispatchOf(t, c.kind, c.number, c.lane, c.profile)
+			d := dispatchOf(t, c.kind, c.number, c.lane, c.profile, c.routine)
 			ev := event{Inputs: d.inputs()}
 			ev.Repository.DefaultBranch = "main"
 			got, err := Decide("workflow_dispatch", ev, "codeaf", lookup, issues)
@@ -121,8 +126,8 @@ func TestDispatchRoundTrip(t *testing.T) {
 				if got.Run {
 					t.Fatalf("Decide(%v) ran a dispatch the gate refuses: %+v", c.inputs, got)
 				}
-				if !strings.Contains(got.Reason, "a plan dispatch takes no") {
-					t.Fatalf("Decide(%v) reason = %q; want the plan-input refusal", c.inputs, got.Reason)
+				if !strings.Contains(got.Reason, c.wantReason) {
+					t.Fatalf("Decide(%v) reason = %q; want the %s refusal", c.inputs, got.Reason, c.wantReason)
 				}
 			})
 		}
@@ -135,31 +140,37 @@ func TestDispatchRoundTrip(t *testing.T) {
 // would reject.
 func TestDispatchInvalid(t *testing.T) {
 	for _, c := range []struct {
-		name   string
-		kind   string
-		number int
+		name    string
+		kind    string
+		number  int
+		routine string
 	}{
-		{"unknown kind", "planner", 3},
-		{"issue zero", "issue", 0},
-		{"issue negative", "issue", -1},
-		{"pr zero", "pr", 0},
-		{"review zero", "review", 0},
+		{"unknown kind", "planner", 3, ""},
+		{"issue zero", "issue", 0, ""},
+		{"issue negative", "issue", -1, ""},
+		{"pr zero", "pr", 0, ""},
+		{"review zero", "review", 0, ""},
+		{"routine empty", "routine", 0, ""},
+		{"routine bad name", "routine", 0, "Model_Prices"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			if _, err := newDispatch(c.kind, c.number, 0, ""); err == nil {
-				t.Fatalf("newDispatch(%s, %d) accepted", c.kind, c.number)
+			if _, err := newDispatch(c.kind, c.number, 0, "", c.routine); err == nil {
+				t.Fatalf("newDispatch(%s, %d, %q) accepted", c.kind, c.number, c.routine)
 			}
 		})
 	}
 	for _, c := range refusedDispatchCases {
 		t.Run("refused "+c.name, func(t *testing.T) {
-			if _, err := newDispatch(c.kind, c.number, c.lane, c.profile); err == nil {
-				t.Fatalf("newDispatch(%s, %d, %d, %q) accepted a dispatch the gate refuses", c.kind, c.number, c.lane, c.profile)
+			if _, err := newDispatch(c.kind, c.number, c.lane, c.profile, c.routine); err == nil {
+				t.Fatalf("newDispatch(%s, %d, %d, %q, %q) accepted a dispatch the gate refuses", c.kind, c.number, c.lane, c.profile, c.routine)
 			}
 		})
 	}
-	if _, err := newDispatch("plan", 0, 2, ""); err != nil {
+	if _, err := newDispatch("plan", 0, 2, "", ""); err != nil {
 		t.Fatalf("newDispatch(plan, 0, 2): %v", err)
+	}
+	if _, err := newDispatch("routine", 0, 2, "", "model-prices"); err != nil {
+		t.Fatalf("newDispatch(routine, 0, 2, model-prices): %v", err)
 	}
 }
 
@@ -170,11 +181,18 @@ func TestDispatchInvalid(t *testing.T) {
 func TestTitlesRoundTrip(t *testing.T) {
 	for _, c := range dispatchCases {
 		t.Run(c.name, func(t *testing.T) {
-			title := dispatchOf(t, c.kind, c.number, c.lane, c.profile).title()
+			title := dispatchOf(t, c.kind, c.number, c.lane, c.profile, c.routine).title()
 			if c.kind == "plan" {
 				lane, ok := runPlanFields(title)
 				if !ok || lane != c.lane {
 					t.Fatalf("runPlanFields(%q) = (%d, %v); want lane %d", title, lane, ok, c.lane)
+				}
+				return
+			}
+			if c.kind == "routine" {
+				name, lane, ok := runRoutineFields(title)
+				if !ok || name != c.routine || lane != c.lane {
+					t.Fatalf("runRoutineFields(%q) = (%q, %d, %v); want (%q, %d)", title, name, lane, ok, c.routine, c.lane)
 				}
 				return
 			}
@@ -198,28 +216,44 @@ var gateInputs = func() map[string]bool {
 }()
 
 // refusedDispatchCases are the input combinations the gate refuses beside
-// plan=true: any target or profile input. newDispatch refuses the same
+// plan=true (any target or profile input) and beside routine=<name> (any
+// target, plan or profile input): newDispatch refuses the same
 // combinations, so a caller cannot build a dispatch whose inputs() the gate
 // would reject — the #61 failure mode. inputs is the raw map such a
 // workflow_dispatch would send, for the Decide side of the assertion; for
 // the plan-with-target cases the struct analogue is a plan carrying a
-// number, which newDispatch refuses with it.
+// number, which newDispatch refuses with it, and for the routine cases a
+// routine carrying a number or a profile (routine plus plan has no numeric
+// analogue, so its struct is a plan carrying a routine name). wantReason
+// is the gate's own refusal, which Decide must name.
 var refusedDispatchCases = []struct {
-	name    string
-	kind    string
-	number  int
-	lane    int
-	profile string
-	inputs  map[string]string
+	name       string
+	kind       string
+	number     int
+	lane       int
+	profile    string
+	routine    string
+	wantReason string
+	inputs     map[string]string
 }{
-	{"plan profile", "plan", 0, 0, "baseline",
+	{"plan profile", "plan", 0, 0, "baseline", "", "a plan dispatch takes no",
 		map[string]string{"lane": "0", "plan": "true", "profile": "baseline"}},
-	{"plan issue", "plan", 3, 0, "",
+	{"plan issue", "plan", 3, 0, "", "", "a plan dispatch takes no",
 		map[string]string{"lane": "0", "plan": "true", "issue": "3"}},
-	{"plan pr", "plan", 7, 0, "",
+	{"plan pr", "plan", 7, 0, "", "", "a plan dispatch takes no",
 		map[string]string{"lane": "0", "plan": "true", "pr": "7"}},
-	{"plan review", "plan", 7, 0, "",
+	{"plan review", "plan", 7, 0, "", "", "a plan dispatch takes no",
 		map[string]string{"lane": "0", "plan": "true", "review": "7"}},
+	{"routine profile", "routine", 0, 0, "baseline", "model-prices", "a routine dispatch takes no",
+		map[string]string{"lane": "0", "routine": "model-prices", "profile": "baseline"}},
+	{"routine issue", "routine", 3, 0, "", "model-prices", "a routine dispatch takes no",
+		map[string]string{"lane": "0", "routine": "model-prices", "issue": "3"}},
+	{"routine pr", "routine", 7, 0, "", "model-prices", "a routine dispatch takes no",
+		map[string]string{"lane": "0", "routine": "model-prices", "pr": "7"}},
+	{"routine review", "routine", 7, 0, "", "model-prices", "a routine dispatch takes no",
+		map[string]string{"lane": "0", "routine": "model-prices", "review": "7"}},
+	{"routine plan", "plan", 0, 0, "", "model-prices", "a routine dispatch takes no",
+		map[string]string{"lane": "0", "plan": "true", "routine": "model-prices"}},
 }
 
 // dispatchFlag extracts the name from one `-f name=` or `-f "name=` flag.

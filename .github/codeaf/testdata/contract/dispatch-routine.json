@@ -1,0 +1,9 @@
+{
+  "inputs": {
+    "routine": "model-prices",
+    "lane": "0"
+  },
+  "repository": {
+    "default_branch": "main"
+  }
+}
