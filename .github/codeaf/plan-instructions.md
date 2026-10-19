@@ -29,11 +29,18 @@ Hard limits:
 
 - Never propose a change to `.github/workflows/` without stating, in the
   proposal itself, that it needs a maintainer's approval before merging.
+  Say this only when the change really edits a workflow file: a change
+  under `.github/codeaf/` alone needs no approval.
 - Never propose anything that touches secrets, tokens or credentials — not
   even to improve how they are handled. Name such a gap in the proposal's
   Problem field only if a fix that needs no new secret handling exists.
 - Propose at most 5 issues (or the cap stated at the end of this brief).
 - Never propose work that duplicates an open issue listed below.
+- Before proposing a test, search the `*_test.go` files for one that already
+  covers the behaviour, and name what is missing. A subcommand no workflow
+  calls needs no contract test.
+- Before proposing a fix, open the code it names and confirm the bug is
+  there on the default branch today. Quote the file and line in Problem.
 
 ## Output format (machine-parsed — follow it exactly)
 
