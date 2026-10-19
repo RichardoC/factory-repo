@@ -66,6 +66,16 @@ type queueOptions struct {
 	// current head is in the set has already been re-picked at that commit
 	// and is skipped until its head moves.
 	PRMarkers map[int][]string
+	// IssueRetries holds, by issue number, the stranded issues (issue #240)
+	// eligible for their one bounded re-pick: open, non-PR issues labelled
+	// codeaf whose latest bot comment is a failed run's report and which
+	// carry no retry marker yet. The caller classifies the comments and
+	// fills the map; Next itself only reads it. An issue in the map is
+	// re-picked like a queued issue — the usual gates (dependencies,
+	// readiness, areas) run again, since the repo may have moved on since
+	// the first run. Issues not in the map keep dropping out of the pick
+	// as before: a second failure is a maintainer hand-off, not a retry.
+	IssueRetries map[int]bool
 	// NoAreaHeld, when non-nil, is called once per candidate held because it
 	// names no area (reason "no area label", issue #132). Like Logf, it is
 	// the caller's side effect; Next's pick never depends on it.
@@ -135,7 +145,12 @@ func startReason(kind string) string {
 // failed publish — open, labelled codeaf, none of the queue labels, no run
 // in progress for it — joins the reviews (issue #215), once per head commit:
 // the caller fetches its head SHA and the SHA any re-pick marker comment
-// names, and a PR whose head still matches its marker is skipped. A pull
+// names, and a PR whose head still matches its marker is skipped. An open
+// issue stranded by a failed run (issue #240) — labelled codeaf, no open
+// pull request closing it, no run in progress for it, its latest bot
+// comment a failed run's report — joins the queued issues for its single
+// bounded re-pick; the caller classifies its comments into IssueRetries,
+// and a second failure goes to a maintainer instead. A pull
 // request is a candidate only while it is open and no in-flight run already
 // has its number as its subject; pull request candidates keep the queue's
 // usual sort (oldest first). Next returns a zero pick when nothing should run: fewer than
@@ -226,6 +241,19 @@ func Next(issues []item, runs []runStatus, o queueOptions) pick {
 				}
 				reviews = append(reviews, i)
 				repicks[i.Number] = head
+			}
+		case i.labelled(o.Label) && !i.labelled(o.QueuedLabel):
+			// Stranded (issue #240): the run this label once marked has
+			// failed, and without a re-pick the issue would drop out of
+			// the factory for good. The caller classified its comments;
+			// only a first failure joins the queue here, for its one
+			// bounded re-pick, and under the usual gates like any queued
+			// issue. A second failure is a maintainer hand-off, never
+			// another retry. An issue carrying both labels is not
+			// stranded — it falls through to the cases below and stays
+			// "already picked up".
+			if o.IssueRetries[i.Number] {
+				queued = append(queued, i)
 			}
 		case !i.labelled(o.QueuedLabel):
 		case i.labelled(o.Label): // already picked up
@@ -960,6 +988,13 @@ func runNext() error {
 	if gh.token != "" {
 		opts.PRHeads, opts.PRMarkers = fetchStrandedPRs(gh, issues, runs, opts.Label, log.Printf)
 	}
+	// The stranded-issue re-pick (issue #240) reads each candidate's
+	// comments here, so Next stays pure. With no token the map stays empty
+	// and no stranded issue is re-picked or escalated.
+	var issueEscalations []int
+	if gh.token != "" {
+		opts.IssueRetries, issueEscalations = fetchStrandedIssues(gh, issues, runs, opts.Label, opts.QueuedLabel, log.Printf)
+	}
 	p := Next(issues, runs, opts)
 	// One comment per held issue, posted once: the marker check keeps a
 	// repeat tick from stacking copies (issue #132, #136). Best effort: a
@@ -976,6 +1011,15 @@ func runNext() error {
 			}
 		}
 	}
+	// The maintainer hand-off (issue #240): label first, then the fixed
+	// comment — the comment failing then still leaves the label on, and
+	// the next tick retries the comment because the marker is missing.
+	// Best effort: a failed escalation never fails the pick.
+	for _, n := range issueEscalations {
+		if err := ensureMaintainerEscalation(gh, n); err != nil {
+			log.Printf("maintainer hand-off on #%d: %v", n, err)
+		}
+	}
 	// The re-pick marker (issue #215): record the head SHA the re-pick was
 	// for, so the next tick skips the PR until its head moves. Best effort:
 	// a failed comment never fails the pick.
@@ -984,6 +1028,15 @@ func runNext() error {
 			if err := ensureRepickMarker(gh, p.Number, sha); err != nil {
 				log.Printf("re-pick marker on #%d: %v", p.Number, err)
 			}
+		}
+	}
+	// The stranded-issue re-pick marker (issue #240): record that the one
+	// retry is spent, so the next failed run hands the issue to a
+	// maintainer instead of looping. Best effort: a failed comment never
+	// fails the pick.
+	if gh.token != "" && p.Kind == kindIssue && opts.IssueRetries[p.Number] {
+		if err := ensureIssueRetryMarker(gh, p.Number); err != nil {
+			log.Printf("re-pick marker on #%d: %v", p.Number, err)
 		}
 	}
 	if p.Kind == "" {
@@ -1276,4 +1329,202 @@ func ensureHoldCommentBody(g github, n int, body string) error {
 		}
 	}
 	return g.post(fmt.Sprintf("/issues/%d/comments", n), map[string]string{"body": body}, nil)
+}
+
+// ---- Stranded issues (issue #240) -------------------------------------
+//
+// A failed run strands its issue: the queue swaps codeaf-queued for codeaf
+// when the run starts, and a codeaf label means "already picked up", so the
+// issue drops out of the factory for good. The re-pick below gives every
+// failure one bounded retry and then hands the issue to a maintainer — the
+// same shape as the stranded pull request re-pick (issue #215), with one
+// difference the PR path does not need: the retry is once per issue, not
+// once per commit, so its marker is remembered across the whole scan.
+
+// queueIssueRetryMarker begins the hidden comment the queue posts when it
+// re-picks a stranded issue: the comment records that the one retry is
+// spent, and keeps the retry to once.
+const queueIssueRetryMarker = "<!-- codeaf-queue-issue-retry -->"
+
+// queueIssueMaintainerMarker begins the hidden comment the queue posts when
+// it hands a stranded issue to a maintainer: the marker keeps repeat ticks
+// from adding the label or posting the comment twice.
+const queueIssueMaintainerMarker = "<!-- codeaf-queue-issue-maintainer -->"
+
+// maintainerLabel goes on an issue the queue stopped retrying: a person has
+// to look at it now.
+const maintainerLabel = "codeaf-maintainer"
+
+// workflowPolicyRefusal is the phrase a publish refusal carries when the
+// change breaks the workflow policy. A run refused on policy grounds fails
+// identically on every retry, so it is never retried at all.
+const workflowPolicyRefusal = "breaks the workflow policy"
+
+// What the queue does with a stranded issue, as strandedIssueState reports
+// it: strandNone leaves the issue where it is, strandRetry re-picks it
+// once, strandMaintainer hands it to a maintainer.
+const (
+	strandNone       = ""
+	strandRetry      = "retry"
+	strandMaintainer = "maintainer"
+)
+
+// strandedIssueState reads what happened to a stranded issue out of its
+// comments: its latest bot comment, the queue's own marker comments aside,
+// is a run report, and the report's outcome decides. A failure report on a
+// first failure is a retry; a failure after the retry, or a publish refusal
+// that names the workflow policy — retrying would repeat the same refusal —
+// goes to a maintainer. Everything else leaves the issue alone: a run that
+// ended well ("done", "changes pushed", "no changes"), a latest bot comment
+// that is no run report, or no bot comments at all.
+//
+// Comments are untrusted data: only bot-authored comments count, so a
+// comment anyone can post on a public repository cannot fake a failed run
+// or spend the retry, and the report shape is matched as strictly as
+// strandedByFailedRun's. The marker comments are skipped in the scan but
+// not forgotten — a retry marker anywhere in the history is what makes the
+// next failure report a maintainer case, whichever order the comments came
+// in.
+func strandedIssueState(comments bodyComments) string {
+	retried, escalated := false, false
+	for _, c := range comments {
+		if c.User.Type != "Bot" {
+			continue
+		}
+		if strings.Contains(c.Body, queueIssueRetryMarker) {
+			retried = true
+		}
+		if strings.Contains(c.Body, queueIssueMaintainerMarker) {
+			escalated = true
+		}
+	}
+	for i := len(comments) - 1; i >= 0; i-- {
+		c := comments[i]
+		if c.User.Type != "Bot" || strings.Contains(c.Body, queueIssueRetryMarker) ||
+			strings.Contains(c.Body, queueIssueMaintainerMarker) || strings.Contains(c.Body, queueRepickMarker) {
+			continue
+		}
+		if !strings.HasPrefix(c.Body, reportMarker+"\n") {
+			return strandNone
+		}
+		failed := strings.HasPrefix(c.Body, reportMarker+"\n### CodeAF run — publishing failed\n") ||
+			strings.HasPrefix(c.Body, reportMarker+"\n### CodeAF run — run job failed\n")
+		if !failed {
+			return strandNone
+		}
+		if escalated || retried || strings.Contains(c.Body, workflowPolicyRefusal) {
+			return strandMaintainer
+		}
+		return strandRetry
+	}
+	return strandNone
+}
+
+// issueRetryBody is the re-pick comment's fixed text (issue #240): the
+// marker, then text built from the issue number alone — no issue text,
+// untrusted data, goes into these comments.
+func issueRetryBody(n int) string {
+	return fmt.Sprintf("%s\nCodeAF's queue re-picked this stranded issue (#%d) once: its last CodeAF run failed and no run is in progress for it. If the run fails again, the queue hands the issue to a maintainer instead of retrying it.", queueIssueRetryMarker, n)
+}
+
+// issueMaintainerBody is the maintainer hand-off's one fixed comment (issue
+// #240), the same text for every hand-off — the run failed again after its
+// retry, or publishing refused the change under the workflow policy. Built
+// from the issue number alone.
+func issueMaintainerBody(n int) string {
+	return fmt.Sprintf("%s\nCodeAF's queue is handing this issue (#%d) to a maintainer: its latest CodeAF run failed in a way retrying will not fix — the run failed again after its one retry, or publishing refused the change under the workflow policy. The issue carries the `codeaf-maintainer` label and needs a person to look at it.", queueIssueMaintainerMarker, n)
+}
+
+// fetchStrandedIssues fetches what the stranded-issue re-pick (issue #240)
+// needs for every candidate the issues list names: the comments of each
+// open, non-PR issue that carries the codeaf label, none of the queue
+// labels, has no run in progress for it, and has no open pull request
+// closing it — that pull request's review or continuation owns the work
+// now. The classification feeds Next through queueOptions, so the pick
+// stays pure. A candidate whose comments cannot be read is skipped: the
+// guard fails closed, since a retry that cannot be recorded could repeat
+// on every tick. Issues already handed to a maintainer stay in the
+// escalations list, so the label and its comment stay ensured;
+// ensureMaintainerEscalation keeps both to once.
+func fetchStrandedIssues(g github, issues []item, runs []runStatus, lbl, queuedLbl string, logf func(string, ...any)) (retries map[int]bool, escalations []int) {
+	retries = map[int]bool{}
+	var inflight []runStatus
+	for _, r := range runs {
+		if r.Status == "queued" || r.Status == "in_progress" {
+			inflight = append(inflight, r)
+		}
+	}
+	// Open pull requests by the issue they close — the `Closes #N` line the
+	// publish step writes first in every PR body. Bodies are untrusted data
+	// of unbounded size, so they are read through cappedBody like every
+	// other body scan.
+	prFor := map[int]bool{}
+	for _, it := range issues {
+		if it.State == "open" && len(it.PullRequest) > 0 {
+			if n := linkedIssue(cappedBody(it.Body)); n > 0 {
+				prFor[n] = true
+			}
+		}
+	}
+	for _, i := range issues {
+		if i.State != "open" || len(i.PullRequest) > 0 {
+			continue
+		}
+		if !i.labelled(lbl) || i.labelled(queuedLbl) || prInFlight(i.Number, inflight) || prFor[i.Number] {
+			continue
+		}
+		var comments bodyComments
+		if err := g.get(fmt.Sprintf("/issues/%d/comments?per_page=100", i.Number), &comments); err != nil {
+			logf("stranded issue #%d comments: %v", i.Number, err)
+			continue
+		}
+		switch strandedIssueState(comments) {
+		case strandRetry:
+			retries[i.Number] = true
+		case strandMaintainer:
+			escalations = append(escalations, i.Number)
+		}
+	}
+	return retries, escalations
+}
+
+// ensureIssueRetryMarker posts the re-pick marker comment on issue n unless
+// a comment carrying the marker is already there (issue #240); the marker
+// keeps the retry to once, whatever later ticks observe.
+func ensureIssueRetryMarker(g github, n int) error {
+	var comments []struct {
+		Body string `json:"body"`
+	}
+	if err := g.get(fmt.Sprintf("/issues/%d/comments?per_page=100", n), &comments); err != nil {
+		return err
+	}
+	for _, c := range comments {
+		if strings.Contains(c.Body, queueIssueRetryMarker) {
+			return nil
+		}
+	}
+	return g.post(fmt.Sprintf("/issues/%d/comments", n), map[string]string{"body": issueRetryBody(n)}, nil)
+}
+
+// ensureMaintainerEscalation hands stranded issue n to a maintainer (issue
+// #240): the codeaf-maintainer label first — the comment failing then still
+// leaves the label on, and the next tick re-posts the comment because the
+// marker is missing — then the one fixed comment, keyed on its marker. A
+// repeat tick with the marker served posts nothing more.
+func ensureMaintainerEscalation(g github, n int) error {
+	var comments []struct {
+		Body string `json:"body"`
+	}
+	if err := g.get(fmt.Sprintf("/issues/%d/comments?per_page=100", n), &comments); err != nil {
+		return err
+	}
+	for _, c := range comments {
+		if strings.Contains(c.Body, queueIssueMaintainerMarker) {
+			return nil
+		}
+	}
+	if err := g.post(fmt.Sprintf("/issues/%d/labels", n), map[string][]string{"labels": {maintainerLabel}}, nil); err != nil {
+		return err
+	}
+	return g.post(fmt.Sprintf("/issues/%d/comments", n), map[string]string{"body": issueMaintainerBody(n)}, nil)
 }
