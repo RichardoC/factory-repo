@@ -1656,6 +1656,132 @@ func TestUpdateIssuesFailsWhenLiveLabelsUnreadable(t *testing.T) {
 	}
 }
 
+// TestUpdateIssuesRefusesUpdateWhenLabelPageTruncated covers the pagination
+// edge of the live label read. The labels connection can truncate just like
+// any other connection, and a truncated page is not a complete label set: a
+// label past the page boundary would be absent from the read, and the update
+// would then delete it — the exact failure the read exists to prevent. So a
+// hasNextPage issue must be treated as unreadable and fail the batch, not be
+// updated from a partial set. The other batch item must not be corrupted
+// either: nothing is written while the refusal stands, and the caller's
+// per-item fallback decides what lands.
+func TestUpdateIssuesRefusesUpdateWhenLabelPageTruncated(t *testing.T) {
+	mutated := false
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID: "team-1",
+			States: config.StateConfig{Todo: "Todo"},
+			Labels: config.LabelConfig{Protected: protectedTestLabels},
+		},
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Query string `json:"query"`
+				}
+				body, _ := io.ReadAll(req.Body)
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
+				}
+				if strings.Contains(payload.Query, "query issueLabelsByID") {
+					// issue-1's labels do not fit one page, so a label the
+					// sync does not own may be on a page this read never saw;
+					// issue-2's page is complete.
+					return jsonResponse(t, `{"data":{"issues":{"nodes":[
+						{"id":"issue-1","labels":{
+							"nodes":[{"id":"label-ordinary","name":"customer-visible"}],
+							"pageInfo":{"hasNextPage":true}
+						}},
+						{"id":"issue-2","labels":{
+							"nodes":[{"id":"label-protected","name":"df:kikimora-snyk"}]
+						}}
+					]}}}`), nil
+				}
+				if strings.Contains(payload.Query, "mutation issueUpdateBatch") {
+					mutated = true
+					return jsonResponse(t, `{"data":{"issueUpdate0":{"success":true}}}`), nil
+				}
+				t.Fatalf("unexpected GraphQL query: %s", payload.Query)
+				return nil, nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolvedTeam:    "team-1",
+		statesByName:    map[string]string{"todo": "state-1"},
+		statesByType:    map[string]string{"unstarted": "state-1"},
+		managedLabelIDs: map[string]string{},
+	}
+
+	updates := []model.IssueUpdate{
+		{
+			Existing: model.ExistingIssue{ID: "issue-1", Identifier: "SNYK-1"},
+			Desired: model.DesiredIssue{
+				Fingerprint: "snyk:proj-1:issue-1",
+				Title:       "Snyk: title",
+				Description: "body",
+				State:       model.StateTodo,
+			},
+		},
+		{
+			Existing: model.ExistingIssue{ID: "issue-2", Identifier: "SNYK-2"},
+			Desired: model.DesiredIssue{
+				Fingerprint: "snyk:proj-1:issue-2",
+				Title:       "Snyk: other title",
+				Description: "other body",
+				State:       model.StateTodo,
+			},
+		},
+	}
+
+	err := client.UpdateIssues(t.Context(), updates)
+	if err == nil {
+		t.Fatal("UpdateIssues() error = nil, want a refusal when the live label page is truncated")
+	}
+	if !strings.Contains(err.Error(), "SNYK-1") {
+		t.Fatalf("UpdateIssues() error = %v, want it to name the truncated issue", err)
+	}
+	if mutated {
+		t.Fatal("UpdateIssues() sent an update mutation from a truncated label page; a label past the page boundary would be deleted")
+	}
+}
+
+// TestFetchLabelsByIssueIDRequestsLabelPageInfo pins the query shape: without
+// pageInfo on the nested labels connection there is no way to tell a complete
+// label set from a truncated one.
+func TestFetchLabelsByIssueIDRequestsLabelPageInfo(t *testing.T) {
+	var capturedQuery string
+	client := &Client{
+		cfg: config.LinearConfig{TeamID: "team-1"},
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Query string `json:"query"`
+				}
+				body, _ := io.ReadAll(req.Body)
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
+				}
+				capturedQuery = payload.Query
+				return jsonResponse(t, `{"data":{"issues":{"nodes":[]}}}`), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		resolvedTeam:    "team-1",
+		statesByName:    map[string]string{},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+
+	if _, err := client.fetchLabelsByIssueID(t.Context(), []string{"issue-1"}); err != nil {
+		t.Fatalf("fetchLabelsByIssueID() error = %v", err)
+	}
+	if !strings.Contains(capturedQuery, "hasNextPage") {
+		t.Fatalf("live label query must request the labels pageInfo, got:\n%s", capturedQuery)
+	}
+	if !strings.Contains(capturedQuery, fmt.Sprintf("labels(first: %d)", maxLiveLabelPage)) {
+		t.Fatalf("live label query must request %d labels per issue, got:\n%s", maxLiveLabelPage, capturedQuery)
+	}
+}
+
 // TestUpdateIssuesAlwaysReadsLiveLabels pins that the live label read runs for
 // every update batch, not only when protected labels are configured. The read
 // is what makes the live set — rather than the run's opening snapshot — the
