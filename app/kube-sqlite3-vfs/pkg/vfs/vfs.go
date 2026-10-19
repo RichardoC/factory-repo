@@ -1203,10 +1203,16 @@ func NewFile(name string, v *vfs) *file {
 
 // Open implements sqlite3vfs.VFS: it backs name with the cluster, creating
 // the file's lock ConfigMap at LockNone and an empty sector 0 if the file
-// has no sectors yet. The lock level stored in the ConfigMap may belong to
-// another process, so a file opened here starts at NONE locally and records
-// only the transitions it performs itself (see file.lockLevel). Transient
-// races between clients are retried up to the VFS's retry budget.
+// has no sectors yet — unless sqlite3vfs.OpenReadOnly is set. A read-only
+// open must leave no trace: for a name with no lock ConfigMap or no sectors
+// it performs no Create and answers CantOpenError, the SQLITE_CANTOPEN a
+// filesystem VFS gives for a missing file, instead of fabricating the
+// lockfile plus empty sector 0 a read-write open would create. Every write
+// path for a read-write open is unchanged. The lock level stored in the
+// ConfigMap may belong to another process, so a file opened here starts at
+// NONE locally and records only the transitions it performs itself (see
+// file.lockLevel). Transient races between clients are retried up to the
+// VFS's retry budget.
 func (v *vfs) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
 	v.logger.Debug("Open", "name", name, "flags", flags)
 
@@ -1215,18 +1221,27 @@ func (v *vfs) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sql
 		return nil, flags, sqlite3vfs.IOError
 	}
 
+	// A read-only open never creates anything: the lock ConfigMap and the
+	// fresh sector 0 are writes, and a reader must not mutate the store.
+	readOnly := flags&sqlite3vfs.OpenReadOnly != 0
+
 	var lastErr error
 	for range v.retries {
-		// Check if namespace and lockfile already exist.
-		// If they don't, create them
-		// if this fails, return readonlyfs
-
 		f := NewFile(name, v)
 
 		// Now check for lock file
 		_, err := v.kc.CoreV1().ConfigMaps(v.namespace).Get(v.ctx, f.LockFileName(), metav1.GetOptions{})
 		switch {
 		case kerrors.IsNotFound(err):
+			if readOnly {
+				// No lock ConfigMap means no file was ever created
+				// here. Creating the lockfile (and the sector 0 the
+				// read-write path adds below) would write to the
+				// cluster on an open that promised not to; fail the
+				// way sqlite expects for a missing file instead.
+				v.logger.Debug("Open: read-only name has no lockfile", "name", name)
+				return nil, flags, sqlite3vfs.CantOpenError
+			}
 			// Fresh lockfile: create it through the CAS so a lost race
 			// against another opener's Create is re-read, not an error.
 			// The no-op mutation leaves the state empty — this file starts
@@ -1267,6 +1282,15 @@ func (v *vfs) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sql
 		v.logger.Debug("Checked for existing sectors", "sectors", names, "len(cms)", len(cms))
 
 		if len(cms) == 0 {
+			if readOnly {
+				// The lock ConfigMap exists but there are no sectors:
+				// no readable file. Fabricating the empty sector 0 is
+				// a write the read-only open must not do — a read of
+				// this name could not be served — so fail the same way
+				// as for a fully missing name.
+				v.logger.Debug("Open: read-only open of an empty file", "name", name)
+				return nil, flags, sqlite3vfs.CantOpenError
+			}
 			// Fresh (or externally emptied) file: create the empty sector 0
 			// that the size computation and reads expect. Known to be new,
 			// so this is one CREATE, with the usual conflict fallback.
