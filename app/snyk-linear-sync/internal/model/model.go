@@ -174,6 +174,14 @@ type ExistingIssue struct {
 	// disappeared (ClosedReasonProjectMissing / ClosedReasonProjectDeactivated),
 	// or "" when the sync did not close it for that reason.
 	ClosedReason string
+	// AwaitingFix records that the sync parked this ticket in Backlog
+	// because Snyk reported the ignore as "until fix available"
+	// (FindingAwaitingFix). It is read from the awaiting_fix marker in the
+	// metadata block, which the sync writes regardless of the label
+	// configuration, so its own Backlog placement stays recognizable even
+	// when LINEAR_AWAITING_FIX_LABEL is off. Tickets written by older code
+	// carry no marker and report false.
+	AwaitingFix bool
 }
 
 // Closed reasons the sync records in the metadata block when it cancels a

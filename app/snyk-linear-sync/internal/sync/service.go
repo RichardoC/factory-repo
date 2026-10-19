@@ -420,12 +420,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			// must move the ticket it parked in Backlog out again. Computed
 			// once here because both the Backlog override below and the
 			// due-date recalculation further down depend on it.
-			//
-			// With LINEAR_AWAITING_FIX_LABEL=off the metadata records no
-			// awaiting-fix label, wasAwaitingFix is always false, and the sync
-			// cannot tell its own Backlog placement from a manual one: the
-			// ticket stays in Backlog as it did before.
-			fixNowAvailable := finding.Status == model.FindingOpen && wasAwaitingFix(existing.ManagedLabels, s.cfg.Linear.Labels.AwaitingFix)
+			fixNowAvailable := finding.Status == model.FindingOpen && wasAwaitingFix(existing, s.cfg.Linear.Labels.AwaitingFix)
 			// The sync itself parked this ticket in Backlog while Snyk reported
 			// the ignore as "until fix available". That is not a manual triage
 			// decision, so neither override below may treat it as one.
@@ -647,6 +642,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 					Identity:      existing.Identity,
 					ManagedLabels: existing.ManagedLabels,
 					ClosedReason:  closedReason,
+					AwaitingFix:   existing.AwaitingFix,
 				}),
 				DueDate:       existing.DueDate,
 				State:         desiredState,
@@ -1239,6 +1235,7 @@ func issueDescriptionWithIdentity(sourceCfg config.SourceConfig, managedLabels [
 		Fingerprint:   finding.Fingerprint,
 		Identity:      identity,
 		ManagedLabels: managedLabels,
+		AwaitingFix:   finding.Status == model.FindingAwaitingFix,
 	}))
 	return strings.Join(lines, "\n")
 }
@@ -1352,6 +1349,13 @@ type managedMetadata struct {
 	// resolve loop; a normal update from a live finding never carries it, so
 	// it is cleared as soon as the ticket tracks an active finding again.
 	ClosedReason string
+	// AwaitingFix marks the ticket as parked in Backlog for a finding Snyk
+	// reports as "ignored until fix available". Unlike the awaiting-fix
+	// label it is written regardless of the label configuration, so the
+	// sync can recognize its own Backlog placement even when
+	// LINEAR_AWAITING_FIX_LABEL is off. It is cleared as soon as the
+	// finding leaves the awaiting-fix state.
+	AwaitingFix bool
 }
 
 func metadataBlock(meta managedMetadata) string {
@@ -1367,6 +1371,9 @@ func metadataBlock(meta managedMetadata) string {
 	}
 	if meta.ClosedReason != "" {
 		lines = append(lines, fmt.Sprintf("closed_reason: %s", meta.ClosedReason))
+	}
+	if meta.AwaitingFix {
+		lines = append(lines, "awaiting_fix: yes")
 	}
 	lines = append(lines, "-->")
 	return strings.Join(lines, "\n")
@@ -2188,15 +2195,21 @@ func isConfiguredBacklogState(existingStateName, configuredBacklog string) bool 
 }
 
 // wasAwaitingFix reports whether the existing Linear issue was previously in
-// the awaiting-fix state, based on the managed label recorded in the metadata
-// block. This detects issues that were blocked on an upstream fix and have
+// the awaiting-fix state. It reads the awaiting_fix marker in the metadata
+// block, which the sync writes whenever a finding is in the awaiting-fix
+// state regardless of the label configuration, and also accepts the
+// configured awaiting-fix label for tickets written before the marker
+// existed. This detects issues that were blocked on an upstream fix and have
 // now become actionable.
-func wasAwaitingFix(managedLabels []string, awaitingFixLabel string) bool {
+func wasAwaitingFix(existing model.ExistingIssue, awaitingFixLabel string) bool {
+	if existing.AwaitingFix {
+		return true
+	}
 	if awaitingFixLabel == "" {
 		return false
 	}
 	normalized := model.NormalizeLabelName(awaitingFixLabel)
-	return slices.Contains(model.NormalizeManagedLabelNames(managedLabels), normalized)
+	return slices.Contains(model.NormalizeManagedLabelNames(existing.ManagedLabels), normalized)
 }
 
 // isNonTerminalModelState reports whether the desired model state is

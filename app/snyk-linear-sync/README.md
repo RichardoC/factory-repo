@@ -257,9 +257,10 @@ When an issue is in the awaiting-fix state, the sync:
 - places the issue in `Backlog` with no due date
 - adds the configured awaiting-fix label
 - renders `Status: ignored (no fix available)` in the description
-- removes the awaiting-fix label when a fix becomes available and the issue moves to `Todo`
+- writes an `awaiting_fix: yes` marker into the metadata block
+- removes the awaiting-fix label and clears the marker when a fix becomes available and the issue moves to `Todo`
 
-Setting `LINEAR_AWAITING_FIX_LABEL=off` has one limitation besides the missing label: the metadata block records no awaiting-fix label, so a later run cannot tell a `Backlog` placement the sync made itself from one a person made by hand. An "ignored until fix available" ticket in `Backlog` therefore stays in `Backlog` when its fix arrives. Keep the label enabled (the default) for the automatic move back to `Todo`.
+The `awaiting_fix` marker is written regardless of the label configuration, so even with `LINEAR_AWAITING_FIX_LABEL=off` a later run can tell a `Backlog` placement the sync made itself from one a person made by hand: when the fix arrives, the ticket still moves back to `Todo` with a recalculated due date. Tickets written before the marker existed carry no `awaiting_fix` line; they keep the old behavior (they stay in `Backlog` once the fix arrives) until the sync rewrites their description in a later awaiting-fix run — no one-time mass update happens on upgrade. Keep the label enabled (the default) to make these tickets filterable.
 
 When tool, origin, or awaiting-fix label mapping is enabled, the sync manages the global automation label plus the derived label set recorded in the metadata block.
 
