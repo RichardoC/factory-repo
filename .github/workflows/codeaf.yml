@@ -652,10 +652,14 @@ jobs:
               # is recomputed here from origin: the merge info the run left
               # is validated data, never executed, and any mismatch refuses
               # the publish.
-              "$HARNESS" merge-default publish "$IN/base-commit" "$IN/merge-info.json" "$RUNNER_TEMP/merge-state.env"
+              # The patch is named so issue #171's replay check can refuse a
+              # patch that would re-publish the base's own changes: a base
+              # merge the run left unverifiable is refused, not squashed into
+              # the work commit. The argument is optional in merge.go, so an
+              # unmerged workflow line keeps calling it with three.
+              "$HARNESS" merge-default publish "$IN/base-commit" "$IN/merge-info.json" "$RUNNER_TEMP/merge-state.env" "$IN/changes.patch"
               if grep -qx "state=clean" "$RUNNER_TEMP/merge-state.env" 2>/dev/null; then merge_state=clean; fi
               if grep -qx "state=conflicted" "$RUNNER_TEMP/merge-state.env" 2>/dev/null; then merge_state=conflicted; fi
-              if grep -qx "state=ff" "$RUNNER_TEMP/merge-state.env" 2>/dev/null; then merge_state=ff; fi
             fi
           else
             # A new branch. If the default branch moved while CodeAF ran, the

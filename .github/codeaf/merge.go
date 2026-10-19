@@ -23,8 +23,12 @@
 //	         verified by recomputation (AGENTS.md, "Security rules"). The
 //	         patch is then applied -- it removes the markers -- and publish
 //	         refuses while any conflict marker remains. When the run left no
-//	         merge info (it died before merging), publish merges the base tip
-//	         itself first, so a behind-but-clean PR is never left behind.
+//	         merge info (it died before merging, or a run the gate kept from
+//	         merging), publish still lands the base as a merge commit with
+//	         both parents first -- never a fast-forward, and never inside the
+//	         work commit -- and refuses a patch that would re-publish the
+//	         base's own changes, the squash run 39094290325 published for
+//	         #163 (issue #171).
 //
 // The invariants hold: `git apply` is still the only thing applied from run;
 // the .github/ approval check still reads the staged patch diff; and every
@@ -46,6 +50,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -70,7 +75,7 @@ type mergeInfo struct {
 // mergeOutcome is what a merge phase did, for the workflow steps to read.
 // State "none" means no merge was made and the patch alone is pushed.
 type mergeOutcome struct {
-	State  string   // "clean", "conflicted", "ff" or "none"
+	State  string   // "clean", "conflicted" or "none"
 	Commit string   // the merge commit made here, when one was
 	Tree   string   // its tree
 	Files  []string // the paths a conflicted merge conflicts in
@@ -355,14 +360,6 @@ func workflowChanges(dir, from, to string) ([]string, error) {
 	return strings.Fields(out), nil
 }
 
-// baseBranchState decides from the compare status whether a merge is needed
-// at all: "behind" and "identical" mean the branch already contains the base
-// tip, and "ahead" means the branch is strictly behind it, which publish
-// fast-forwards. Everything else is handled by the callers.
-func mergeNeeded(status string) bool {
-	return status == "diverged"
-}
-
 // runMerge is the run-job half of issue #57: it merges the base branch tip
 // into the PR head branch in the run job's checkout, before CodeAF works. A
 // clean merge is committed as an ordinary merge commit; a conflicted one as a
@@ -410,19 +407,28 @@ func runMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile string, compar
 		log.Printf("merge-default: could not compare the branch with %s (%v); continuing without a merge", baseRef, err)
 		return out, nil
 	}
+	// The branch point the merge is computed over: for a diverged branch the
+	// compare API's merge base; for a strictly-behind branch (issue #171) the
+	// head itself, which is its own branch point.
+	base := ""
 	switch {
-	case !mergeNeeded(cmp.Status):
-		if cmp.Status != "ahead" && cmp.Status != "behind" && cmp.Status != "identical" {
-			log.Printf("merge-default: unexpected compare status %q; continuing without a merge", cmp.Status)
+	case cmp.Status == "behind" || cmp.Status == "identical":
+		return out, nil // the base tip is already contained in the branch
+	case cmp.Status == "ahead":
+		// The branch is strictly behind its base: still a merge, never a
+		// fast-forward -- a single-parent commit would leave the base's
+		// changes indistinguishable from the branch's own work (issue #171).
+		base = head
+	case cmp.Status == "diverged":
+		if cmp.MergeBase == "" || !isSHA(cmp.MergeBase) {
+			log.Printf("merge-default: the compare API named no merge base; continuing without a merge")
+			return out, nil
 		}
-		// "ahead": the branch is strictly behind its base; publish
-		// fast-forwards it. "behind"/"identical": the base is already in.
-		return out, nil
-	case cmp.MergeBase == "" || !isSHA(cmp.MergeBase):
-		log.Printf("merge-default: the compare API named no merge base; continuing without a merge")
+		base = cmp.MergeBase
+	default:
+		log.Printf("merge-default: unexpected compare status %q; continuing without a merge", cmp.Status)
 		return out, nil
 	}
-	base := cmp.MergeBase
 	if err := fetchCommit(dir, base); err != nil {
 		log.Printf("merge-default: could not fetch the merge base %s (%v); continuing without a merge", shortSHA(base), err)
 		return out, nil
@@ -477,14 +483,18 @@ func runMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile string, compar
 	return out, nil
 }
 
-// publishMerge is the publish half of issue #57. With the run's merge info it
-// recreates the merge from the same two parents, refusing unless the tree it
-// computes itself matches the recorded one. Without it -- a run that merged
-// nothing, or died before merging -- it merges the base tip first, so a
-// behind-but-clean PR is never left behind, and keeps the stale-patch refusal
-// for a branch that moved. It writes the merge state for the workflow steps
-// and the marker check; the caller pushes only what this produced.
-func publishMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile, stateFile string, compare compareFunc) (out mergeOutcome, err error) {
+// publishMerge is the publish half of issues #57 and #171. With the run's
+// merge info it recreates the merge from the same two parents, refusing
+// unless the tree it computes itself matches the recorded one. Without it --
+// a run that merged nothing, or died before merging -- it still lands the
+// base as a merge commit with both parents (never a fast-forward, and never
+// inside the work commit), and refuses a patch that would re-publish the
+// base's own changes, the squash run 39094290325 published for #163, rather
+// than push a single commit whose parents cannot show what came from the
+// base. The stale-patch refusal stays for a branch that moved. It writes the
+// merge state for the workflow steps and the marker check; the caller pushes
+// only what this produced.
+func publishMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile, stateFile, patchPath string, compare compareFunc) (out mergeOutcome, err error) {
 	// On success the state file records what happened, for the workflow
 	// steps (the push condition, the report) and the marker check.
 	defer func() {
@@ -513,7 +523,7 @@ func publishMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile, stateFile
 	// No merge info: the run merged nothing. The patch must be against the
 	// branch head, as it always was.
 	if baseCommit != head {
-		return mergeOutcome{State: "none"}, fmt.Errorf("the branch moved while CodeAF ran (base commit %.12s, branch head %.12s); refusing to apply a stale patch", baseCommit, head)
+		return mergeOutcome{State: "none"}, fmt.Errorf("the run's base commit %.12s is not the PR head publish fetched (%.12s): the branch moved while CodeAF ran, or the run made a base merge it left no verifiable merge info for; refusing to apply a stale patch", baseCommit, head)
 	}
 	out = mergeOutcome{State: "none"}
 	if baseRef == "" {
@@ -537,23 +547,45 @@ func publishMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile, stateFile
 		return out, nil
 	}
 	switch {
-	case !mergeNeeded(cmp.Status):
-		if cmp.Status == "ahead" {
-			// The branch is strictly behind its base: a fast-forward brings
-			// the base in with no merge commit, and the patch applies on top.
-			if wf, err := workflowChanges(dir, head, onto); err != nil || len(wf) > 0 {
-				log.Printf("merge-default: %s changed workflows (%v); the push token cannot carry them, so pushing the patch without a fast-forward", baseRef, wf)
-				return out, nil
-			}
-			if err := gitRun(dir, "reset", "--hard", onto); err != nil {
-				return out, err
-			}
-			out.State = "ff"
-			fmt.Printf("::notice::fast-forwarded %s to %s (%s)\n", branch, shortSHA(onto), baseRef)
+	case cmp.Status == "behind" || cmp.Status == "identical":
+		return out, nil // the base tip is already contained in the branch
+	case cmp.Status == "ahead":
+		// The branch is strictly behind its base (issue #171): the base comes
+		// in as a merge commit with both parents, never a fast-forward -- a
+		// single-parent commit leaves the base's changes indistinguishable
+		// from the branch's own work, and the PR's diff replays them.
+		if err := refuseReplayedBaseMerge(dir, patchPath, head, onto); err != nil {
+			return out, err
+		}
+		if wf, err := workflowChanges(dir, head, onto); err != nil || len(wf) > 0 {
+			log.Printf("merge-default: %s changed workflows (%v); the push token cannot carry them, so pushing the patch without the merge", baseRef, wf)
 			return out, nil
 		}
+		tree, _, conflicted, err := mergeTree(dir, head, head, onto)
+		if err != nil || conflicted {
+			// ours is the merge base here, so the merge cannot conflict;
+			// anything else is a degraded host state, and the patch goes
+			// alone as before #57.
+			log.Printf("merge-default: could not compute the behind-branch merge (%v); pushing the patch without one", err)
+			return out, nil
+		}
+		commit, err := commitMerge(dir, tree, head, onto, fmt.Sprintf("Merge %s into %s", baseRef, branch))
+		if err != nil {
+			return out, err
+		}
+		if err := gitRun(dir, "reset", "--hard", commit); err != nil {
+			return out, err
+		}
+		out = mergeOutcome{State: mergeKindClean, Commit: commit, Tree: tree}
+		fmt.Printf("::notice::landed a merge commit bringing %s (%s) into %s before the patch\n", baseRef, shortSHA(onto), branch)
 		return out, nil
-	case cmp.MergeBase == "" || !isSHA(cmp.MergeBase):
+	case cmp.Status == "diverged":
+		// handled below, over the compare API's merge base
+	default:
+		log.Printf("merge-default: unexpected compare status %q; pushing the patch without a merge", cmp.Status)
+		return out, nil
+	}
+	if cmp.MergeBase == "" || !isSHA(cmp.MergeBase) {
 		log.Printf("merge-default: the compare API named no merge base; pushing the patch without a merge")
 		return out, nil
 	}
@@ -561,6 +593,14 @@ func publishMerge(dir, branch, baseRef, baseCommitFile, mergeInfoFile, stateFile
 	if err := fetchCommit(dir, base); err != nil {
 		log.Printf("merge-default: could not fetch the merge base %s (%v); pushing the patch without a merge", shortSHA(base), err)
 		return out, nil
+	}
+	// Issue #171: a patch that would re-publish the base's own changes is a
+	// base merge the run left unverifiable, and is refused before anything is
+	// applied -- checked here and on the behind branch above, always before
+	// the workflow gate, whose "patch alone" outcome is where the squash of
+	// run 39094290325 happened.
+	if err := refuseReplayedBaseMerge(dir, patchPath, base, onto); err != nil {
+		return out, err
 	}
 	if wf, err := workflowChanges(dir, base, onto); err != nil || len(wf) > 0 {
 		log.Printf("merge-default: %s changed workflows since the branch point (%v); the push token cannot carry them, so pushing the patch without the merge", baseRef, wf)
@@ -640,13 +680,19 @@ func recreateMerge(dir, branch, baseRef string, info *mergeInfo, baseCommit, hea
 	if err != nil {
 		return out, fmt.Errorf("could not compare the branch with the recorded base tip: %w", err)
 	}
-	if rel.Status != "diverged" {
+	// A diverged branch merges over the compare API's merge base; a strictly
+	// behind one (issue #171: a run that brought a behind branch up to its
+	// base) merges over the head itself, which is its own branch point.
+	if rel.Status != "diverged" && rel.Status != "ahead" {
 		return out, fmt.Errorf("the parents of the recorded merge are not diverged (compare says %q); refusing the merge", rel.Status)
 	}
-	if rel.MergeBase == "" || !isSHA(rel.MergeBase) {
+	base := rel.MergeBase
+	if rel.Status == "ahead" {
+		base = head
+	}
+	if base == "" || !isSHA(base) {
 		return out, errors.New("the compare API named no merge base for the recorded merge; refusing")
 	}
-	base := rel.MergeBase
 	if err := fetchCommit(dir, base); err != nil {
 		return out, fmt.Errorf("could not fetch the merge base %s: %w", shortSHA(base), err)
 	}
@@ -757,6 +803,212 @@ func verifyMerge(dir, stateFile string) error {
 	return nil
 }
 
+// The bounds of the issue #171 replay check. A patch or a base changed-file
+// list over either cap is not checked: publish then relies on the strict (or
+// 3-way) apply, as before #171. The check never reads past these caps.
+const maxReplayNames = 2000
+const maxReplayPatchSize = 1 << 26 // 64 MB; the workflow refuses over 50 MB
+
+// refuseReplayedBaseMerge refuses a patch that would re-publish the base
+// branch's own changes (issue #171): when the run made a base merge it left
+// no verifiable record of -- merge-info.json missing or unusable -- its
+// content reaches publish only inside the patch, and applying it lands the
+// base's changes in the work commit as a squash, the way run 39094290325
+// published #163: one commit carrying #161/#164's snyk-linear-sync code,
+// #166's queue gate and #162's copied workflow edit, with no merge commit
+// anywhere.
+//
+// Only an exact replay is refused: a post-image the base tip also has means
+// the patch is carrying the base's content, and without merge info publish
+// cannot tell a base merge the run made from work the agent did on top of it.
+// A file the agent edited beyond the base's content is the agent's own work;
+// the strict (or 3-way) apply then decides whether it fits. Every read is
+// bounded, and an over-cap or unparsable patch skips the check: the apply
+// decides, as it did before #171. The patch is run-job output, so it is
+// untrusted data (AGENTS.md): parsed, never sourced, and applied only in a
+// private index that starts at the branch head.
+func refuseReplayedBaseMerge(dir, patchPath, branchPoint, onto string) error {
+	if patchPath == "" || !isSHA(branchPoint) || !isSHA(onto) {
+		return nil
+	}
+	// What the base branch changed since the branch point, bounded.
+	changed, err := gitOutput(dir, "diff", "--no-renames", "--name-only", branchPoint, onto)
+	if err != nil {
+		return nil // cannot tell what the base changed; the apply decides
+	}
+	baseFiles, bounded := boundedNames(changed, maxReplayNames)
+	if !bounded {
+		log.Printf("merge-default: over %d files changed in the base since the branch point; the replay check is skipped", maxReplayNames)
+		return nil
+	}
+	patchFiles, bounded := patchTouchedFiles(patchPath)
+	if !bounded {
+		log.Printf("merge-default: over %d files touched by the patch; the replay check is skipped", maxReplayNames)
+		return nil
+	}
+	var common []string
+	for f := range baseFiles {
+		if patchFiles[f] {
+			common = append(common, f)
+		}
+	}
+	sort.Strings(common)
+	if len(common) == 0 {
+		return nil // the patch touches nothing the base changed: no replay
+	}
+	post, ok := patchPostImages(dir, patchPath, common)
+	if !ok {
+		return nil // the patch does not apply on the branch head; the apply decides
+	}
+	for _, f := range common {
+		if post[f] == baseBlob(dir, onto, f) {
+			return fmt.Errorf("the patch replays the base branch's changes to %s: the run's base merge is present but unverifiable (no merge info), and applying it would land the base's changes in the work commit; refusing to publish them as a single commit", f)
+		}
+	}
+	return nil
+}
+
+// boundedNames splits a newline list into a set, reporting whether it fit.
+func boundedNames(list string, max int) (map[string]bool, bool) {
+	out := make(map[string]bool)
+	for _, line := range strings.Split(strings.TrimRight(list, "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		if len(out) >= max {
+			return nil, false
+		}
+		out[line] = true
+	}
+	return out, true
+}
+
+// patchTouchedFiles names the files a patch touches, from its "diff --git"
+// lines. It reports false when the patch is over its size cap or names more
+// files than the cap, or when a "diff --git" line cannot be parsed with
+// bounds (a quoted path): the caller then skips the replay check and lets the
+// apply decide. A missing patch file touches nothing.
+func patchTouchedFiles(patchPath string) (map[string]bool, bool) {
+	data, err := os.ReadFile(patchPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return map[string]bool{}, true
+		}
+		return nil, false
+	}
+	if len(data) > maxReplayPatchSize {
+		return nil, false
+	}
+	out := make(map[string]bool)
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "diff --git ") || strings.Contains(line, `"`) {
+			continue // a quoted path: parsed with bounds, the apply decides
+		}
+		rest := strings.TrimPrefix(line, "diff --git a/")
+		i := strings.Index(rest, " b/")
+		if i <= 0 {
+			continue
+		}
+		a, b := rest[:i], rest[i+3:]
+		for _, name := range []string{a, b} {
+			if name == "" {
+				continue
+			}
+			if len(out) >= maxReplayNames {
+				return nil, false
+			}
+			out[name] = true
+		}
+	}
+	return out, true
+}
+
+// patchPostImages reads the post-image (mode and blob) the patch produces for
+// each named file, in a private index that starts at the branch head: the
+// checkout's index and working tree are never touched. It reports false when
+// the patch does not apply on the head; the caller then lets the apply
+// decide.
+func patchPostImages(dir, patchPath string, files []string) (map[string]string, bool) {
+	index, err := os.CreateTemp("", "codeaf-replay-index-")
+	if err != nil {
+		return nil, false
+	}
+	name := index.Name()
+	index.Close()
+	defer os.Remove(name)
+	if err := gitIndexRun(dir, name, "read-tree", "HEAD"); err != nil {
+		return nil, false
+	}
+	if err := gitIndexRun(dir, name, "apply", "--cached", "--binary", "--whitespace=nowarn", patchPath); err != nil {
+		return nil, false
+	}
+	out := make(map[string]string, len(files))
+	for _, f := range files {
+		line, err := gitIndexOutput(dir, name, "ls-files", "-s", "--", f)
+		if err != nil {
+			return nil, false
+		}
+		out[f] = indexPostImage(line)
+	}
+	return out, true
+}
+
+// indexPostImage turns one "git ls-files -s" line into its "mode blob" pair,
+// empty when the index carries no entry (the patch deleted the file).
+func indexPostImage(line string) string {
+	fields := strings.Fields(strings.TrimSpace(line))
+	if len(fields) < 2 {
+		return ""
+	}
+	return fields[0] + " " + fields[1]
+}
+
+// baseBlob reads the "mode blob" pair the named commit carries for a path,
+// empty when the commit has no entry there.
+func baseBlob(dir, commit, path string) string {
+	out, err := gitOutput(dir, "ls-tree", commit, "--", path)
+	if err != nil {
+		return ""
+	}
+	fields := strings.Fields(out)
+	if len(fields) < 3 || fields[1] != "blob" {
+		return ""
+	}
+	return fields[0] + " " + fields[2]
+}
+
+// gitIndexOutput runs git with a private index (GIT_INDEX_FILE) and returns
+// its stdout, for reads that must not touch the checkout's index.
+func gitIndexOutput(dir, indexFile string, args ...string) (string, error) {
+	return gitEnvOutput(dir, []string{"GIT_INDEX_FILE=" + indexFile}, args...)
+}
+
+// gitIndexRun runs git with a private index, discarding stdout.
+func gitIndexRun(dir, indexFile string, args ...string) error {
+	_, err := gitEnvOutput(dir, []string{"GIT_INDEX_FILE=" + indexFile}, args...)
+	return err
+}
+
+// gitEnvOutput runs git with extra environment and returns its stdout. A
+// nonzero exit is an error carrying the first of stderr.
+func gitEnvOutput(dir string, env []string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), env...)
+	var out, errBuf bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errBuf
+	err := cmd.Run()
+	if err != nil {
+		stderr := strings.TrimSpace(errBuf.String())
+		if len(stderr) > 300 {
+			stderr = stderr[:300]
+		}
+		return out.String(), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, stderr)
+	}
+	return out.String(), nil
+}
+
 // runMergeDefault implements `harness merge-default` (issue #57):
 //
 //	harness merge-default run BASE_COMMIT_FILE MERGE_INFO_FILE
@@ -790,10 +1042,17 @@ func runMergeDefault() error {
 		_, err := runMerge(".", branch, baseRef, args[0], args[1], ghCompare)
 		return err
 	case "publish":
-		if len(args) != 3 {
-			return errors.New("usage: harness merge-default publish BASE_COMMIT_FILE MERGE_INFO_FILE STATE_FILE")
+		if len(args) != 3 && len(args) != 4 {
+			return errors.New("usage: harness merge-default publish BASE_COMMIT_FILE MERGE_INFO_FILE STATE_FILE [PATCH_FILE]")
 		}
-		_, err := publishMerge(".", branch, baseRef, args[0], args[1], args[2], ghCompare)
+		// The patch file is optional so an unmerged workflow line (applied by
+		// a maintainer, per AGENTS.md) keeps calling this with three
+		// arguments; without it the issue #171 replay check is skipped.
+		patchPath := ""
+		if len(args) == 4 {
+			patchPath = args[3]
+		}
+		_, err := publishMerge(".", branch, baseRef, args[0], args[1], args[2], patchPath, ghCompare)
 		return err
 	case "verify":
 		if len(args) != 1 {

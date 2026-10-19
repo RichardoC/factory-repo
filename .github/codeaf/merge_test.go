@@ -357,9 +357,10 @@ func TestRunMergeCommitsCleanMerge(t *testing.T) {
 	}
 }
 
-// No merge is needed when the branch already contains the base tip, when the
-// branch is strictly behind it (publish fast-forwards instead), when HEAD is
-// not the branch the gate named, or when the compare API is unavailable.
+// No merge is made when the branch already contains the base tip, when HEAD
+// is not the branch the gate named, or when the compare API is unavailable. A
+// branch strictly behind its base is not a skip any more (issue #171): the
+// run commits the merge the same way it does for a diverged branch.
 func TestRunMergeSkipsWhenNoMergeNeeded(t *testing.T) {
 	baseFiles := map[string]string{"f.txt": "a\n"}
 	r := newTestRepo(t)
@@ -368,7 +369,7 @@ func TestRunMergeSkipsWhenNoMergeNeeded(t *testing.T) {
 	r.setBranch("main", base) // the base tip is older: the branch contains it
 	r.setBranch("pr", ahead)
 	r.onBranch("pr")
-	r.withOrigin("pr", "main")
+	origin := r.withOrigin("pr", "main")
 	baseFile, infoFile, _ := artifactDir(t)
 
 	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
@@ -382,15 +383,23 @@ func TestRunMergeSkipsWhenNoMergeNeeded(t *testing.T) {
 		t.Fatalf("merge info written for a skipped merge: %v", err)
 	}
 
-	// Strictly behind: publish fast-forwards, the run does nothing.
+	// Strictly behind (issue #171): the run still lands the base as an
+	// ordinary merge commit with both parents, and records it.
 	r.setBranch("main", ahead)
 	r.setBranch("pr", base)
+	r.onBranch("pr")
+	gitTest(t, r.dir, "push", "-qf", origin, "refs/heads/main:refs/heads/main")
+	gitTest(t, r.dir, "push", "-qf", origin, "refs/heads/pr:refs/heads/pr")
 	got, err = runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
-	if err != nil || got.State != "none" {
-		t.Fatalf("behind branch: state=%q err=%v", got.State, err)
+	if err != nil || got.State != mergeKindClean {
+		t.Fatalf("behind branch: state=%q err=%v; want a clean merge", got.State, err)
 	}
-	if r.head() != base {
-		t.Fatal("the branch moved without a merge")
+	head := strings.TrimSpace(gitTest(t, r.dir, "rev-parse", "HEAD"))
+	if parents := strings.Fields(gitTest(t, r.dir, "log", "--format=%P", "-1", head)); len(parents) != 2 || parents[0] != base || parents[1] != ahead {
+		t.Fatalf("behind merge parents = %v; want [%s %s]", parents, base, ahead)
+	}
+	if _, err := os.Stat(infoFile); err != nil {
+		t.Fatalf("behind merge left no merge info: %v", err)
 	}
 
 	// A compare API failure degrades to no merge, never an error.
@@ -484,7 +493,7 @@ func TestPublishRecreatesConflictedMerge(t *testing.T) {
 		t.Fatalf("publish checkout at %s, want the PR head %s", pubHead, pr)
 	}
 
-	got, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, dagCompare(r))
+	got, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
 	if err != nil {
 		t.Fatalf("publishMerge: %v", err)
 	}
@@ -525,7 +534,7 @@ func TestPublishRecreatesMergeAfterMainMoved(t *testing.T) {
 	gitTest(t, r.dir, "push", "-q", origin, "refs/heads/main:refs/heads/main")
 
 	pub := publishCheckout(t, origin, "pr")
-	got, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, dagCompare(r))
+	got, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
 	if err != nil {
 		t.Fatalf("publishMerge after main moved: %v", err)
 	}
@@ -549,7 +558,7 @@ func TestPublishMergesFirstWhenClean(t *testing.T) {
 	}
 
 	pub := publishCheckout(t, origin, "pr")
-	got, err := publishMerge(pub, "pr", "main", baseFile, filepath.Join(t.TempDir(), "absent.json"), stateFile, dagCompare(r))
+	got, err := publishMerge(pub, "pr", "main", baseFile, filepath.Join(t.TempDir(), "absent.json"), stateFile, "", dagCompare(r))
 	if err != nil {
 		t.Fatalf("publishMerge: %v", err)
 	}
@@ -563,31 +572,77 @@ func TestPublishMergesFirstWhenClean(t *testing.T) {
 	_ = base
 }
 
-// The branch that is strictly behind its base is fast-forwarded: the base
-// comes in with no merge commit, and the patch applies on top.
-func TestPublishFastForwardsBehindBranch(t *testing.T) {
-	r, _, _, _ := divergedClean(t)
+// Issue #171: a PR branch behind main by two commits, plus a run patch
+// touching one file, publishes as a merge commit with main's tip as second
+// parent and then one work commit. Never a fast-forward: a single-parent
+// commit leaves main's changes indistinguishable from the branch's own, and
+// the PR's diff replays them.
+func TestPublishPRModeKeepsMergeCommit(t *testing.T) {
+	r := newTestRepo(t)
+	base := r.commit("base", map[string]string{"g.txt": "x\n"})
+	c1 := r.commit("main 1", map[string]string{"g.txt": "x\n", "main1.txt": "one\n"}, base)
+	c2 := r.commit("main 2", map[string]string{"g.txt": "x\n", "main2.txt": "two\n"}, c1)
+	r.setBranch("main", c2)
+	r.setBranch("pr", base) // the branch is strictly behind main
+	r.onBranch("pr")
+	// The pushed branch never carries the run's merge commit: publish it
+	// before the run makes one.
 	origin := r.withOrigin("pr", "main")
-	baseFile, _, stateFile := artifactDir(t)
-	// main moved past the branch; the branch is its base's ancestor.
-	mainTip := strings.TrimSpace(gitTest(t, r.dir, "rev-parse", "main"))
-	prOld := strings.TrimSpace(gitTest(t, r.dir, "rev-parse", "main~1"))
-	r.setBranch("pr", prOld)
-	gitTest(t, r.dir, "push", "-qf", origin, "refs/heads/pr:refs/heads/pr")
-	if err := os.WriteFile(baseFile, []byte(prOld+"\n"), 0o644); err != nil {
-		t.Fatal(err)
+	baseFile, infoFile, stateFile := artifactDir(t)
+
+	// The run job: the deterministic merge brings main in as an ordinary
+	// merge commit, records it, and makes it the base commit.
+	got, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r))
+	if err != nil || got.State != mergeKindClean {
+		t.Fatalf("runMerge: state=%q err=%v; want a clean merge", got.State, err)
+	}
+	info, err := readMergeInfo(infoFile)
+	if err != nil {
+		t.Fatalf("the run left no verifiable merge info: %v", err)
+	}
+	if parents := r.parents(info.Commit); len(parents) != 2 || parents[0] != base || parents[1] != c2 {
+		t.Fatalf("run merge parents = %v; want [%s %s]", parents, base, c2)
+	}
+	if recorded, err := os.ReadFile(baseFile); err != nil || strings.TrimSpace(string(recorded)) != info.Commit {
+		t.Fatalf("base commit file = %q (%v); want the merge commit %s", recorded, err, info.Commit)
 	}
 
+	// Publish starts from a fresh checkout of the pushed branch head.
 	pub := publishCheckout(t, origin, "pr")
-	got, err := publishMerge(pub, "pr", "main", baseFile, filepath.Join(t.TempDir(), "absent.json"), stateFile, dagCompare(r))
-	if err != nil {
+	if _, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r)); err != nil {
 		t.Fatalf("publishMerge: %v", err)
 	}
-	if got.State != "ff" {
-		t.Fatalf("state = %q, want ff", got.State)
+	head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD"))
+	if parents := strings.Fields(gitTest(t, pub, "log", "--format=%P", "-1", head)); len(parents) != 2 || parents[0] != base || parents[1] != c2 {
+		t.Fatalf("published merge parents = %v; want [%s %s] -- main's tip as second parent", parents, base, c2)
 	}
-	if head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD")); head != mainTip {
-		t.Fatalf("HEAD = %s, want the fast-forwarded %s", head, mainTip)
+
+	// The agent's own patch touches one file; the workflow applies it on the
+	// merge commit and commits it as the work commit.
+	workBlob := strings.TrimSpace(gitTestIn(t, pub, "agent\n", "hash-object", "-w", "--stdin"))
+	mergeTree := strings.TrimSpace(gitTest(t, pub, "rev-parse", head+"^{tree}"))
+	entries := gitTest(t, pub, "ls-tree", mergeTree) + "100644 blob " + workBlob + "\twork.txt\n"
+	workTree := strings.TrimSpace(gitTestIn(t, pub, entries, "mktree"))
+	work := strings.TrimSpace(gitTest(t, pub, "commit-tree", workTree, "-p", head, "-m", "the agent's work"))
+	patchFile := filepath.Join(t.TempDir(), "changes.patch")
+	if err := os.WriteFile(patchFile, []byte(gitTest(t, pub, "diff", head, work)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, pub, "reset", "-q", "--hard", head)
+	gitTest(t, pub, "apply", "--index", "--binary", patchFile)
+	gitTest(t, pub, "commit", "-q", "-m", "codeaf: work for #171")
+
+	// git log --graph shows the work commit over the merge commit, and the
+	// PR's file list is only the agent's own file.
+	workCommit := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD"))
+	if parents := strings.Fields(gitTest(t, pub, "log", "--format=%P", "-1", workCommit)); len(parents) != 1 || parents[0] != head {
+		t.Fatalf("work commit parents = %v; want the merge commit alone", parents)
+	}
+	if files := gitTest(t, pub, "diff", "main...HEAD", "--name-only"); files != "work.txt\n" {
+		t.Fatalf("git diff main...HEAD = %q; want only work.txt", files)
+	}
+	if state, err := os.ReadFile(stateFile); err != nil || string(state) != "state=clean\nmerged=true\n" {
+		t.Fatalf("merge state = %q (%v)", state, err)
 	}
 }
 
@@ -601,7 +656,7 @@ func TestPublishRefusesStalePatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	pub := publishCheckout(t, origin, "pr")
-	_, err := publishMerge(pub, "pr", "main", baseFile, filepath.Join(t.TempDir(), "absent.json"), stateFile, dagCompare(r))
+	_, err := publishMerge(pub, "pr", "main", baseFile, filepath.Join(t.TempDir(), "absent.json"), stateFile, "", dagCompare(r))
 	if err == nil || !strings.Contains(err.Error(), "stale") {
 		t.Fatalf("publishMerge err = %v, want a stale refusal", err)
 	}
@@ -629,7 +684,7 @@ func TestPublishRefusesTreeMismatch(t *testing.T) {
 	}
 
 	pub := publishCheckout(t, origin, "pr")
-	_, err = publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, dagCompare(r))
+	_, err = publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
 	if err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("publishMerge err = %v, want a tree mismatch refusal", err)
 	}
@@ -650,7 +705,7 @@ func TestPublishRefusesMergeInfoMismatch(t *testing.T) {
 	if err := os.WriteFile(baseFile, []byte(base+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, dagCompare(r))
+	_, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
 	if err == nil || !strings.Contains(err.Error(), "base commit") {
 		t.Fatalf("base commit mismatch err = %v, want a refusal", err)
 	}
@@ -660,7 +715,7 @@ func TestPublishRefusesMergeInfoMismatch(t *testing.T) {
 	r.setBranch("pr", r.commit("moved", map[string]string{"f.txt": "moved\n"}, pr))
 	gitTest(t, r.dir, "push", "-qf", origin, "refs/heads/pr:refs/heads/pr")
 	pub2 := publishCheckout(t, origin, "pr")
-	_, err = publishMerge(pub2, "pr", "main", baseFile, infoFile, stateFile, dagCompare(r))
+	_, err = publishMerge(pub2, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
 	if err == nil || !strings.Contains(err.Error(), "another commit") {
 		t.Fatalf("stale merge info err = %v, want a base mismatch refusal", err)
 	}
@@ -693,7 +748,7 @@ func TestPublishRefusesForeignBaseTip(t *testing.T) {
 	}
 
 	pub := publishCheckout(t, origin, "pr")
-	_, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, dagCompare(r))
+	_, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
 	if err == nil || !strings.Contains(err.Error(), "not contained") {
 		t.Fatalf("publishMerge err = %v, want a foreign base tip refusal", err)
 	}
@@ -709,7 +764,7 @@ func TestPublishKeepsPatchWhenMergeConflicts(t *testing.T) {
 		t.Fatal(err)
 	}
 	pub := publishCheckout(t, origin, "pr")
-	got, err := publishMerge(pub, "pr", "main", baseFile, filepath.Join(t.TempDir(), "absent.json"), stateFile, dagCompare(r))
+	got, err := publishMerge(pub, "pr", "main", baseFile, filepath.Join(t.TempDir(), "absent.json"), stateFile, "", dagCompare(r))
 	if err != nil {
 		t.Fatalf("publishMerge: %v", err)
 	}
@@ -897,7 +952,7 @@ func TestConflictedMergeRoundTrip(t *testing.T) {
 
 	// Publish, from a fresh checkout still at the pushed PR head.
 	pub := publishCheckout(t, origin, "pr")
-	out, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, dagCompare(r))
+	out, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
 	if err != nil {
 		t.Fatalf("publishMerge: %v", err)
 	}
@@ -962,11 +1017,209 @@ func TestMergeSkipsWorkflowChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	pub := publishCheckout(t, origin, "pr")
-	got, err = publishMerge(pub, "pr", "main", baseFile, filepath.Join(t.TempDir(), "absent.json"), stateFile, dagCompare(r))
+	got, err = publishMerge(pub, "pr", "main", baseFile, filepath.Join(t.TempDir(), "absent.json"), stateFile, "", dagCompare(r))
 	if err != nil || got.State != "none" {
 		t.Fatalf("publishMerge = %+v, %v; want no merge", got, err)
 	}
 	if head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD")); head != pr {
 		t.Fatalf("publish head = %s, want the untouched branch %s", head, pr)
 	}
+}
+
+// Issue #171: a tampered or missing merge-info.json, with the run's recorded
+// base merge present in the base-commit artifact, is refused -- never
+// published as a single commit whose parents cannot show what came from the
+// base.
+func TestPublishPRModeRefusesUnverifiableMerge(t *testing.T) {
+	r, _, pr, _ := divergedClean(t)
+	origin := r.withOrigin("pr", "main")
+	baseFile, infoFile, stateFile := artifactDir(t)
+
+	// The run made its base merge and rewrote the base-commit artifact to the
+	// merge commit; the merge info is what publish verifies it against. The
+	// branch head publish fetched never carried the merge.
+	if _, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r)); err != nil {
+		t.Fatalf("runMerge: %v", err)
+	}
+	recorded, err := os.ReadFile(baseFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseCommit := strings.TrimSpace(string(recorded))
+	if baseCommit == pr {
+		t.Fatalf("base commit %s is the branch head; the run recorded no base merge", baseCommit)
+	}
+
+	// Tampered: the info no longer validates as the run's record.
+	if err := os.WriteFile(infoFile, []byte(`{"kind":"squashed"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pub := publishCheckout(t, origin, "pr")
+	_, err = publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
+	if err == nil || !strings.Contains(err.Error(), "unknown kind") {
+		t.Fatalf("publishMerge err = %v; want a tampered merge info refusal", err)
+	}
+	if head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD")); head != pr {
+		t.Fatalf("publish head = %s; want the untouched branch %s", head, pr)
+	}
+
+	// Missing: the base merge is present in the base-commit artifact, but the
+	// info that verifies it is gone. Publish refuses with the reason, rather
+	// than pushing a single commit.
+	if err := os.Remove(infoFile); err != nil {
+		t.Fatal(err)
+	}
+	pub2 := publishCheckout(t, origin, "pr")
+	_, err = publishMerge(pub2, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r))
+	if err == nil || !strings.Contains(err.Error(), "no verifiable merge info") {
+		t.Fatalf("publishMerge err = %v; want a missing merge info refusal", err)
+	}
+	if head := strings.TrimSpace(gitTest(t, pub2, "rev-parse", "HEAD")); head != pr {
+		t.Fatalf("publish head = %s; want the untouched branch %s", head, pr)
+	}
+}
+
+// The regression from run 39094290325 (issue #171): the run's gate left no
+// merge info (its base carried a workflow edit, as #162's did), and the patch
+// replayed the base's changes -- #161/#164's snyk-linear-sync code, #162's
+// workflow edit and #166's queue gate -- beside the agent's own fix. Before
+// the fix, publish kept the patch alone and the workflow applied it as one
+// commit on the old head: the squash. After it, publish refuses the replay,
+// and a re-run whose gate passes records the merge, which publish recreates
+// as a merge commit.
+func TestRegressionSquashFromRun39094290325(t *testing.T) {
+	// Builds the run's shape through an index, because mktree takes no nested
+	// paths and main's gain includes #162's workflow edit.
+	build := func(t *testing.T, withWorkflow bool) (*testRepo, string, string, string) {
+		r := newTestRepo(t)
+		base := r.commit("base", map[string]string{"f.txt": "a\nb\nc\n"})
+		pr := r.commit("pr fix", map[string]string{"f.txt": "a\nb\nc\n", "fix.go": "package fix\n"}, base)
+		index := filepath.Join(t.TempDir(), "index")
+		blob := func(content string) string {
+			return strings.TrimSpace(gitTestIn(t, r.dir, content, "hash-object", "-w", "--stdin"))
+		}
+		env := func(args ...string) string {
+			cmd := exec.Command("git", args...)
+			cmd.Dir = r.dir
+			cmd.Env = append(os.Environ(), "GIT_INDEX_FILE="+index)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("git %v: %v: %s", args, err, out)
+			}
+			return strings.TrimSpace(string(out))
+		}
+		env("update-index", "--add", "--cacheinfo", "100644,"+blob("a\nb\nsnyk\n")+",f.txt")
+		env("update-index", "--add", "--cacheinfo", "100644,"+blob("package snyk\n")+",snyk.go")
+		env("update-index", "--add", "--cacheinfo", "100644,"+blob("package queue\n")+",queue.go")
+		if withWorkflow {
+			env("update-index", "--add", "--cacheinfo", "100644,"+blob("on: push\n")+",.github/workflows/ci.yml")
+		}
+		mainTip := r.commitTree(env("write-tree"), []string{base}, "main: snyk-linear-sync (#161, #164), queue gate (#166), workflow edit (#162)")
+		r.setBranch("main", mainTip)
+		r.setBranch("pr", pr)
+		r.onBranch("pr")
+		return r, base, pr, mainTip
+	}
+	// The agent's tree: the fix beside a replay of main's changes, as the
+	// package step would export it from a run whose session merged.
+	agentTree := func(t *testing.T, r *testRepo, withWorkflow bool) string {
+		index := filepath.Join(t.TempDir(), "index")
+		blob := func(content string) string {
+			return strings.TrimSpace(gitTestIn(t, r.dir, content, "hash-object", "-w", "--stdin"))
+		}
+		env := func(args ...string) string {
+			cmd := exec.Command("git", args...)
+			cmd.Dir = r.dir
+			cmd.Env = append(os.Environ(), "GIT_INDEX_FILE="+index)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("git %v: %v: %s", args, err, out)
+			}
+			return strings.TrimSpace(string(out))
+		}
+		env("read-tree", r.head()+"^{tree}") // the branch head the run recorded
+		env("update-index", "--cacheinfo", "100644,"+blob("a\nb\nsnyk\n")+",f.txt")
+		// The agent's own work beside the replay: it continued its fix.
+		env("update-index", "--cacheinfo", "100644,"+blob("package fix\n// the agent's own work\n")+",fix.go")
+		env("update-index", "--add", "--cacheinfo", "100644,"+blob("package snyk\n")+",snyk.go")
+		env("update-index", "--add", "--cacheinfo", "100644,"+blob("package queue\n")+",queue.go")
+		if withWorkflow {
+			env("update-index", "--add", "--cacheinfo", "100644,"+blob("on: push\n")+",.github/workflows/ci.yml")
+		}
+		return env("write-tree")
+	}
+
+	t.Run("the squash before the fix", func(t *testing.T) {
+		r, _, pr, _ := build(t, true)
+		origin := r.withOrigin("pr", "main")
+		baseFile, _, stateFile := artifactDir(t)
+		if err := os.WriteFile(baseFile, []byte(pr+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		// The run's gate left no merge info: its artifact carries none.
+		patchFile := filepath.Join(t.TempDir(), "changes.patch")
+		patch := gitTest(t, r.dir, "diff", pr, r.commitTree(agentTree(t, r, true), []string{pr}, "the run's export"))
+		if err := os.WriteFile(patchFile, []byte(patch+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		// Before the fix: publish kept the patch alone (its base changed a
+		// workflow, so the push token could not carry the merge) and the
+		// workflow applied it on the old head as one commit -- main's changes
+		// squashed into the work commit, `git log --graph` a straight line.
+		pub := publishCheckout(t, origin, "pr")
+		gitTest(t, pub, "apply", "--index", "--binary", patchFile)
+		gitTest(t, pub, "commit", "-q", "-m", "codeaf: work for #163")
+		squashed := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD"))
+		if parents := strings.Fields(gitTest(t, pub, "log", "--format=%P", "-1", squashed)); len(parents) != 1 {
+			t.Fatalf("the squash has %v parents; want the single parent that made the PR replay main", parents)
+		}
+		files := gitTest(t, pub, "diff", pr, squashed, "--name-only")
+		for _, want := range []string{".github/workflows/ci.yml", "fix.go", "queue.go", "snyk.go"} {
+			if !strings.Contains(files, want) {
+				t.Fatalf("the squashed commit lacks %s (files: %s)", want, files)
+			}
+		}
+
+		// After the fix: publish refuses the replay instead -- nothing is
+		// applied, and the branch head never moves.
+		pub2 := publishCheckout(t, origin, "pr")
+		_, err := publishMerge(pub2, "pr", "main", baseFile, filepath.Join(t.TempDir(), "absent.json"), stateFile, patchFile, dagCompare(r))
+		if err == nil || !strings.Contains(err.Error(), "replays") {
+			t.Fatalf("publishMerge err = %v; want a replay refusal", err)
+		}
+		if head := strings.TrimSpace(gitTest(t, pub2, "rev-parse", "HEAD")); head != pr {
+			t.Fatalf("publish head = %s; want the untouched branch %s", head, pr)
+		}
+	})
+
+	t.Run("the merge commit after the fix", func(t *testing.T) {
+		r, _, pr, mainTip := build(t, false) // a re-run whose gate passes
+		origin := r.withOrigin("pr", "main")
+		baseFile, infoFile, stateFile := artifactDir(t)
+		if _, err := runMerge(r.dir, "pr", "main", baseFile, infoFile, dagCompare(r)); err != nil {
+			t.Fatalf("runMerge: %v", err)
+		}
+		if _, err := readMergeInfo(infoFile); err != nil {
+			t.Fatalf("the re-run left no verifiable merge info: %v", err)
+		}
+		// Publish recreates the recorded merge from the same two parents.
+		pub := publishCheckout(t, origin, "pr")
+		if _, err := publishMerge(pub, "pr", "main", baseFile, infoFile, stateFile, "", dagCompare(r)); err != nil {
+			t.Fatalf("publishMerge: %v", err)
+		}
+		head := strings.TrimSpace(gitTest(t, pub, "rev-parse", "HEAD"))
+		if parents := strings.Fields(gitTest(t, pub, "log", "--format=%P", "-1", head)); len(parents) != 2 || parents[0] != pr || parents[1] != mainTip {
+			t.Fatalf("recreated merge parents = %v; want [%s %s]", parents, pr, mainTip)
+		}
+		// The same replay patch no longer applies on the merged tree: main's
+		// changes are in it, so the squash is dead for good.
+		patchFile := filepath.Join(t.TempDir(), "changes.patch")
+		patch := gitTest(t, r.dir, "diff", pr, r.commitTree(agentTree(t, r, true), []string{pr}, "the run's export"))
+		if err := os.WriteFile(patchFile, []byte(patch+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := gitRun(pub, "apply", "--index", "--binary", patchFile); err == nil {
+			t.Fatal("the replay patch applied on the merged tree; the squash is still reachable")
+		}
+	})
 }
