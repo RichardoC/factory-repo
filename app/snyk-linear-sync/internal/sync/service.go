@@ -251,6 +251,33 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		}
 	}
 
+	// An empty Snyk snapshot is not evidence that every finding went away.
+	// The documented symptom of an API key without the required project read
+	// permission, and of an outage that answers success with no results, is a
+	// silently empty project and finding list. Resolving on such a snapshot
+	// would cancel every managed ticket in one run, so refuse instead: the
+	// only safe reading of "no projects at all" alongside existing managed
+	// tickets is that the snapshot is not a truthful source right now. The
+	// trigger is deliberate: zero active *and* zero inactive projects, never
+	// zero findings. An organization whose issues are all fixed still lists
+	// its projects, and those tickets must still move to the resolved state.
+	// A brand-new deployment with no managed tickets yet is unaffected. This
+	// is not a percentage threshold: a partial listing is a separate concern.
+	if len(snykSnapshot.ProjectIDs) == 0 && len(snykSnapshot.InactiveProjectIDs) == 0 && len(existingByFingerprint) > 0 {
+		message := "the Snyk snapshot contains no projects while managed Linear issues exist; " +
+			"this is the documented symptom of an API key that cannot read projects " +
+			"(project and issue queries silently return empty results), of an outage, " +
+			"or of a SNYK_ORG_ID naming an organization the API key cannot see; " +
+			"check SNYK_ORG_ID and the Snyk API key, and Snyk status, before running the sync again"
+		if s.cfg.DryRun {
+			// A dry run must still show the plan it would have executed, but
+			// the operator has to see that a live run would refuse.
+			s.logger.Error(message)
+		} else {
+			return RunResult{}, fmt.Errorf("%s", message)
+		}
+	}
+
 	// rebindCandidates indexes, by project-independent identity, the tickets
 	// a finding may take over after Snyk recreates its project under a new
 	// project ID (see rebindCandidatesByIdentity for who qualifies).
