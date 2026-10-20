@@ -89,8 +89,8 @@ whether through prompt injection or a compromised model.
 - CodeAF's state is carried between runs in one shared bundle
   (`.github/codeaf/state.go`, `codeaf-state.yml`): the memory db
   (`graph.db`), `router-events.jsonl`, the model ratings and the rolling 7-day
-  credit spend (spend is credit at subscription rates on a rolling 7-day week;
-  the account is on synthetic.new's Big plan).
+  spend (at API list prices on a rolling 7-day week; the account is on
+  synthetic.new's Big plan).
   This was a deliberate decision. CodeAF puts saved memories from `graph.db`
   into every worker's prompt, so a poisoned memory would reach later runs.
   Hence the rules below:

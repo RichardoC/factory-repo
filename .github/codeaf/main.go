@@ -143,10 +143,12 @@ func main() {
 // ---------------------------------------------------------------- models
 
 // Model is one row of models.json. Prices are USD per million tokens.
-// Input/Output/CacheRead are the synthetic.new SUBSCRIPTION rates: they price
-// the credit a call draws down the weekly quota. The API* fields are the API
-// list rates: what the same call costs once the quota is gone and overage
-// begins.
+// The API* fields are the API list ("overage") rates, and they are the
+// prices the factory quotes and caps on: the ledger, the run and weekly
+// caps, the reports and the catalog CodeAF budgets from (the owner's
+// decision, 2026-10-20). Input/Output/CacheRead are the synthetic.new
+// SUBSCRIPTION rates, the credit a call draws down the weekly quota; they
+// are kept for reference and are not used for any figure or cap.
 type Model struct {
 	ID              string   `json:"id"`       // what CodeAF sees
 	Upstream        string   `json:"upstream"` // the synthetic.new model id
@@ -361,12 +363,13 @@ func (u Usage) reasoningTokens() (int, bool) {
 }
 
 // CostOf prices one call: uncached input, cached input and output (which
-// includes reasoning tokens) at the model's per-million SUBSCRIPTION rates.
-// This is the credit the call draws down the weekly quota, and the cost the
-// ledger and the report carry.
+// includes reasoning tokens) at the model's per-million API list ("overage")
+// rates. It is the cost the ledger, the caps and the report carry; quoting
+// the overage price, not the cheaper subscription credit, is the owner's
+// decision (2026-10-20). The weekly quota itself is enforced from
+// synthetic.new's own percentRemaining, not from these figures.
 func CostOf(m Model, u Usage) float64 {
-	cached := u.cached()
-	return (float64(u.PromptTokens-cached)*m.Input + float64(cached)*m.CacheRead + float64(u.CompletionTokens)*m.Output) / 1e6
+	return ApiCostOf(m, u)
 }
 
 // ApiCostOf prices the same call at the model's API list rates (api_*): what
@@ -572,10 +575,11 @@ func catalog(models []Model) map[string][]catalogRow {
 		row.Created = 1760000000
 		row.Architecture.Input = m.InputModalities
 		row.Architecture.Output = []string{"text"}
-		row.Pricing.Prompt = perToken(m.Input)
-		row.Pricing.Completion = perToken(m.Output)
+		// The overage prices, the same ones the proxy caps on (CostOf).
+		row.Pricing.Prompt = perToken(m.APIInput)
+		row.Pricing.Completion = perToken(m.APIOutput)
 		row.Pricing.Request = "0"
-		row.Pricing.InputCacheRead = perToken(m.CacheRead)
+		row.Pricing.InputCacheRead = perToken(m.APICached)
 		row.SupportedParameters = []string{"tools", "tool_choice", "reasoning", "include_reasoning",
 			"response_format", "structured_outputs", "temperature", "top_p", "max_tokens", "stop", "seed"}
 		row.Reasoning.DefaultEnabled = true
@@ -3756,8 +3760,8 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 			weekBefore, weekKnown = v, true
 		}
 	}
-	// apiCost is what this run would have cost at the API list rates;
-	// overage is the part of it spent past the weekly credit. apiPrice uses
+	// overage is the part of this run, at the API list rates, spent past the
+	// weekly credit. apiPrice uses
 	// the ledger's APICostUSD when the line carries one (the source this
 	// proxy wrote); lines written before the field existed carry only
 	// tokens, and are re-priced from them at the config's api_* rates.
@@ -3781,7 +3785,7 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 		}{CachedTokens: l.CachedTokens}
 		return ApiCostOf(m, usage)
 	}
-	var apiCost, overage float64
+	var overage float64
 	totals := map[string]*modelTotals{}
 	for _, l := range lines {
 		if l.Kind != "" {
@@ -3808,10 +3812,8 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 		if !l.UsageSeen {
 			t.unpriced++
 		}
-		api := apiPrice(id, l)
-		apiCost += api
 		if over {
-			overage += api
+			overage += apiPrice(id, l)
 		}
 		week += l.CostUSD
 		if week >= cfg.Limits.WeeklyCreditUSD {
@@ -3935,16 +3937,16 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 	fmt.Fprintf(&b, "| seats | worker %s, planner %s, checker %s (allowed: %s; no escalation) |\n",
 		seat(result.Model), seat(result.PlanModel), seat(result.CheckModel), strings.Join(allowed, ", "))
 	fmt.Fprintf(&b, "| CodeAF's own spend figure | %s (plan estimate %s) |\n", money(result.SpendUSD), money(result.EstUSD))
-	// The Big-plan metered row (issue #59): what the proxy records is credit
-	// — subscription-rate dollars — plus the same calls at API list prices
-	// and the overage past the weekly credit. previousReportSection looks
-	// this exact label up for continuations, so the label must not change.
+	// The Big-plan metered row (issue #59): what the proxy records, priced at
+	// the overage (API list) rates the factory quotes (CostOf), plus the
+	// overage past the weekly credit. previousReportSection looks this exact
+	// label up for continuations, so the label must not change.
 	weekCell := "?"
 	if weekKnown {
 		weekCell = money(weekBefore + total)
 	}
-	fmt.Fprintf(&b, "| metered by proxy (from its ledger) | **%s** credit this run · %s this week (cap $%s/run, $%s/week) · %s at API prices · %s overage |\n",
-		money(total), weekCell, trimNumber(cfg.Limits.RunCreditUSD), trimNumber(cfg.Limits.WeeklyCreditUSD), money(apiCost), money(overage))
+	fmt.Fprintf(&b, "| metered by proxy (from its ledger) | **%s** this run at overage prices · %s this week (cap $%s/run, $%s/week) · %s overage |\n",
+		money(total), weekCell, trimNumber(cfg.Limits.RunCreditUSD), trimNumber(cfg.Limits.WeeklyCreditUSD), money(overage))
 	// The quota state synthetic.new reported at proxy start, re-parsed from
 	// the ledger's "quotas" marker. Omitted when the marker is absent or
 	// its body does not parse; the units are undocumented, so the row says
@@ -4071,7 +4073,7 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 			p, known := prices[id]
 			inPrice, cachedPrice, outPrice := "—", "—", "—"
 			if known {
-				inPrice, cachedPrice, outPrice = trimNumber(p.Input), trimNumber(p.CacheRead), trimNumber(p.Output)
+				inPrice, cachedPrice, outPrice = trimNumber(p.APIInput), trimNumber(p.APICached), trimNumber(p.APIOutput)
 			}
 			cost := money(t.cost)
 			if t.unpriced > 0 {
