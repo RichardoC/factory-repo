@@ -563,6 +563,64 @@ func TestReviewPlan(t *testing.T) {
 	}
 }
 
+// TestReviewTableUnlocated renders the findings table for an unlocated
+// finding — the inline form (issue #49) whose path and line are empty — and
+// pins the whole table, because that cell used to render as `:0` (issue
+// #190): a location a fix run and a reader both read, naming no file. The
+// word `unlocated` is the explicit fallback, and no `:0` may appear
+// anywhere in the table.
+func TestReviewTableUnlocated(t *testing.T) {
+	answer := "## Findings\n\n" +
+		"- [medium] service.go wc -l 1200, split it\n" +
+		"- [high] app/x/main.go:42 - the mutex is released twice\n"
+	findings, sawSection := parseFindings(answer)
+	if !sawSection || len(findings) != 2 {
+		t.Fatalf("parse = %d findings, sawSection %t, want 2/true: %+v", len(findings), sawSection, findings)
+	}
+	// The first finding carries no location at all; the second does.
+	if findings[0].Path != "" || findings[0].Line != 0 {
+		t.Fatalf("first finding is not unlocated: %+v", findings[0])
+	}
+	if findings[1].Path != "app/x/main.go" || findings[1].Line != 42 {
+		t.Fatalf("second finding lost its location: %+v", findings[1])
+	}
+
+	table := reviewTable(findings)
+	want := "| severity | location | finding |\n|---|---|---|\n" +
+		"| `medium` | unlocated | service.go wc -l 1200, split it |\n" +
+		"| `high` | app/x/main.go:42 | the mutex is released twice |\n"
+	if table != want {
+		t.Errorf("unlocated table =\n%q\nwant\n%q", table, want)
+	}
+	if strings.Contains(table, ":0") {
+		t.Errorf("the table renders :0 for an unlocated finding: %q", table)
+	}
+	assertReviewBodyClean(t, table)
+
+	// The whole comment — table, command line and footer — carries no `:0`.
+	t.Setenv("RESULT_PATH", "")
+	t.Setenv("LEDGER_PATH", "")
+	t.Setenv("TRAJECTORY_PATH", "")
+	blocking := blockingFindings(findings)
+	if len(blocking) != 2 {
+		t.Fatalf("blocking = %d findings, want 2: %+v", len(blocking), blocking)
+	}
+	body := reviewFixBody(blocking, findings, 0, "zai-org/glm-5.3-flash", stopDone)
+	if !strings.Contains(body, "| `medium` | unlocated |") {
+		t.Errorf("the fix comment does not name the unlocated finding: %q", body)
+	}
+	if strings.Contains(body, ":0") {
+		t.Errorf("the fix comment renders :0: %q", body)
+	}
+	assertReviewBodyClean(t, body)
+
+	// A located finding still renders its own path and line unchanged, and
+	// the renderer is what decides: a zero line with a path is not unlocated.
+	if got := reviewTable([]Finding{{Severity: stopDone, Path: "a.go", Line: 0}}); !strings.Contains(got, "| a.go:0 |") {
+		t.Errorf("a path with a zero line stopped rendering its location: %q", got)
+	}
+}
+
 // assertReviewBodyClean checks the invariants every review comment must
 // hold: no report marker, and no unescaped hostile text.
 func assertReviewBodyClean(t *testing.T, body string) {

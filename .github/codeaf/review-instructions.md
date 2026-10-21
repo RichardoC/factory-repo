@@ -69,9 +69,12 @@ in exactly this form, and write nothing after it:
   path, so a second request deadlocks
 - [low] the changelog does not mention the new flag
 
-Severity is high, medium or low. A finding without a file and line is still
-one bullet. When the review is clean, end with the section holding the single
-word `none`:
+Severity is high, medium or low. Give every finding the `path:line` it
+belongs to; when there is genuinely no file — a missing test, a commit
+message — write `unlocated` in place of the location rather than leaving it
+off, so the posted findings table never shows a location that names no file.
+A finding without a file and line is still one bullet. When the review is
+clean, end with the section holding the single word `none`:
 
 ## Findings
 

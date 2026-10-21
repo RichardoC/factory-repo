@@ -535,14 +535,30 @@ func safeReviewPath(path string) string {
 // backticks, anything else escaped), the location and the text through
 // escapeMD — so a hostile answer cannot inject markdown, mention anyone, or
 // carry a raw HTML comment into the posted comment.
+//
+// A finding with no location — the inline form (issue #49) — has no file to
+// name, so its location cell reads `unlocated` instead of the `:0` that a
+// path:line of the empty path would otherwise render (issue #190): a fix run
+// and a reader both read `:0` as a location, and it names no file.
 func reviewTable(findings []Finding) string {
 	var b strings.Builder
 	b.WriteString("| severity | location | finding |\n|---|---|---|\n")
 	for _, f := range findings {
-		fmt.Fprintf(&b, "| %s | %s:%d | %s |\n",
-			tokenCell(f.Severity, 200), escapeMD(f.Path, 200, true), f.Line, escapeMD(f.Text, 200, true))
+		fmt.Fprintf(&b, "| %s | %s | %s |\n",
+			tokenCell(f.Severity, 200), reviewLocation(f), escapeMD(f.Text, 200, true))
 	}
 	return b.String()
+}
+
+// reviewLocation renders one finding's location cell: `path:line` when the
+// finding carries a location, and the fixed word `unlocated` when it does
+// not. The path is escaped and capped like every other cell, so a hostile
+// path cannot break out of the table or the comment (issue #190).
+func reviewLocation(f Finding) string {
+	if f.Path == "" && f.Line == 0 {
+		return "unlocated"
+	}
+	return escapeMD(f.Path, 200, true) + ":" + strconv.Itoa(f.Line)
 }
 
 // reviewFooter ends the review comment: the reviewer model, the sanitized
