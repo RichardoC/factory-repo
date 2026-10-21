@@ -1011,10 +1011,10 @@ func runNext() error {
 			}
 		}
 	}
-	// The maintainer hand-off (issue #240): label first, then the fixed
-	// comment — the comment failing then still leaves the label on, and
-	// the next tick retries the comment because the marker is missing.
-	// Best effort: a failed escalation never fails the pick.
+	// The maintainer hand-off (issue #240): the label and the fixed
+	// comment are ensured independently, so either half failing leaves
+	// the other on the issue and the next tick retries only what is
+	// missing. Best effort: a failed escalation never fails the pick.
 	for _, n := range issueEscalations {
 		if err := ensureMaintainerEscalation(gh, n); err != nil {
 			log.Printf("maintainer hand-off on #%d: %v", n, err)
@@ -1355,6 +1355,14 @@ const queueIssueMaintainerMarker = "<!-- codeaf-queue-issue-maintainer -->"
 // to look at it now.
 const maintainerLabel = "codeaf-maintainer"
 
+// maintainerLabelColor and maintainerLabelDesc dress codeaf-maintainer when
+// the queue creates it: an attention colour, with a description that says
+// what the label means, like every hand-made factory label in the workflows.
+const (
+	maintainerLabelColor = "d93f0b"
+	maintainerLabelDesc  = "The queue hands this issue to a maintainer: retrying the run again will not fix it"
+)
+
 // workflowPolicyRefusal is the phrase a publish refusal carries when the
 // change breaks the workflow policy. A run refused on policy grounds fails
 // identically on every retry, so it is never retried at all.
@@ -1507,11 +1515,67 @@ func ensureIssueRetryMarker(g github, n int) error {
 }
 
 // ensureMaintainerEscalation hands stranded issue n to a maintainer (issue
-// #240): the codeaf-maintainer label first — the comment failing then still
-// leaves the label on, and the next tick re-posts the comment because the
-// marker is missing — then the one fixed comment, keyed on its marker. A
-// repeat tick with the marker served posts nothing more.
+// #240). It is two idempotent halves, ensured independently (the review of
+// #248): the codeaf-maintainer label and the one fixed comment. Each half
+// checks for its own footprint on the issue and skips if it is already
+// there, so one half failing never suppresses the other — a tick whose
+// label add failed still posts the comment, and a later tick with the
+// comment up still adds the missing label — and an escalated issue stays in
+// fetchStrandedIssues' escalations list until both halves are served.
 func ensureMaintainerEscalation(g github, n int) error {
+	labelErr := ensureMaintainerLabel(g, n)
+	commentErr := ensureMaintainerComment(g, n)
+	return errors.Join(labelErr, commentErr)
+}
+
+// ensureMaintainerLabel puts the codeaf-maintainer label on issue n (issue
+// #240). The label's presence is read from the issue's own labels, not from
+// the hand-off comment's marker: a tick that posted the comment but failed
+// the label add leaves the marker present and the label missing, so the
+// marker can never stand in for the label. When the label is missing it is
+// created first — no workflow creates codeaf-maintainer, so the queue does,
+// exactly like ensureAreaLabels — and then added to the issue. Best effort
+// by the caller: a failed post is retried by the next tick, alone.
+func ensureMaintainerLabel(g github, n int) error {
+	var it item
+	if err := g.get(fmt.Sprintf("/issues/%d", n), &it); err != nil {
+		return err
+	}
+	if it.labelled(maintainerLabel) {
+		return nil
+	}
+	if err := createMaintainerLabel(g); err != nil {
+		return err
+	}
+	return g.post(fmt.Sprintf("/issues/%d/labels", n), map[string][]string{"labels": {maintainerLabel}}, nil)
+}
+
+// createMaintainerLabel creates the codeaf-maintainer label in the
+// repository if it does not exist yet (the review of #248). A 422
+// "already_exists" reply — the steady state on every tick after the first
+// normal creation — counts as success, the same tolerance
+// ensureAreaLabels applies at its own post.
+func createMaintainerLabel(g github) error {
+	body := map[string]string{
+		"name":        maintainerLabel,
+		"color":       maintainerLabelColor,
+		"description": maintainerLabelDesc,
+	}
+	if err := g.post("/labels", body, nil); err != nil {
+		text := err.Error()
+		if strings.Contains(text, "422") || strings.Contains(text, "already_exists") {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// ensureMaintainerComment posts the hand-off's one fixed comment on issue n
+// (issue #240), keyed on its marker: a repeat tick with the marker served
+// posts nothing more. The marker governs only the comment; the label's
+// ensure is separate, so it still runs when the comment is already up.
+func ensureMaintainerComment(g github, n int) error {
 	var comments []struct {
 		Body string `json:"body"`
 	}
@@ -1522,9 +1586,6 @@ func ensureMaintainerEscalation(g github, n int) error {
 		if strings.Contains(c.Body, queueIssueMaintainerMarker) {
 			return nil
 		}
-	}
-	if err := g.post(fmt.Sprintf("/issues/%d/labels", n), map[string][]string{"labels": {maintainerLabel}}, nil); err != nil {
-		return err
 	}
 	return g.post(fmt.Sprintf("/issues/%d/comments", n), map[string]string{"body": issueMaintainerBody(n)}, nil)
 }

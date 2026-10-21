@@ -1639,6 +1639,7 @@ func TestRunNextRetriesStrandedIssue(t *testing.T) {
 	comments := []string{report("run job failed")}
 	posts := 0
 	var labels []string
+	labelCreates := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/issues" && r.URL.Query().Get("state") == "open":
@@ -1671,6 +1672,21 @@ func TestRunNextRetriesStrandedIssue(t *testing.T) {
 			_ = json.Unmarshal(data, &body)
 			labels = append(labels, body.Labels...)
 			fmt.Fprint(w, `[]`)
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/RichardoC/factory-repo/labels":
+			// The queue creates codeaf-maintainer before it adds it (the
+			// review of #248): no workflow creates the label, and an
+			// issue-labels post cannot add a label that is missing.
+			labelCreates++
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/issues/120":
+			// The label ensure reads the issue's own labels, so a repeat
+			// tick with both halves served posts nothing more.
+			var ls []string
+			for _, l := range labels {
+				ls = append(ls, fmt.Sprintf(`{"name":%q}`, l))
+			}
+			fmt.Fprintf(w, `{"number":120,"state":"open","labels":[%s]}`, strings.Join(ls, ","))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/contents/app":
 			fmt.Fprint(w, `[]`)
 		default:
@@ -1718,14 +1734,17 @@ func TestRunNextRetriesStrandedIssue(t *testing.T) {
 	if posts != 2 || len(labels) != 1 || labels[0] != maintainerLabel || !strings.Contains(comments[3], queueIssueMaintainerMarker) {
 		t.Fatalf("comments = %q (posts %d, labels %v); want one maintainer comment and the %s label", comments, posts, labels, maintainerLabel)
 	}
+	if labelCreates != 1 {
+		t.Fatalf("%d codeaf-maintainer creations; want exactly one, before the label add", labelCreates)
+	}
 
 	// Third tick: everything the hand-off needs is on the issue — nothing
 	// is posted and nothing is printed.
 	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "" {
 		t.Fatalf("runNext on the repeat tick printed %q, %v; wanted nothing", out, err)
 	}
-	if posts != 2 || len(labels) != 1 {
-		t.Fatalf("repeat tick posted (posts %d, labels %v); want nothing more", posts, labels)
+	if posts != 2 || len(labels) != 1 || labelCreates != 1 {
+		t.Fatalf("repeat tick posted (posts %d, labels %v, creates %d); want nothing more", posts, labels, labelCreates)
 	}
 }
 
@@ -1752,6 +1771,7 @@ func TestRunNextStrandedIssueGuards(t *testing.T) {
 	                {"number":120,"state":"open","created_at":"2024-01-06T00:00:00Z","body":"## Done when\n\n- tests pass\n\n## End-to-end check\n\nharness next prints number=120\n","labels":[{"name":"codeaf"},{"name":"area:app/x"}]}]`
 	posts := map[int]int{}
 	labels := map[int][]string{}
+	labelCreates := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		switch {
@@ -1788,6 +1808,21 @@ func TestRunNextStrandedIssueGuards(t *testing.T) {
 			_ = json.Unmarshal(data, &body)
 			labels[n] = append(labels[n], body.Labels...)
 			fmt.Fprint(w, `[]`)
+		case r.Method == http.MethodPost && path == "/repos/RichardoC/factory-repo/labels":
+			// 422 already_exists on every create call: the steady state
+			// once the label exists, which createMaintainerLabel counts
+			// as success like ensureAreaLabels does.
+			labelCreates++
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			fmt.Fprint(w, `{"message":"Validation Failed","errors":[{"code":"already_exists"}]}`)
+		case r.Method == http.MethodGet && strings.HasPrefix(path, "/repos/RichardoC/factory-repo/issues/") && !strings.Contains(path, "/comments"):
+			n := 0
+			fmt.Sscanf(path, "/repos/RichardoC/factory-repo/issues/%d", &n)
+			var ls []string
+			for _, l := range labels[n] {
+				ls = append(ls, fmt.Sprintf(`{"name":%q}`, l))
+			}
+			fmt.Fprintf(w, `{"number":%d,"state":"open","labels":[%s]}`, n, strings.Join(ls, ","))
 		case r.Method == http.MethodGet && path == "/repos/RichardoC/factory-repo/contents/app":
 			fmt.Fprint(w, `[]`)
 		default:
@@ -1827,9 +1862,136 @@ func TestRunNextStrandedIssueGuards(t *testing.T) {
 	if len(labels[117]) != 1 || labels[117][0] != maintainerLabel || posts[117] != 1 {
 		t.Fatalf("#117: labels %v, %d posts; want the %s label and one comment", labels[117], posts[117], maintainerLabel)
 	}
+	if labelCreates != 1 {
+		t.Fatalf("#117: %d codeaf-maintainer creations; want one, tolerated as already_exists", labelCreates)
+	}
 	for _, n := range []int{171, 122, 124} {
 		if posts[n] != 0 || len(labels[n]) != 0 {
 			t.Fatalf("#%d posted (comments %q, labels %v); want nothing", n, comments[n], labels[n])
 		}
+	}
+}
+
+// TestRunNextMaintainerEscalationRetriesHalves covers the review of #248 on
+// the fake GitHub server: the codeaf-maintainer label and the hand-off
+// comment are ensured independently. A label add that fails does not
+// suppress the comment — the comment is posted on the same tick — and the
+// next tick adds the missing label alone, without posting the comment
+// twice; once both halves are served, a repeat tick posts nothing at all.
+func TestRunNextMaintainerEscalationRetriesHalves(t *testing.T) {
+	report := func(outcome string) string {
+		return reportMarker + "\n### CodeAF run — " + outcome + "\n\n| | |\n"
+	}
+	// The issue is past its one retry: its retry marker is followed by a
+	// failed run report, so every tick classifies it as a maintainer case.
+	comments := []string{issueRetryBody(120), report("run job failed")}
+	posts := 0
+	labelAttempts, labelCreates := 0, 0
+	labels := []string{}
+	issueJSON := `[{"number":120,"state":"open","created_at":"2024-01-01T00:00:00Z","body":"## Done when\n\n- tests pass\n\n## End-to-end check\n\nharness next prints nothing for #120\n","labels":[{"name":"codeaf"},{"name":"area:app/x"}]}]`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/issues" && r.URL.Query().Get("state") == "open":
+			fmt.Fprint(w, issueJSON)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/issues/120/comments":
+			var items []string
+			for _, c := range comments {
+				items = append(items, fmt.Sprintf(`{"body":%q,"user":{"type":"Bot"}}`, c))
+			}
+			fmt.Fprint(w, "["+strings.Join(items, ",")+"]")
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/RichardoC/factory-repo/issues/120/comments":
+			posts++
+			var body struct {
+				Body string `json:"body"`
+			}
+			data, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(data, &body)
+			comments = append(comments, body.Body)
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/issues/120":
+			// The label's footprint: only a label add that succeeded is
+			// served back, so a failed add is retried by the next tick.
+			var ls []string
+			for _, l := range labels {
+				ls = append(ls, fmt.Sprintf(`{"name":%q}`, l))
+			}
+			fmt.Fprintf(w, `{"number":120,"state":"open","labels":[%s]}`, strings.Join(ls, ","))
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/RichardoC/factory-repo/issues/120/labels":
+			labelAttempts++
+			if labelAttempts == 1 {
+				w.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprint(w, `{"message":"boom"}`)
+				return
+			}
+			var body struct {
+				Labels []string `json:"labels"`
+			}
+			data, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(data, &body)
+			labels = append(labels, body.Labels...)
+			fmt.Fprint(w, `[]`)
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/RichardoC/factory-repo/labels":
+			labelCreates++
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/contents/app":
+			fmt.Fprint(w, `[]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	t.Setenv("GITHUB_API_URL", server.URL)
+	t.Setenv("GITHUB_REPOSITORY", "RichardoC/factory-repo")
+	t.Setenv("GH_TOKEN", "tok")
+	t.Setenv("PROXY_MODELS", "models.json")
+	t.Setenv("CODEAF_WEEK_SPENT_USD", "1")
+	if _, err := loadConfig("models.json"); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	issuesPath := filepath.Join(dir, "issues.json")
+	runsPath := filepath.Join(dir, "runs.json")
+	if err := os.WriteFile(issuesPath, []byte(issueJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(runsPath, []byte(`[{"status":"completed"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// First tick: the label add fails, and the comment is still posted —
+	// one half failing never suppresses the other. Nothing is picked.
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "" {
+		t.Fatalf("runNext printed %q, %v; want nothing picked", out, err)
+	}
+	if posts != 1 || !strings.Contains(comments[2], queueIssueMaintainerMarker) {
+		t.Fatalf("comments = %q (posts %d); want the maintainer comment despite the label failure", comments, posts)
+	}
+	if len(labels) != 0 || labelCreates != 1 || labelAttempts != 1 {
+		t.Fatalf("labels %v (creates %d, attempts %d); want the failed add recorded, the label absent", labels, labelCreates, labelAttempts)
+	}
+
+	// Second tick: the marker comment is up, and the label is added
+	// alone — no second comment, and the label is created first again.
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "" {
+		t.Fatalf("second runNext printed %q, %v; want nothing picked", out, err)
+	}
+	if posts != 1 || len(comments) != 3 {
+		t.Fatalf("second tick posted (comments %q, posts %d); want no duplicate comment", comments, posts)
+	}
+	if len(labels) != 1 || labels[0] != maintainerLabel || labelAttempts != 2 {
+		t.Fatalf("labels %v (attempts %d); want the %s label added alone", labels, labelAttempts, maintainerLabel)
+	}
+
+	// Third tick: both halves are served — nothing is created, added or
+	// posted.
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "" {
+		t.Fatalf("third runNext printed %q, %v; want nothing picked", out, err)
+	}
+	if posts != 1 || len(labels) != 1 || labelCreates != 2 || labelAttempts != 2 {
+		t.Fatalf("third tick acted (posts %d, labels %v, creates %d, attempts %d); want nothing", posts, labels, labelCreates, labelAttempts)
 	}
 }
