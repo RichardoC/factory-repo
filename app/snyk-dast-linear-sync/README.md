@@ -576,6 +576,10 @@ already finished changes nothing.
 - Console logs show startup, load progress, work progress, cache refresh, and final summary.
 - Error logs are appended to `ERROR_LOG_FILE`.
 - Default error log path: `logs/snyk-dast-linear-sync-errors.log`
+- The console and error-log handlers are independent: every record is offered to
+  each handler whose level admits it, and one handler failing (a closed console
+  pipe, a full disk) never stops the record reaching the other. A handler
+  failure is reported as the logger's error but does not swallow the record.
 
 ## More Detail
 
