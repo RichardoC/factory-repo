@@ -57,13 +57,13 @@ func main() {
 	))
 
 	// As in the sync binary: Ctrl-C or SIGTERM cancels in-flight calls instead
-	// of killing the process mid-write.
+	// of killing the process mid-write, so the tool reports on what it had
+	// loaded rather than dying with the signal. The shutdown line is emitted
+	// from finish, on the way out, together with the exit status it announces;
+	// nothing here may print it earlier, because until the diagnostic path is
+	// done the process has not decided to exit yet.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	go func() {
-		<-ctx.Done()
-		logger.Info("shutdown requested, cancelling in-flight calls and exiting non-zero")
-	}()
 
 	snykdast, err := snykdastclient.New(ctx, cfg, logger.With("service", "snyk-dast"))
 	if err != nil {
@@ -82,7 +82,7 @@ func main() {
 	existing, err := linear.LoadIssueByIdentifier(ctx, identifier)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: load Linear issue %q: %v\n", identifier, err)
-		os.Exit(1)
+		os.Exit(finish(ctx, logger, 1))
 	}
 
 	if existing.Fingerprint == "" {
@@ -94,7 +94,7 @@ func main() {
 	snykdastSnapshot, err := snykdast.LoadSnapshot(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: load Snyk DAST snapshot: %v\n", err)
-		os.Exit(1)
+		os.Exit(finish(ctx, logger, 1))
 	}
 
 	finding, findingErr := findFinding(snykdastSnapshot, existing.Fingerprint)
@@ -112,10 +112,51 @@ func main() {
 
 	if *jsonOut {
 		emitJSON(diag, cacheSnapshot, cacheErr)
-		return
+	} else {
+		printDiagnostics(diag, cacheSnapshot, cacheErr)
 	}
 
-	printDiagnostics(diag, cacheSnapshot, cacheErr)
+	// The diagnostics above are printed either way, so an interrupted run still
+	// reports what it saw. This has to be the last thing main does: os.Exit
+	// skips deferred calls.
+	os.Exit(finish(ctx, logger, exitCode(ctx, nil)))
+}
+
+// finish reports the outcome and returns the exit status main passes to
+// os.Exit. It is the only place that announces the shutdown, and it does so on
+// the way out, next to the exit status the line talks about -- a line printed
+// when the signal arrives would describe a decision the process had not made
+// yet (the diagnostic path has to run first, and it may still fail).
+//
+// WHAT the two lines promise, exactly: the shutdown line is printed whenever
+// the context was cancelled, whatever the exit status is, and the exit line is
+// printed whenever the status is non-zero, whatever the reason (a failed load,
+// not only an interruption). finish is not reached at all for the failures that
+// happen before the clients are up -- config, flags, client construction -- but
+// those cannot have a cancellation to report either: they exit before the
+// signal watcher context is created. Every later failure path goes through it.
+func finish(ctx context.Context, logger *slog.Logger, status int) int {
+	if ctx.Err() != nil {
+		logger.Info("shutdown requested; cancelling in-flight calls and exiting non-zero")
+	}
+	if status != 0 {
+		logger.Error("exiting non-zero", "exit_code", status)
+	}
+	return status
+}
+
+// exitCode is the process exit status: non-zero once the context was cancelled.
+//
+// It keys on the context and not only on the error, because the cancellation
+// can land after the last call has already completed successfully -- the call
+// returns nil, the run was still interrupted, and the snapshot it printed is
+// the one the shutdown log line promised not to trust. A scheduler has to see
+// that as a failure, which is what the log line says happens.
+func exitCode(ctx context.Context, err error) int {
+	if err != nil || ctx.Err() != nil {
+		return 1
+	}
+	return 0
 }
 
 func extractIdentifier(ref string) string {

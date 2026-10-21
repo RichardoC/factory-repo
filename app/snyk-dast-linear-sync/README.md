@@ -540,6 +540,15 @@ go run ./cmd/investigate-duedate --env-file .env --issue SEC-12127
 
 Add `--json` for machine-readable output.
 
+The helper follows the sync's signal handling: Ctrl-C or SIGTERM cancels its
+in-flight calls, and the run then finishes the way it always does -- it prints
+the diagnostics it could build from what was loaded and exits non-zero. On the
+way out it says so on stderr: `shutdown requested; cancelling in-flight calls
+and exiting non-zero`, followed by `exiting non-zero` with the status it exited
+with. If the signal lands before a call answers, that cancelled call is what the
+run reports as its error instead of the diagnostics; either way the run is never
+reported to a shell or a scheduler as a success, and a complete run exits 0.
+
 ## Exit Status
 
 The sync exits non-zero when a state-changing Linear operation was left
