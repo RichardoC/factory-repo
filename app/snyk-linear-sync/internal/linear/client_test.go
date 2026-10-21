@@ -1692,7 +1692,7 @@ func TestUpdateIssuesRefusesUpdateWhenLabelPageTruncated(t *testing.T) {
 		cfg: config.LinearConfig{
 			TeamID: "team-1",
 			States: config.StateConfig{Todo: "Todo"},
-			Labels: config.LabelConfig{Protected: protectedTestLabels},
+			Labels: config.LabelConfig{Protected: []string{"control:protected"}},
 		},
 		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
 			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -1713,7 +1713,7 @@ func TestUpdateIssuesRefusesUpdateWhenLabelPageTruncated(t *testing.T) {
 							"pageInfo":{"hasNextPage":true}
 						}},
 						{"id":"issue-2","labels":{
-							"nodes":[{"id":"label-protected","name":"df:kikimora-snyk"}]
+							"nodes":[{"id":"label-protected","name":"control:protected"}]
 						}}
 					]}}}`), nil
 				}
