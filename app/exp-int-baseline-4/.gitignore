@@ -1,0 +1,5 @@
+# Built app binary: `go build ./...` on this single-main-package module writes
+# it into this directory (same reason issue #139 added the seed's binary to
+# the root .gitignore). This copy is kept out of the deliverable here, inside
+# the experiment's own directory.
+/exp-int-baseline-4
