@@ -110,6 +110,10 @@ func TestRunPlanBriefSections(t *testing.T) {
 		"> stop: deadline",
 		"# Output contract",
 		"### Proposal: <one-line title>",
+		// Issue #189: the plan brief's standing instructions say the PATH
+		// harness is the pre-change build, so a proposal is grounded in the
+		// source, never in that binary's output.
+		planHarnessPreChangeSentence,
 	} {
 		if !strings.Contains(brief, want) {
 			t.Errorf("brief missing %q", want)

@@ -613,6 +613,11 @@ func capDiff(diff string, max int) string {
 	return diff[:cut] + note
 }
 
+// reviewHarnessPreChangeSentence is the evidence rule review-instructions.md
+// carries (issue #189): the `harness` on PATH predates the run, so a review
+// of a .github/codeaf/ diff rebuilds from the diff's tree.
+const reviewHarnessPreChangeSentence = "the `harness` binary on `PATH` was built from the default\nbranch before this run started"
+
 // runReviewBrief implements `harness review-brief` (issue #32): the review
 // run's brief. It mirrors runBrief's conventions — the budget line, the
 // standing instructions from the harness directory, sections joined by a

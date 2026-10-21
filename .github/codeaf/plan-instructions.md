@@ -72,3 +72,9 @@ Write one section per proposal, in exactly this shape:
   any file you wrote. Repeat every proposal there, in exactly the
   `### Proposal:` format above. A run whose proposals never reach the final
   answer opens no issues.
+
+Evidence rule: the `harness` binary on `PATH` was built from the default
+branch before this run started, so it does not contain any change under
+`.github/codeaf/` in the working tree; a read-only plan run cannot rebuild
+it, so ground a proposal's Problem in the source file and line, not in the
+`harness` binary's output.
