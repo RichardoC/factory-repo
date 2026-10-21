@@ -22,6 +22,7 @@ github.com/tesslio/snyk-linear-sync
 - Ensures a configurable managed label is applied to all managed issues, unless label management is explicitly turned off.
 - Moves stale issues to the configured resolved state when the finding is no longer present but the Snyk project still exists.
 - Cancels managed Linear issues when their Snyk project no longer exists, such as after project deletion.
+- Fails the run instead of cancelling everything when the Snyk snapshot lists no projects at all (neither active nor inactive) while managed issues exist, so a Snyk outage, a revoked key or a wrong `SNYK_ORG_ID` cannot mass-cancel the board.
 - Rebinds a ticket to its finding when Snyk recreates the project under a new project ID (see [Project Recreation](#project-recreation)), instead of cancelling it and creating a copy.
 - Reopens a ticket that was closed while Snyk kept reporting the exact same occurrence as open, instead of creating a duplicate (see [Reopen Guard](#reopen-guard)).
 - Uses a local SQLite cache to skip unchanged findings and unchanged Linear issues on steady-state runs.
@@ -362,6 +363,7 @@ be trusted to select which issues to load.
 - fixed (or resolved/disappeared) -> `Done`
 - missing finding in an existing active Snyk project -> `Done`
 - missing finding because the Snyk project no longer exists -> `Cancelled`
+- Snyk snapshot lists no projects at all (active and inactive both empty) while managed issues exist -> the run fails with an error and writes nothing (`--dry-run` still reports the plan and logs the refusal at error level)
 - Snyk project is inactive (de-activated) -> `Cancelled`
 
 The configured Linear state names are resolved by name first, then by workflow type where possible.
