@@ -4217,3 +4217,28 @@ func TestProductionHeaderWaitGrace(t *testing.T) {
 		t.Fatalf("default header wait grace = %v, want in [10s, 30s)", g)
 	}
 }
+
+// TestNextLink covers the `Link` header parser the paged list reads run on
+// (issue #223): the header is untrusted data, so a next link is picked out
+// only from a well-formed <url>; rel="next" entry.
+func TestNextLink(t *testing.T) {
+	for _, c := range []struct {
+		header string
+		want   string
+	}{
+		{`<https://api.github.com/repositories/1/issues/7/comments?page=2>; rel="next", <https://api.github.com/repositories/1/issues/7/comments?page=1>; rel="prev"`, "https://api.github.com/repositories/1/issues/7/comments?page=2"},
+		// A next link that is not the comma-list's first entry, the way the
+		// real API orders a middle page: rel="prev" comes before it.
+		{`<https://api.github.com/repositories/1/issues/7/comments?page=1>; rel="prev", <https://api.github.com/repositories/1/issues/7/comments?page=2>; rel="next"`, "https://api.github.com/repositories/1/issues/7/comments?page=2"},
+		{`<https://api.github.com/repositories/1/issues/7/comments?page=1>; rel="prev"`, ""},
+		{"", ""},
+		{"no link header at all", ""},
+		{`<unclosed-url; rel="next"`, ""},
+		{`rel="next" without a url`, ""},
+		{`<https://api.github.com/r/1>; rel='"next"'`, "https://api.github.com/r/1"},
+	} {
+		if got := nextLink(c.header); got != c.want {
+			t.Errorf("nextLink(%q) = %q, want %q", c.header, got, c.want)
+		}
+	}
+}

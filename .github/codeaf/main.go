@@ -50,8 +50,10 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -2335,23 +2337,145 @@ func newGitHub() github {
 	}
 }
 
-func (g github) get(path string, into any) error {
+// doGet performs one GET against the repository API and returns the open
+// response with the status checked, so the one-shot get and the paged
+// getList share a single request path.
+func (g github) doGet(path string) (*http.Response, error) {
 	request, err := http.NewRequest(http.MethodGet, g.api+"/repos/"+g.repo+path, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	request.Header.Set("Authorization", "Bearer "+g.token)
 	request.Header.Set("Accept", "application/vnd.github+json")
 	response, err := g.client.Do(request)
 	if err != nil {
+		return nil, err
+	}
+	if response.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		return nil, fmt.Errorf("GET %s: %s: %.300s", path, response.Status, data)
+	}
+	return response, nil
+}
+
+// get sends one GET and decodes the reply. On a paged listing that stops
+// at the API's own page size (100 items by default): the list reads the
+// harness makes go through getList instead, which follows the next pages
+// (issue #223).
+func (g github) get(path string, into any) error {
+	response, err := g.doGet(path)
+	if err != nil {
 		return err
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		data, _ := io.ReadAll(response.Body)
-		return fmt.Errorf("GET %s: %s: %.300s", path, response.Status, data)
-	}
 	return json.NewDecoder(response.Body).Decode(into)
+}
+
+// maxListPages caps how many pages a paged list read follows (issue #223):
+// with per_page=100 that is a thousand items, more than any list the
+// harness reads tells apart, and it bounds a listing that keeps offering a
+// next page. A read that stops at the cap is truncated, so it comes back
+// as an error: the caller treats the list as unread, which for the area
+// guard means conflicting with everything rather than making do with the
+// first pages.
+const maxListPages = 10
+
+// nextLink returns the URL of the rel="next" link in a `Link` header, or ""
+// when the header offers none. The header is untrusted data; it is only
+// parsed here, and listNext decides whether it may be followed.
+func nextLink(h string) string {
+	for _, link := range strings.Split(h, ",") {
+		part := strings.TrimSpace(link)
+		if !strings.HasPrefix(part, "<") {
+			continue
+		}
+		end := strings.Index(part, ">")
+		if end < 0 {
+			continue
+		}
+		for _, param := range strings.Split(part[end+1:], ";") {
+			key, value, ok := strings.Cut(strings.TrimSpace(param), "=")
+			if !ok || strings.TrimSpace(key) != "rel" {
+				continue
+			}
+			if strings.Trim(strings.TrimSpace(value), `"'`) == "next" {
+				return part[1:end]
+			}
+		}
+	}
+	return ""
+}
+
+// listNext reduces a next link to the path the next page is read with. The
+// link is untrusted data: it is followed only when it leads back to this
+// API and this repository's prefix, and anything else — another host, a
+// relative link outside /repos/<repo>/, an unparseable URL — is an error,
+// because a listing that cannot be continued safely is a truncated one.
+func (g github) listNext(h string) (string, error) {
+	next := nextLink(h)
+	if next == "" {
+		return "", nil
+	}
+	u, err := url.Parse(next)
+	if err != nil {
+		return "", fmt.Errorf("next link %q: %v", next, err)
+	}
+	if base, err := url.Parse(g.api); err == nil && u.Host != "" && u.Host != base.Host {
+		return "", fmt.Errorf("next link %q leaves the API host", next)
+	}
+	uri := u.RequestURI() // path and query, never a scheme or host
+	prefix := "/repos/" + g.repo + "/"
+	if !strings.HasPrefix(uri, prefix) {
+		return "", fmt.Errorf("next link %q leaves the repository", next)
+	}
+	// The prefix ends with the repository's separator, so what follows it
+	// is the path below /repos/<repo> without its leading slash — which
+	// doGet expects, like the one-shot paths it is handed.
+	return "/" + strings.TrimPrefix(uri, prefix), nil
+}
+
+// getList reads a paged list — issue and PR comments, reviews, review
+// comments, pull request files, commits and the timeline (issue #223) —
+// following GitHub's `Link: rel="next"` header page by page, up to
+// maxListPages pages, and appending every page into the slice `into` points
+// to. A reply that offers no next link answers after one request, exactly
+// like get. Hitting the page cap, or a next link that does not stay inside
+// this repository's API, returns an error instead of a silent partial
+// list, so a truncated listing never looks like a complete one.
+func (g github) getList(path string, into any) error {
+	slice := reflect.ValueOf(into)
+	if slice.Kind() != reflect.Ptr || slice.Elem().Kind() != reflect.Slice {
+		return fmt.Errorf("github.getList: %T is not a pointer to a slice", into)
+	}
+	all := slice.Elem()
+	first := path
+	for pages := 0; path != ""; pages++ {
+		if pages == maxListPages {
+			return fmt.Errorf("GET %s: stopped after %d pages, the listing may be truncated", first, maxListPages)
+		}
+		response, err := g.doGet(path)
+		if err != nil {
+			return err
+		}
+		data, err := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if err != nil {
+			return err
+		}
+		page := reflect.New(all.Type())
+		if err := json.Unmarshal(data, page.Interface()); err != nil {
+			return err
+		}
+		all = reflect.AppendSlice(all, page.Elem())
+		next, err := g.listNext(response.Header.Get("Link"))
+		if err != nil {
+			return err
+		}
+		path = next
+	}
+	slice.Elem().Set(all)
+	return nil
 }
 
 // post sends a JSON body to the API and decodes the reply, when into is not
@@ -2775,7 +2899,7 @@ func lastN[T any](items []T, n int) []T {
 
 func (g github) thread(number int) (string, error) {
 	var comments []issueComment
-	if err := g.get(fmt.Sprintf("/issues/%d/comments?per_page=100", number), &comments); err != nil {
+	if err := g.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", number), &comments); err != nil {
 		return "", err
 	}
 	var b strings.Builder
@@ -2955,7 +3079,7 @@ func previousReportSection(gh github, number int) string {
 	var b strings.Builder
 	b.WriteString("## The previous CodeAF report\n")
 	var comments []issueComment
-	if err := gh.get(fmt.Sprintf("/issues/%d/comments?per_page=100", number), &comments); err != nil {
+	if err := gh.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", number), &comments); err != nil {
 		fmt.Fprintf(&b, "\n(previous CodeAF report unavailable: %s)\n", escapeMD(err.Error(), 200, true))
 		return b.String()
 	}
@@ -3007,7 +3131,7 @@ type finding struct {
 // commit it returns the zero time, which includes every finding.
 func (g github) prBotCutoff(number int) (time.Time, error) {
 	var commits []prCommit
-	if err := g.get(fmt.Sprintf("/pulls/%d/commits?per_page=100", number), &commits); err != nil {
+	if err := g.getList(fmt.Sprintf("/pulls/%d/commits?per_page=100", number), &commits); err != nil {
 		return time.Time{}, err
 	}
 	cutoff := time.Time{}
@@ -3032,7 +3156,7 @@ func (g github) prBotCutoff(number int) (time.Time, error) {
 // brief.
 func (g github) reviewFindings(number int, cutoff time.Time, triggerCommentID, triggerReviewID int64) (items []finding, notes []string) {
 	var comments []issueComment
-	if err := g.get(fmt.Sprintf("/issues/%d/comments?per_page=100", number), &comments); err != nil {
+	if err := g.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", number), &comments); err != nil {
 		notes = append(notes, err.Error())
 	}
 	for _, c := range comments {
@@ -3047,7 +3171,7 @@ func (g github) reviewFindings(number int, cutoff time.Time, triggerCommentID, t
 	}
 
 	var reviews []comment
-	if err := g.get(fmt.Sprintf("/pulls/%d/reviews?per_page=100", number), &reviews); err != nil {
+	if err := g.getList(fmt.Sprintf("/pulls/%d/reviews?per_page=100", number), &reviews); err != nil {
 		notes = append(notes, err.Error())
 	}
 	for _, r := range reviews {
@@ -3065,7 +3189,7 @@ func (g github) reviewFindings(number int, cutoff time.Time, triggerCommentID, t
 	}
 
 	var inline []reviewComment
-	if err := g.get(fmt.Sprintf("/pulls/%d/comments?per_page=100", number), &inline); err != nil {
+	if err := g.getList(fmt.Sprintf("/pulls/%d/comments?per_page=100", number), &inline); err != nil {
 		notes = append(notes, err.Error())
 	}
 	for _, c := range inline {
@@ -3220,7 +3344,7 @@ func depsFromBody(body string) []int {
 // answered the first error comes back.
 func (g github) mergedPRForIssue(n int) (int, pull, error) {
 	var events []timelineEvent
-	if err := g.get(fmt.Sprintf("/issues/%d/timeline?per_page=100", n), &events); err != nil {
+	if err := g.getList(fmt.Sprintf("/issues/%d/timeline?per_page=100", n), &events); err != nil {
 		return 0, pull{}, err
 	}
 	best, bestAt, firstErr := 0, time.Time{}, error(nil)
@@ -3275,7 +3399,7 @@ func dependencyBullet(gh github, n int) string {
 	}
 	line += fmt.Sprintf(" — merged as PR #%d %s", m, escapeMD(pr.Title, 200, true))
 	var files []prFile
-	if err := gh.get(fmt.Sprintf("/pulls/%d/files?per_page=100", m), &files); err != nil {
+	if err := gh.getList(fmt.Sprintf("/pulls/%d/files?per_page=100", m), &files); err != nil {
 		return line + " (unavailable: " + escapeMD(err.Error(), 200, true) + ")\n"
 	}
 	var b strings.Builder
@@ -3389,7 +3513,7 @@ func runBrief() error {
 			}
 		}
 		var reviews []reviewComment
-		if err := gh.get(fmt.Sprintf("/pulls/%d/comments?per_page=100", number), &reviews); err != nil {
+		if err := gh.getList(fmt.Sprintf("/pulls/%d/comments?per_page=100", number), &reviews); err != nil {
 			return err
 		}
 		if len(reviews) > 0 {

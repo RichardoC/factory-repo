@@ -7,7 +7,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -193,6 +195,106 @@ func commentsServer(t *testing.T, comments []issueComment, status int) *httptest
 	}))
 	t.Cleanup(server.Close)
 	return server
+}
+
+// commentsPagesServer serves issue #7's comments the way the real API
+// does: perPage per page, and a `Link: rel="next"` header while more
+// remain. The pointer it returns counts the pages served.
+func commentsPagesServer(t *testing.T, perPage int, comments []issueComment) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/RichardoC/factory-repo/issues/7/comments" {
+			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+		requests.Add(1)
+		page := 1
+		if s := r.URL.Query().Get("page"); s != "" {
+			if v, err := strconv.Atoi(s); err == nil {
+				page = v
+			}
+		}
+		start := (page - 1) * perPage
+		if start >= len(comments) {
+			http.Error(w, "page past the end", http.StatusBadRequest)
+			return
+		}
+		end := start + perPage
+		if end > len(comments) {
+			end = len(comments)
+		}
+		var b strings.Builder
+		b.WriteString("[")
+		for i := start; i < end; i++ {
+			if i > start {
+				b.WriteString(",")
+			}
+			fmt.Fprintf(&b, `{"id":%d,"body":%q}`, comments[i].ID, comments[i].Body)
+		}
+		b.WriteString("]")
+		if end < len(comments) {
+			w.Header().Set("Link", fmt.Sprintf("<%s%s?per_page=%d&page=%d>; rel=\"next\"", serverURL(r), r.URL.Path, perPage, page+1))
+		}
+		_, _ = io.WriteString(w, b.String())
+	}))
+	t.Cleanup(server.Close)
+	return server, &requests
+}
+
+// serverURL rebuilds the request's own base URL, so the served next link
+// points back at the stub the way the real API's links point at itself.
+func serverURL(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host
+}
+
+// TestCountReportsAcrossPages is the issue #223 stub: more than 100 report
+// comments, served across two pages, must reach countReports whole — the
+// one-page read counted only the first 100, the cap stayed unfired and fix
+// runs repeated.
+func TestCountReportsAcrossPages(t *testing.T) {
+	server, requests := commentsPagesServer(t, 100, reportComments(150))
+	ghEnv(t, server)
+	gh := newGitHub()
+	action, body, used, err := continuePlan(gh, 7, stopDeadline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "cap" || !continuationCapReached(used) {
+		t.Fatalf("with 150 reports on two pages, action = %q, used = %d; want the cap fired (used >= %d)", action, used, maxContinuations)
+	}
+	if want := capBody(stopDeadline); body != want {
+		t.Errorf("body = %q, want the cap comment %q", body, want)
+	}
+	if n := requests.Load(); n != 2 {
+		t.Errorf("pages read = %d, want 2: the second page holds the reports past 100", n)
+	}
+}
+
+// TestCountReportsSinglePage is the other issue #223 stub: a reply with no
+// `Link` header answers after one request, with nothing re-read, so the
+// single-page case is unchanged by the pagination.
+func TestCountReportsSinglePage(t *testing.T) {
+	server, requests := commentsPagesServer(t, 100, reportComments(1))
+	ghEnv(t, server)
+	gh := newGitHub()
+	action, body, used, err := continuePlan(gh, 7, stopDeadline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "continue" || used != 0 {
+		t.Fatalf("with one report, action = %q, used = %d; want continue and none used", action, used)
+	}
+	if want := continueBody(stopDeadline, 0); body != want {
+		t.Errorf("body = %q, want %q", body, want)
+	}
+	if n := requests.Load(); n != 1 {
+		t.Errorf("requests = %d, want 1: a reply with no next link needs no extra request", n)
+	}
 }
 
 func TestContinuePlan(t *testing.T) {
