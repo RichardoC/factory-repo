@@ -1541,3 +1541,484 @@ func TestStrandedByFailedRun(t *testing.T) {
 		}
 	}
 }
+
+// botComment builds one bot-authored comment, and personComment a
+// human-authored one: only the bot's comments count for the stranded states
+// (issue #240), so a person's comment can neither fake a failure nor spend
+// the retry.
+func botComment(body string) (c bodyComments) {
+	return append(c, bodyComments{{Body: body}}[0])
+}
+
+// The stranded-issue states (issue #240): only a failed run's report as the
+// latest bot comment strands an issue, a retry marker anywhere in the
+// history turns the next failure into a maintainer hand-off, and a publish
+// refusal that names the workflow policy is never retried at all.
+func TestStrandedIssueState(t *testing.T) {
+	report := func(outcome string) string {
+		return reportMarker + "\n### CodeAF run — " + outcome + "\n\n| | |\n"
+	}
+	policy := report("publishing failed") + "\n| error | the workflow change breaks the workflow policy (above) and no maintainer approved it; refusing it |\n"
+	bot := func(bodies ...string) bodyComments {
+		var cs bodyComments
+		for _, b := range bodies {
+			cs = append(cs, botComment(b)[0])
+			cs[len(cs)-1].User.Type = "Bot"
+		}
+		return cs
+	}
+	person := func(body string) bodyComments {
+		return botComment(body) // User.Type stays empty: not a bot
+	}
+	cases := []struct {
+		name     string
+		comments bodyComments
+		want     string
+	}{
+		{"no comments", nil, strandNone},
+		{"run job failed on a first failure", bot(report("run job failed")), strandRetry},
+		{"publishing failed on a first failure", bot(report("publishing failed")), strandRetry},
+		{"changes pushed is no failure", bot(report("changes pushed")), strandNone},
+		{"no changes is no failure", bot(report("no changes")), strandNone},
+		{"done is no failure", bot(report("done")), strandNone},
+		{"a later bot comment that is no report ends the strand", bot(report("run job failed"), "ran again, still going"), strandNone},
+		{"a non-bot report cannot fake a failure", person(report("run job failed")), strandNone},
+		{"a person's comment does not shield a failure", append(bot(report("run job failed")), personComment("looking into it")...), strandRetry},
+		{"a failure after the retry marker goes to a maintainer", bot(report("run job failed"), issueRetryBody(120), report("run job failed")), strandMaintainer},
+		{"a policy refusal is never retried", bot(policy), strandMaintainer},
+		{"a policy refusal after the retry marker stays a hand-off", bot(report("run job failed"), issueRetryBody(120), policy), strandMaintainer},
+		{"a retry marker with a well-ended run after it strands nobody", bot(report("run job failed"), issueRetryBody(120), report("done")), strandNone},
+		{"an escalation marker keeps later failures a hand-off", bot(report("run job failed"), issueRetryBody(120), report("run job failed"), issueMaintainerBody(120), report("run job failed")), strandMaintainer},
+	}
+	for _, tc := range cases {
+		if got := strandedIssueState(tc.comments); got != tc.want {
+			t.Errorf("%s: strandedIssueState = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// personComment is a named helper for readability in the table above.
+func personComment(body string) bodyComments {
+	return bodyComments{{Body: body}}
+}
+
+// The re-pick rides the queue's usual gates (issue #240): without the
+// caller's classification the issue stays out of the pick, with it the
+// re-pick is an issue run, and an open dependency still holds it.
+func TestNextStrandedIssue(t *testing.T) {
+	stranded := queuedIssue(120, "2024-01-01T00:00:00Z", "codeaf", "area:app/x")
+	o := nextOpts()
+	if p, _ := nextPick([]item{stranded}, nil, o); p.Kind != "" {
+		t.Fatalf("Next on a stranded issue without the retry = %+v; want nothing", p)
+	}
+	o.IssueRetries = map[int]bool{120: true}
+	if p, _ := nextPick([]item{stranded}, nil, o); p.Kind != kindIssue || p.Number != 120 {
+		t.Fatalf("Next on the re-pick = %+v; want issue #120", p)
+	}
+	// The usual gates run again on the re-pick: an open dependency holds
+	// the stranded issue, and the queue moves on to the next candidate.
+	blocked := stranded
+	blocked.Body = "Depends on #9\n" + readyBody
+	dep := queuedIssue(9, "2024-02-01T00:00:00Z", "codeaf-queued", "area:app/x")
+	if p, _ := nextPick([]item{blocked, dep}, nil, o); p.Kind != kindIssue || p.Number != 9 {
+		t.Fatalf("Next on a re-pick with an open dependency = %+v; want #9, the dependency held aside", p)
+	}
+}
+
+// TestRunNextRetriesStrandedIssue is the end-to-end check of issue #240, on
+// the fake GitHub server: an open issue labelled only codeaf, whose latest
+// bot comment is a failed run's report, is picked once (kind=issue) and gets
+// one retry marker comment; with that marker and a later failed run report
+// served, the issue is not re-picked — it gets the codeaf-maintainer label
+// and one fixed comment; a third tick posts nothing more and prints nothing.
+func TestRunNextRetriesStrandedIssue(t *testing.T) {
+	report := func(outcome string) string {
+		return reportMarker + "\n### CodeAF run — " + outcome + "\n\n| | |\n"
+	}
+	issueJSON := `[{"number":120,"state":"open","created_at":"2024-01-01T00:00:00Z","body":"## Done when\n\n- tests pass\n\n## End-to-end check\n\nharness next prints number=120\n","labels":[{"name":"codeaf"},{"name":"area:app/x"}]}]`
+	comments := []string{report("run job failed")}
+	posts := 0
+	var labels []string
+	labelCreates := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/issues" && r.URL.Query().Get("state") == "open":
+			fmt.Fprint(w, issueJSON)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/issues/120/comments":
+			if len(comments) == 0 {
+				fmt.Fprint(w, `[]`)
+				return
+			}
+			var items []string
+			for _, c := range comments {
+				items = append(items, fmt.Sprintf(`{"body":%q,"user":{"type":"Bot"}}`, c))
+			}
+			fmt.Fprint(w, "["+strings.Join(items, ",")+"]")
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/RichardoC/factory-repo/issues/120/comments":
+			posts++
+			var body struct {
+				Body string `json:"body"`
+			}
+			data, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(data, &body)
+			comments = append(comments, body.Body)
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/RichardoC/factory-repo/issues/120/labels":
+			var body struct {
+				Labels []string `json:"labels"`
+			}
+			data, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(data, &body)
+			labels = append(labels, body.Labels...)
+			fmt.Fprint(w, `[]`)
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/RichardoC/factory-repo/labels":
+			// The queue creates codeaf-maintainer before it adds it (the
+			// review of #248): no workflow creates the label, and an
+			// issue-labels post cannot add a label that is missing.
+			labelCreates++
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/issues/120":
+			// The label ensure reads the issue's own labels, so a repeat
+			// tick with both halves served posts nothing more.
+			var ls []string
+			for _, l := range labels {
+				ls = append(ls, fmt.Sprintf(`{"name":%q}`, l))
+			}
+			fmt.Fprintf(w, `{"number":120,"state":"open","labels":[%s]}`, strings.Join(ls, ","))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/contents/app":
+			fmt.Fprint(w, `[]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	t.Setenv("GITHUB_API_URL", server.URL)
+	t.Setenv("GITHUB_REPOSITORY", "RichardoC/factory-repo")
+	t.Setenv("GH_TOKEN", "tok")
+	t.Setenv("PROXY_MODELS", "models.json")
+	t.Setenv("CODEAF_WEEK_SPENT_USD", "1")
+	if _, err := loadConfig("models.json"); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	issuesPath := filepath.Join(dir, "issues.json")
+	runsPath := filepath.Join(dir, "runs.json")
+	write := func(path, data string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(issuesPath, issueJSON)
+	write(runsPath, `[{"status":"completed"}]`)
+
+	// First tick: the stranded issue is re-picked once, and one marker
+	// comment records the retry.
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "kind=issue\nnumber=120\nlane=0\n" {
+		t.Fatalf("runNext printed %q, %v", out, err)
+	}
+	if posts != 1 || len(comments) != 2 || !strings.Contains(comments[1], queueIssueRetryMarker) {
+		t.Fatalf("comments = %q (posts %d); want one retry marker comment", comments, posts)
+	}
+
+	// Second tick: the run failed again after the marker. No re-pick —
+	// the issue gets the maintainer label and the one fixed comment.
+	comments = append(comments, report("run job failed"))
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "" {
+		t.Fatalf("runNext after the second failure printed %q, %v; wanted nothing", out, err)
+	}
+	if posts != 2 || len(labels) != 1 || labels[0] != maintainerLabel || !strings.Contains(comments[3], queueIssueMaintainerMarker) {
+		t.Fatalf("comments = %q (posts %d, labels %v); want one maintainer comment and the %s label", comments, posts, labels, maintainerLabel)
+	}
+	if labelCreates != 1 {
+		t.Fatalf("%d codeaf-maintainer creations; want exactly one, before the label add", labelCreates)
+	}
+
+	// Third tick: everything the hand-off needs is on the issue — nothing
+	// is posted and nothing is printed.
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "" {
+		t.Fatalf("runNext on the repeat tick printed %q, %v; wanted nothing", out, err)
+	}
+	if posts != 2 || len(labels) != 1 || labelCreates != 1 {
+		t.Fatalf("repeat tick posted (posts %d, labels %v, creates %d); want nothing more", posts, labels, labelCreates)
+	}
+}
+
+// TestRunNextStrandedIssueGuards covers the negative space of issue #240 on
+// the fake server: a publish refusal naming the workflow policy goes to a
+// maintainer at once, while a well-ended run's report, an open pull request
+// closing the issue, and a run in progress all leave the issue alone.
+func TestRunNextStrandedIssueGuards(t *testing.T) {
+	report := func(outcome, extra string) string {
+		return reportMarker + "\n### CodeAF run — " + outcome + "\n\n| | |\n" + extra
+	}
+	comments := map[int][]string{
+		117: {report("publishing failed", "\n| error | the workflow change breaks the workflow policy (above) and no maintainer approved it; refusing it |\n")},
+		171: {report("changes pushed", "")},
+		122: {report("run job failed", "")},
+		124: {report("run job failed", "")},
+		120: {report("run job failed", "")},
+	}
+	issuesJSON := `[{"number":117,"state":"open","created_at":"2024-01-01T00:00:00Z","body":"## Done when\n\n- tests pass\n\n## End-to-end check\n\nharness next holds #117\n","labels":[{"name":"codeaf"},{"name":"area:app/z"}]},
+	                {"number":171,"state":"open","created_at":"2024-01-02T00:00:00Z","body":"## Done when\n\n- tests pass\n\n## End-to-end check\n\nharness next holds #171\n","labels":[{"name":"codeaf"},{"name":"area:app/z"}]},
+	                {"number":122,"state":"open","created_at":"2024-01-03T00:00:00Z","body":"## Done when\n\n- tests pass\n\n## End-to-end check\n\nharness next holds #122\n","labels":[{"name":"codeaf"},{"name":"area:app/x"}]},
+	                {"number":123,"state":"open","created_at":"2024-01-04T00:00:00Z","body":"Closes #122","pull_request":{"number":123},"labels":[]},
+	                {"number":124,"state":"open","created_at":"2024-01-05T00:00:00Z","body":"## Done when\n\n- tests pass\n\n## End-to-end check\n\nharness next holds #124\n","labels":[{"name":"codeaf"},{"name":"area:app/y"}]},
+	                {"number":120,"state":"open","created_at":"2024-01-06T00:00:00Z","body":"## Done when\n\n- tests pass\n\n## End-to-end check\n\nharness next prints number=120\n","labels":[{"name":"codeaf"},{"name":"area:app/x"}]}]`
+	posts := map[int]int{}
+	labels := map[int][]string{}
+	labelCreates := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case r.Method == http.MethodGet && path == "/repos/RichardoC/factory-repo/issues" && r.URL.Query().Get("state") == "open":
+			fmt.Fprint(w, issuesJSON)
+		case r.Method == http.MethodGet && strings.HasPrefix(path, "/repos/RichardoC/factory-repo/issues/") && strings.HasSuffix(path, "/comments"):
+			n := 0
+			fmt.Sscanf(path, "/repos/RichardoC/factory-repo/issues/%d/comments", &n)
+			cs := comments[n]
+			var items []string
+			for _, c := range cs {
+				items = append(items, fmt.Sprintf(`{"body":%q,"user":{"type":"Bot"}}`, c))
+			}
+			fmt.Fprint(w, "["+strings.Join(items, ",")+"]")
+		case r.Method == http.MethodPost && strings.HasPrefix(path, "/repos/RichardoC/factory-repo/issues/") && strings.HasSuffix(path, "/comments"):
+			n := 0
+			fmt.Sscanf(path, "/repos/RichardoC/factory-repo/issues/%d/comments", &n)
+			posts[n]++
+			var body struct {
+				Body string `json:"body"`
+			}
+			data, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(data, &body)
+			comments[n] = append(comments[n], body.Body)
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{}`)
+		case r.Method == http.MethodPost && strings.HasPrefix(path, "/repos/RichardoC/factory-repo/issues/") && strings.HasSuffix(path, "/labels"):
+			n := 0
+			fmt.Sscanf(path, "/repos/RichardoC/factory-repo/issues/%d/labels", &n)
+			var body struct {
+				Labels []string `json:"labels"`
+			}
+			data, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(data, &body)
+			labels[n] = append(labels[n], body.Labels...)
+			fmt.Fprint(w, `[]`)
+		case r.Method == http.MethodPost && path == "/repos/RichardoC/factory-repo/labels":
+			// 422 already_exists on every create call: the steady state
+			// once the label exists, which createMaintainerLabel counts
+			// as success like ensureAreaLabels does.
+			labelCreates++
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			fmt.Fprint(w, `{"message":"Validation Failed","errors":[{"code":"already_exists"}]}`)
+		case r.Method == http.MethodGet && strings.HasPrefix(path, "/repos/RichardoC/factory-repo/issues/") && !strings.Contains(path, "/comments"):
+			n := 0
+			fmt.Sscanf(path, "/repos/RichardoC/factory-repo/issues/%d", &n)
+			var ls []string
+			for _, l := range labels[n] {
+				ls = append(ls, fmt.Sprintf(`{"name":%q}`, l))
+			}
+			fmt.Fprintf(w, `{"number":%d,"state":"open","labels":[%s]}`, n, strings.Join(ls, ","))
+		case r.Method == http.MethodGet && path == "/repos/RichardoC/factory-repo/contents/app":
+			fmt.Fprint(w, `[]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	t.Setenv("GITHUB_API_URL", server.URL)
+	t.Setenv("GITHUB_REPOSITORY", "RichardoC/factory-repo")
+	t.Setenv("GH_TOKEN", "tok")
+	t.Setenv("PROXY_MODELS", "models.json")
+	t.Setenv("CODEAF_WEEK_SPENT_USD", "1")
+	if _, err := loadConfig("models.json"); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	issuesPath := filepath.Join(dir, "issues.json")
+	runsPath := filepath.Join(dir, "runs.json")
+	if err := os.WriteFile(issuesPath, []byte(issuesJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The run in progress on #124: it occupies lane 1 and holds that
+	// issue, whatever its comments say.
+	if err := os.WriteFile(runsPath, []byte(`[{"status":"in_progress","databaseId":100,"displayTitle":"CodeAF #124 (lane 1)"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Only #120 is re-picked; #117's policy refusal escalates at once.
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "kind=issue\nnumber=120\nlane=0\n" {
+		t.Fatalf("runNext printed %q, %v; want only the #120 re-pick", out, err)
+	}
+	if posts[120] != 1 || len(comments[120]) != 2 {
+		t.Fatalf("#120: %d posts, comments %q; want the one retry marker", posts[120], comments[120])
+	}
+	if len(labels[117]) != 1 || labels[117][0] != maintainerLabel || posts[117] != 1 {
+		t.Fatalf("#117: labels %v, %d posts; want the %s label and one comment", labels[117], posts[117], maintainerLabel)
+	}
+	if labelCreates != 1 {
+		t.Fatalf("#117: %d codeaf-maintainer creations; want one, tolerated as already_exists", labelCreates)
+	}
+	for _, n := range []int{171, 122, 124} {
+		if posts[n] != 0 || len(labels[n]) != 0 {
+			t.Fatalf("#%d posted (comments %q, labels %v); want nothing", n, comments[n], labels[n])
+		}
+	}
+}
+
+// TestRunNextMaintainerEscalationRetriesHalves covers the review of #248 on
+// the fake GitHub server: the codeaf-maintainer label and the hand-off
+// comment are ensured independently. A label add that fails does not
+// suppress the comment — the comment is posted on the same tick — and the
+// next tick adds the missing label alone, without posting the comment
+// twice; once both halves are served, a repeat tick posts nothing at all.
+func TestRunNextMaintainerEscalationRetriesHalves(t *testing.T) {
+	report := func(outcome string) string {
+		return reportMarker + "\n### CodeAF run — " + outcome + "\n\n| | |\n"
+	}
+	// The issue is past its one retry: its retry marker is followed by a
+	// failed run report, so every tick classifies it as a maintainer case.
+	comments := []string{issueRetryBody(120), report("run job failed")}
+	posts := 0
+	labelAttempts, labelCreates := 0, 0
+	labels := []string{}
+	issueJSON := `[{"number":120,"state":"open","created_at":"2024-01-01T00:00:00Z","body":"## Done when\n\n- tests pass\n\n## End-to-end check\n\nharness next prints nothing for #120\n","labels":[{"name":"codeaf"},{"name":"area:app/x"}]}]`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/issues" && r.URL.Query().Get("state") == "open":
+			fmt.Fprint(w, issueJSON)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/issues/120/comments":
+			var items []string
+			for _, c := range comments {
+				items = append(items, fmt.Sprintf(`{"body":%q,"user":{"type":"Bot"}}`, c))
+			}
+			fmt.Fprint(w, "["+strings.Join(items, ",")+"]")
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/RichardoC/factory-repo/issues/120/comments":
+			posts++
+			var body struct {
+				Body string `json:"body"`
+			}
+			data, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(data, &body)
+			comments = append(comments, body.Body)
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/issues/120":
+			// The label's footprint: only a label add that succeeded is
+			// served back, so a failed add is retried by the next tick.
+			var ls []string
+			for _, l := range labels {
+				ls = append(ls, fmt.Sprintf(`{"name":%q}`, l))
+			}
+			fmt.Fprintf(w, `{"number":120,"state":"open","labels":[%s]}`, strings.Join(ls, ","))
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/RichardoC/factory-repo/issues/120/labels":
+			labelAttempts++
+			if labelAttempts == 1 {
+				w.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprint(w, `{"message":"boom"}`)
+				return
+			}
+			var body struct {
+				Labels []string `json:"labels"`
+			}
+			data, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(data, &body)
+			labels = append(labels, body.Labels...)
+			fmt.Fprint(w, `[]`)
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/RichardoC/factory-repo/labels":
+			labelCreates++
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/contents/app":
+			fmt.Fprint(w, `[]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	t.Setenv("GITHUB_API_URL", server.URL)
+	t.Setenv("GITHUB_REPOSITORY", "RichardoC/factory-repo")
+	t.Setenv("GH_TOKEN", "tok")
+	t.Setenv("PROXY_MODELS", "models.json")
+	t.Setenv("CODEAF_WEEK_SPENT_USD", "1")
+	if _, err := loadConfig("models.json"); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	issuesPath := filepath.Join(dir, "issues.json")
+	runsPath := filepath.Join(dir, "runs.json")
+	if err := os.WriteFile(issuesPath, []byte(issueJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(runsPath, []byte(`[{"status":"completed"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// First tick: the label add fails, and the comment is still posted —
+	// one half failing never suppresses the other. Nothing is picked.
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "" {
+		t.Fatalf("runNext printed %q, %v; want nothing picked", out, err)
+	}
+	if posts != 1 || !strings.Contains(comments[2], queueIssueMaintainerMarker) {
+		t.Fatalf("comments = %q (posts %d); want the maintainer comment despite the label failure", comments, posts)
+	}
+	if len(labels) != 0 || labelCreates != 1 || labelAttempts != 1 {
+		t.Fatalf("labels %v (creates %d, attempts %d); want the failed add recorded, the label absent", labels, labelCreates, labelAttempts)
+	}
+
+	// Second tick: the marker comment is up, and the label is added
+	// alone — no second comment, and the label is created first again.
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "" {
+		t.Fatalf("second runNext printed %q, %v; want nothing picked", out, err)
+	}
+	if posts != 1 || len(comments) != 3 {
+		t.Fatalf("second tick posted (comments %q, posts %d); want no duplicate comment", comments, posts)
+	}
+	if len(labels) != 1 || labels[0] != maintainerLabel || labelAttempts != 2 {
+		t.Fatalf("labels %v (attempts %d); want the %s label added alone", labels, labelAttempts, maintainerLabel)
+	}
+
+	// Third tick: both halves are served — nothing is created, added or
+	// posted.
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "" {
+		t.Fatalf("third runNext printed %q, %v; want nothing picked", out, err)
+	}
+	if posts != 1 || len(labels) != 1 || labelCreates != 2 || labelAttempts != 2 {
+		t.Fatalf("third tick acted (posts %d, labels %v, creates %d, attempts %d); want nothing", posts, labels, labelCreates, labelAttempts)
+	}
+}
+
+// A run the proxy refused from its first call reports "no changes" with ok
+// false: that is a failure and strands its issue or PR like a failed
+// publish; a run that ended ok with no changes is not.
+func TestFailedRunReportCountsRefusedNoChanges(t *testing.T) {
+	refused := reportMarker + "\n### CodeAF run — no changes\n\n| | |\n|---|---|\n| stop / ok | `incomplete` / `false` |\n"
+	nothing := reportMarker + "\n### CodeAF run — no changes\n\n| | |\n|---|---|\n| stop / ok | `done` / `true` |\n"
+	pushed := reportMarker + "\n### CodeAF run — changes pushed\n\n| | |\n|---|---|\n| stop / ok | `incomplete` / `false` |\n"
+	for _, tc := range []struct {
+		body string
+		want bool
+	}{
+		{refused, true},
+		{nothing, false},
+		{pushed, false},
+		{reportMarker + "\n### CodeAF run — run job failed\n\n", true},
+	} {
+		if got := failedRunReport(tc.body); got != tc.want {
+			t.Errorf("failedRunReport(%q) = %v, want %v", tc.body[:60], got, tc.want)
+		}
+	}
+	bot := bodyComments{{Body: refused}}
+	bot[0].User.Type = "Bot"
+	if got := strandedIssueState(bot); got != strandRetry {
+		t.Errorf("refused issue state = %q, want %q", got, strandRetry)
+	}
+}
