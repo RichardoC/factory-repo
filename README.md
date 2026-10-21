@@ -87,10 +87,9 @@ maintainer's approval, like any other change under `.github/`.
   length of the job and sits between CodeAF and [synthetic.new](https://synthetic.new).
   It:
   - serves CodeAF an OpenRouter-style `/models` catalog containing only the models in
-    [`models.json`](.github/codeaf/models.json), at synthetic.new's **subscription
-    rates** — the prices that draw down the weekly credit, so CodeAF's estimates and
-    model routing see what usage really costs against the quota; the same file also
-    carries each model's API list rates (`api_*`), what overage past the quota costs
+    [`models.json`](.github/codeaf/models.json), at synthetic.new's **API list
+    ("overage") prices** (`api_*`), the prices every figure and cap in the factory
+    uses; the same file also keeps each model's subscription rates, for reference only
     (both checked 2026-10-17, [synthetic.new/pricing](https://synthetic.new/pricing));
   - adds `usage.cost` to every response, which is where CodeAF's spend accounting
     reads cost from;
