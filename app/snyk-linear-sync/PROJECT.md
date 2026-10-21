@@ -215,6 +215,8 @@ When an issue is in the awaiting-fix state, the sync adds the configured label. 
 
 The metadata block stores the full managed label set so the sync can remove stale tool-derived, origin-derived, and awaiting-fix labels while preserving unrelated manual labels.
 
+Because `issueUpdate` replaces the ticket's whole label set, every update batch re-reads the current labels of the issues it is about to write, immediately before the write, and carries labels the sync does not own over from that live read rather than from the run's opening snapshot. An issue whose labels that read cannot deliver is refused instead of guessed at: this covers an issue absent from the response and one returned with a truncated labels page (`pageInfo.hasNextPage`), where a label past the page boundary — including a `LINEAR_PROTECTED_LABELS` control label — would be absent from the read and then deleted by the update. The refusal is not paginated away: a nested connection cannot be paged from within this one query, and the sync's own cap of 250 labels per issue makes a truncating ticket pathological rather than a case worth serving. The caller retries the batch item by item, so only the refused issue fails; its update is counted in `failed_ops`.
+
 `LINEAR_UNSUBSCRIBE_ACTOR` is an optional operator control for notification behavior.
 
 - default: `true`
