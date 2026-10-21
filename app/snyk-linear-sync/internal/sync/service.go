@@ -137,6 +137,26 @@ func New(cfg config.Config, logger *slog.Logger, snyk SnykClient, linear LinearC
 	}
 }
 
+// Err reports whether the run left state-changing work permanently unapplied,
+// so the caller can exit non-zero. A run that logs a failure but reports
+// success is worse than a noisy one: nothing downstream notices the drift, and
+// the next scheduled run reports success again.
+//
+// Only permanent failures count. FailedOps is incremented after the per-item
+// retry has itself failed, so a batch that fails and then succeeds on retry is
+// a clean run and returns nil here. The exception is an ambiguous batch create
+// whose reconciliation lookup also fails: the whole batch is counted without a
+// retry, because there is no safe way to tell which entries landed. Comment
+// failures never reach FailedOps: a
+// missing change comment leaves the synced issue state correct, and comments
+// are opt-in via LINEAR_COMMENTS, so they are logged as warnings only.
+func (r RunResult) Err() error {
+	if r.FailedOps > 0 {
+		return fmt.Errorf("sync finished with failed_ops=%d; see the error log for the Linear operation(s) that could not be applied", r.FailedOps)
+	}
+	return nil
+}
+
 // Run loads both the Snyk and the Linear snapshot, plans the work that brings
 // the tickets in line with the findings and executes that plan over a pool of
 // cfg.Sync.Workers workers.
