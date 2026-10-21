@@ -60,12 +60,22 @@ func newTestVFS(tb testing.TB) (*vfs, *fake.Clientset) {
 	return NewVFS(tb.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3), fcs
 }
 
-// openTestFile opens name through the VFS itself, as sqlite would.
+// openTestFile opens name through the VFS itself, as sqlite would, with
+// zero open flags — this helper's historical default. Zero carries no
+// read-only bit, so Open takes the read-write path; tests that need a
+// read-only open use openTestFileWithFlags instead.
 func openTestFile(tb testing.TB, v *vfs, name string) *file {
 	tb.Helper()
-	sf, _, err := v.Open(name, 0)
+	return openTestFileWithFlags(tb, v, name, 0)
+}
+
+// openTestFileWithFlags is openTestFile for callers that must pick the open
+// flags themselves — read-write or read-only — as sqlite does for mode=ro.
+func openTestFileWithFlags(tb testing.TB, v *vfs, name string, flags sqlite3vfs.OpenFlag) *file {
+	tb.Helper()
+	sf, _, err := v.Open(name, flags)
 	if err != nil {
-		tb.Fatalf("Open(%q) failed: %v", name, err)
+		tb.Fatalf("Open(%q, flags=%d) failed: %v", name, flags, err)
 	}
 	f, ok := sf.(*file)
 	if !ok {
@@ -2155,9 +2165,11 @@ func TestOpenNonexistentJournalIsZeroLength(t *testing.T) {
 	const journal = "fresh.db-journal"
 
 	// Opening a journal that has no sectors must succeed and look like a
-	// zero-length file, exactly as opening a fresh database does: Open
-	// pre-creates the empty sector 0 the size computation expects.
-	f := openTestFile(t, v, journal)
+	// zero-length file, exactly as opening a fresh database does: a
+	// READ-WRITE open pre-creates the empty sector 0 the size computation
+	// expects. This test is deliberately explicit about the flags now that
+	// Open honours its read-only bit: only a read-write open may create.
+	f := openTestFileWithFlags(t, v, journal, sqlite3vfs.OpenReadWrite)
 
 	// The lockfile was created and sector 0 exists, empty.
 	getLockfileConfigMap(t, fcs, f)
@@ -2178,6 +2190,72 @@ func TestOpenNonexistentJournalIsZeroLength(t *testing.T) {
 	}
 	if size != 0 {
 		t.Errorf("FileSize on fresh journal = %d, want 0", size)
+	}
+}
+
+func TestOpenReadOnlyNonexistentCreatesNothing(t *testing.T) {
+	v, fcs := newTestVFS(t)
+	const db = "missing.db"
+
+	// A READ-ONLY open of a name that does not exist must not fabricate the
+	// file: no lock ConfigMap via casLock, no empty sector 0. The only calls
+	// the fake clientset may see are the reads that establish the file is
+	// missing (the lock ConfigMap Get), and the answer is SQLITE_CANTOPEN —
+	// what a filesystem VFS gives for a missing file. Before the flags were
+	// honoured this open created the lockfile and sector 0 and reported
+	// success, so a read-only reader mutated the store (issue #226).
+	fcs.ClearActions()
+	sf, _, err := v.Open(db, sqlite3vfs.OpenReadOnly)
+
+	if err != sqlite3vfs.CantOpenError {
+		t.Fatalf("Open(%q, OpenReadOnly) error = %v, want %v", db, err, sqlite3vfs.CantOpenError)
+	}
+	if sf != nil {
+		t.Errorf("Open(%q, OpenReadOnly) returned file %T, want nil", db, sf)
+	}
+
+	writes := 0
+	for _, a := range fcs.Actions() {
+		switch verb := a.GetVerb(); verb {
+		case "create", "update", "patch", "replace", "delete", "delete-collection":
+			t.Errorf("read-only Open recorded %q on %q, want no writes", verb, a.GetResource())
+			writes++
+		}
+	}
+	if writes == 0 && len(fcs.Actions()) == 0 {
+		t.Errorf("read-only Open of %q recorded zero actions: it no longer probed for the file", db)
+	}
+}
+
+func TestOpenReadOnlyExistingFileCreatesNothing(t *testing.T) {
+	v, fcs := newTestVFS(t)
+	const db = "there.db"
+
+	// A read-write open creates the file; a second, READ-ONLY open of the
+	// now-existing name must succeed (hot-journal recovery and reads rely
+	// on readonly opens working on existing names, see cmd/db-download) and
+	// record only reads: no lock ConfigMap write, no sector write.
+	f := openTestFile(t, v, db)
+	if _, err := f.WriteAt([]byte("krew"), 0); err != nil {
+		t.Fatalf("WriteAt: %v", err)
+	}
+
+	fcs.ClearActions()
+	ro := openTestFileWithFlags(t, v, db, sqlite3vfs.OpenReadOnly)
+	for _, a := range fcs.Actions() {
+		switch verb := a.GetVerb(); verb {
+		case "create", "update", "patch", "replace", "delete", "delete-collection":
+			t.Errorf("read-only Open of existing %q recorded %q on %q, want no writes", db, verb, a.GetResource())
+		}
+	}
+
+	// What the read-only opener reads is what the writer wrote.
+	buf := make([]byte, 4)
+	if _, err := ro.ReadAt(buf, 0); err != nil {
+		t.Fatalf("ReadAt through read-only open: %v", err)
+	}
+	if string(buf) != "krew" {
+		t.Errorf("read-only open ReadAt = %q, want %q", buf, "krew")
 	}
 }
 
