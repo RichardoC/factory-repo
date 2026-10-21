@@ -3426,6 +3426,32 @@ func TestBriefNamesAcceptanceCriteria(t *testing.T) {
 	}
 }
 
+// TestRunBriefSaysHarnessBinaryIsPreChange pins the fixed paragraph runBrief
+// carries from instructions.md (issue #189): the `harness` on PATH is the
+// default-branch build, so a change under .github/codeaf/ must be rebuilt
+// before any end-to-end proof cites it. A worker that "proves" a harness
+// change by running the PATH binary proves the pre-change code instead.
+func TestRunBriefSaysHarnessBinaryIsPreChange(t *testing.T) {
+	routes := map[string]string{
+		"/repos/RichardoC/factory-repo/issues/7":          `{"number":7,"title":"The task","body":"## Done when\n\n- TestRunBriefSaysHarnessBinaryIsPreChange passes\n\n## End-to-end check\n\ngo -C .github/codeaf test -race .\n","state":"open"}`,
+		"/repos/RichardoC/factory-repo/issues/7/comments": `[]`,
+	}
+	brief := runBriefInto(t, routes, "issue", issueEvent)
+	for _, want := range []string{
+		"## " + harnessBinaryPreChangeHeading,
+		"built from the default\nbranch before your run started",
+		"rebuild it",
+		"State in your answer which binary produced the\nevidence.",
+	} {
+		if !strings.Contains(brief, want) {
+			t.Fatalf("the brief does not say the PATH harness is the pre-change build (missing %q):\n%s", want, brief)
+		}
+	}
+	// Print the paragraph itself: the issue's end-to-end check runs this test
+	// and is expected to show it in the rendered issue brief, not only pass.
+	t.Logf("the rendered issue brief carries:\n%s", briefSection(brief, harnessBinaryPreChangeHeading))
+}
+
 // TestCommentBodiesEscapeRemoteText feeds one hostile string as every
 // remote-derived input of every comment body the harness posts (issue #135)
 // and asserts each body stays inert markdown: no raw @-mention (the escaped

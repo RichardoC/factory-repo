@@ -2818,6 +2818,15 @@ func budgetLine() string {
 // but a crafted target body, thread or dependency list still adds up.
 const maxBriefBytes = 100000
 
+// harnessBinaryPreChangeHeading is the heading, without its `## ` marker, of
+// the fixed paragraph instructions.md carries (issue #189), and the
+// argument of briefSection. The `harness` binary on the run job's PATH is
+// built from the default branch before the agent starts, so a worker that
+// "proves" a .github/codeaf/ change by running it proves the pre-change
+// code; the brief says so, and the test pins it to the standing
+// instructions rather than to a section runBrief adds.
+const harnessBinaryPreChangeHeading = "The `harness` binary on PATH is the pre-change build"
+
 // capBrief truncates s at max bytes without splitting a UTF-8 rune and
 // appends a note line; the note counts against the cap.
 func capBrief(s string, max int) string {

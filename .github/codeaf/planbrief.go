@@ -35,6 +35,11 @@ const (
 	planStandingFileName = "plan-instructions.md"
 )
 
+// planHarnessPreChangeSentence is the evidence rule plan-instructions.md
+// carries (issue #189): the `harness` on PATH predates the run, so a plan
+// run grounds a proposal's Problem in the source, not in that binary.
+const planHarnessPreChangeSentence = "the `harness` binary on `PATH` was built from the default\nbranch before this run started"
+
 // planMaxProposals reads planner.max_proposals from models.json with its own
 // tiny struct — deliberately not cfg.Planner, so the plan side of the
 // planner keeps compiling however the config type moves — and answers 5
