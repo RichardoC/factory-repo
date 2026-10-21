@@ -39,3 +39,4 @@ __pycache__/
 
 # Built app binaries (issue #139: a 3.9 MB exp-int-seed binary sat committed for a day)
 app/exp-int-seed/exp-int-seed
+app/exp-int-deepseek-4/exp-int-deepseek-4
