@@ -521,6 +521,12 @@ the outcome after that retry counts:
 - a create, update, resolve or duplicate-cancellation whose retry also failed
   is counted in `failed_ops` and **fails** the run
 
+Ambiguous batch creates are the exception to "the outcome after that retry":
+if the reconciliation lookup that decides what landed fails too, the whole
+batch is counted in `failed_ops` without a retry — there is no safe way to
+tell which entries landed, so every one is treated as unapplied and left for
+the next run (see [Current Behavior](#current-behavior)).
+
 The count appears in the `sync complete` summary log either way, and that
 summary is emitted before the exit status is decided.
 
@@ -530,9 +536,9 @@ start, and the run logs `shutdown requested, cancelling in-flight calls and
 leaving the cache untouched`. The cache is **not** refreshed — the plan was
 only partly written, so a refresh would describe the fingerprints whose jobs
 never ran as reconciled (see [Cache Behavior](#cache-behavior)) — and `Run`
-returns an error wrapping the context cancellation, which becomes the process
-exit status. A signal that arrives after a run has already finished changes
-nothing.
+returns an error wrapping `context.Canceled`/`context.DeadlineExceeded`, which
+becomes the process exit status. A signal that arrives after a run has already
+finished changes nothing.
 
 ## Logs
 

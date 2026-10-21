@@ -144,7 +144,10 @@ func New(cfg config.Config, logger *slog.Logger, snyk SnykClient, linear LinearC
 //
 // Only permanent failures count. FailedOps is incremented after the per-item
 // retry has itself failed, so a batch that fails and then succeeds on retry is
-// a clean run and returns nil here. Comment failures never reach FailedOps: a
+// a clean run and returns nil here. The exception is an ambiguous batch create
+// whose reconciliation lookup also fails: the whole batch is counted without a
+// retry, because there is no safe way to tell which entries landed. Comment
+// failures never reach FailedOps: a
 // missing change comment leaves the synced issue state correct, and comments
 // are opt-in via LINEAR_COMMENTS, so they are logged as warnings only.
 func (r RunResult) Err() error {

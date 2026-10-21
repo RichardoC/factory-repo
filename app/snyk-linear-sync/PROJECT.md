@@ -429,7 +429,10 @@ the run fails only when state-changing work was left permanently unapplied.
 
 `FailedOps` is incremented *after* the per-item retry has itself failed, so a
 batch failure recovered by retry leaves it at zero and the run succeeds — the
-operation applied, it just took two calls. A non-zero count fails the run,
+operation applied, it just took two calls. The exception is an ambiguous batch
+create whose reconciliation lookup also fails: the whole batch is counted
+without a retry, because there is no safe way to tell which entries landed. A
+non-zero count fails the run,
 because a run that logs a dropped ticket and then reports success means nothing
 downstream notices, and the next scheduled run reports success again.
 
