@@ -574,6 +574,20 @@ func perToken(perMillion float64) string {
 	return strconv.FormatFloat(perMillion/1e6, 'f', 12, 64)
 }
 
+// defaultEffort picks the first effort above "none"/"minimal", falling back
+// to efforts[0] only when no other effort exists.
+func defaultEffort(efforts []string) string {
+	for _, e := range efforts {
+		if e != "none" && e != "minimal" {
+			return e
+		}
+	}
+	if len(efforts) > 0 {
+		return efforts[0]
+	}
+	return ""
+}
+
 func catalog(models []Model) map[string][]catalogRow {
 	rows := make([]catalogRow, 0, len(models))
 	for _, m := range models {
@@ -592,7 +606,14 @@ func catalog(models []Model) map[string][]catalogRow {
 			"response_format", "structured_outputs", "temperature", "top_p", "max_tokens", "stop", "seed"}
 		row.Reasoning.DefaultEnabled = true
 		row.Reasoning.SupportedEfforts = m.Efforts
-		row.Reasoning.DefaultEffort = m.Efforts[0]
+		// A default_enabled row must not advertise "none" as its default
+		// effort: that contradicts the flag, and would run any seat that
+		// honours the catalog default (the planner and checker are on
+		// DeepSeek-V4.1-Flash, whose first effort is "none") with reasoning
+		// off — a setting the factory never chose. Pick the first effort
+		// above "none"/"minimal" instead, falling back to Efforts[0] only
+		// when no other effort exists.
+		row.Reasoning.DefaultEffort = defaultEffort(m.Efforts)
 		row.HuggingFaceID = strings.TrimPrefix(m.Upstream, "hf:")
 		rows = append(rows, row)
 	}

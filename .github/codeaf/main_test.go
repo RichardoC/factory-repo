@@ -166,6 +166,47 @@ func TestCatalogIsParseableByCodeAF(t *testing.T) {
 	}
 }
 
+// TestCatalogDefaultEffortIsNotNone: for every model in models.json,
+// a default_enabled catalog row must not advertise "none" (or "minimal") as
+// its default effort — the catalog would otherwise run seats that honour the
+// default with reasoning off while claiming reasoning is enabled.
+func TestCatalogDefaultEffortIsNotNone(t *testing.T) {
+	rows := catalog(testModels(t))["data"]
+	if len(rows) == 0 {
+		t.Fatal("no catalog rows")
+	}
+	for _, row := range rows {
+		if !row.Reasoning.DefaultEnabled {
+			continue
+		}
+		switch row.Reasoning.DefaultEffort {
+		case "", "none", "minimal":
+			t.Errorf("%s: default_enabled with default_effort %q (supported efforts %v)",
+				row.ID, row.Reasoning.DefaultEffort, row.Reasoning.SupportedEfforts)
+		}
+	}
+}
+
+// TestDefaultEffortPicksTheFirstRealEffort: the fallback order for a model
+// whose effort list starts below "low".
+func TestDefaultEffortPicksTheFirstRealEffort(t *testing.T) {
+	for _, tc := range []struct {
+		efforts []string
+		want    string
+	}{
+		{[]string{"none", "low", "high"}, "low"},
+		{[]string{"minimal", "high"}, "high"},
+		{[]string{"low"}, "low"},
+		// No effort above "none": fall back to Efforts[0].
+		{[]string{"none"}, "none"},
+		{nil, ""},
+	} {
+		if got := defaultEffort(tc.efforts); got != tc.want {
+			t.Errorf("defaultEffort(%v) = %q, want %q", tc.efforts, got, tc.want)
+		}
+	}
+}
+
 // TestProxyEndToEnd runs the proxy against a fake upstream: prices are added
 // to both JSON and streamed responses, the ledger records them, and the caps
 // and the model allowlist are enforced.
