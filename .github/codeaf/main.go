@@ -2819,7 +2819,7 @@ func budgetLine() string {
 const maxBriefBytes = 100000
 
 // harnessBinaryPreChangeHeading is the heading, without its `## ` marker, of
-// the fixed paragraph instructions.md carries (issue #189), and the CPU
+// the fixed paragraph instructions.md carries (issue #189), and the
 // argument of briefSection. The `harness` binary on the run job's PATH is
 // built from the default branch before the agent starts, so a worker that
 // "proves" a .github/codeaf/ change by running it proves the pre-change
