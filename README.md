@@ -555,10 +555,10 @@ fail with a message naming the field. Each routine carries:
 A routine is due only when the same guards as any run hold: the rolling
 week's spend under the queue's threshold, and a free lane under
 `queue.max_parallel_runs`. `harness routines-due issues.json runs.json`
-prints one `routine=<name> lane=<n>` line per due routine; the dedicated
-read-only routines workflow (maintainer-wired) runs it on an hourly
-schedule and the queue tick calls it too, so a routine is at most an hour
-late while anything is happening. A routine dispatch is gated like every
+prints one `routine=<name> lane=<n>` line per due routine. **Not wired yet:**
+no workflow calls it. A dedicated read-only routines workflow, on an hourly
+schedule, and `codeaf.yml`'s routine mode are a maintainer's hand edit,
+because the workflow policy freezes the CodeAF workflows. A routine dispatch is gated like every
 other dispatch: `routine=<name>` must name a routine in `routines.json`,
 and refuses any issue, pr, review, plan or profile input beside it.
 
@@ -576,7 +576,7 @@ and refuses any issue, pr, review, plan or profile input beside it.
   the per-run credit cap, enforced by the proxy. `TestRoutineCatalog`
   fails if the template file is missing.
 
-Shipped today: `model-prices` (daily check of the synthetic.new catalog
+Defined in `routines.json` (they run once the workflow is wired): `model-prices` (daily check of the synthetic.new catalog
 against `models.json`), `codeaf-upgrade` (daily agent run that classifies
 upstream CodeAF changes as take/hold/skip and proposes the bump),
 `quota-calibration` (6h check that re-estimates `weekly_credit_usd` from
