@@ -316,6 +316,49 @@ It uses:
 
 The cache is critical for steady-state performance. A healthy steady-state run should do little or no work when nothing has changed.
 
+### Batch Failure Handling
+
+Linear mutations are batched, one GraphQL alias per entry, so a create batch can
+fail in two ways that need different handling to avoid duplicating tickets:
+
+- **Per-alias failure.** The response carries `success: false`, or omits the
+  alias, while the other aliases succeeded. Only the reported entries are
+  retried; retrying the batch would duplicate the ones that already exist.
+- **Ambiguous failure.** No aliases were decoded at all, so nothing is known per
+  entry. This covers a transport-level failure and equally a GraphQL failure
+  that returned no data, such as a 502 arriving after Linear had already
+  committed the mutation. Crucially it does *not* prove Linear rejected the
+  mutation, and Linear exposes no idempotency key to make the retry safe: the
+  sync therefore reconciles first. `ExistingFingerprints` asks Linear which of
+  the batch's fingerprints now have a live issue, and only the rest are
+  re-created. That reconciliation query is scoped exactly like the snapshot
+  (team plus the identity arms: the title prefix and the managed label), so a
+  shared team cannot be paged through during the retry path. The metadata block
+  that carries the fingerprint is deliberately *not* used as a query predicate:
+  Linear does not apply `description` comparators, and filtering on them
+  silently widens the query to every issue in the team (the same trap the
+  sibling snyk-dast-linear-sync hit). The fingerprint check still runs on each
+  decoded description, so the scope governs which issues are read, not what
+  counts as a match.
+
+  If the reconciliation query itself fails, nothing is retried: the batch is
+  counted in `FailedOps` and left for the next run, which creates whatever is
+  genuinely missing. The finding is still reported by Snyk either way; if its
+  issue was never created it is absent from the next Linear snapshot and gets
+  created then. Missing a ticket for one cycle is recoverable; a duplicate is
+  only undone later by the duplicate-cancellation pass, after duplicate
+  notifications have gone out.
+
+A residual race remains by construction: a write that lands between the
+reconciliation query and the retry still duplicates. The
+duplicate-cancellation pass converges that case on a later run.
+
+Update, resolve and duplicate-cancel batches keep their item-by-item fallback:
+those writes set state, so re-applying one that already landed converges instead
+of duplicating. Change comments also have no fingerprint to reconcile against;
+an ambiguous comment-batch failure retries each comment individually, accepting
+a possible duplicate notification comment over a missing one.
+
 ## SQLite Cache
 
 The SQLite cache stores:

@@ -59,6 +59,16 @@ type fakeLinear struct {
 	lastOpenStatesErr   error
 	lastOpenStatesCalls [][]string
 
+	// createBatchErr makes the first (batch) create call fail with an error,
+	// simulating an ambiguous transport failure, while single-entry retries
+	// succeed. landedFingerprints is what ExistingFingerprints then reports
+	// as already present in Linear, and existingErr makes that
+	// reconciliation query itself fail.
+	createBatchErr     error
+	landedFingerprints []string
+	existingErr        error
+	existingCalls      int
+
 	// updateErr, when non-nil, makes every UpdateIssues call fail; the
 	// recording behaviour is kept so a test can still see what was attempted.
 	// createErr does the same for CreateIssues, which makes both the batch
@@ -100,6 +110,24 @@ func (f *fakeLinear) LoadSnapshot(context.Context) ([]model.ExistingIssue, error
 	return f.snapshot, nil
 }
 
+func (f *fakeLinear) ExistingFingerprints(_ context.Context, fingerprints []string) (map[string]struct{}, error) {
+	f.existingCalls++
+	if f.existingErr != nil {
+		return nil, f.existingErr
+	}
+	wanted := make(map[string]struct{}, len(fingerprints))
+	for _, fingerprint := range fingerprints {
+		wanted[fingerprint] = struct{}{}
+	}
+	found := map[string]struct{}{}
+	for _, fingerprint := range f.landedFingerprints {
+		if _, ok := wanted[fingerprint]; ok {
+			found[fingerprint] = struct{}{}
+		}
+	}
+	return found, nil
+}
+
 func (f *fakeLinear) CreateIssues(ctx context.Context, desired []model.DesiredIssue) ([]int, error) {
 	if f.cancelCreate != nil {
 		cancel := f.cancelCreate
@@ -111,6 +139,9 @@ func (f *fakeLinear) CreateIssues(ctx context.Context, desired []model.DesiredIs
 		return nil, err
 	}
 	f.createCallBatches = append(f.createCallBatches, append([]model.DesiredIssue(nil), desired...))
+	if f.createBatchErr != nil && len(desired) > 1 {
+		return nil, f.createBatchErr
+	}
 	if f.createErr != nil {
 		return nil, f.createErr
 	}
@@ -5291,6 +5322,135 @@ func TestRunBatchCreatePartialFailureRetriesOnlyFailedIssue(t *testing.T) {
 
 	if result.FailedOps != 0 {
 		t.Fatalf("FailedOps = %d, want 0 (the individual retry succeeded)", result.FailedOps)
+	}
+}
+
+// TestRunReconcilesAmbiguousBatchCreateBeforeRetry covers the lost-response
+// case: a transport failure does not prove Linear rejected the mutation, so
+// the entries that actually landed must not be created a second time.
+func TestRunReconcilesAmbiguousBatchCreateBeforeRetry(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint: "snyk:project-a:issue-1",
+					SnykIssueID: "issue-1",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "First finding",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					CreatedAt:   time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+				{
+					Fingerprint: "snyk:project-a:issue-2",
+					SnykIssueID: "issue-2",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "Second finding",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					CreatedAt:   time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+
+	linear := &fakeLinear{
+		// The batch create died with a transport error, but one of its two
+		// creates was committed before the response was lost.
+		createBatchErr:     errors.New("connection reset by peer"),
+		landedFingerprints: []string{"snyk:project-a:issue-1"},
+	}
+
+	service := New(minimalCfg(), logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if linear.existingCalls != 1 {
+		t.Fatalf("ExistingFingerprints calls = %d, want 1", linear.existingCalls)
+	}
+	// The batch call errored before recording anything, and the landed
+	// entry is skipped by the reconciliation, so the only create the fake
+	// ever records is the retry for the un-landed fingerprint.
+	if len(linear.created) != 1 {
+		t.Fatalf("created = %d (%#v), want 1: only the entry that did not land may be recreated", len(linear.created), linear.created)
+	}
+	if linear.created[0].Fingerprint != "snyk:project-a:issue-2" {
+		t.Fatalf("recreated %q, want the un-landed snyk:project-a:issue-2", linear.created[0].Fingerprint)
+	}
+	if len(linear.createCallBatches) != 2 {
+		t.Fatalf("CreateIssues calls = %d, want 2 (failed batch + single-item retry)", len(linear.createCallBatches))
+	}
+	retry := linear.createCallBatches[1]
+	if len(retry) != 1 || retry[0].Fingerprint != "snyk:project-a:issue-2" {
+		t.Fatalf("retry batch = %+v, want only the un-landed issue-2", retry)
+	}
+	if result.FailedOps != 0 {
+		t.Fatalf("FailedOps = %d, want 0: reconciliation and the retry both succeeded", result.FailedOps)
+	}
+}
+
+// TestRunLeavesUnreconcilableBatchForNextRun covers the other branch of the
+// ambiguous-failure contract: with no way to tell what landed, nothing is
+// retried and the whole batch is counted as failed. A missing ticket is
+// recoverable on the next run; a duplicate is only undone later by the
+// duplicate-cancellation pass.
+func TestRunLeavesUnreconcilableBatchForNextRun(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint: "snyk:project-a:issue-1",
+					SnykIssueID: "issue-1",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "First finding",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					CreatedAt:   time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+				{
+					Fingerprint: "snyk:project-a:issue-2",
+					SnykIssueID: "issue-2",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "Second finding",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					CreatedAt:   time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+
+	linear := &fakeLinear{
+		createBatchErr: errors.New("connection reset by peer"),
+		existingErr:    errors.New("lookup failed too"),
+	}
+
+	service := New(minimalCfg(), logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if len(linear.created) != 0 {
+		t.Fatalf("created = %d (%#v), want 0: an unreconcilable ambiguous failure must not be retried", len(linear.created), linear.created)
+	}
+	if result.FailedOps != 2 {
+		t.Fatalf("FailedOps = %d, want 2 (the whole unreconciled batch)", result.FailedOps)
+	}
+	if len(linear.createCallBatches) != 1 {
+		t.Fatalf("CreateIssues calls = %d, want 1: no per-item retry may follow a failed reconciliation", len(linear.createCallBatches))
 	}
 }
 

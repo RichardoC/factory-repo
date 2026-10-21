@@ -302,9 +302,11 @@ func (c *Client) StateID(state model.IssueState) (string, error) {
 //
 // A non-nil error means the request itself could not be completed (e.g. a
 // transport/HTTP failure) and no per-alias results are available at all. In
-// that case the caller cannot tell which, if any, items succeeded and must
-// fall back to retrying every item in desired individually — that is
-// unavoidable without idempotency keys on the mutation.
+// that case the caller cannot tell which, if any, items succeeded — the
+// mutation may even have been committed before the response was lost — so
+// the caller must reconcile first (see ExistingFingerprints) and re-create
+// only the fingerprints that did not land. Linear exposes no idempotency
+// key, so a blind retry duplicates the tickets the batch already created.
 func (c *Client) CreateIssues(ctx context.Context, desired []model.DesiredIssue) ([]int, error) {
 	if len(desired) == 0 {
 		return nil, nil
@@ -759,6 +761,48 @@ func (c *Client) lastOpenState(transitions []stateTransition) (model.WorkflowSta
 	return model.WorkflowState{ID: last, Name: c.statesByID[last].name}, true
 }
 
+// identityFilter returns the OR of the sync's identity arms. Every managed
+// issue's title is built with the titlePrefix, and the managed label is
+// stamped at create and re-asserted on every update, so either alone
+// identifies a managed ticket. Both are kept as alternatives so that losing
+// one -- a retitled issue, or a label removed by hand -- does not hide the
+// ticket and mint a duplicate. Both disjuncts are exact predicates -- a title
+// prefix and a label name -- so the queries using this scope are bounded to
+// this sync's own tickets even when the Linear team is shared with another
+// sync.
+//
+// The managed-label arm is only added when label management is enabled: with
+// LINEAR_MANAGED_LABEL=off there is no label to match, and an arm matching
+// nothing would narrow the snapshot rather than widen it.
+//
+// The metadata block that carries the fingerprint is deliberately NOT used as
+// a query predicate. Filtering on `description: { contains }` did not bound
+// the result set: the sibling snyk-dast-linear-sync, which uses this same
+// filter shape against this same team, loaded 59,866 issues for 7 findings --
+// effectively every issue in the team. Linear does not document `description`
+// as supporting the string comparators at all, so the arm appears to be
+// ignored rather than applied, silently widening the OR to everything. The
+// metadata block is still the authority for identity once an issue is loaded;
+// it just cannot be trusted to select which ones to load.
+//
+// loadIssues and ExistingFingerprints share this scope, so neither can widen
+// to the rest of a team shared with another sync.
+func (c *Client) identityFilter() linearapi.IssueFilter {
+	arms := []linearapi.IssueFilter{
+		{Title: &linearapi.StringComparator{StartsWith: new(titlePrefix)}},
+	}
+	if managedLabel := strings.TrimSpace(c.cfg.Labels.Managed); managedLabel != "" {
+		arms = append(arms, linearapi.IssueFilter{
+			Labels: &linearapi.IssueLabelCollectionFilter{
+				Some: &linearapi.IssueLabelFilter{
+					Name: &linearapi.StringComparator{EqIgnoreCase: &managedLabel},
+				},
+			},
+		})
+	}
+	return linearapi.IssueFilter{Or: arms}
+}
+
 func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) {
 	// Include archived issues so the sync can still see recently-closed
 	// tickets (the reopen guard needs them). Without this, auto-archiving
@@ -787,30 +831,11 @@ func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) 
 	// archived) -- which is what the first two OR clauses below intend.
 	archivedAtIsNull := true
 
-	// Every managed issue's title is built with the titlePrefix, and the managed
-	// label is stamped at create and re-asserted on every update, so either alone
-	// identifies a managed ticket. Both are kept as alternatives so that losing
-	// one -- a retitled issue, or a label removed by hand -- does not hide the
-	// ticket and mint a duplicate.
-	identityArms := []linearapi.IssueFilter{
-		{Title: &linearapi.StringComparator{StartsWith: new(titlePrefix)}},
-	}
-	// Only when label management is enabled: with LINEAR_MANAGED_LABEL=off there
-	// is no label to match, and an arm matching nothing would narrow the snapshot
-	// rather than widen it.
-	if managedLabel := strings.TrimSpace(c.cfg.Labels.Managed); managedLabel != "" {
-		identityArms = append(identityArms, linearapi.IssueFilter{
-			Labels: &linearapi.IssueLabelCollectionFilter{
-				Some: &linearapi.IssueLabelFilter{
-					Name: &linearapi.StringComparator{EqIgnoreCase: &managedLabel},
-				},
-			},
-		})
-	}
+	identity := c.identityFilter()
 	c.log.Info("Linear loadIssues identity scope",
 		slog.String("title_prefix", titlePrefix),
 		slog.String("managed_label", c.cfg.Labels.Managed),
-		slog.Int("identity_arms", len(identityArms)),
+		slog.Int("identity_arms", len(identity.Or)),
 	)
 
 	filter := linearapi.IssueFilter{
@@ -825,23 +850,8 @@ func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) 
 					{AutoArchivedAt: &linearapi.NullableDateComparator{Gte: &archiveCutoffDate}},
 				},
 			},
-			// Identity. Both disjuncts are exact predicates -- a title prefix and
-			// a label name -- so the snapshot is bounded to this sync's own
-			// tickets even when the Linear team is shared with another sync.
-			//
-			// The metadata block that carries the fingerprint is deliberately NOT
-			// used as a query predicate. Filtering on `description: { contains }`
-			// did not bound the result set: the sibling snyk-dast-linear-sync,
-			// which uses this same filter shape against this same team, loaded
-			// 59,866 issues for 7 findings -- effectively every issue in the team.
-			// Linear does not document `description` as supporting the string
-			// comparators at all, so the arm appears to be ignored rather than
-			// applied, silently widening the OR to everything. The metadata block
-			// is still the authority for identity once an issue is loaded; it just
-			// cannot be trusted to select which ones to load.
-			{
-				Or: identityArms,
-			},
+			// Identity: see identityFilter.
+			identity,
 		},
 	}
 
@@ -911,6 +921,108 @@ query existingIssues($filter: IssueFilter!, $after: String) {
 	}
 
 	return issues, nil
+}
+
+// ExistingFingerprints returns the subset of fingerprints that currently have a
+// LIVE (non-archived) managed issue in Linear. It exists to reconcile ambiguous
+// write outcomes: when a batch create fails at the transport level, the
+// mutation may still have been committed before the response was lost, so
+// retrying blindly duplicates tickets. Asking Linear what actually exists
+// resolves that.
+//
+// Archived issues are deliberately excluded. A live issue is evidence the
+// create landed; an archived one is not, and counting it would suppress the
+// deliberate replacement ticket created when an archived issue's finding
+// becomes active again.
+//
+// The query is scoped exactly like the snapshot (identityFilter): team AND the
+// sync's identity arms, so a team shared with another sync does not get paged
+// through during the retry path. No `description` predicate is used to select
+// the issues either -- Linear does not apply it (see identityFilter) -- but the
+// fingerprint check below still runs on each decoded description, so the scope
+// only governs which issues are read, not what counts as a match.
+func (c *Client) ExistingFingerprints(ctx context.Context, fingerprints []string) (map[string]struct{}, error) {
+	wanted := make(map[string]struct{}, len(fingerprints))
+	for _, fingerprint := range fingerprints {
+		if trimmed := strings.TrimSpace(fingerprint); trimmed != "" {
+			wanted[trimmed] = struct{}{}
+		}
+	}
+	if len(wanted) == 0 {
+		return map[string]struct{}{}, nil
+	}
+	if err := c.resolveTeam(ctx); err != nil {
+		return nil, err
+	}
+
+	filter := linearapi.IssueFilter{
+		Team: &linearapi.TeamFilter{
+			Id: &linearapi.IDComparator{Eq: c.teamID()},
+		},
+		And: []linearapi.IssueFilter{c.identityFilter()},
+	}
+
+	found := map[string]struct{}{}
+	var after *string
+	for page := 1; ; page++ {
+		op := gqlclient.NewOperation(`
+query issuesByFingerprint($filter: IssueFilter!, $after: String) {
+  issues(first: 100, after: $after, filter: $filter, includeArchived: false) {
+    nodes {
+      id
+      identifier
+      description
+    }
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+  }
+}`)
+		op.Var("filter", filter)
+		op.Var("after", after)
+
+		var resp struct {
+			Issues struct {
+				Nodes []struct {
+					ID          string  `json:"id"`
+					Identifier  string  `json:"identifier"`
+					Description *string `json:"description"`
+				} `json:"nodes"`
+				PageInfo struct {
+					HasNextPage bool    `json:"hasNextPage"`
+					EndCursor   *string `json:"endCursor"`
+				} `json:"pageInfo"`
+			} `json:"issues"`
+		}
+		if err := c.execute(ctx, op, &resp); err != nil {
+			return nil, fmt.Errorf("look up Linear issues by fingerprint: %w", err)
+		}
+
+		for _, issue := range resp.Issues.Nodes {
+			fingerprint := extractFingerprint(deref(issue.Description))
+			if fingerprint == "" {
+				continue
+			}
+			if _, ok := wanted[fingerprint]; ok {
+				found[fingerprint] = struct{}{}
+			}
+		}
+
+		next := resp.Issues.PageInfo.EndCursor
+		if !resp.Issues.PageInfo.HasNextPage || next == nil {
+			break
+		}
+		// A cursor that does not advance would loop forever. The run context may
+		// carry no deadline, so this is guarded explicitly rather than relying on
+		// cancellation to break out.
+		if after != nil && *next == *after {
+			return nil, fmt.Errorf("look up Linear issues by fingerprint: pagination cursor did not advance after page %d", page)
+		}
+		after = next
+	}
+
+	return found, nil
 }
 
 func (c *Client) resolveTeam(ctx context.Context) error {

@@ -128,7 +128,13 @@ CI enforces all of these: `gofmt -l`, `go fix` + `git diff --exit-code`,
 - Stores a human-facing Snyk UI link in the Linear description.
 - Keeps the Snyk REST API link as a secondary reference.
 - Includes repository, project reference, target file, and source location details when Snyk provides them.
-- Batches Linear create and update mutations to reduce request pressure.
+- Batches Linear create and update mutations to reduce request pressure. When a
+  create batch fails without per-item information (a transport failure, or a
+  lost response after Linear committed the mutation), the sync first asks
+  Linear which of the batch's fingerprints already have a live ticket and
+  re-creates only the rest, so a lost response does not duplicate tickets. If
+  that lookup also fails, the batch is left for the next run rather than
+  blindly retried.
 - Retries and backs off on Linear rate limiting.
 - Normalizes common Linear markdown rewrites when comparing descriptions so steady-state runs do not churn, and ignores the scanned commit and line numbers of Snyk Code findings, so a rescan that changes nothing else does not rewrite every ticket of the repository. The commit and line links on a ticket are refreshed when anything else about its finding changes.
 

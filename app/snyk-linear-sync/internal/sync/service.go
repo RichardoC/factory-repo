@@ -32,8 +32,18 @@ type LinearClient interface {
 	// CreateIssues returns the indices (into desired) of items whose alias
 	// failed, so the caller retries only those instead of the whole batch.
 	// A non-nil error means no per-alias data is available (e.g. a
-	// transport failure) and every item must be retried individually.
+	// transport failure): nothing is known per item, and the mutation may
+	// even have been committed before the response was lost. The caller
+	// must reconcile which entries landed (ExistingFingerprints) before
+	// retrying any of them.
 	CreateIssues(ctx context.Context, desired []model.DesiredIssue) ([]int, error)
+	// ExistingFingerprints reports which of the given fingerprints already
+	// have a live (non-archived) managed issue in Linear. It reconciles the
+	// ambiguous batch-create outcome: a non-nil error from CreateIssues
+	// carries no per-alias data, and a transport failure does not prove
+	// Linear rejected the mutation, so the caller asks what actually landed
+	// before retrying any item.
+	ExistingFingerprints(ctx context.Context, fingerprints []string) (map[string]struct{}, error)
 	UpdateIssues(ctx context.Context, updates []model.IssueUpdate) error
 	// PostComments returns the indices (into updates) whose comment failed
 	// to post, so the caller retries only those instead of the whole batch.
@@ -880,6 +890,74 @@ func (f *failedFingerprints) has(fp string) bool {
 	return ok
 }
 
+// createOne retries a single issue create. A per-entry failure reported
+// through the failed-index return is treated exactly like an error: the issue
+// does not exist either way, so the run must not count it as done. Ignoring
+// the indices here would let a failed retry pass silently and the run report
+// success for work that never landed.
+func (s *Service) createOne(ctx context.Context, desired model.DesiredIssue) error {
+	failed, err := s.linear.CreateIssues(ctx, []model.DesiredIssue{desired})
+	if err != nil {
+		return err
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("Linear reported the create as failed without returning an error")
+	}
+	return nil
+}
+
+// retryUnlandedCreates reconciles an ambiguous batch-create failure. Linear
+// exposes no idempotency key, so a lost response does not prove the mutation
+// was rejected: the batch may have committed server-side before the response
+// was lost, and retrying every item would duplicate those tickets until only
+// the duplicate-cancellation pass converges them away on a later run, after
+// duplicate notifications went out. It therefore asks Linear which of the
+// batch's fingerprints now have a live issue and re-creates only the rest.
+//
+// If the reconciliation query itself fails there is no safe way to tell what
+// landed, so nothing is retried: the batch is counted in FailedOps and left
+// for the next run, which creates whatever is genuinely missing — the finding
+// is still reported by Snyk and its absent ticket is missing from the next
+// Linear snapshot. Missing a ticket for one cycle is recoverable; a duplicate
+// is only undone later by the duplicate-cancellation pass.
+func (s *Service) retryUnlandedCreates(ctx context.Context, batch []model.DesiredIssue, result *RunResult, failed *failedFingerprints) {
+	fingerprints := make([]string, 0, len(batch))
+	for _, desired := range batch {
+		fingerprints = append(fingerprints, desired.Fingerprint)
+	}
+
+	landed, err := s.linear.ExistingFingerprints(ctx, fingerprints)
+	if err != nil {
+		atomic.AddInt64(&result.FailedOps, int64(len(batch)))
+		// No safe way to tell what landed, so every entry is treated as
+		// failed and kept out of the refreshed cache: the next run
+		// re-creates whatever is genuinely missing.
+		failed.add(fingerprints...)
+		s.logger.Error("could not reconcile an ambiguous batch create against Linear; not retrying, the next run will create whatever is missing",
+			slog.Int("batch_size", len(batch)),
+			slog.Any("error", err),
+		)
+		return
+	}
+
+	for _, desired := range batch {
+		if _, ok := landed[desired.Fingerprint]; ok {
+			s.logger.Info("issue was created despite the batch error, not retrying",
+				slog.String("fingerprint", desired.Fingerprint),
+			)
+			continue
+		}
+		if err := s.createOne(ctx, desired); err != nil {
+			atomic.AddInt64(&result.FailedOps, 1)
+			failed.add(desired.Fingerprint)
+			s.logger.Error("failed to create issue",
+				slog.String("fingerprint", desired.Fingerprint),
+				slog.Any("error", err),
+			)
+		}
+	}
+}
+
 // updateBatchWithFallback sends batch to Linear in one call and, when the
 // call fails, retries every item on its own. It reports whether the batch call
 // itself succeeded, counts each item that still fails in FailedOps, and records
@@ -980,22 +1058,16 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult, fa
 		}
 		failedIdx, err := s.linear.CreateIssues(ctx, job.desiredBatch)
 		if err != nil {
-			// No per-alias data at all (e.g. a transport failure): fall back
-			// to retrying every item individually, same as before.
-			s.logger.Warn("batch create failed, retrying issues individually",
+			// No per-alias data at all (e.g. a transport failure, or a 502
+			// after Linear had already committed the mutation): nothing is
+			// known per item, and retrying blindly would create a second
+			// copy of every ticket the batch landed server-side. Reconcile
+			// against Linear first; see retryUnlandedCreates.
+			s.logger.Warn("batch create failed, reconciling which issues landed before retrying",
 				slog.Int("batch_size", len(job.desiredBatch)),
 				slog.Any("error", err),
 			)
-			for _, desired := range job.desiredBatch {
-				if _, err := s.linear.CreateIssues(ctx, []model.DesiredIssue{desired}); err != nil {
-					atomic.AddInt64(&result.FailedOps, 1)
-					failed.add(desired.Fingerprint)
-					s.logger.Error("failed to create issue",
-						slog.String("fingerprint", desired.Fingerprint),
-						slog.Any("error", err),
-					)
-				}
-			}
+			s.retryUnlandedCreates(ctx, job.desiredBatch, result, failed)
 		} else if len(failedIdx) > 0 {
 			// Partial failure: the batch call told us exactly which items
 			// failed. Only retry those — the rest were already created and
