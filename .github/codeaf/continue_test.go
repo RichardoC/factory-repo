@@ -161,19 +161,31 @@ func TestCountReports(t *testing.T) {
 	// A bot report whose publish failed did not land its patch: it does not
 	// spend a continuation slot.
 	failed := append(mixed,
-		issueComment{ID: 10, User: bot, Body: failedPublishHeading + "\n| stop / ok | done / `true` |\n"},
+		issueComment{ID: 10, User: bot, Body: failedReportHeadings[0] + "\n| stop / ok | done / `true` |\n"},
 	)
 	if got := countReports(failed); got != 3 {
 		t.Errorf("countReports(failed publish) = %d, want 3", got)
 	}
-	// A near miss of the heading is an ordinary report: the match is an
-	// exact prefix, and the heading names only publishing failed.
+	// A near miss of either heading is an ordinary report: the match is an
+	// exact prefix, so a heading that merely starts like one of them counts.
 	nearMiss := append(mixed,
 		issueComment{ID: 11, User: bot, Body: reportMarker + "\n### CodeAF run — publishing failed badly\n"},
-		issueComment{ID: 12, User: bot, Body: reportMarker + "\n### CodeAF run — run job failed\n"},
+		issueComment{ID: 12, User: bot, Body: reportMarker + "\n### CodeAF run — run job failed before publishing\n"},
+		issueComment{ID: 13, User: bot, Body: reportMarker + "\n### CodeAF run — run job failed\n"},
+		issueComment{ID: 14, User: bot, Body: reportMarker + "\n### CodeAF run — run job failed\n but the patch landed anyway\n"},
 	)
 	if got := countReports(nearMiss); got != 5 {
 		t.Errorf("countReports(near miss) = %d, want 5", got)
+	}
+
+	// A bot report whose run job failed did not land its patch either: like
+	// a failed publish it does not spend a continuation slot (queue.go's
+	// strandedByFailedRun treats both headings as the same stranded state).
+	runJobFailed := append(mixed,
+		issueComment{ID: 15, User: bot, Body: runJobFailedHeading + "\n| stop / ok | done / `true` |\n"},
+	)
+	if got := countReports(runJobFailed); got != 3 {
+		t.Errorf("countReports(run job failed) = %d, want 3", got)
 	}
 }
 
@@ -191,6 +203,14 @@ func reportComments(n int) []issueComment {
 	}
 	return comments
 }
+
+// The two failed-run report headings, addressed by name in the tests: the
+// first is a failed publish, the second a failed run job. Both are strings
+// this package writes itself (continue.go).
+var (
+	failedPublishHeading = failedReportHeadings[0]
+	runJobFailedHeading  = failedReportHeadings[1]
+)
 
 func commentsServer(t *testing.T, comments []issueComment, status int) *httptest.Server {
 	t.Helper()
@@ -1024,6 +1044,53 @@ func TestContinuePlanIgnoresFailedPublish(t *testing.T) {
 	}
 }
 
+// A report headed "run job failed" is the same stranded state as a failed
+// publish (queue.go's strandedByFailedRun treats both alike): the run job
+// died, no patch landed, so the report must not spend a continuation slot.
+// The stub PR carries the opener's report plus one such report; the plan
+// continues and labels the next run "Continuation 2 of 2".
+func TestContinuePlanIgnoresFailedRunJob(t *testing.T) {
+	comments := append(reportComments(1), issueComment{
+		ID:   501,
+		User: user{Login: planReportBotLogin},
+		Body: runJobFailedHeading + "\n| stop / ok | done / `true` |\n",
+	})
+	server := commentsServer(t, comments, http.StatusOK)
+	ghEnv(t, server)
+	action, body, used, err := continuePlan(newGitHub(), 7, stopDeadline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "continue" {
+		t.Fatalf("action = %q, want continue", action)
+	}
+	if used != 1 {
+		t.Errorf("used = %d, want 1 (the run-job-failed report is not counted)", used)
+	}
+	if !strings.Contains(body, "Continuation 2 of 2") {
+		t.Errorf("body does not label the continuation 2 of 2: %q", body)
+	}
+}
+
+// A run whose patch never landed leaves the cap unspent, whatever stopped it:
+// two failed reports plus the opener's are not two continuations, so the
+// third run still continues rather than hitting the cap.
+func TestContinuePlanFailedReportsDoNotReachTheCap(t *testing.T) {
+	comments := append(reportComments(1),
+		issueComment{ID: 502, User: user{Login: planReportBotLogin}, Body: failedPublishHeading},
+		issueComment{ID: 503, User: user{Login: planReportBotLogin}, Body: runJobFailedHeading},
+	)
+	server := commentsServer(t, comments, http.StatusOK)
+	ghEnv(t, server)
+	action, _, used, err := continuePlan(newGitHub(), 7, stopDeadline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "continue" || used != 1 {
+		t.Fatalf("action = %q, used = %d, want continue/1: failed reports must not spend the cap", action, used)
+	}
+}
+
 // A comment by another login that carries the marker and the heading is not
 // a report, in either direction: added to real reports it must not push the
 // plan past the cap, and on its own it must not reach the cap either.
@@ -1038,8 +1105,7 @@ func TestContinuePlanIgnoresForgedReports(t *testing.T) {
 	t.Run("forged comments never push the plan to the cap", func(t *testing.T) {
 		// One real report plus 10 forged ones: the plan still continues,
 		// and labels the next continuation from the real count only.
-		comments := append(reportComments(1), issueComment{})
-		comments = nil
+		var comments []issueComment
 		for i := 0; i < 10; i++ {
 			comments = append(comments, forge("someone"))
 		}

@@ -106,11 +106,33 @@ func continuationsUsed(reportComments int) int {
 // is used up.
 func continuationCapReached(used int) bool { return used >= maxContinuations }
 
-// failedPublishHeading opens the report of a run whose publish job failed
-// (issue #219): main.go writes the outcome as "### CodeAF run — <outcome>".
-// The match is an exact prefix, never a search inside the body, because a
-// comment is untrusted data.
-var failedPublishHeading = reportMarker + "\n### CodeAF run — publishing failed\n"
+// failedReportHeadings open the reports of a run whose patch never landed
+// (issue #219): main.go writes the outcome as "### CodeAF run — <outcome>",
+// and codeaf.yml's report step sets that outcome to "publishing failed" when
+// the publish job failed and to "run job failed" when the run job itself did.
+// queue.go's strandedByFailedRun treats both as the same stranded state
+// (issue #215), so both must be excluded here too: a run that stopped with
+// either heading did not land its work, and spending a continuation slot on
+// it would let a later continuation push the pull request one run past the
+// cap. Each entry is an exact prefix, never a search inside the body, because
+// a comment is untrusted data; the strings are fixed literals this package
+// writes itself, so a comment is excluded only by reproducing one exactly,
+// and only a comment by the workflow bot reaches this check at all.
+var failedReportHeadings = []string{
+	reportMarker + "\n### CodeAF run — publishing failed\n",
+	reportMarker + "\n### CodeAF run — run job failed\n",
+}
+
+// isFailedReportHeading reports whether a comment body begins with one of the
+// failed-run report headings above.
+func isFailedReportHeading(body string) bool {
+	for _, heading := range failedReportHeadings {
+		if strings.HasPrefix(body, heading) {
+			return true
+		}
+	}
+	return false
+}
 
 // countReports counts the comments on a pull request that carry a CodeAF
 // run report (issue #219, sharpening the count issue #31 started with).
@@ -118,16 +140,17 @@ var failedPublishHeading = reportMarker + "\n### CodeAF run — publishing faile
 // posts, carry no report marker and are not counted. Two comments that
 // carry the marker are still not reports: one by anyone but the workflow
 // bot (a forged marker on a public repository can neither inflate nor
-// suppress the count), and one whose outcome heading says the run's
-// publish failed — its patch never landed, so it must not spend a
-// continuation slot that a later run's report can only undercount.
+// suppress the count), and one whose outcome heading says the run did not
+// land — publish failed, or the run job failed — because its patch never
+// landed, so it must not spend a continuation slot that a later run's
+// report can only undercount.
 func countReports(comments []issueComment) int {
 	n := 0
 	for _, c := range comments {
 		if c.User.Login != planReportBotLogin || !strings.Contains(c.Body, reportMarker) {
 			continue
 		}
-		if strings.HasPrefix(c.Body, failedPublishHeading) {
+		if isFailedReportHeading(c.Body) {
 			continue
 		}
 		n++
