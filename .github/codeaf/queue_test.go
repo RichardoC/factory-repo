@@ -1995,3 +1995,30 @@ func TestRunNextMaintainerEscalationRetriesHalves(t *testing.T) {
 		t.Fatalf("third tick acted (posts %d, labels %v, creates %d, attempts %d); want nothing", posts, labels, labelCreates, labelAttempts)
 	}
 }
+
+// A run the proxy refused from its first call reports "no changes" with ok
+// false: that is a failure and strands its issue or PR like a failed
+// publish; a run that ended ok with no changes is not.
+func TestFailedRunReportCountsRefusedNoChanges(t *testing.T) {
+	refused := reportMarker + "\n### CodeAF run — no changes\n\n| | |\n|---|---|\n| stop / ok | `incomplete` / `false` |\n"
+	nothing := reportMarker + "\n### CodeAF run — no changes\n\n| | |\n|---|---|\n| stop / ok | `done` / `true` |\n"
+	pushed := reportMarker + "\n### CodeAF run — changes pushed\n\n| | |\n|---|---|\n| stop / ok | `incomplete` / `false` |\n"
+	for _, tc := range []struct {
+		body string
+		want bool
+	}{
+		{refused, true},
+		{nothing, false},
+		{pushed, false},
+		{reportMarker + "\n### CodeAF run — run job failed\n\n", true},
+	} {
+		if got := failedRunReport(tc.body); got != tc.want {
+			t.Errorf("failedRunReport(%q) = %v, want %v", tc.body[:60], got, tc.want)
+		}
+	}
+	bot := bodyComments{{Body: refused}}
+	bot[0].User.Type = "Bot"
+	if got := strandedIssueState(bot); got != strandRetry {
+		t.Errorf("refused issue state = %q, want %q", got, strandRetry)
+	}
+}

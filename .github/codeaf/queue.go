@@ -1221,10 +1221,27 @@ func strandedByFailedRun(comments bodyComments) bool {
 		if !strings.HasPrefix(c.Body, reportMarker+"\n") {
 			return false
 		}
-		return strings.HasPrefix(c.Body, reportMarker+"\n### CodeAF run — publishing failed\n") ||
-			strings.HasPrefix(c.Body, reportMarker+"\n### CodeAF run — run job failed\n")
+		return failedRunReport(c.Body)
 	}
 	return false
+}
+
+// failedRunReport reports whether a run report (the body of a bot comment
+// that starts with reportMarker) is a failed run: publishing failed, the run
+// job failed, or the run changed nothing and ended not ok -- what a run the
+// proxy refused from its first call reports (the 2026-10-19 quota stall
+// stranded a dozen issues and PRs this way). A run that ended ok with no
+// changes had nothing to do, and is not a failure.
+func failedRunReport(body string) bool {
+	if strings.HasPrefix(body, reportMarker+"\n### CodeAF run — publishing failed\n") ||
+		strings.HasPrefix(body, reportMarker+"\n### CodeAF run — run job failed\n") {
+		return true
+	}
+	if !strings.HasPrefix(body, reportMarker+"\n### CodeAF run — no changes\n") {
+		return false
+	}
+	cell, ok := reportTableRow(body, "stop / ok")
+	return ok && strings.HasSuffix(cell, "/ `false`")
 }
 
 // repickMarkers collects the head SHAs the re-pick marker comments name, in
@@ -1415,9 +1432,7 @@ func strandedIssueState(comments bodyComments) string {
 		if !strings.HasPrefix(c.Body, reportMarker+"\n") {
 			return strandNone
 		}
-		failed := strings.HasPrefix(c.Body, reportMarker+"\n### CodeAF run — publishing failed\n") ||
-			strings.HasPrefix(c.Body, reportMarker+"\n### CodeAF run — run job failed\n")
-		if !failed {
+		if !failedRunReport(c.Body) {
 			return strandNone
 		}
 		if escalated || retried || strings.Contains(c.Body, workflowPolicyRefusal) {
@@ -1500,14 +1515,15 @@ func fetchStrandedIssues(g github, issues []item, runs []runStatus, lbl, queuedL
 // a comment carrying the marker is already there (issue #240); the marker
 // keeps the retry to once, whatever later ticks observe.
 func ensureIssueRetryMarker(g github, n int) error {
-	var comments []struct {
-		Body string `json:"body"`
-	}
+	var comments bodyComments
 	if err := g.get(fmt.Sprintf("/issues/%d/comments?per_page=100", n), &comments); err != nil {
 		return err
 	}
 	for _, c := range comments {
-		if strings.Contains(c.Body, queueIssueRetryMarker) {
+		// Only a bot's marker counts, as in strandedIssueState: a copy of
+		// the marker anyone can paste on a public issue must not stop the
+		// real one being posted, or the retry would never be spent.
+		if c.User.Type == "Bot" && strings.Contains(c.Body, queueIssueRetryMarker) {
 			return nil
 		}
 	}
