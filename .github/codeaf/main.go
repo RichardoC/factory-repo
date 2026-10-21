@@ -574,6 +574,22 @@ func perToken(perMillion float64) string {
 	return strconv.FormatFloat(perMillion/1e6, 'f', 12, 64)
 }
 
+// firstEffortAboveNone picks the first effort that actually enables
+// reasoning, for a catalog row whose default_enabled is true: "none" and
+// "minimal" mean reasoning off. Falls back to efforts[0] when every effort
+// disables reasoning (or the list is empty), so the row still has an effort.
+func firstEffortAboveNone(efforts []string) string {
+	for _, e := range efforts {
+		if e != "none" && e != "minimal" {
+			return e
+		}
+	}
+	if len(efforts) == 0 {
+		return ""
+	}
+	return efforts[0]
+}
+
 func catalog(models []Model) map[string][]catalogRow {
 	rows := make([]catalogRow, 0, len(models))
 	for _, m := range models {
@@ -592,7 +608,11 @@ func catalog(models []Model) map[string][]catalogRow {
 			"response_format", "structured_outputs", "temperature", "top_p", "max_tokens", "stop", "seed"}
 		row.Reasoning.DefaultEnabled = true
 		row.Reasoning.SupportedEfforts = m.Efforts
-		row.Reasoning.DefaultEffort = m.Efforts[0]
+		// When reasoning is on by default, the default effort must be an
+		// effort above "none"/"minimal": Efforts[0] can be "none" (the
+		// DeepSeek-V4.1-Flash rows), which would advertise reasoning
+		// enabled with a default that turns it off (issue #236).
+		row.Reasoning.DefaultEffort = firstEffortAboveNone(m.Efforts)
 		row.HuggingFaceID = strings.TrimPrefix(m.Upstream, "hf:")
 		rows = append(rows, row)
 	}
