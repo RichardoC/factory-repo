@@ -219,6 +219,13 @@ func TestContract(t *testing.T) {
 			runGateBoth(t, "dispatch-plan.json",
 				"run=true\nreason=plan dispatch\nlane=1\nmode=plan\nnumber=0\nbranch=\nbase=main\nprofile=\n")
 		})
+		// A routine dispatch (issue #117) validates its name against
+		// routines.json beside the binary or beside the source, like the
+		// profile against experiments.json: both layouts must find it.
+		t.Run("routine", func(t *testing.T) {
+			runGateBoth(t, "dispatch-routine.json",
+				"run=true\nreason=routine dispatch\nlane=0\nmode=routine\nnumber=0\nbranch=\nbase=main\nprofile=\n")
+		})
 		// The profile dispatch validates the named profile against
 		// experiments.json beside the binary or beside the source (the
 		// regression PR #85 fixed: the go run layout found no

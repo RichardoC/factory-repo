@@ -66,7 +66,7 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("harness: ")
 	if len(os.Args) < 2 {
-		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|plan-check|plan-brief|plan-report|ref-check|merge-default|search|metrics|gh-retry")
+		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|plan-check|plan-brief|plan-report|ref-check|routines-due|routine-brief|routine-check|merge-default|search|metrics|gh-retry")
 	}
 	commands := map[string]func() error{
 		"proxy":         runProxy,
@@ -90,6 +90,14 @@ func main() {
 		// plan run this tick? plan-brief and plan-report, the run side of
 		// the planner, are separate commands.
 		"plan-check": runPlanCheck,
+		// Factory routines (issue #117): routines-due decides which
+		// routines' cooldowns have passed (the routines workflow calls it
+		// on its schedule and on every queue tick); routine-brief builds
+		// an agent routine's read-only brief; routine-check runs a check
+		// command and prints its report for the tracking issue.
+		"routines-due":  runRoutinesDue,
+		"routine-brief": runRoutineBrief,
+		"routine-check": runRoutineCheck,
 		// The planner run side (issue #61): the plan run brief, and the
 		// publish-side report that parses its proposals.
 		"plan-brief":  runPlanBrief,
@@ -2165,6 +2173,47 @@ func Decide(name string, ev event, labelName string, lookupPR, lookupIssue func(
 		// each concurrent run a different model. The input is untrusted,
 		// so only its digits are read; anything else is lane 0.
 		lane := dispatchLane(ev.Inputs["lane"])
+		// A routine run (issue #117) is dispatched by the routines
+		// workflow with the routine's name in the `routine` input. Like a
+		// plan run it is read-only: it proposes issues and writes no patch
+		// and no PR. The input is untrusted, so only a name that matches
+		// routineNameRe and is present in the validated routines.json runs;
+		// if routines.json cannot be loaded, skip — fail closed, a routine
+		// the config cannot vouch for never runs. It accepts no other
+		// target: an issue, pr, review, plan or profile input alongside it
+		// is skipped rather than silently demoted to that mode. The
+		// decision carries the validated lane, the default branch as base,
+		// and no number, no branch and no profile — every workflow step
+		// that reads one must treat all three as empty.
+		if raw := ev.Inputs["routine"]; raw != "" {
+			switch {
+			case ev.Inputs["issue"] != "" || ev.Inputs["pr"] != "" ||
+				ev.Inputs["review"] != "" || ev.Inputs["plan"] != "" ||
+				ev.Inputs["profile"] != "":
+				return skip("a routine dispatch takes no issue, pr, review, plan or profile input"), nil
+			case !routineNameRe.MatchString(raw):
+				return skip(fmt.Sprintf("routine input %q does not match %s", raw, routineNameRe)), nil
+			}
+			routines, err := LoadRoutines()
+			if err != nil {
+				return skip(fmt.Sprintf("routines.json cannot be loaded: %v", err)), nil
+			}
+			known := false
+			for _, r := range routines {
+				if r.Name == raw {
+					known = true
+					break
+				}
+			}
+			if !known {
+				return skip(fmt.Sprintf("routine %q is not in routines.json", raw)), nil
+			}
+			if _, err := runID(); err != nil {
+				return Decision{}, err
+			}
+			return Decision{Run: true, Reason: "routine dispatch", Mode: "routine",
+				Base: ev.Repository.DefaultBranch, Lane: lane}, nil
+		}
 		// A plan run (issue #61) is dispatched by the queue's planner
 		// step with plan=true and nothing else but the lane: the run reads
 		// the repository and proposes issues, and writes no patch and no

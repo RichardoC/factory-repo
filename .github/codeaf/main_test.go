@@ -1164,7 +1164,7 @@ func TestMain(m *testing.M) {
 		// The workflows read the config and instruction files from beside
 		// the binary (harnessDir), so put them there like the run job's
 		// cp -r .github/codeaf does.
-		for _, f := range []string{"models.json", "codeaf-config.json", "experiments.json", "panel.json", "instructions.md", "review-instructions.md", "plan-instructions.md"} {
+		for _, f := range []string{"models.json", "codeaf-config.json", "experiments.json", "panel.json", "routines.json", "instructions.md", "review-instructions.md", "plan-instructions.md"} {
 			b, err := os.ReadFile(f)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "copy beside binary:", err)

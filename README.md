@@ -522,6 +522,69 @@ following each app's README TODO list. Proposals that would change
 maintainer's approval (the `codeaf-harness` environment, see *Limits worth
 knowing*).
 
+## Routines
+
+Recurring factory activities — checking synthetic.new's prices and models,
+deciding whether to take a CodeAF upgrade, recalibrating the weekly credit —
+are **routines**: one mechanism, configured in one trusted file,
+[`routines.json`](.github/codeaf/routines.json) (issue #117). The file sits
+next to `models.json`, is validated on load, and unknown keys or bad values
+fail with a message naming the field. Each routine carries:
+
+- **`name`** — lowercase, digits and dashes, at most 32 characters. It names
+  the run title (`CodeAF routine <name> (lane N)`), the dispatch input and
+  the proposal label (`routine:<name>`).
+- **`every_hours`** — the cooldown: a routine is due when no run of that
+  name has started within this many hours. The cooldown is read off each
+  run's `createdAt` stamp; a run whose stamp is missing or unparseable
+  counts as inside the cooldown, never outside it (fail closed).
+- **`kind`** — either:
+  - **`check`**: a deterministic harness command (`command`), run by the
+    routines workflow. No model runs, no secret beyond `GITHUB_TOKEN`, and
+    it reads the network only for public data. It renders its report
+    itself; a check routine may update one tracking issue per routine with
+    its latest result, built from validated data only — never model text.
+  - **`agent`**: a read-only CodeAF run whose brief is a template under
+    [`routines/`](.github/codeaf/routines/) (`brief`), capped per run by
+    **`max_usd`** like `run_credit_usd`. Like a plan run it writes no
+    patch: its proposals go through the planner's path and open as issues
+    labelled `codeaf-proposed` (plus `routine:<name>`), deduped against
+    the open issues — **never** `codeaf-queued`. A person, or Claude acting
+    for the owner, promotes them.
+
+A routine is due only when the same guards as any run hold: the rolling
+week's spend under the queue's threshold, and a free lane under
+`queue.max_parallel_runs`. `harness routines-due issues.json runs.json`
+prints one `routine=<name> lane=<n>` line per due routine. **Not wired yet:**
+no workflow calls it. A dedicated read-only routines workflow, on an hourly
+schedule, and `codeaf.yml`'s routine mode are a maintainer's hand edit,
+because the workflow policy freezes the CodeAF workflows. A routine dispatch is gated like every
+other dispatch: `routine=<name>` must name a routine in `routines.json`,
+and refuses any issue, pr, review, plan or profile input beside it.
+
+**How to add a routine.** Add one object to the `routines` array in
+`routines.json`:
+
+- for a **check** routine, add `"kind": "check"` and `"command": "<name>"`,
+  then implement a Go function in `.github/codeaf/` that renders the report
+  and register it with `registerCheck("<name>", fn)` in an `init` — the
+  same pattern `check_modelprices.go` uses. `TestRoutineCatalog` fails if a
+  committed command is not registered.
+- for an **agent** routine, add `"kind": "agent"`, `"brief":
+  "routines/<file>.md"` (a template under `.github/codeaf/routines/`,
+  read-only instructions ending in the output contract) and `"max_usd"` —
+  the per-run credit cap, enforced by the proxy. `TestRoutineCatalog`
+  fails if the template file is missing.
+
+Defined in `routines.json` (they run once the workflow is wired): `model-prices` (daily check of the synthetic.new catalog
+against `models.json`), `codeaf-upgrade` (daily agent run that classifies
+upstream CodeAF changes as take/hold/skip and proposes the bump),
+`quota-calibration` (6h check that re-estimates `weekly_credit_usd` from
+the ledger and the quota drops), `pr-sweep` (6h check on open `codeaf/*`
+PRs that are red, conflicted or carry an unaddressed review finding),
+`flaky-tests` (daily `go test -race -count=10` over every module) and
+`factory-report` (weekly report on the tracking issue).
+
 ## Limits worth knowing
 
 - The agent has a shell on the runner, so treat it as having the same access as any
