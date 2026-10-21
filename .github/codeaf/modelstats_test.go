@@ -166,6 +166,24 @@ func modelStatsTestConfig(t *testing.T) Config {
 	return Config{Alerts: alerts, Models: []Model{{ID: "alpha"}, {ID: "beta"}, {ID: "gamma"}}}
 }
 
+// modelStatsTestConfigWith builds a config whose models are exactly the ids
+// given. The shared test config carries three models, two of which have no
+// calls, and "configured model with no calls in the window" is an alert of
+// its own: a test that counts alerts states its own model set so the count
+// is about the alert under test.
+func modelStatsTestConfigWith(t *testing.T, ids ...string) Config {
+	t.Helper()
+	alerts, err := validateAlerts(Alerts{})
+	if err != nil {
+		t.Fatalf("validateAlerts: %v", err)
+	}
+	models := make([]Model, 0, len(ids))
+	for _, id := range ids {
+		models = append(models, Model{ID: id})
+	}
+	return Config{Alerts: alerts, Models: models}
+}
+
 // modelStatsTestZip builds an in-memory zip, the way a downloaded
 // codeaf-output artifact arrives -- there is no fixture on disk and nothing
 // is extracted.
@@ -226,7 +244,14 @@ func TestModelStatsRejectsHostileRows(t *testing.T) {
 		`{"ts":"2026-10-21T11:00:00Z","model":"alpha","completion_tokens":1000,"usage_seen":true,"ttft_ms":1000,"dur_ms":9000}`,
 		// A free-text field carrying markdown and at-mentions, alongside the
 		// valid fields: the row is accepted, and nothing of it is echoed.
-		`{"ts":"2026-10-21T11:00:00Z","model":"alpha","upstream":"` + hostileMarkdown + `","completion_tokens":1000,"usage_seen":true,"ttft_ms":1500,"dur_ms":9000,"kind":"` + hostileMarkdown + `"}`,
+		// Its kind is empty -- the proxy leaves kind empty on a call -- so it
+		// is a call and not an unknown kind; the hostile text below is in
+		// fields the report never reads.
+		`{"ts":"2026-10-21T11:00:00Z","model":"alpha","upstream":"` + hostileMarkdown + `","completion_tokens":1000,"usage_seen":true,"ttft_ms":1500,"dur_ms":9000,"kind":""}`,
+		// A kind the reader does not know, carrying hostile text: refused,
+		// and the text is not echoed. (Not a row that "was accepted and never
+		// echoed": an unknown kind is not a call.)
+		`{"ts":"2026-10-21T11:00:00Z","model":"alpha","completion_tokens":1000,"usage_seen":true,"ttft_ms":1500,"dur_ms":9000,"kind":"` + hostileMarkdown + `"}`,
 		// An unknown model id, and an id that is not a string at all.
 		`{"ts":"2026-10-21T11:00:00Z","model":"` + hostileMarkdown + `","ttft_ms":1000,"dur_ms":9000}`,
 		`{"ts":"2026-10-21T11:00:00Z","model":12345,"ttft_ms":1000,"dur_ms":9000}`,
@@ -286,6 +311,7 @@ func TestModelStatsRejectsHostileRows(t *testing.T) {
 			!strings.Contains(l, "model not in") && !strings.Contains(l, "outside") &&
 			!strings.Contains(l, "not a JSON") && !strings.Contains(l, "longer than") &&
 			!strings.Contains(l, "timestamp") && !strings.Contains(l, "not finite") &&
+			!strings.Contains(l, "line kind") &&
 			!strings.Contains(l, "s:") && !strings.Contains(l, "skipped") {
 			t.Errorf("unexpected reported reason %q", l)
 		}
@@ -384,4 +410,339 @@ func zipReaderUncompressedSize(zr *zip.Reader) uint64 {
 		return 0
 	}
 	return zr.File[0].UncompressedSize64
+}
+
+// modelStatsBaselineFixture builds the hours a baseline alert needs, in one
+// run (zip), and returns the parsed input plus the window and clock the
+// report is rendered with. The hours are laid out against the default 72 h
+// window ending 2026-10-21 12:00 UTC:
+//
+//	2026-10-19 00:00  (60 h old)  the older part of the same window
+//	2026-10-21 09:00  ( 3 h old)  the recent hour
+//
+// now-168h is 2026-10-14 12:00, well before the window starts, so the
+// configured 168 h baseline reaches past the window and the routine has to
+// measure it from the older part of the same window -- the case the 2x alert
+// could never fire on before (every hour sat inside the 168 h cutoff, base
+// was 0 and ratioUsable was false).
+func modelStatsBaselineFixture(t *testing.T, cfg Config, oldHour, recentHour []string) (modelStatsInput, modelStatsWindow, time.Time) {
+	t.Helper()
+	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	win := modelStatsWindowFrom(cfg, now)
+	lines := append(append([]string{}, oldHour...), recentHour...)
+	zr := modelStatsTestZip(t, "codeaf-ledger.jsonl", strings.Join(lines, "\n")+"\n")
+	return parseModelStatsZips([]*zip.Reader{zr}, cfg), win, now
+}
+
+// TestModelStatsTrailingP50AlertReachable: recent hours whose first-token p50
+// is above 2x the older hours' p50 must emit the trailing-p50 alert at the
+// DEFAULT 72 h window. Before the baseline was clamped to the window start,
+// now-168h put every hour bucket inside the cutoff, base was 0,
+// ratioUsable was false and the alert was unreachable -- this test emitted no
+// alert at all.
+func TestModelStatsTrailingP50AlertReachable(t *testing.T) {
+	cfg := modelStatsTestConfigWith(t, "alpha")
+	if cfg.Alerts.WindowHours == nil || *cfg.Alerts.WindowHours != 72 {
+		t.Fatalf("this test is about the default window, got %v", cfg.Alerts.WindowHours)
+	}
+	if cfg.Alerts.TTFTp50RatioBaselineHours == nil || *cfg.Alerts.TTFTp50RatioBaselineHours != 168 {
+		t.Fatalf("this test is about the default 168 h baseline, got %v", cfg.Alerts.TTFTp50RatioBaselineHours)
+	}
+	var oldHour, recentHour []string
+	for i := 0; i < *cfg.Alerts.HourCalls; i++ { // older hour: p50 1000 ms
+		oldHour = append(oldHour, `{"ts":"2026-10-19T00:00:00Z","model":"alpha","completion_tokens":10,"usage_seen":true,"ttft_ms":1000,"dur_ms":5000}`)
+	}
+	for i := 0; i < *cfg.Alerts.HourCalls; i++ { // recent hour: p50 5000 ms = 5x
+		recentHour = append(recentHour, `{"ts":"2026-10-21T09:00:00Z","model":"alpha","completion_tokens":10,"usage_seen":true,"ttft_ms":5000,"dur_ms":9000}`)
+	}
+	in, win, now := modelStatsBaselineFixture(t, cfg, oldHour, recentHour)
+	got := modelStatsReport(in, cfg, win, now)
+	for _, want := range []string{
+		// The baseline is the older hour's p50, measured inside the 72 h
+		// window; the recent hour is 5000 ms against a 2x limit of 2000 ms.
+		"- **`alpha`: 1 hour(s) with at least 30 calls above 2x the trailing 7.0 h first-token p50 " +
+			"(`alpha` over 5.0 s vs a 1.0 s baseline; first was 2026-10-21 09:00 UTC with 30 calls)**",
+		"### Alerts (1)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("report is missing %q:\n%s", want, got)
+		}
+	}
+	if !strings.Contains(got, "hour(s) with at least 30 calls above") {
+		t.Errorf("the 2x trailing-p50 alert did not fire at the default 72 h window:\n%s", got)
+	}
+}
+
+// TestModelStatsTrailingP50AlertNotReachableBelowThreshold: the same fixture
+// with the recent hour at 1.5x rather than 5x must NOT alert. This is what
+// keeps the test above honest: it proves the alert fires on the ratio and not
+// merely because recent and older hours exist.
+func TestModelStatsTrailingP50AlertNotReachableBelowThreshold(t *testing.T) {
+	cfg := modelStatsTestConfigWith(t, "alpha")
+	var oldHour, recentHour []string
+	for i := 0; i < *cfg.Alerts.HourCalls; i++ {
+		oldHour = append(oldHour, `{"ts":"2026-10-19T00:00:00Z","model":"alpha","completion_tokens":10,"usage_seen":true,"ttft_ms":1000,"dur_ms":5000}`)
+	}
+	for i := 0; i < *cfg.Alerts.HourCalls; i++ {
+		recentHour = append(recentHour, `{"ts":"2026-10-21T09:00:00Z","model":"alpha","completion_tokens":10,"usage_seen":true,"ttft_ms":1500,"dur_ms":6000}`)
+	}
+	in, win, now := modelStatsBaselineFixture(t, cfg, oldHour, recentHour)
+	got := modelStatsReport(in, cfg, win, now)
+	if strings.Contains(got, "above 2x the trailing") {
+		t.Errorf("1.5x the baseline must not fire the 2x alert:\n%s", got)
+	}
+}
+
+// TestModelStatsDecodeAlertReachable: a recent hour whose decode p50 sits
+// below 0.7x the older hour's decode p50 must emit the decode alert. The old
+// baseline was the very p50 the alert compared (x < 0.7x), so it could never
+// fire.
+func TestModelStatsDecodeAlertReachable(t *testing.T) {
+	cfg := modelStatsTestConfigWith(t, "alpha")
+	var oldHour, recentHour []string
+	// Older hour: 1000 tokens in 11000-1000 = 10000 ms -> 100.0 tok/s.
+	for i := 0; i < 3; i++ {
+		oldHour = append(oldHour, `{"ts":"2026-10-19T00:00:00Z","model":"alpha","completion_tokens":1000,"usage_seen":true,"ttft_ms":1000,"dur_ms":11000}`)
+	}
+	// Recent hour: 1000 tokens in 21000-1000 = 20000 ms -> 50.0 tok/s,
+	// below 0.7 x 100.0 = 70.0 tok/s.
+	for i := 0; i < 3; i++ {
+		recentHour = append(recentHour, `{"ts":"2026-10-21T09:00:00Z","model":"alpha","completion_tokens":1000,"usage_seen":true,"ttft_ms":1000,"dur_ms":21000}`)
+	}
+	in, win, now := modelStatsBaselineFixture(t, cfg, oldHour, recentHour)
+	got := modelStatsReport(in, cfg, win, now)
+	want := "`alpha`: decode p50 50.0 tok/s below 0.7x its 100.0 tok/s baseline"
+	if !strings.Contains(got, want) {
+		t.Errorf("report is missing the decode alert %q:\n%s", want, got)
+	}
+	// The table's own decode p50 is the window-wide figure the alert compares
+	// -- 50.0 tok/s, the nearest-rank p50 of [100,100,100,50,50,50] -- and
+	// the baseline is the older hour's 100.0. The alert fired on the trailing
+	// baseline, not on the compared figure: the old decodeBaseline returned
+	// exactly this 50.0, and 50.0 < 0.7*50.0 can never hold.
+	if !strings.Contains(got, "| `alpha` | 6 | 1 | 1.0 s | 1.0 s | 1.0 s | 50.0 (50.0-100.0) | 47.6 |") {
+		t.Errorf("the decode table does not carry the window-wide p50:\n%s", got)
+	}
+	if !strings.Contains(got, "### Alerts (1)") {
+		t.Errorf("the decode fixture must emit exactly its one alert:\n%s", got)
+	}
+}
+
+// TestModelStatsSingleHourEmitsNoBaselineAlerts: one complete hour is a
+// single measurement. It is neither old nor recent relative to another hour,
+// so it yields no baseline at all and NEITHER the trailing-p50 alert nor the
+// decode alert fires -- even at 5x the p90 threshold's ratio and with a
+// decode rate no other hour can judge.
+func TestModelStatsSingleHourEmitsNoBaselineAlerts(t *testing.T) {
+	cfg := modelStatsTestConfigWith(t, "alpha")
+	var hour []string
+	for i := 0; i < *cfg.Alerts.HourCalls; i++ {
+		hour = append(hour, `{"ts":"2026-10-21T09:00:00Z","model":"alpha","completion_tokens":1000,"usage_seen":true,"ttft_ms":5000,"dur_ms":40000}`)
+	}
+	// One hour, and 5 h of it: every row is in the same bucket.
+	in, win, now := modelStatsBaselineFixture(t, cfg, nil, hour)
+	aggs := modelAggregate(in, cfg, win)
+	if len(aggs) == 0 {
+		t.Fatal("no aggregate for alpha")
+	}
+	var alpha *modelAgg
+	for _, a := range aggs {
+		if a.ID == "alpha" {
+			alpha = a
+		}
+	}
+	if alpha == nil || len(alpha.hours) != 1 {
+		t.Fatalf("fixture is not a single hour: %+v", alpha)
+	}
+	if got := ttftBaseline(alpha, cfg, win, now); got != 0 {
+		t.Errorf("ttft baseline for one complete hour = %v, want 0 (no baseline hour)", got)
+	}
+	if got := decodeBaseline(alpha, cfg, win, now); got != 0 {
+		t.Errorf("decode baseline for one complete hour = %v, want 0 (no baseline hour)", got)
+	}
+	got := modelStatsReport(in, cfg, win, now)
+	for _, leak := range []string{"above 2x the trailing", "decode p50"} {
+		if strings.Contains(got, leak) {
+			t.Errorf("a single complete hour emitted %q:\n%s", leak, got)
+		}
+	}
+	if !strings.Contains(got, "**No alerts.**") {
+		t.Errorf("a single complete hour must emit no alert at all:\n%s", got)
+	}
+	// 30 calls in one hour, so the hourly floor is met and the hour would be
+	// judged -- if there were a second hour to judge it against.
+	if !strings.Contains(got, "| 2026-10-21 09:00 | `alpha` | 30 | 5.0 s |") {
+		t.Errorf("the single hour is not in the by-hour table:\n%s", got)
+	}
+}
+
+// TestModelStatsCutCountedOnce: a cut row that produced no completion is
+// one cut, not two. Found by review (finding 3): modelAggregate counted
+// `r.Cut && r.TTFTMs > 0` and then called miss(r), which counted r.Cut
+// again for the same non-completion row, so one cut+no-completion row read
+// as Cuts=2 in the table while a cut row that did complete read as 1.
+func TestModelStatsCutCountedOnce(t *testing.T) {
+	cfg := modelStatsTestConfig(t)
+	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	win := modelStatsWindowFrom(cfg, now)
+
+	// One row only: a streaming call that was cut (the stream ended without
+	// a [DONE] line) and produced no completion at all -- status 500, no
+	// usage, zero tokens. That is exactly the review's probe.
+	lines := []string{
+		`{"ts":"2026-10-21T11:00:00Z","model":"alpha","completion_tokens":0,"usage_seen":false,"ttft_ms":1000,"dur_ms":9000,"cut":true,"status":500}`,
+	}
+	zr := modelStatsTestZip(t, modelStatsLedgerName, strings.Join(lines, "\n")+"\n")
+	in := parseModelStatsZips([]*zip.Reader{zr}, cfg)
+	if in.Stats.Rows != 1 || in.Stats.Rejected != 0 {
+		t.Fatalf("probe row: rows=%d rejected=%d (classes=%v), want 1/0", in.Stats.Rows, in.Stats.Rejected, in.Stats.RejectedClass)
+	}
+	// One row is one cut. The error class the row also carries (a 5xx) is
+	// untouched by the fix: miss still owns that, and only that.
+	aggs := modelAggregate(in, cfg, win)
+	if len(aggs) == 0 {
+		t.Fatalf("no aggregates")
+	}
+	a := aggs[0]
+	if a.ID != "alpha" {
+		t.Fatalf("first aggregate is %q, want alpha", a.ID)
+	}
+	if a.Calls != 1 || a.Cuts != 1 {
+		t.Errorf("cut+no-completion row: calls=%d cuts=%d, want 1/1 (was cuts=2 before the fix)", a.Calls, a.Cuts)
+	}
+	if a.Fivexx != 1 || a.Errs != 1 {
+		t.Errorf("the row's 5xx class was lost by the fix: fivexx=%d errs=%d, want 1/1", a.Fivexx, a.Errs)
+	}
+	got := modelStatsReport(in, cfg, win, now)
+	// The table's cut column for that row, read as a whole line: n=1, one
+	// run, cut=1, 429=0, error=1, stall=0.
+	if !strings.Contains(got, "| `alpha` | 1 | 1 | 1.0 s | 1.0 s | 1.0 s | — | 0.0 | 1 | 0 | 1 | 0 | 0.00% | 0 | 0.0 | 0 |") {
+		t.Errorf("the reported cut column is not 1 for the single cut row:\n%s", got)
+	}
+}
+
+// TestModelStatsProxyMarkerLinesAreNotRows: the proxy's own ledger markers
+// -- kind "proxy_start" (recordMarker, main.go), kind "quotas" (recordQuotas,
+// main.go:1483) and kind "search" (search.go:158, whose model is the fixed id
+// "web-search") -- are not rows about a model. Found by review (finding 5):
+// they were decoded as model "" (or "web-search"), which is not in
+// models.json, so every one of them was a rejection and a normal run tripped
+// the >1% reject alert on the proxy's own bookkeeping.
+func TestModelStatsProxyMarkerLinesAreNotRows(t *testing.T) {
+	cfg := modelStatsTestConfig(t)
+	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	win := modelStatsWindowFrom(cfg, now)
+
+	lines := []string{
+		// The one real call in the run.
+		`{"ts":"2026-10-21T11:00:00Z","model":"alpha","completion_tokens":1000,"usage_seen":true,"ttft_ms":1000,"dur_ms":9000}`,
+		// proxy_start: no model field at all.
+		`{"kind":"proxy_start"}`,
+		// quotas: an opaque body, no model field.
+		`{"kind":"quotas","quotas":"{\"plan\":\"big\"}"}`,
+		// search: the model the proxy writes is the fixed id web-search, not
+		// a model in models.json.
+		`{"kind":"search","model":"web-search","query_len":3,"results":2}`,
+	}
+	zr := modelStatsTestZip(t, modelStatsLedgerName, strings.Join(lines, "\n")+"\n")
+	in := parseModelStatsZips([]*zip.Reader{zr}, cfg)
+
+	if in.Stats.Rows != 1 || in.Stats.Rejected != 0 {
+		t.Fatalf("proxy markers counted as rows: rows=%d rejected=%d classes=%v, want 1/0 (review probe was 1 accepted, 3 rejected = 75%%)",
+			in.Stats.Rows, in.Stats.Rejected, in.Stats.RejectedClass)
+	}
+	got := modelStatsReport(in, cfg, win, now)
+	if !strings.Contains(got, "Rows: 1 accepted, 0 rejected (0.00%, threshold 1.00%)") {
+		t.Errorf("reject rate is not 0%% for a run carrying only proxy markers:\n%s", got)
+	}
+	if strings.Contains(got, "above the 1.00% threshold") {
+		t.Errorf("the reject alert fired on the proxy's own marker lines:\n%s", got)
+	}
+	// The real call still reached the tables, and so did its hour.
+	if !strings.Contains(got, "| `alpha` | 1 | 1 | 1.0 s | 1.0 s | 1.0 s | 125.0 (125.0-125.0) | 111.1 | 0 | 0 | 0 | 0 | 0.00% | 0 | 0.0 | 0 |") {
+		t.Errorf("the real call is missing from the model table:\n%s", got)
+	}
+	if !strings.Contains(got, "| 2026-10-21 11:00 | `alpha` | 1 | 1.0 s |") {
+		t.Errorf("the real call's hour is missing from the hourly table:\n%s", got)
+	}
+	// No model invented for the markers: web-search must never appear as a
+	// model of its own.
+	if strings.Contains(got, "web-search") {
+		t.Errorf("the proxy's search line was reported as a model:\n%s", got)
+	}
+
+	// A "status" marker must keep working exactly as before: kept as a
+	// marker for its error class, never a row and never a rejection.
+	markerZip := modelStatsTestZip(t, modelStatsLedgerName, strings.Join([]string{
+		lines[0],
+		`{"ts":"2026-10-21T11:00:00Z","model":"alpha","kind":"status","status":429}`,
+	}, "\n")+"\n")
+	m := parseModelStatsZips([]*zip.Reader{markerZip}, cfg)
+	if m.Stats.Rows != 1 || m.Stats.Rejected != 0 || len(m.Stats.Markers) != 1 {
+		t.Fatalf("status marker: rows=%d rejected=%d markers=%d, want 1/0/1", m.Stats.Rows, m.Stats.Rejected, len(m.Stats.Markers))
+	}
+	if m.Stats.Markers[0].Status != 429 || m.Stats.Markers[0].Model != "alpha" {
+		t.Fatalf("status marker lost its class: %+v", m.Stats.Markers[0])
+	}
+}
+
+// TestModelStatsUnknownKindRefused: a kind that is neither a call (no kind),
+// "status", "proxy_start", "quotas" nor "search" is refused, never silently
+// accepted; and a row with no kind at all and an unknown model is still
+// refused under the model class. The proxy markers are skipped before the
+// model check, so that change must not become a hole a hostile row can slip
+// through.
+func TestModelStatsUnknownKindRefused(t *testing.T) {
+	cfg := modelStatsTestConfig(t)
+	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	win := modelStatsWindowFrom(cfg, now)
+
+	lines := []string{
+		// The honest call: the row the run really carries.
+		`{"ts":"2026-10-21T11:00:00Z","model":"alpha","completion_tokens":1000,"usage_seen":true,"ttft_ms":1000,"dur_ms":9000}`,
+		// A line with no kind at all and an unknown model: refused under the
+		// model class, exactly as before.
+		`{"ts":"2026-10-21T11:00:00Z","model":"not-a-model-in-models.json","completion_tokens":1,"usage_seen":true,"ttft_ms":1000,"dur_ms":9000}`,
+		// A line with no kind and no model at all: refused too.
+		`{"ts":"2026-10-21T11:00:00Z","completion_tokens":1,"usage_seen":true,"ttft_ms":1000,"dur_ms":9000}`,
+		// Kinds the reader does not know: a hostile line cannot borrow a real
+		// model id and a made-up kind to skip the report, and it is not
+		// silently accepted either.
+		`{"ts":"2026-10-21T11:00:00Z","model":"alpha","kind":"totally-unknown-kind","ttft_ms":1000,"dur_ms":9000}`,
+		`{"ts":"2026-10-21T11:00:00Z","model":"alpha","kind":"Proxy_Start","ttft_ms":1000,"dur_ms":9000}`,
+	}
+	zr := modelStatsTestZip(t, modelStatsLedgerName, strings.Join(lines, "\n")+"\n")
+	in := parseModelStatsZips([]*zip.Reader{zr}, cfg)
+
+	if in.Stats.Rows != 1 {
+		t.Fatalf("accepted rows = %d, want 1 (only the honest call)", in.Stats.Rows)
+	}
+	// Four refusals: two under the model class (an unknown id, a missing
+	// one), two under the unknown-kind class.
+	if in.Stats.Rejected != 4 {
+		t.Fatalf("rejected rows = %d, want 4: %v", in.Stats.Rejected, in.Stats.RejectedClass)
+	}
+	if got := in.Stats.RejectedClass[rejectUnknown]; got != 2 {
+		t.Errorf("model-not-in-models.json class = %d, want 2 (one unknown id, one missing): %v", got, in.Stats.RejectedClass)
+	}
+	if got := in.Stats.RejectedClass[rejectUnknownKind]; got != 2 {
+		t.Errorf("unknown-kind class = %d, want 2: %v", got, in.Stats.RejectedClass)
+	}
+	// The count is reported, and by class, in the comment.
+	got := modelStatsReport(in, cfg, win, now)
+	if !strings.Contains(got, "Rows: 1 accepted, 4 rejected (80.00%, threshold 1.00%)") {
+		t.Errorf("the report does not carry the rejected count:\n%s", got)
+	}
+	if !strings.Contains(got, "- "+string(rejectUnknown)+": 2") {
+		t.Errorf("the report does not carry the model class count:\n%s", got)
+	}
+	if !strings.Contains(got, "- "+string(rejectUnknownKind)+": 2") {
+		t.Errorf("the report does not carry the unknown-kind class count:\n%s", got)
+	}
+	// Nothing a hostile line carried is echoed.
+	for _, leaked := range []string{"totally-unknown-kind", "Proxy_Start", "not-a-model-in-models.json"} {
+		if strings.Contains(got, leaked) {
+			t.Errorf("report echoes hostile input %q:\n%s", leaked, got)
+		}
+	}
 }

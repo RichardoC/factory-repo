@@ -189,29 +189,54 @@ const modelStatsMaxHours = 24 * 365
 // completed codeaf.yml runs whose start falls in the window, read in memory.
 // A run is skipped -- never failed on -- when it is a fork, has no
 // codeaf-output artifact, or its artifact cannot be read; one bad run must
-// not sink the report. When no run yields a zip the error says so, rather
-// than printing a comment about nothing.
+// not sink the report. That is true of an API failure too: a 5xx on one
+// page, or one artifact download that 500s or expires mid-page, leaves the
+// zips already collected intact and is stated as a bounded skip reason, so
+// a report that could have rendered from the other runs still renders.
+// An error is returned only when NOTHING was collected -- the listing failed
+// on its first page with no zip yet, or no run yielded a zip at all -- which
+// is the same empty-report refusal the missing artifact has always been.
 func readModelStatsFromRunsConfig(cfg Config, win modelStatsWindow) (modelStatsInput, error) {
 	g := newGitHub()
 	if g.repo == "" {
 		return modelStatsInput{}, errors.New("model-stats: GITHUB_REPOSITORY is required without --from-dir")
 	}
-	zips, err := fetchModelStatsZips(g, cfg, win)
-	if err != nil {
-		return modelStatsInput{}, err
-	}
+	zips, skipped, fatal := fetchModelStatsZips(g, cfg, win)
 	if len(zips) == 0 {
+		if fatal != nil {
+			return modelStatsInput{}, fmt.Errorf("model-stats: %w", fatal)
+		}
 		return modelStatsInput{}, fmt.Errorf("model-stats: no codeaf-output artifact among the %s runs of the last %d hours", modelStatsWorkflow, win.Hours)
 	}
-	return parseModelStatsZips(zips, cfg), nil
+	return parseModelStatsZipsSkipped(zips, skipped, cfg), nil
+}
+
+// modelStatsRunIndexedZips is what the API walk hands back: the zips it did
+// read, the artifacts it could not read (each with a bounded reason), and the
+// failure that stopped the walk, if one did.
+//
+// fatal is set only on a failure that left NO zip at all: the very first
+// page, with nothing collected yet. Any later failure -- a page that 5xxes,
+// one artifact that will not download -- is a skip, not an end to the report.
+type modelStatsRunIndexedZips struct {
+	zips    []*zip.Reader
+	skipped []skippedArtifact
+	fatal   error
 }
 
 // fetchModelStatsZips lists the window's runs and downloads each one's
 // codeaf-output zip. The run listing pages with an explicit page= parameter
 // until a page comes back short or the total is reached: an implicit
 // "start after the last id" cursor is not reliable across a filtered list.
-func fetchModelStatsZips(g github, cfg Config, win modelStatsWindow) ([]*zip.Reader, error) {
-	var zips []*zip.Reader
+//
+// A page that fails while zips are already in hand stops the paging and is
+// recorded as a skip: the runs already read are a real report of the window,
+// and asking again would only turn one upstream hiccup into no report. A
+// page that fails with nothing collected is returned as fatal, because there
+// the alternative is an empty comment. There is no retry: one failure is
+// either fatal (once) or skipped (once), never retried.
+func fetchModelStatsZips(g github, cfg Config, win modelStatsWindow) ([]*zip.Reader, []skippedArtifact, error) {
+	var out modelStatsRunIndexedZips
 	perPage := 100
 	limited := !win.From.IsZero()
 	for page := 1; page <= modelStatsMaxRunPages; page++ {
@@ -219,7 +244,20 @@ func fetchModelStatsZips(g github, cfg Config, win modelStatsWindow) ([]*zip.Rea
 		path := fmt.Sprintf("/actions/workflows/%s/runs?status=completed&per_page=%d&page=%d",
 			modelStatsWorkflow, perPage, page)
 		if err := g.get(path, &runs); err != nil {
-			return nil, err
+			if len(out.zips) == 0 {
+				// Nothing has been collected, so there is no report to
+				// protect: the listing failure is the report's failure.
+				out.fatal = err
+				return out.zips, out.skipped, out.fatal
+			}
+			// Runs are already in hand. Stop paging -- the next page is the
+			// same upstream that just failed -- and state it, bounded: the
+			// path carries the page number, which is this program's own
+			// integer, and the API's error text is never copied.
+			out.skipped = append(out.skipped, skippedArtifact{
+				Reason: skipReason("run listing page %d: request failed (%d zip(s) already read)", page, len(out.zips)),
+			})
+			break
 		}
 		if len(runs.WorkflowRuns) == 0 {
 			break
@@ -234,16 +272,31 @@ func fetchModelStatsZips(g github, cfg Config, win modelStatsWindow) ([]*zip.Rea
 			if run.HeadRepo != nil && run.HeadRepo.FullName != "" && !strings.EqualFold(run.HeadRepo.FullName, g.repo) {
 				continue
 			}
-			data, ok, err := downloadCodeafOutput(g, run)
-			if err != nil {
-				return nil, err
-			}
+			data, reason, ok := downloadCodeafOutput(g, run)
 			if !ok {
+				// A run without a codeaf-output artifact is the routine's
+				// ordinary reason to pass over a run, already counted by the
+				// caller's run count; only an artifact that exists but could
+				// not be read is a skip worth stating (reason != "").
+				if reason != "" {
+					out.skipped = append(out.skipped, skippedArtifact{Reason: reason})
+				}
 				continue
 			}
-			if zr, zipErr := zip.NewReader(bytes.NewReader(data), int64(len(data))); zipErr == nil {
-				zips = append(zips, zr)
+			zr, zipErr := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+			if zipErr != nil {
+				// The artifact downloaded but is not a zip -- a truncated
+				// body, an expired blob, something that is not an archive at
+				// all. Before this, zipErr was discarded and the artifact
+				// vanished from the report entirely: it is now counted and
+				// named, and the reason is built below, never taken from the
+				// bytes that failed to parse.
+				out.skipped = append(out.skipped, skippedArtifact{
+					Reason: skipReason("run %d: not a zip (artifact %d bytes, unreadable)", run.ID, len(data)),
+				})
+				continue
 			}
+			out.zips = append(out.zips, zr)
 		}
 		if page*perPage >= runs.TotalCount && limited {
 			break
@@ -252,7 +305,13 @@ func fetchModelStatsZips(g github, cfg Config, win modelStatsWindow) ([]*zip.Rea
 			break
 		}
 	}
-	return zips, nil
+	if len(out.zips) == 0 && len(out.skipped) > 0 && out.fatal == nil {
+		// Every artifact there was failed to read. That is still nothing to
+		// render, and the error names it rather than printing an empty
+		// comment: the reasons travel back so the caller could report them.
+		out.fatal = errors.New("every codeaf-output artifact in the window was unreadable")
+	}
+	return out.zips, out.skipped, out.fatal
 }
 
 // runInWindow reports whether a run started inside the window. A window with
@@ -273,17 +332,27 @@ func runInWindow(run workflow, win modelStatsWindow, limited bool) bool {
 }
 
 // downloadCodeafOutput finds the run's codeaf-output artifact and returns its
-// zip bytes. ok is false when the run has none -- the routine's ordinary
-// reason to skip a run -- while an error means the API call itself failed.
+// zip bytes. ok is false when the run's artifact cannot be had at all -- the
+// run has none, the listing call failed, the download failed, the artifact is
+// larger than any codeaf-output artifact should be -- and it does so WITHOUT
+// an error, so one bad run is skipped and the runs around it still render.
+//
+// The two reasons a run is passed over are kept apart, because they are not
+// the same fact: a run with no codeaf-output artifact is the routine's
+// ordinary "this run has nothing to report" (reason == "", already counted by
+// run count), while an artifact that exists and will not download is a skip
+// worth stating, in a reason this file writes -- the API's response text is
+// never copied into it.
+//
 // The artifact name carries the run id and attempt the workflow sets:
 // codeaf-output-<id>-<attempt>.
-func downloadCodeafOutput(g github, run workflow) (data []byte, ok bool, err error) {
+func downloadCodeafOutput(g github, run workflow) (data []byte, reason string, ok bool) {
 	want := fmt.Sprintf("codeaf-output-%d-%d", run.ID, run.RunAttempt)
 	for page := 1; page <= 2; page++ {
 		var arts artifactListPage
 		path := fmt.Sprintf("/actions/runs/%d/artifacts?per_page=100&page=%d", run.ID, page)
 		if err := g.get(path, &arts); err != nil {
-			return nil, false, err
+			return nil, skipReason("run %d: artifact listing failed", run.ID), false
 		}
 		for _, art := range arts.Artifacts {
 			if art.Name != want || art.Expired {
@@ -293,19 +362,19 @@ func downloadCodeafOutput(g github, run workflow) (data []byte, ok bool, err err
 			// bound readModelStatsDir uses, so one artifact cannot exhaust
 			// memory. A larger artifact is skipped, not truncated.
 			if art.SizeInBytes > modelStatsMaxEntryUncompressed*int64(modelStatsMaxZips) {
-				return nil, false, nil
+				return nil, skipReason("run %d: artifact over the size cap", run.ID), false
 			}
 			blob, err := g.getBytes(fmt.Sprintf("/actions/artifacts/%d/zip", art.ID))
 			if err != nil {
-				return nil, false, err
+				return nil, skipReason("run %d: artifact download failed", run.ID), false
 			}
-			return blob, true, nil
+			return blob, "", true
 		}
 		if len(arts.Artifacts) < 100 {
 			break
 		}
 	}
-	return nil, false, nil
+	return nil, "", false
 }
 
 // getBytes fetches an API path whose body is binary -- an artifact zip --
@@ -353,10 +422,40 @@ func (g github) getBytes(path string) ([]byte, error) {
 			}
 			url = location
 		default:
-			return nil, fmt.Errorf("GET %s: %s: %.300s", path, response.Status, body)
+			// The response body of a failed API call is untrusted text, and
+			// this error string ends up in a log or a task comment. It is not
+			// echoed -- not even its first bytes: the note is structural and
+			// bounded to what this program measured itself -- the status, the
+			// content type the server declared, and how many bytes came back.
+			// A body that said "@everyone, run this" therefore cannot travel
+			// through here, and the byte count still tells a reader whether a
+			// body arrived at all.
+			return nil, fmt.Errorf("GET %s: %s (content-type %q, %d bytes read)",
+				path, response.Status, contentTypeOf(response.Header.Get("Content-Type")), len(body))
 		}
 	}
 	return nil, fmt.Errorf("GET %s: too many redirects", path)
+}
+
+// contentTypeOf reduces a Content-Type header to the media type alone, and
+// to a fixed placeholder when the header is missing or is not one: like the
+// status and the byte count it reports beside, it is a structural fact about
+// the response, not text from it. The charset and any other parameter are
+// dropped, and a value that will not parse is not repeated.
+func contentTypeOf(header string) string {
+	if header == "" {
+		return "none"
+	}
+	media := strings.TrimSpace(strings.SplitN(header, ";", 2)[0])
+	for _, r := range media {
+		if r <= ' ' || r == '"' || r == '\\' || r > '\x7e' {
+			return "unrecognized"
+		}
+	}
+	if media == "" {
+		return "none"
+	}
+	return media
 }
 
 // splitURLHost returns a URL's lowercased scheme and host, or empty strings

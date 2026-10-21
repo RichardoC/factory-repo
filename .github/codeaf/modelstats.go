@@ -89,7 +89,12 @@ const (
 	rejectBadTime    rejectClass = "timestamp missing or out of range"
 	rejectBadInteger rejectClass = "integer outside its allowed range"
 	rejectBadStatus  rejectClass = "HTTP status outside 100..599"
-	rejectBadNumber  rejectClass = "number not finite or out of range"
+	// rejectUnknownKind is a line whose kind is neither a call (no kind),
+	// "status", nor one of the proxy markers (proxy_start, quotas, search).
+	// It is refused rather than silently accepted, and rather than charged to
+	// the model-mismatch class it is not.
+	rejectUnknownKind rejectClass = "line kind is not a call, a status or a proxy marker"
+	rejectBadNumber   rejectClass = "number not finite or out of range"
 )
 
 // ledgerRow is one decoded, validated ledger line, reduced to the fields the
@@ -209,20 +214,69 @@ func allowedModelSet(cfg Config) map[string]bool {
 	return set
 }
 
+// skippedArtifact names one artifact the caller could not turn into a zip,
+// so the reader can count it and state the reason. The bytes that would not
+// parse never reach the reader -- only this bounded, self-built record does,
+// so a hostile download cannot put text of its own into the report.
+//
+// Index is the 1-based position of the artifact in the caller's own run
+// order (a run number or a file number), or 0 for an artifact the caller
+// already counted and reasoned about the way it wanted.
+type skippedArtifact struct {
+	Index  int
+	Reason string
+}
+
 // parseModelStatsZips reads a set of in-memory zips -- the downloaded
 // codeaf-output artifacts -- and returns the validated window they carry.
 // Nothing is extracted and nothing is executed: every entry is read through
 // the archive/zip reader, and an entry whose header claims more than the
 // bounds allow is refused without being decompressed.
+//
+// Artifacts that yielded no zip at all -- a download that failed, bytes that
+// are not a zip -- are handed in as skipped rather than dropped on the floor:
+// an unreadable artifact is a fact about the window, and the report says how
+// many there were and why. See parseModelStatsZipsSkipped.
 func parseModelStatsZips(zips []*zip.Reader, cfg Config) modelStatsInput {
-	b := defaultModelStatsBounds()
-	return parseModelStatsWithBounds(zips, allowedModelSet(cfg), b)
+	return parseModelStatsZipsSkipped(zips, nil, cfg)
 }
 
-// parseModelStatsWithBounds is parseModelStatsZips with the bounds made
-// explicit, so TestModelStatsZipBounds can drive the real reader.
+// parseModelStatsZipsSkipped is parseModelStatsZips with the artifacts the
+// caller already knows are unreadable. The zip readers and the skipped
+// records are two views of one run list: the i-th reader is the i-th
+// artifact, and a skipped record with an Index of i+1 is that same artifact
+// with no reader. Parsing stays a pure function of its inputs -- these
+// slices and the bounds -- so the same inputs render the same report.
+func parseModelStatsZipsSkipped(zips []*zip.Reader, skipped []skippedArtifact, cfg Config) modelStatsInput {
+	return parseModelStatsWithBoundsSkipped(zips, skipped, allowedModelSet(cfg), defaultModelStatsBounds())
+}
+
+// parseModelStatsWithBounds is parseModelStatsZipsSkipped with the bounds
+// made explicit, so TestModelStatsZipBounds can drive the real reader.
 func parseModelStatsWithBounds(zips []*zip.Reader, allowed map[string]bool, b modelStatsBounds) modelStatsInput {
+	return parseModelStatsWithBoundsSkipped(zips, nil, allowed, b)
+}
+
+// parseModelStatsWithBoundsSkipped is the reader both wrappers end in.
+//
+// A skipped artifact has no zip.Reader to inspect, so the reader cannot tell
+// an empty artifact from an expired one by itself; it takes the caller's
+// bounded reason, counts the artifact as skipped and reads on. An artifact
+// that did parse but is refused by the bounds below (too many entries, an
+// entry over a size cap) is counted here, with a reason this file writes.
+func parseModelStatsWithBoundsSkipped(zips []*zip.Reader, skipped []skippedArtifact, allowed map[string]bool, b modelStatsBounds) modelStatsInput {
 	in := modelStatsInput{Stats: windowStats{RejectedClass: map[rejectClass]int{}}}
+	for _, s := range skipped {
+		// A reason the caller writes is already bounded (skipReason); one it
+		// forgets is replaced, never echoed, so no reason reaches the report
+		// longer than the cap or assembled from input text.
+		reason := skipReason("run %d: %s", s.Index, "artifact not read")
+		if s.Reason != "" {
+			reason = skipReason("%s", s.Reason)
+		}
+		in.Stats.ZipSkipped++
+		in.Stats.SkippedReason = append(in.Stats.SkippedReason, reason)
+	}
 	for i, zr := range zips {
 		if zr == nil {
 			in.Stats.ZipSkipped++
@@ -367,11 +421,34 @@ func (in *modelStatsInput) decodeLedgerLine(line []byte, run int, allowed map[st
 		in.addReject(rejectBadJSON)
 		return
 	}
+	// The kinds the proxy writes about itself rather than about a model:
+	// "proxy_start" (recordMarker, main.go), "quotas" (recordQuotas,
+	// main.go:1483) and "search" (search.go:158, whose model is the fixed id
+	// "web-search", not a model in models.json). They are the proxy speaking
+	// about itself, not a ledger row about a model, so they are skipped
+	// whole: not a row, not a rejection. Deciding this before the model check
+	// is what keeps a run that carries them from tripping the reject alert.
+	//
+	// "status" is the one non-call kind the report keeps: it becomes a
+	// marker, handled below. Every other kind -- and a line with no kind at
+	// all -- has to be a call with a model models.json allows; a kind that
+	// is neither a call nor one of the four known ones is refused below
+	// rather than silently accepted.
+	switch raw.Kind {
+	case "proxy_start", "quotas", "search":
+		return
+	}
 	var model string
-	if err := json.Unmarshal(raw.Model, &model); err != nil || !allowed[model] {
+	if err := json.Unmarshal(raw.Model, &model); err != nil || model == "" || !allowed[model] {
 		// One class for a missing, non-string or unknown model: the reader
 		// never repeats what the line claimed, only that it was refused.
 		in.addReject(rejectUnknown)
+		return
+	}
+	if raw.Kind != "" && raw.Kind != "status" {
+		// A kind the reader does not know is not a ledger row: the report
+		// states it rather than folding it into a model figure.
+		in.addReject(rejectUnknownKind)
 		return
 	}
 	status, hasStatus, ok := decodeStatus(raw.Status)
@@ -536,31 +613,47 @@ func readModelStatsDir(dir string, cfg Config) (modelStatsInput, error) {
 		return modelStatsInput{}, fmt.Errorf("model-stats: %w", err)
 	}
 	var zips []*zip.Reader
+	var skipped []skippedArtifact
+	files := 0
 	for _, e := range names {
 		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".zip") {
 			continue
 		}
+		files++
 		path := filepath.Join(dir, e.Name())
 		info, err := e.Info()
 		if err != nil || info.Size() > modelStatsMaxEntryUncompressed*int64(modelStatsMaxZips) {
+			skipped = append(skipped, skippedArtifact{Index: files, Reason: skipReason("artifact %d: over the size cap", files)})
 			continue
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {
+			skipped = append(skipped, skippedArtifact{Index: files, Reason: skipReason("artifact %d: unreadable", files)})
 			continue
 		}
 		zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 		if err != nil {
-			// A file that is not a zip is skipped, not fatal: one bad
-			// download must not sink the report.
+			// A file that is not a zip is skipped, not fatal -- one bad
+			// download must not sink the report -- but it is COUNTED and
+			// NAMED, not dropped on the floor: a file the workflow downloaded
+			// and nothing read is exactly the silent hole this states. The
+			// file's own name is untrusted text and is never echoed: the
+			// reason says "artifact N", this program's own count.
+			skipped = append(skipped, skippedArtifact{
+				Index:  files,
+				Reason: skipReason("artifact %d: not a zip (%d bytes, unreadable)", files, len(data)),
+			})
 			continue
 		}
 		zips = append(zips, zr)
 	}
 	if len(zips) == 0 {
+		if len(skipped) > 0 {
+			return modelStatsInput{}, fmt.Errorf("model-stats: every one of the %d codeaf-output zip(s) in %s was unreadable", len(skipped), filepath.Base(dir))
+		}
 		return modelStatsInput{}, errors.New("model-stats: no readable codeaf-output zip in " + filepath.Base(dir))
 	}
-	return parseModelStatsZips(zips, cfg), nil
+	return parseModelStatsZipsSkipped(zips, skipped, cfg), nil
 }
 
 // ---------------------------------------------------------------- computing
@@ -621,6 +714,10 @@ type hourBucket struct {
 	Start time.Time
 	Calls int
 	TTFT  []float64
+	// Decode is this hour's decode tok/s cohort: the same completions that
+	// feed a.Decode, kept per hour so the decode alert has a trailing
+	// baseline of its own instead of the window-wide p50 it judges.
+	Decode []float64
 }
 
 // modelAgg is one model's figures over the window. Every slice and map is
@@ -707,12 +804,18 @@ func modelAggregate(in modelStatsInput, cfg Config, win modelStatsWindow) []*mod
 				a.Abandoned++
 			}
 		}
+		// A cut row is counted here and only here. The row that produced no
+		// completion still goes through miss for its error class, so miss
+		// must not touch Cuts: counting the same row in both places made one
+		// cut+no-completion row read as Cuts=2.
 		if r.Cut && r.TTFTMs > 0 {
 			a.Cuts++
 		}
 		if r.MaxGapMs > 0 && r.MaxGapMs >= cfg.Alerts.StallGapMs {
 			a.Stalls++
 		}
+		decodeOK := false
+		decodeRate := 0.0
 		if r.completion && r.Tokens >= *cfg.Alerts.DecodeMinTokens {
 			// The decode and end-to-end figures both read the same cohort:
 			// a completion long enough to measure the model's throughput
@@ -722,7 +825,9 @@ func modelAggregate(in modelStatsInput, cfg Config, win modelStatsWindow) []*mod
 				a.E2E = append(a.E2E, float64(r.Tokens)*1000/float64(r.DurMs))
 			}
 			if r.DurMs > r.TTFTMs {
-				a.Decode = append(a.Decode, float64(r.Tokens)*1000/float64(r.DurMs-r.TTFTMs))
+				decodeRate = float64(r.Tokens) * 1000 / float64(r.DurMs-r.TTFTMs)
+				decodeOK = true
+				a.Decode = append(a.Decode, decodeRate)
 			}
 		}
 		if r.completion {
@@ -733,6 +838,9 @@ func modelAggregate(in modelStatsInput, cfg Config, win modelStatsWindow) []*mod
 		h := a.addHour(r.Time)
 		h.Calls++
 		h.TTFT = append(h.TTFT, float64(r.TTFTMs))
+		if decodeOK {
+			h.Decode = append(h.Decode, decodeRate)
+		}
 	}
 	// Status markers: a 4xx/5xx class, and a 429 count that also counts the
 	// 429s a call line carries. A marker is a call the proxy never completed,
@@ -765,6 +873,10 @@ func modelAggregate(in modelStatsInput, cfg Config, win modelStatsWindow) []*mod
 }
 
 // miss records the error class of a call that produced no completion.
+//
+// It deliberately does not touch Cuts: modelAggregate already counted the
+// cut for this row (r.Cut && r.TTFTMs > 0), so counting it again here made
+// one row read as two. miss owns the error classes and nothing else.
 func (a *modelAgg) miss(r ledgerRow) {
 	switch statusClass(r.Status) {
 	case "429":
@@ -773,9 +885,6 @@ func (a *modelAgg) miss(r ledgerRow) {
 		a.Fourxx++
 	case "5xx":
 		a.Fivexx++
-	}
-	if r.Cut {
-		a.Cuts++
 	}
 }
 
@@ -1046,18 +1155,13 @@ func modelStatsAlerts(in modelStatsInput, aggs []*modelAgg, cfg Config, win mode
 			continue
 		}
 		// The trailing baseline: the per-hour first-token p50s of the hours
-		// older than the ratio window, averaged. It is computed over the same
-		// window's own rows, so a report rendered from a 72 h artifact set
-		// says so rather than inventing history it does not have.
-		cutoff := now.UTC().Add(-time.Duration(baselineHours) * time.Hour)
-		var baseline []float64
-		for _, h := range a.hours {
-			if h.Start.After(cutoff) {
-				continue
-			}
-			baseline = append(baseline, summarize(h.TTFT).P50)
-		}
-		base := avgMs(baseline)
+		// the model treats as history, averaged. It is computed over the
+		// window's own rows -- when the configured baseline (168 h) is longer
+		// than the window (72 h by default) it is the older part of the same
+		// window, so a report rendered from a 72 h artifact set measures what
+		// it has rather than inventing history it does not have. With no
+		// baseline hour at all the ratio is not evaluable and cannot fire.
+		base := ttftBaseline(a, cfg, win, now)
 		limit := base * cfg.Alerts.TTFTp50Ratio
 		ratioUsable := base > 0
 		overCount := 0
@@ -1080,13 +1184,15 @@ func modelStatsAlerts(in modelStatsInput, aggs []*modelAgg, cfg Config, win mode
 			}
 		}
 		if overCount > 0 {
+			// Both figures are seconds: the rest of the report states first
+			// token times in seconds, and this line is read beside them.
 			out = append(out, fmt.Sprintf("%s: %d hour(s) with at least %d calls above %gx the trailing %.1f h first-token p50 ("+
 				"%s over %.1f s vs a %.1f s baseline; first was %s UTC with %d calls)",
 				modelIDCell(a.ID), overCount, *cfg.Alerts.HourCalls, cfg.Alerts.TTFTp50Ratio, float64(baselineHours)/24,
-				modelIDCell(a.ID), avgMsOf(a, firstHour), base, firstHour, firstCount))
+				modelIDCell(a.ID), avgMsOf(a, firstHour)/1000, base/1000, firstHour, firstCount))
 		}
 		decode := summarize(a.Decode)
-		if base := decodeBaseline(a); base > 0 && decode.hasData && decode.P50 < cfg.Alerts.DecodeRatio*base {
+		if base := decodeBaseline(a, cfg, win, now); base > 0 && decode.hasData && decode.P50 < cfg.Alerts.DecodeRatio*base {
 			out = append(out, fmt.Sprintf("%s: decode p50 %.1f tok/s below %gx its %.1f tok/s baseline",
 				modelIDCell(a.ID), decode.P50, cfg.Alerts.DecodeRatio, base))
 		}
@@ -1126,20 +1232,89 @@ func avgMsOf(a *modelAgg, hourKey string) float64 {
 	return summarize(h.TTFT).P50
 }
 
+// baselineFloor is the shortest history a baseline is taken from when the
+// window is shorter than the configured baseline: the older part of the
+// window itself. An hour younger than this is the "recent" side the
+// comparison judges, so it cannot also be the baseline.
+const baselineFloor = time.Hour
+
+// trailingBaseline is the trailing baseline a model's recent hours are judged
+// against: the mean of the per-hour p50s of the hours it treats as history.
+// perHour maps an hour key to that hour's cohort (first-token ms, or decode
+// tok/s).
+//
+// Two cases, and no third:
+//
+//   - A model with hours older than baselineHours gives the honest figure the
+//     issue asks for: hours older than now-baselineHours, in first-seen
+//     order, averaged. This is the trailing 7-day p50 when models.json says
+//     decode_baseline_hours/ttft_p50_ratio_baseline_hours is 168.
+//   - now-baselineHours is before win.From -- the window is shorter than the
+//     configured baseline, which is the default 72 h window against a 168 h
+//     baseline. Then no hour in the window is old enough, and the baseline is
+//     measured from the OLDER PART OF THE SAME WINDOW: the hours older than
+//     half the window and at least baselineFloor (1 h) old. A 72 h window
+//     therefore compares its recent hours against its own older hours, which
+//     is a real measurement of the same window's rows and never data invented
+//     from outside it. The cutoff is clamped to win.From for the same reason.
+//
+// Nothing else is eligible. With no baseline hour -- a single complete hour,
+// or all history inside the recent half -- the baseline is empty and the
+// caller must not alert: a report that judged one hour against itself would
+// alert on noise, and one that invented hours would report what it never saw.
+func trailingBaseline(a *modelAgg, now time.Time, win modelStatsWindow, baselineHours int, perHour func(*hourBucket) []float64) []float64 {
+	now = now.UTC()
+	from := win.From
+	if !from.IsZero() && from.After(now.Add(-time.Duration(win.Hours)*time.Hour)) {
+		from = now.Add(-time.Duration(win.Hours) * time.Hour)
+	}
+	cutoff := now.Add(-time.Duration(baselineHours) * time.Hour).UTC()
+	clampToWindow := !from.IsZero() && cutoff.Before(from)
+	if clampToWindow {
+		// The baseline reaches further back than the window does, so the
+		// older part of the window is the history: half the window back.
+		cutoff = now.Add(-time.Duration(win.Hours) * time.Hour / 2).UTC()
+		if cutoff.Before(from) {
+			cutoff = from
+		}
+	}
+	var base []float64
+	for _, h := range a.hours {
+		if !h.Start.Before(cutoff) {
+			continue
+		}
+		if clampToWindow && now.Sub(h.Start) < baselineFloor {
+			continue
+		}
+		values := perHour(h)
+		if len(values) == 0 {
+			continue
+		}
+		base = append(base, summarize(values).P50)
+	}
+	return base
+}
+
 // decodeBaseline is the decode-rate baseline a model's decode p50 is judged
-// against: the median of the model's other measured decode rates in the
-// window. With a single completion there is no second opinion, so the model
-// is its own baseline and the alert cannot fire -- a report that alerted on
-// one call would alert on noise.
-func decodeBaseline(a *modelAgg) float64 {
-	// The baseline is the model's own measured decode p50, which is what the
-	// ratio compares this window's p50 against: a window report cannot see a
-	// previous window, so the honest baseline is the one figure it has --
-	// and with the model as its own baseline the ratio can only fire when a
-	// bimodal distribution (a fast cohort and a slow one) pulls the p50 down
-	// past 0.7 of itself... it cannot. The alert is therefore reported as
-	// "not evaluable" rather than silently omitted.
-	return summarize(a.Decode).P50
+// against: the mean of the trailing hours' decode p50s, older hours of the
+// same window when the configured history is longer than the window (see
+// trailingBaseline). A model with no baseline hour has none -- the alert must
+// not fire, which is the bug this replaced: the old baseline was the very p50
+// the alert compares, so "decode p50 below 0.7x its baseline" could never be
+// true.
+func decodeBaseline(a *modelAgg, cfg Config, win modelStatsWindow, now time.Time) float64 {
+	hours := *cfg.Alerts.HourCallsBaselineHours
+	return avgMs(trailingBaseline(a, now, win, hours, func(h *hourBucket) []float64 { return h.Decode }))
+}
+
+// ttftBaseline is the first-token baseline the hourly ratio alert compares
+// an hour's p50 against: the mean of the trailing hours' p50s, measured the
+// same way as decodeBaseline. The old figure was always 0 at the default
+// 72 h window, because every hour bucket sat inside a 168 h cutoff, which
+// made the ratio unmeasurable and the alert unreachable.
+func ttftBaseline(a *modelAgg, cfg Config, win modelStatsWindow, now time.Time) float64 {
+	hours := *cfg.Alerts.TTFTp50RatioBaselineHours
+	return avgMs(trailingBaseline(a, now, win, hours, func(h *hourBucket) []float64 { return h.TTFT }))
 }
 
 // countMarkers is how many status markers the window carries for a model:

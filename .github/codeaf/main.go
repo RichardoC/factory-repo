@@ -130,8 +130,6 @@ func main() {
 		"patch-split": runPatchSplit,
 		// The PR comment body for a refused part of a patch
 		// (refusedcomment.go): reason plus the refused diff in a fence.
-		// The PR comment body for a refused part of a patch
-		// (refusedcomment.go): reason plus the refused diff in a fence.
 		"refused-comment": runRefusedComment,
 		// Model latency and throughput (issue #131): renders the
 		// first-token, decode-rate and failure tables from the ledger
@@ -1174,11 +1172,10 @@ type LedgerLine struct {
 // charge of the figure, and keeps the call's end where the call actually ended
 // -- the relays are the last thing that touches the upstream stream.
 type callTiming struct {
-	TTFT     time.Duration // issue of the upstream request -> first relayed data line
-	Dur      time.Duration // setup -> the end of the call
-	MaxGap   time.Duration // longest silence between two streamed lines
-	Cut      bool          // streamed: the stream ended without `data: [DONE]`
-	Streamed bool          // the relay actually read an SSE stream (vs relayJSON)
+	TTFT   time.Duration // issue of the upstream request -> first relayed data line
+	Dur    time.Duration // setup -> the end of the call
+	MaxGap time.Duration // longest silence between two streamed lines
+	Cut    bool          // streamed: the stream ended without `data: [DONE]`
 }
 
 // timingOf builds the ledger's timing from the call's start and the current
@@ -2245,7 +2242,7 @@ func (p *proxy) relayStream(out *sseSink, upstream io.Reader, m Model, started t
 	// upstream's error, a bare EOF, or the client going away and cancelling
 	// the body out from under the read.
 	p.record(m, usage, true, started, slotWait, headerWait, chars, repaired, 0, callTiming{
-		TTFT: ttft, Dur: time.Since(started), MaxGap: timingGap, Cut: !sawDone, Streamed: true})
+		TTFT: ttft, Dur: time.Since(started), MaxGap: timingGap, Cut: !sawDone})
 }
 
 // ---------------------------------------------------------------- GitHub
