@@ -4430,11 +4430,14 @@ func TestRunAwaitingFixToOpenKeepsManuallyChosenInProgress(t *testing.T) {
 	}
 }
 
-// TestRunAwaitingFixLabelOffLeavesBacklogAlone pins the documented limitation:
-// with no configured awaiting-fix label the metadata records none, so
-// wasAwaitingFix is always false and the sync cannot tell its own Backlog
-// placement from a manual move. The ticket stays in Backlog, exactly as it did
-// before this change.
+// TestRunAwaitingFixLabelOffLeavesBacklogAlone pins the backward-compatibility
+// contract for tickets written before the awaiting_fix marker existed: a
+// Backlog ticket whose metadata block carries neither the awaiting-fix label
+// (the label is off) nor the marker cannot be told apart from a manual Backlog
+// move, so the sync leaves it in Backlog. No one-time mass update fires on
+// upgrade; a legacy ticket only becomes eligible for the automatic move after
+// the sync rewrites its description (any later awaiting-fix run adds the
+// marker).
 func TestRunAwaitingFixLabelOffLeavesBacklogAlone(t *testing.T) {
 	cfg := minimalCfg()
 	cfg.Linear.States.Backlog = "Backlog"
@@ -4494,6 +4497,101 @@ func TestRunAwaitingFixLabelOffLeavesBacklogAlone(t *testing.T) {
 	}
 	if updated.State != model.StateBacklog {
 		t.Fatalf("updated state = %q, want %q", updated.State, model.StateBacklog)
+	}
+}
+
+// TestRunAwaitingFixLabelOffMarkerMovesBacklogToTodo verifies that the
+// awaiting_fix marker in the metadata block — which the sync writes whenever
+// a finding is in the awaiting-fix state, regardless of the label
+// configuration — lets the sync recognize its own Backlog placement even with
+// LINEAR_AWAITING_FIX_LABEL=off. When the fix arrives the ticket moves back to
+// Todo with a recalculated due date, and the marker is cleared.
+func TestRunAwaitingFixLabelOffMarkerMovesBacklogToTodo(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.States.Backlog = "Backlog"
+	cfg.Linear.Labels.AwaitingFix = "" // LINEAR_AWAITING_FIX_LABEL=off
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  "XSS in postcss",
+		IssueType:   "package_vulnerability",
+		Severity:    "high",
+		Status:      model.FindingOpen,                                      // fix is now available
+		CreatedAt:   time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC), // months ago
+	}
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       "Snyk: [high] XSS in postcss",
+				Description: "old body\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\nmanaged_labels: snyk-automation\nawaiting_fix: yes\n-->",
+				DueDate:     "",        // was cleared for awaiting-fix
+				StateName:   "Backlog", // the sync parked it here for the awaiting-fix finding
+				Fingerprint: finding.Fingerprint,
+				Priority:    2,
+				// No awaiting-fix label recorded: the label is off. Only the
+				// marker can identify this as the sync's own placement.
+				ManagedLabels: []string{"snyk-automation"},
+				Labels:        []model.IssueLabel{{ID: "l1", Name: "snyk-automation"}},
+				// What extractAwaitingFix returns for the description above.
+				AwaitingFix: true,
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("PlannedUpdates = %d, want 1", result.PlannedUpdates)
+	}
+	if len(linear.updated) != 1 {
+		t.Fatalf("updated = %d, want 1", len(linear.updated))
+	}
+	updated := linear.updated[0]
+
+	// The marker identifies the Backlog placement as the sync's own, so the
+	// manual Backlog override must not apply: the ticket moves to Todo and
+	// the update carries the state change.
+	if updated.State != model.StateTodo {
+		t.Fatalf("updated state = %q, want %q (awaiting_fix marker, fix arrived)", updated.State, model.StateTodo)
+	}
+	if updated.PreserveState {
+		t.Fatalf("updated PreserveState = true, want false (Backlog was the sync's own placement)")
+	}
+	if len(linear.updates) != 1 {
+		t.Fatalf("updates = %d, want 1", len(linear.updates))
+	}
+	if !linear.updates[0].Diff.StateChanged {
+		t.Fatalf("Diff.StateChanged = false, want true (state must be sent to Linear)")
+	}
+
+	// Due date is recalculated from fix availability, not from the months-old
+	// created_at the SLA was originally based on.
+	expectedDueDate := time.Now().AddDate(0, 0, 30)
+	expectedStr := time.Date(expectedDueDate.Year(), expectedDueDate.Month(), expectedDueDate.Day(), 0, 0, 0, 0, time.UTC).Format(time.DateOnly)
+	if updated.DueDate != expectedStr {
+		t.Fatalf("updated due date = %q, want %q (SLA from fix availability)", updated.DueDate, expectedStr)
+	}
+
+	// The marker has served its purpose and must not outlive the
+	// awaiting-fix state.
+	if strings.Contains(updated.Description, "awaiting_fix") {
+		t.Fatalf("awaiting_fix marker should be cleared once the fix arrived:\n%s", updated.Description)
 	}
 }
 
@@ -5296,6 +5394,9 @@ func storedIssue(id, identifier, stateName string, desired model.DesiredIssue) m
 		if after, ok := strings.CutPrefix(line, "closed_reason: "); ok {
 			issue.ClosedReason = after
 		}
+		if after, ok := strings.CutPrefix(line, "awaiting_fix: "); ok {
+			issue.AwaitingFix = after == "yes"
+		}
 	}
 	return issue
 }
@@ -5683,6 +5784,53 @@ func TestMetadataBlockClosedReasonRoundTrips(t *testing.T) {
 	cleared := upsertManagedMetadata(description, managedMetadata{Fingerprint: "snyk:project-a:issue-1:pkg@1.0.0"})
 	if strings.Contains(cleared, "closed_reason") || strings.Contains(cleared, "identity:") {
 		t.Fatalf("stale metadata left behind:\n%s", cleared)
+	}
+}
+
+func TestMetadataBlockAwaitingFixRoundTrips(t *testing.T) {
+	description := upsertManagedMetadata("body", managedMetadata{
+		Fingerprint:   "snyk:project-a:issue-1",
+		ManagedLabels: []string{"snyk-automation"},
+		AwaitingFix:   true,
+	})
+	if !strings.Contains(description, "awaiting_fix: yes") {
+		t.Fatalf("awaiting_fix marker missing:\n%s", description)
+	}
+	got := storedIssue("id", "SNYK-1", "Backlog", model.DesiredIssue{Description: description})
+	if !got.AwaitingFix {
+		t.Fatalf("AwaitingFix = false, want true:\n%s", description)
+	}
+	// Rewriting the block for a finding that left the awaiting-fix state
+	// clears the marker.
+	cleared := upsertManagedMetadata(description, managedMetadata{Fingerprint: "snyk:project-a:issue-1"})
+	if strings.Contains(cleared, "awaiting_fix") {
+		t.Fatalf("stale awaiting_fix marker left behind:\n%s", cleared)
+	}
+	got = storedIssue("id", "SNYK-1", "Todo", model.DesiredIssue{Description: cleared})
+	if got.AwaitingFix {
+		t.Fatalf("AwaitingFix = true, want false after clear:\n%s", cleared)
+	}
+}
+
+// TestMetadataBlockWritesAwaitingFixMarkerWithLabelOff verifies the marker is
+// written regardless of the awaiting-fix label configuration — that
+// independence is the whole point of the marker.
+func TestMetadataBlockWritesAwaitingFixMarkerWithLabelOff(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.Labels.AwaitingFix = "" // off
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		Status:      model.FindingAwaitingFix,
+	}
+	description := issueDescription(cfg.Source, managedLabels(cfg.Linear.Labels, finding), finding)
+	if !strings.Contains(description, "awaiting_fix: yes") {
+		t.Fatalf("awaiting_fix marker missing with label off:\n%s", description)
+	}
+	// An open finding must not carry the marker.
+	finding.Status = model.FindingOpen
+	description = issueDescription(cfg.Source, managedLabels(cfg.Linear.Labels, finding), finding)
+	if strings.Contains(description, "awaiting_fix") {
+		t.Fatalf("awaiting_fix marker present for an open finding:\n%s", description)
 	}
 }
 

@@ -47,20 +47,20 @@ func TestCostOf(t *testing.T) {
 		CachedTokens int `json:"cached_tokens"`
 	}{CachedTokens: 400}
 	// Per model, 600 uncached input + 400 cached input + 200 output tokens:
-	// CostOf prices the credit the call draws down the weekly credit, at the
-	// subscription rates; ApiCostOf prices the same call at the API list
-	// rates, what it costs as overage once the credit is gone.
+	// CostOf and ApiCostOf both price a call at the API list ("overage")
+	// rates, the prices the factory quotes and caps on (2026-10-20); the
+	// subscription rates in models.json are reference only.
 	for _, tc := range []struct {
 		id         string
 		creditCost float64
 		apiCost    float64
 	}{
-		// flash: 600×0.10 + 400×0.02 + 200×0.25 vs 600×0.15 + 400×0.04 + 200×0.50
-		{"zai-org/glm-5.3-flash", 0.000118, 0.000206},
-		// GLM-5.3: 600×0.40 + 400×0.07 + 200×2.20 vs 600×1.40 + 400×0.26 + 200×4.40
-		{"zai-org/glm-5.3", 0.000708, 0.001824},
-		// DeepSeek: 600×0.06 + 400×0.003 + 200×0.30 vs 600×0.60 + 400×0.03 + 200×1.20
-		{"deepseek-ai/deepseek-v4.1-flash", 0.0000972, 0.000612},
+		// flash: 600×0.15 + 400×0.04 + 200×0.50
+		{"zai-org/glm-5.3-flash", 0.000206, 0.000206},
+		// GLM-5.3: 600×1.40 + 400×0.26 + 200×4.40
+		{"zai-org/glm-5.3", 0.001824, 0.001824},
+		// DeepSeek: 600×0.60 + 400×0.03 + 200×1.20
+		{"deepseek-ai/deepseek-v4.1-flash", 0.000612, 0.000612},
 	} {
 		m := mustResolve(t, testModels(t), tc.id)
 		if got, want := CostOf(m, usage), tc.creditCost; math.Abs(got-want) > 1e-12 {
@@ -73,7 +73,7 @@ func TestCostOf(t *testing.T) {
 	// With no cache, the whole prompt is uncached, for both pricings.
 	plain := Usage{PromptTokens: 1000, CompletionTokens: 200}
 	flash := mustResolve(t, testModels(t), "zai-org/glm-5.3-flash")
-	if got, want := CostOf(flash, plain), 0.00015; math.Abs(got-want) > 1e-12 {
+	if got, want := CostOf(flash, plain), 0.00025; math.Abs(got-want) > 1e-12 {
 		t.Errorf("uncached CostOf = %v, want %v", got, want)
 	}
 	if got, want := ApiCostOf(flash, plain), 0.00025; math.Abs(got-want) > 1e-12 {
@@ -161,8 +161,29 @@ func TestCatalogIsParseableByCodeAF(t *testing.T) {
 		t.Fatalf("got %d rows", len(rows))
 	}
 	// CodeAF's parsePrice is strconv.ParseFloat on these strings: no "$".
-	if got := rows[0].Pricing.Completion; got != "0.000000250000" {
+	if got := rows[0].Pricing.Completion; got != "0.000000500000" {
 		t.Errorf("completion price = %q", got)
+	}
+}
+
+// TestCatalogDefaultEffortEnablesReasoning: a catalog row with
+// default_enabled true must not advertise a default effort of "none" (or
+// "minimal"), which means reasoning off (issue #236).
+func TestCatalogDefaultEffortEnablesReasoning(t *testing.T) {
+	rows := catalog(testModels(t))["data"]
+	if len(rows) == 0 {
+		t.Fatal("no catalog rows")
+	}
+	for _, row := range rows {
+		if !row.Reasoning.DefaultEnabled {
+			continue
+		}
+		if row.Reasoning.DefaultEffort == "none" || row.Reasoning.DefaultEffort == "minimal" {
+			t.Errorf("%s: default_enabled with default_effort %q", row.ID, row.Reasoning.DefaultEffort)
+		}
+		if row.Reasoning.DefaultEffort == "" {
+			t.Errorf("%s: default_enabled with empty default_effort", row.ID)
+		}
 	}
 }
 
@@ -208,19 +229,19 @@ func TestProxyEndToEnd(t *testing.T) {
 	}
 
 	response, body := post(`{"model":"zai-org/glm-5.3-flash","messages":[]}`)
-	if response.StatusCode != 200 || !strings.Contains(body, `"cost":0.000118`) || !strings.Contains(body, `"model":"zai-org/glm-5.3-flash"`) {
+	if response.StatusCode != 200 || !strings.Contains(body, `"cost":0.000206`) || !strings.Contains(body, `"model":"zai-org/glm-5.3-flash"`) {
 		t.Fatalf("JSON call: %d %s", response.StatusCode, body)
 	}
 
 	response, body = post(`{"model":"zai-org/glm-5.3","stream":true,"messages":[]}`)
-	if response.StatusCode != 200 || !strings.Contains(body, `"cost":0.000708`) || !strings.Contains(body, "data: [DONE]") {
+	if response.StatusCode != 200 || !strings.Contains(body, `"cost":0.001824`) || !strings.Contains(body, "data: [DONE]") {
 		t.Fatalf("stream call: %d %s", response.StatusCode, body)
 	}
 	if seen[1]["model"] != "hf:zai-org/GLM-5.3" {
 		t.Errorf("upstream saw model %v", seen[1]["model"])
 	}
 
-	// $0.000826 spent > the $0.0005 run credit cap: the next call is refused.
+	// $0.00203 spent > the $0.0005 run credit cap: the next call is refused.
 	if response, body = post(`{"model":"zai-org/glm-5.3-flash","messages":[]}`); response.StatusCode != http.StatusPaymentRequired {
 		t.Fatalf("over cap: %d %s", response.StatusCode, body)
 	}
@@ -232,7 +253,7 @@ func TestProxyEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(lines) != 2 || math.Abs(ledgerTotal(lines)-0.000826) > 1e-12 || !lines[1].Stream || !lines[1].UsageSeen {
+	if len(lines) != 2 || math.Abs(ledgerTotal(lines)-0.00203) > 1e-12 || !lines[1].Stream || !lines[1].UsageSeen {
 		t.Fatalf("ledger = %+v", lines)
 	}
 	models, err := http.Get(server.URL + "/v1/models")
@@ -727,9 +748,9 @@ func TestReport(t *testing.T) {
 	for _, want := range []string{
 		reportMarker,
 		"| stop / ok | `done` / `true` |",
-		"**$0.0025** credit this run · $1.2025 this week (cap $5/run, $20/week) · $0.0025 at API prices · $0.0000 overage",
-		"| `zai-org/glm-5.3` | 0.4 · 0.07 · 2.2 | 2 | 1000 | 0 | 200 | — | — | $0.0023 (+1 unpriced) |",
-		"| `zai-org/glm-5.3-flash` | 0.1 · 0.02 · 0.25 | 1 | 1000 | 400 | 200 | — | — | $0.0002 |",
+		"**$0.0025** this run at overage prices · $1.2025 this week (cap $5/run, $20/week) · $0.0000 overage",
+		"| `zai-org/glm-5.3` | 1.4 · 0.26 · 4.4 | 2 | 1000 | 0 | 200 | — | — | $0.0023 (+1 unpriced) |",
+		"| `zai-org/glm-5.3-flash` | 0.15 · 0.04 · 0.5 | 1 | 1000 | 400 | 200 | — | — | $0.0002 |",
 		// Old-format ledger lines: the timing figures degrade to em-dashes.
 		"| run job wall time | — |",
 		"| time with a call in flight | — |",
@@ -984,8 +1005,8 @@ func TestReportReasoningShare(t *testing.T) {
 	cfg := Config{Limits: Limits{Plan: "big", WeeklyCreditUSD: 20, RunCreditUSD: 5, OverageUSD: 0}, Models: testModels(t)}
 	report := Report(result, true, lines, cfg, nil, ReportInputs{}, func(string) string { return "" })
 	for _, want := range []string{
-		"| `zai-org/glm-5.3-flash` | 0.1 · 0.02 · 0.25 | 1 | 0 | 0 | 0 | — | ~60% (chars) | $0.0002 |",
-		"| `zai-org/glm-5.3` | 0.4 · 0.07 · 2.2 | 2 | 100 | 0 | 200 | 50 | 25% | $0.0023 (+1 unpriced) |",
+		"| `zai-org/glm-5.3-flash` | 0.15 · 0.04 · 0.5 | 1 | 0 | 0 | 0 | — | ~60% (chars) | $0.0002 |",
+		"| `zai-org/glm-5.3` | 1.4 · 0.26 · 4.4 | 2 | 100 | 0 | 200 | 50 | 25% | $0.0023 (+1 unpriced) |",
 		"(chars) is an estimate",
 	} {
 		if !strings.Contains(report, want) {
@@ -1045,9 +1066,9 @@ func TestReportTiming(t *testing.T) {
 		"255.6 tok/s", // (45003+1000) output tokens over the 3m in flight
 		"| longest single call | 2m30s · 1000 tok · `zai-org/glm-5.3` |",
 		"| queued at the model limit | 1m30s |",
-		"| `zai-org/glm-5.3-flash` | 0.1 · 0.02 · 0.25 | 1 | 1000 | 0 | 45003 | 321 | 0.7% | $0.0225 |",
-		"| `zai-org/glm-5.3` | 0.4 · 0.07 · 2.2 | 1 | 1000 | 0 | 1000 | — | — | $0.0044 |",
-		"**$0.0269** credit this run", // marker line adds nothing to the metered total
+		"| `zai-org/glm-5.3-flash` | 0.15 · 0.04 · 0.5 | 1 | 1000 | 0 | 45003 | 321 | 0.7% | $0.0225 |",
+		"| `zai-org/glm-5.3` | 1.4 · 0.26 · 4.4 | 1 | 1000 | 0 | 1000 | — | — | $0.0044 |",
+		"**$0.0269** this run at overage prices", // marker line adds nothing to the metered total
 	} {
 		if !strings.Contains(report, want) {
 			t.Errorf("report lacks %q:\n%s", want, report)
@@ -1071,7 +1092,7 @@ func TestReportTiming(t *testing.T) {
 		"| output tok/s while in flight | — |",
 		"| longest single call | — |",
 		"| queued at the model limit | — |",
-		"| `zai-org/glm-5.3-flash` | 0.1 · 0.02 · 0.25 | 1 | 1000 | 0 | 200 | — | — | $0.0001 |",
+		"| `zai-org/glm-5.3-flash` | 0.15 · 0.04 · 0.5 | 1 | 1000 | 0 | 200 | — | — | $0.0001 |",
 	} {
 		if !strings.Contains(report, want) {
 			t.Errorf("old-format report lacks %q:\n%s", want, report)
@@ -1164,7 +1185,7 @@ func TestMain(m *testing.M) {
 		// The workflows read the config and instruction files from beside
 		// the binary (harnessDir), so put them there like the run job's
 		// cp -r .github/codeaf does.
-		for _, f := range []string{"models.json", "codeaf-config.json", "experiments.json", "panel.json", "instructions.md", "review-instructions.md", "plan-instructions.md"} {
+		for _, f := range []string{"models.json", "codeaf-config.json", "experiments.json", "panel.json", "routines.json", "instructions.md", "review-instructions.md", "plan-instructions.md"} {
 			b, err := os.ReadFile(f)
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "copy beside binary:", err)
@@ -1259,7 +1280,7 @@ func TestReportGroupsUnknownModels(t *testing.T) {
 	}
 	for _, want := range []string{
 		"| `(other)` | — · — · — | 2 | 200 | 0 | 500 | — | — | $0.7500 |",
-		"| `zai-org/glm-5.3` | 0.4 · 0.07 · 2.2 | 1 | 1000 | 0 | 200 | — | — | $0.0023 |",
+		"| `zai-org/glm-5.3` | 1.4 · 0.26 · 4.4 | 1 | 1000 | 0 | 200 | — | — | $0.0023 |",
 		"| longest single call | 2m0s · 500 tok · `(other)` |",
 	} {
 		if !strings.Contains(report, want) {
@@ -1305,7 +1326,7 @@ func TestReportDropsAbsurdTiming(t *testing.T) {
 		"| CodeAF session (proxy start → last call end) | 31m0s |",
 		"| longest single call | 1m0s · 10000000 tok · `zai-org/glm-5.3` |",
 		"| queued at the model limit | 24h0m0s |",
-		"| `zai-org/glm-5.3` | 0.4 · 0.07 · 2.2 | 4 | 10000000 | 0 | 10000000 | 10000000 | 100% | $0.0100 (+3 unpriced) |",
+		"| `zai-org/glm-5.3` | 1.4 · 0.26 · 4.4 | 4 | 10000000 | 0 | 10000000 | 10000000 | 100% | $0.0100 (+3 unpriced) |",
 	} {
 		if !strings.Contains(report, want) {
 			t.Errorf("report lacks %q:\n%s", want, report)
@@ -2688,7 +2709,7 @@ func TestReportWeekAndOverage(t *testing.T) {
 	// WEEK_SPENT_BEFORE empty: the week figure is "?" and the replay starts
 	// from 0, so only the third call counts as overage.
 	report := Report(result, true, lines, cfg, nil, ReportInputs{}, func(string) string { return "" })
-	want := "| metered by proxy (from its ledger) | **$0.0025** credit this run · ? this week (cap $5/run, $0.001/week) · $0.0068 at API prices · $0.0023 overage |"
+	want := "| metered by proxy (from its ledger) | **$0.0025** this run at overage prices · ? this week (cap $5/run, $0.001/week) · $0.0023 overage |"
 	if !strings.Contains(report, want) {
 		t.Errorf("report lacks %q:\n%s", want, report)
 	}
@@ -2700,7 +2721,7 @@ func TestReportWeekAndOverage(t *testing.T) {
 	// report consistent with the caps the proxy enforced (/healthz).
 	env := map[string]string{"WEEK_SPENT_BEFORE": "0.5"}
 	report = Report(result, true, lines, cfg, nil, ReportInputs{}, func(k string) string { return env[k] })
-	want = "| metered by proxy (from its ledger) | **$0.0025** credit this run · $0.5025 this week (cap $5/run, $0.001/week) · $0.0068 at API prices · $0.0046 overage |"
+	want = "| metered by proxy (from its ledger) | **$0.0025** this run at overage prices · $0.5025 this week (cap $5/run, $0.001/week) · $0.0046 overage |"
 	if !strings.Contains(report, want) {
 		t.Errorf("report lacks %q:\n%s", want, report)
 	}
@@ -2709,25 +2730,6 @@ func TestReportWeekAndOverage(t *testing.T) {
 	report = Report(result, true, lines, cfg, nil, ReportInputs{}, func(k string) string { return env[k] })
 	if !strings.Contains(report, "? this week") {
 		t.Errorf("invalid WEEK_SPENT_BEFORE did not render \"?\":\n%s", report)
-	}
-}
-
-// The run at API prices is summed from the ledger's APICostUSD; lines written
-// before the field existed are re-priced from their tokens at the config's
-// api_* rates.
-func TestReportAPICostSources(t *testing.T) {
-	result := Result{Stop: "done"}
-	cfg := Config{Limits: Limits{Plan: "big", WeeklyCreditUSD: 20, RunCreditUSD: 5, OverageUSD: 0}, Models: testModels(t)}
-	// Recorded: 0.00228. Re-priced from tokens (1000 in, 0 cached, 1000 out
-	// at glm-5.3's api rates 1.40/0.26/4.40): (1400 + 0 + 4400)/1e6 = 0.0058.
-	lines := []LedgerLine{
-		{Model: "zai-org/glm-5.3", PromptTokens: 1000, CompletionTokens: 1000, CostUSD: 0.00084, APICostUSD: 0.00228, UsageSeen: true},
-		{Model: "zai-org/glm-5.3", PromptTokens: 1000, CompletionTokens: 1000, CostUSD: 0.00084, UsageSeen: true},
-	}
-	report := Report(result, true, lines, cfg, nil, ReportInputs{}, func(string) string { return "" })
-	want := "$0.0081 at API prices · $0.0000 overage" // 0.00228 + 0.0058
-	if !strings.Contains(report, want) {
-		t.Errorf("report lacks %q:\n%s", want, report)
 	}
 }
 

@@ -239,6 +239,7 @@ func linearIssueToModel(issue linearIssueNode) model.ExistingIssue {
 		ClosedAt:      closedAt,
 		Identity:      extractIdentity(description),
 		ClosedReason:  extractClosedReason(description),
+		AwaitingFix:   extractAwaitingFix(description),
 	}
 }
 
@@ -1085,6 +1086,16 @@ func extractIdentity(description string) string {
 // disappeared, or "".
 func extractClosedReason(description string) string {
 	return metadataValue(description, "closed_reason:")
+}
+
+// extractAwaitingFix reports whether the metadata block carries the
+// awaiting_fix marker the sync writes for findings Snyk reports as
+// "ignored until fix available". The marker is independent of the
+// awaiting-fix label, so a Backlog placement the sync made itself stays
+// recognizable even when LINEAR_AWAITING_FIX_LABEL is off. Tickets written
+// by older code carry no marker line and report false.
+func extractAwaitingFix(description string) bool {
+	return metadataValue(description, "awaiting_fix:") == "yes"
 }
 
 // metadataValue returns the canonicalized, lowercased value of the first

@@ -66,7 +66,7 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("harness: ")
 	if len(os.Args) < 2 {
-		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|plan-check|plan-brief|plan-report|ref-check|merge-default|search|metrics|gh-retry")
+		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|plan-check|plan-brief|plan-report|ref-check|routines-due|routine-brief|routine-check|merge-default|search|metrics|gh-retry")
 	}
 	commands := map[string]func() error{
 		"proxy":         runProxy,
@@ -90,6 +90,14 @@ func main() {
 		// plan run this tick? plan-brief and plan-report, the run side of
 		// the planner, are separate commands.
 		"plan-check": runPlanCheck,
+		// Factory routines (issue #117): routines-due decides which
+		// routines' cooldowns have passed (the routines workflow calls it
+		// on its schedule and on every queue tick); routine-brief builds
+		// an agent routine's read-only brief; routine-check runs a check
+		// command and prints its report for the tracking issue.
+		"routines-due":  runRoutinesDue,
+		"routine-brief": runRoutineBrief,
+		"routine-check": runRoutineCheck,
 		// The planner run side (issue #61): the plan run brief, and the
 		// publish-side report that parses its proposals.
 		"plan-brief":  runPlanBrief,
@@ -143,10 +151,12 @@ func main() {
 // ---------------------------------------------------------------- models
 
 // Model is one row of models.json. Prices are USD per million tokens.
-// Input/Output/CacheRead are the synthetic.new SUBSCRIPTION rates: they price
-// the credit a call draws down the weekly quota. The API* fields are the API
-// list rates: what the same call costs once the quota is gone and overage
-// begins.
+// The API* fields are the API list ("overage") rates, and they are the
+// prices the factory quotes and caps on: the ledger, the run and weekly
+// caps, the reports and the catalog CodeAF budgets from (the owner's
+// decision, 2026-10-20). Input/Output/CacheRead are the synthetic.new
+// SUBSCRIPTION rates, the credit a call draws down the weekly quota; they
+// are kept for reference and are not used for any figure or cap.
 type Model struct {
 	ID              string   `json:"id"`       // what CodeAF sees
 	Upstream        string   `json:"upstream"` // the synthetic.new model id
@@ -361,12 +371,13 @@ func (u Usage) reasoningTokens() (int, bool) {
 }
 
 // CostOf prices one call: uncached input, cached input and output (which
-// includes reasoning tokens) at the model's per-million SUBSCRIPTION rates.
-// This is the credit the call draws down the weekly quota, and the cost the
-// ledger and the report carry.
+// includes reasoning tokens) at the model's per-million API list ("overage")
+// rates. It is the cost the ledger, the caps and the report carry; quoting
+// the overage price, not the cheaper subscription credit, is the owner's
+// decision (2026-10-20). The weekly quota itself is enforced from
+// synthetic.new's own percentRemaining, not from these figures.
 func CostOf(m Model, u Usage) float64 {
-	cached := u.cached()
-	return (float64(u.PromptTokens-cached)*m.Input + float64(cached)*m.CacheRead + float64(u.CompletionTokens)*m.Output) / 1e6
+	return ApiCostOf(m, u)
 }
 
 // ApiCostOf prices the same call at the model's API list rates (api_*): what
@@ -563,6 +574,22 @@ func perToken(perMillion float64) string {
 	return strconv.FormatFloat(perMillion/1e6, 'f', 12, 64)
 }
 
+// firstEffortAboveNone picks the first effort that actually enables
+// reasoning, for a catalog row whose default_enabled is true: "none" and
+// "minimal" mean reasoning off. Falls back to efforts[0] when every effort
+// disables reasoning (or the list is empty), so the row still has an effort.
+func firstEffortAboveNone(efforts []string) string {
+	for _, e := range efforts {
+		if e != "none" && e != "minimal" {
+			return e
+		}
+	}
+	if len(efforts) == 0 {
+		return ""
+	}
+	return efforts[0]
+}
+
 func catalog(models []Model) map[string][]catalogRow {
 	rows := make([]catalogRow, 0, len(models))
 	for _, m := range models {
@@ -572,15 +599,20 @@ func catalog(models []Model) map[string][]catalogRow {
 		row.Created = 1760000000
 		row.Architecture.Input = m.InputModalities
 		row.Architecture.Output = []string{"text"}
-		row.Pricing.Prompt = perToken(m.Input)
-		row.Pricing.Completion = perToken(m.Output)
+		// The overage prices, the same ones the proxy caps on (CostOf).
+		row.Pricing.Prompt = perToken(m.APIInput)
+		row.Pricing.Completion = perToken(m.APIOutput)
 		row.Pricing.Request = "0"
-		row.Pricing.InputCacheRead = perToken(m.CacheRead)
+		row.Pricing.InputCacheRead = perToken(m.APICached)
 		row.SupportedParameters = []string{"tools", "tool_choice", "reasoning", "include_reasoning",
 			"response_format", "structured_outputs", "temperature", "top_p", "max_tokens", "stop", "seed"}
 		row.Reasoning.DefaultEnabled = true
 		row.Reasoning.SupportedEfforts = m.Efforts
-		row.Reasoning.DefaultEffort = m.Efforts[0]
+		// When reasoning is on by default, the default effort must be an
+		// effort above "none"/"minimal": Efforts[0] can be "none" (the
+		// DeepSeek-V4.1-Flash rows), which would advertise reasoning
+		// enabled with a default that turns it off (issue #236).
+		row.Reasoning.DefaultEffort = firstEffortAboveNone(m.Efforts)
 		row.HuggingFaceID = strings.TrimPrefix(m.Upstream, "hf:")
 		rows = append(rows, row)
 	}
@@ -2161,6 +2193,47 @@ func Decide(name string, ev event, labelName string, lookupPR, lookupIssue func(
 		// each concurrent run a different model. The input is untrusted,
 		// so only its digits are read; anything else is lane 0.
 		lane := dispatchLane(ev.Inputs["lane"])
+		// A routine run (issue #117) is dispatched by the routines
+		// workflow with the routine's name in the `routine` input. Like a
+		// plan run it is read-only: it proposes issues and writes no patch
+		// and no PR. The input is untrusted, so only a name that matches
+		// routineNameRe and is present in the validated routines.json runs;
+		// if routines.json cannot be loaded, skip — fail closed, a routine
+		// the config cannot vouch for never runs. It accepts no other
+		// target: an issue, pr, review, plan or profile input alongside it
+		// is skipped rather than silently demoted to that mode. The
+		// decision carries the validated lane, the default branch as base,
+		// and no number, no branch and no profile — every workflow step
+		// that reads one must treat all three as empty.
+		if raw := ev.Inputs["routine"]; raw != "" {
+			switch {
+			case ev.Inputs["issue"] != "" || ev.Inputs["pr"] != "" ||
+				ev.Inputs["review"] != "" || ev.Inputs["plan"] != "" ||
+				ev.Inputs["profile"] != "":
+				return skip("a routine dispatch takes no issue, pr, review, plan or profile input"), nil
+			case !routineNameRe.MatchString(raw):
+				return skip(fmt.Sprintf("routine input %q does not match %s", raw, routineNameRe)), nil
+			}
+			routines, err := LoadRoutines()
+			if err != nil {
+				return skip(fmt.Sprintf("routines.json cannot be loaded: %v", err)), nil
+			}
+			known := false
+			for _, r := range routines {
+				if r.Name == raw {
+					known = true
+					break
+				}
+			}
+			if !known {
+				return skip(fmt.Sprintf("routine %q is not in routines.json", raw)), nil
+			}
+			if _, err := runID(); err != nil {
+				return Decision{}, err
+			}
+			return Decision{Run: true, Reason: "routine dispatch", Mode: "routine",
+				Base: ev.Repository.DefaultBranch, Lane: lane}, nil
+		}
 		// A plan run (issue #61) is dispatched by the queue's planner
 		// step with plan=true and nothing else but the lane: the run reads
 		// the repository and proposes issues, and writes no patch and no
@@ -3756,8 +3829,8 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 			weekBefore, weekKnown = v, true
 		}
 	}
-	// apiCost is what this run would have cost at the API list rates;
-	// overage is the part of it spent past the weekly credit. apiPrice uses
+	// overage is the part of this run, at the API list rates, spent past the
+	// weekly credit. apiPrice uses
 	// the ledger's APICostUSD when the line carries one (the source this
 	// proxy wrote); lines written before the field existed carry only
 	// tokens, and are re-priced from them at the config's api_* rates.
@@ -3781,7 +3854,7 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 		}{CachedTokens: l.CachedTokens}
 		return ApiCostOf(m, usage)
 	}
-	var apiCost, overage float64
+	var overage float64
 	totals := map[string]*modelTotals{}
 	for _, l := range lines {
 		if l.Kind != "" {
@@ -3808,10 +3881,8 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 		if !l.UsageSeen {
 			t.unpriced++
 		}
-		api := apiPrice(id, l)
-		apiCost += api
 		if over {
-			overage += api
+			overage += apiPrice(id, l)
 		}
 		week += l.CostUSD
 		if week >= cfg.Limits.WeeklyCreditUSD {
@@ -3935,16 +4006,16 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 	fmt.Fprintf(&b, "| seats | worker %s, planner %s, checker %s (allowed: %s; no escalation) |\n",
 		seat(result.Model), seat(result.PlanModel), seat(result.CheckModel), strings.Join(allowed, ", "))
 	fmt.Fprintf(&b, "| CodeAF's own spend figure | %s (plan estimate %s) |\n", money(result.SpendUSD), money(result.EstUSD))
-	// The Big-plan metered row (issue #59): what the proxy records is credit
-	// — subscription-rate dollars — plus the same calls at API list prices
-	// and the overage past the weekly credit. previousReportSection looks
-	// this exact label up for continuations, so the label must not change.
+	// The Big-plan metered row (issue #59): what the proxy records, priced at
+	// the overage (API list) rates the factory quotes (CostOf), plus the
+	// overage past the weekly credit. previousReportSection looks this exact
+	// label up for continuations, so the label must not change.
 	weekCell := "?"
 	if weekKnown {
 		weekCell = money(weekBefore + total)
 	}
-	fmt.Fprintf(&b, "| metered by proxy (from its ledger) | **%s** credit this run · %s this week (cap $%s/run, $%s/week) · %s at API prices · %s overage |\n",
-		money(total), weekCell, trimNumber(cfg.Limits.RunCreditUSD), trimNumber(cfg.Limits.WeeklyCreditUSD), money(apiCost), money(overage))
+	fmt.Fprintf(&b, "| metered by proxy (from its ledger) | **%s** this run at overage prices · %s this week (cap $%s/run, $%s/week) · %s overage |\n",
+		money(total), weekCell, trimNumber(cfg.Limits.RunCreditUSD), trimNumber(cfg.Limits.WeeklyCreditUSD), money(overage))
 	// The quota state synthetic.new reported at proxy start, re-parsed from
 	// the ledger's "quotas" marker. Omitted when the marker is absent or
 	// its body does not parse; the units are undocumented, so the row says
@@ -4071,7 +4142,7 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 			p, known := prices[id]
 			inPrice, cachedPrice, outPrice := "—", "—", "—"
 			if known {
-				inPrice, cachedPrice, outPrice = trimNumber(p.Input), trimNumber(p.CacheRead), trimNumber(p.Output)
+				inPrice, cachedPrice, outPrice = trimNumber(p.APIInput), trimNumber(p.APICached), trimNumber(p.APIOutput)
 			}
 			cost := money(t.cost)
 			if t.unpriced > 0 {
