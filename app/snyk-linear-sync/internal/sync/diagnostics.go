@@ -36,7 +36,7 @@ type DueDateDiagnostics struct {
 func DiagnoseDueDate(cfg config.Config, finding model.Finding, existing model.ExistingIssue) DueDateDiagnostics {
 	desired := desiredIssue(cfg, finding)
 
-	awaitingFix := wasAwaitingFix(existing.ManagedLabels, cfg.Linear.Labels.AwaitingFix)
+	awaitingFix := wasAwaitingFix(existing, cfg.Linear.Labels.AwaitingFix)
 	if finding.Status == model.FindingOpen && awaitingFix {
 		desired.DueDate, desired.DueDateBase, desired.DueDateReason = issueDueDateFromFixAvailability(cfg.Linear.Due, finding)
 	}

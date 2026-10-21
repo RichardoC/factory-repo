@@ -211,7 +211,7 @@ The configured label must already exist in Linear. If it does not, the run fails
 - any other value: the exact Linear label name to apply
 - the label must already exist in Linear
 
-When an issue is in the awaiting-fix state, the sync adds the configured label. When the fix becomes available and the issue moves to `Todo`, the label is removed. The label is tracked in the metadata block alongside tool and origin labels.
+When an issue is in the awaiting-fix state, the sync adds the configured label. When the fix becomes available and the issue moves to `Todo`, the label is removed. The label is tracked in the metadata block alongside tool and origin labels. The metadata block also carries an `awaiting_fix: yes` marker, written whenever the finding is in the awaiting-fix state regardless of the label configuration, and cleared when the state ends.
 
 The metadata block stores the full managed label set so the sync can remove stale tool-derived, origin-derived, and awaiting-fix labels while preserving unrelated manual labels.
 
@@ -273,7 +273,7 @@ The `ignored until fix available` state is distinct from other ignored states be
 
 When a user manually moves a managed open ticket from `Todo` to `Backlog` in Linear, subsequent syncs preserve the `Backlog` state instead of overriding it back to `Todo`. This prevents the automation from fighting intentional user triage decisions. The override matches the configured `LINEAR_STATE_BACKLOG` value with case-insensitive normalization.
 
-The override does not apply to a ticket the sync itself parked in `Backlog` for an `ignored until fix available` finding: that placement is the sync's own, not a manual move. When the fix becomes available Snyk flips `ignored=false`, the next run moves the ticket to `Todo` with a recalculated due date, and the change comment says why. Only the `Backlog` state the sync chose is overridden this way — if a person moved the awaiting-fix ticket to some other non-terminal state (for example `In Progress`), the general manual non-terminal state override below still preserves their choice. This detection needs the awaiting-fix label recorded in the metadata block: with `LINEAR_AWAITING_FIX_LABEL=off` there is no label, the sync cannot tell its own `Backlog` placement from a manual one, and the ticket stays in `Backlog` as before.
+The override does not apply to a ticket the sync itself parked in `Backlog` for an `ignored until fix available` finding: that placement is the sync's own, not a manual move. When the fix becomes available Snyk flips `ignored=false`, the next run moves the ticket to `Todo` with a recalculated due date, and the change comment says why. Only the `Backlog` state the sync chose is overridden this way — if a person moved the awaiting-fix ticket to some other non-terminal state (for example `In Progress`), the general manual non-terminal state override below still preserves their choice. The detection reads the `awaiting_fix` marker in the metadata block, which the sync writes regardless of the label configuration, so it works with `LINEAR_AWAITING_FIX_LABEL=off` too. Tickets written before the marker existed carry neither marker nor label and keep the old behavior: the sync cannot tell its own `Backlog` placement from a manual one, and the ticket stays in `Backlog` when the fix arrives, until the sync rewrites its description in a later awaiting-fix run.
 
 ### Manual Non-Terminal State Override
 

@@ -508,6 +508,27 @@ func TestExtractFingerprintCanonicalizesLinearMangledMarkdown(t *testing.T) {
 	}
 }
 
+// TestExtractAwaitingFix verifies the awaiting_fix marker parsing: present
+// inside the metadata block reports true, an absent line (tickets written
+// before the marker existed) reports false, and a line in user-written body
+// text outside the block is ignored.
+func TestExtractAwaitingFix(t *testing.T) {
+	if got := extractAwaitingFix("body\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\nawaiting_fix: yes\n-->"); !got {
+		t.Fatalf("extractAwaitingFix(marker) = false, want true")
+	}
+	if got := extractAwaitingFix("body\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\n-->"); got {
+		t.Fatalf("extractAwaitingFix(legacy) = true, want false (no marker line)")
+	}
+	if got := extractAwaitingFix("awaiting_fix: yes\n\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\n-->"); got {
+		t.Fatalf("extractAwaitingFix(outside block) = true, want false (spoofed line ignored)")
+	}
+	// Linear escapes underscores in the stored key (awaiting\_fix); the
+	// canonicalization used for fingerprints must undo that.
+	if got := extractAwaitingFix("<!-- snyk-linear-sync\nawaiting\\_fix: yes\n-->"); !got {
+		t.Fatalf("extractAwaitingFix(escaped key) = false, want true")
+	}
+}
+
 func TestExtractManagedLabelsSupportsLegacyAndNewMetadata(t *testing.T) {
 	if got := extractManagedLabels("<!-- snyk-linear-sync\nmanaged_label: snyk-automation\n-->"); !slices.Equal(got, []string{"snyk-automation"}) {
 		t.Fatalf("extractManagedLabels(legacy) = %#v", got)
