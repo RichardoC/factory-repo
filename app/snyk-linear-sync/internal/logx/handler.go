@@ -2,6 +2,7 @@ package logx
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 )
 
@@ -23,15 +24,16 @@ func (h *MultiHandler) Enabled(ctx context.Context, level slog.Level) bool {
 }
 
 func (h *MultiHandler) Handle(ctx context.Context, record slog.Record) error {
+	var errs []error
 	for _, handler := range h.handlers {
 		if !handler.Enabled(ctx, record.Level) {
 			continue
 		}
 		if err := handler.Handle(ctx, record); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (h *MultiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {

@@ -86,7 +86,11 @@ Update the Linear issue when managed fields differ:
 
 When a previously tracked finding no longer exists in Snyk but its Snyk project still exists, move the Linear issue to the resolved state.
 
-When a previously tracked finding no longer exists because its Snyk project no longer exists, cancel the Linear issue instead. When the sync itself closes an open ticket this way it records `closed_reason: project-missing` (or `project-deactivated`) in the metadata block, so a later run can tell the closure was machine-made and rebind the ticket if the project is recreated. A ticket that is already closed keeps its state and records no `closed_reason`: a `Done` ticket stays `Done`, because the project going away says nothing about how the ticket was closed.
+When a previously tracked finding no longer exists because its Snyk project no longer exists, cancel the Linear issue instead.
+
+When the sync itself closes an open ticket this way it records `closed_reason: project-missing` (or `project-deactivated`) in the metadata block, so a later run can tell the closure was machine-made and rebind the ticket if the project is recreated. A ticket that is already closed keeps its state and records no `closed_reason`: a `Done` ticket stays `Done`, because the project going away says nothing about how the ticket was closed.
+
+An empty Snyk snapshot is not trusted: if the snapshot lists no projects at all — neither active nor inactive — while managed tickets exist in Linear, the run fails with an error instead of resolving anything, and makes no Linear write and no cache refresh. A silently empty project and finding list is the documented symptom of an API key that cannot read projects, of an outage, or of `SNYK_ORG_ID` naming an organization the API key cannot see — acting on it would cancel every managed ticket in one run. In `--dry-run` the plan is still reported, with the same message logged at error level. A brand-new deployment with no managed tickets yet is not affected, and an organization whose issues are all fixed still lists its projects, so those tickets still move to the resolved state. The guard covers the "nothing at all" case only; a partial listing is not a plausibility failure.
 
 ### Reopen Guard
 

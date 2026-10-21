@@ -2,6 +2,7 @@ package logx
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 )
 
@@ -22,16 +23,23 @@ func (h *MultiHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	return false
 }
 
+// Handle fans the record out to every enabled child and returns the joined
+// error. It deliberately does not stop at the first child error: the console
+// handler and the error-file handler share one MultiHandler, and a console
+// write failure (a closed pipe, a full disk) must not starve the error log of
+// the very records that explain what happened. A failing child never prevents
+// the others from seeing the record.
 func (h *MultiHandler) Handle(ctx context.Context, record slog.Record) error {
+	var errs []error
 	for _, handler := range h.handlers {
 		if !handler.Enabled(ctx, record.Level) {
 			continue
 		}
 		if err := handler.Handle(ctx, record); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (h *MultiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
