@@ -166,6 +166,27 @@ func TestCatalogIsParseableByCodeAF(t *testing.T) {
 	}
 }
 
+// TestCatalogDefaultEffortEnablesReasoning: a catalog row with
+// default_enabled true must not advertise a default effort of "none" (or
+// "minimal"), which means reasoning off (issue #236).
+func TestCatalogDefaultEffortEnablesReasoning(t *testing.T) {
+	rows := catalog(testModels(t))["data"]
+	if len(rows) == 0 {
+		t.Fatal("no catalog rows")
+	}
+	for _, row := range rows {
+		if !row.Reasoning.DefaultEnabled {
+			continue
+		}
+		if row.Reasoning.DefaultEffort == "none" || row.Reasoning.DefaultEffort == "minimal" {
+			t.Errorf("%s: default_enabled with default_effort %q", row.ID, row.Reasoning.DefaultEffort)
+		}
+		if row.Reasoning.DefaultEffort == "" {
+			t.Errorf("%s: default_enabled with empty default_effort", row.ID)
+		}
+	}
+}
+
 // TestProxyEndToEnd runs the proxy against a fake upstream: prices are added
 // to both JSON and streamed responses, the ledger records them, and the caps
 // and the model allowlist are enforced.
