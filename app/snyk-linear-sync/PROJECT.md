@@ -86,7 +86,11 @@ Update the Linear issue when managed fields differ:
 
 When a previously tracked finding no longer exists in Snyk but its Snyk project still exists, move the Linear issue to the resolved state.
 
-When a previously tracked finding no longer exists because its Snyk project no longer exists, cancel the Linear issue instead. When the sync itself closes an open ticket this way it records `closed_reason: project-missing` (or `project-deactivated`) in the metadata block, so a later run can tell the closure was machine-made and rebind the ticket if the project is recreated. A ticket that is already closed keeps its state and records no `closed_reason`: a `Done` ticket stays `Done`, because the project going away says nothing about how the ticket was closed.
+When a previously tracked finding no longer exists because its Snyk project no longer exists, cancel the Linear issue instead.
+
+When the sync itself closes an open ticket this way it records `closed_reason: project-missing` (or `project-deactivated`) in the metadata block, so a later run can tell the closure was machine-made and rebind the ticket if the project is recreated. A ticket that is already closed keeps its state and records no `closed_reason`: a `Done` ticket stays `Done`, because the project going away says nothing about how the ticket was closed.
+
+An empty Snyk snapshot is not trusted: if the snapshot lists no projects at all — neither active nor inactive — while managed tickets exist in Linear, the run fails with an error instead of resolving anything, and makes no Linear write and no cache refresh. A silently empty project and finding list is the documented symptom of an API key that cannot read projects, of an outage, or of `SNYK_ORG_ID` naming an organization the API key cannot see — acting on it would cancel every managed ticket in one run. In `--dry-run` the plan is still reported, with the same message logged at error level. A brand-new deployment with no managed tickets yet is not affected, and an organization whose issues are all fixed still lists its projects, so those tickets still move to the resolved state. The guard covers the "nothing at all" case only; a partial listing is not a plausibility failure.
 
 ### Reopen Guard
 
@@ -207,7 +211,7 @@ The configured label must already exist in Linear. If it does not, the run fails
 - any other value: the exact Linear label name to apply
 - the label must already exist in Linear
 
-When an issue is in the awaiting-fix state, the sync adds the configured label. When the fix becomes available and the issue moves to `Todo`, the label is removed. The label is tracked in the metadata block alongside tool and origin labels.
+When an issue is in the awaiting-fix state, the sync adds the configured label. When the fix becomes available and the issue moves to `Todo`, the label is removed. The label is tracked in the metadata block alongside tool and origin labels. The metadata block also carries an `awaiting_fix: yes` marker, written whenever the finding is in the awaiting-fix state regardless of the label configuration, and cleared when the state ends.
 
 The metadata block stores the full managed label set so the sync can remove stale tool-derived, origin-derived, and awaiting-fix labels while preserving unrelated manual labels.
 
@@ -271,7 +275,7 @@ The `ignored until fix available` state is distinct from other ignored states be
 
 When a user manually moves a managed open ticket from `Todo` to `Backlog` in Linear, subsequent syncs preserve the `Backlog` state instead of overriding it back to `Todo`. This prevents the automation from fighting intentional user triage decisions. The override matches the configured `LINEAR_STATE_BACKLOG` value with case-insensitive normalization.
 
-The override does not apply to a ticket the sync itself parked in `Backlog` for an `ignored until fix available` finding: that placement is the sync's own, not a manual move. When the fix becomes available Snyk flips `ignored=false`, the next run moves the ticket to `Todo` with a recalculated due date, and the change comment says why. Only the `Backlog` state the sync chose is overridden this way — if a person moved the awaiting-fix ticket to some other non-terminal state (for example `In Progress`), the general manual non-terminal state override below still preserves their choice. This detection needs the awaiting-fix label recorded in the metadata block: with `LINEAR_AWAITING_FIX_LABEL=off` there is no label, the sync cannot tell its own `Backlog` placement from a manual one, and the ticket stays in `Backlog` as before.
+The override does not apply to a ticket the sync itself parked in `Backlog` for an `ignored until fix available` finding: that placement is the sync's own, not a manual move. When the fix becomes available Snyk flips `ignored=false`, the next run moves the ticket to `Todo` with a recalculated due date, and the change comment says why. Only the `Backlog` state the sync chose is overridden this way — if a person moved the awaiting-fix ticket to some other non-terminal state (for example `In Progress`), the general manual non-terminal state override below still preserves their choice. The detection reads the `awaiting_fix` marker in the metadata block, which the sync writes regardless of the label configuration, so it works with `LINEAR_AWAITING_FIX_LABEL=off` too. Tickets written before the marker existed carry neither marker nor label and keep the old behavior: the sync cannot tell its own `Backlog` placement from a manual one, and the ticket stays in `Backlog` when the fix arrives, until the sync rewrites its description in a later awaiting-fix run.
 
 ### Manual Non-Terminal State Override
 

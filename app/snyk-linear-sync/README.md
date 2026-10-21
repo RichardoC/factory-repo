@@ -22,6 +22,7 @@ github.com/tesslio/snyk-linear-sync
 - Ensures a configurable managed label is applied to all managed issues, unless label management is explicitly turned off.
 - Moves stale issues to the configured resolved state when the finding is no longer present but the Snyk project still exists.
 - Cancels managed Linear issues when their Snyk project no longer exists, such as after project deletion.
+- Fails the run instead of cancelling everything when the Snyk snapshot lists no projects at all (neither active nor inactive) while managed issues exist, so a Snyk outage, a revoked key or a wrong `SNYK_ORG_ID` cannot mass-cancel the board.
 - Rebinds a ticket to its finding when Snyk recreates the project under a new project ID (see [Project Recreation](#project-recreation)), instead of cancelling it and creating a copy.
 - Reopens a ticket that was closed while Snyk kept reporting the exact same occurrence as open, instead of creating a duplicate (see [Reopen Guard](#reopen-guard)).
 - Uses a local SQLite cache to skip unchanged findings and unchanged Linear issues on steady-state runs.
@@ -257,9 +258,10 @@ When an issue is in the awaiting-fix state, the sync:
 - places the issue in `Backlog` with no due date
 - adds the configured awaiting-fix label
 - renders `Status: ignored (no fix available)` in the description
-- removes the awaiting-fix label when a fix becomes available and the issue moves to `Todo`
+- writes an `awaiting_fix: yes` marker into the metadata block
+- removes the awaiting-fix label and clears the marker when a fix becomes available and the issue moves to `Todo`
 
-Setting `LINEAR_AWAITING_FIX_LABEL=off` has one limitation besides the missing label: the metadata block records no awaiting-fix label, so a later run cannot tell a `Backlog` placement the sync made itself from one a person made by hand. An "ignored until fix available" ticket in `Backlog` therefore stays in `Backlog` when its fix arrives. Keep the label enabled (the default) for the automatic move back to `Todo`.
+The `awaiting_fix` marker is written regardless of the label configuration, so even with `LINEAR_AWAITING_FIX_LABEL=off` a later run can tell a `Backlog` placement the sync made itself from one a person made by hand: when the fix arrives, the ticket still moves back to `Todo` with a recalculated due date. Tickets written before the marker existed carry no `awaiting_fix` line; they keep the old behavior (they stay in `Backlog` once the fix arrives) until the sync rewrites their description in a later awaiting-fix run — no one-time mass update happens on upgrade. Keep the label enabled (the default) to make these tickets filterable.
 
 When tool, origin, or awaiting-fix label mapping is enabled, the sync manages the global automation label plus the derived label set recorded in the metadata block.
 
@@ -365,6 +367,7 @@ be trusted to select which issues to load.
 - fixed (or resolved/disappeared) -> `Done`
 - missing finding in an existing active Snyk project -> `Done`
 - missing finding because the Snyk project no longer exists -> `Cancelled`
+- Snyk snapshot lists no projects at all (active and inactive both empty) while managed issues exist -> the run fails with an error and writes nothing (`--dry-run` still reports the plan and logs the refusal at error level)
 - Snyk project is inactive (de-activated) -> `Cancelled`
 
 The configured Linear state names are resolved by name first, then by workflow type where possible.
