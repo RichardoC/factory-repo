@@ -15,6 +15,10 @@ package main
 //     `copy from` lines): a renamed workflow file would leave the old path
 //     behind or the new one unpublished, and the policy cannot judge either;
 //   - the patch is over 50 MB (the same cap the publish job applies);
+//   - a section's `---`/`+++` (or `rename from`/`rename to`, `copy from`/
+//     `copy to`) path disagrees with its `diff --git` header: git apply
+//     routes by the `---`/`+++` paths, so a header that names a KEEP
+//     file cannot be trusted on its own;
 //   - a `diff --git` header does not parse (headerPaths returns both paths
 //     empty), because the section could then be routed the wrong way.
 //
@@ -139,9 +143,21 @@ func patchSplit(patchFile, keepFile, refusedFile string) error {
 // error return is a refusal reason (exit 2). A header whose paths do not
 // parse is a refusal for every section, refused or not: it cannot be
 // routed safely either way.
+//
+// git apply takes a section's pre- and post-image paths from its `---`/
+// `+++` lines (and from `rename from`/`rename to`, `copy from`/`copy to`
+// when there are none), so the header is not trusted alone: every path
+// the section names, header or body, routes it, and a body path that
+// disagrees with the header is a refusal the same way an unparseable
+// header is, because git apply would route one way while the header
+// says the other. Metadata is read only before the first `@@` hunk or
+// `GIT binary patch` payload: inside a hunk, a deleted line whose
+// content starts with `-- ` is line-shaped like a `---` marker.
 func refusedSection(sec []byte) (refused bool, why string, err error) {
 	var line []byte
 	rest := sec
+	meta := true         // still before the hunks: header metadata only
+	var pre, post string // the paths the diff --git line names
 	for len(rest) > 0 {
 		if i := bytes.IndexByte(rest, '\n'); i >= 0 {
 			line, rest = rest[:i], rest[i+1:]
@@ -150,18 +166,81 @@ func refusedSection(sec []byte) (refused bool, why string, err error) {
 		}
 		switch {
 		case bytes.HasPrefix(line, []byte("diff --git ")):
-			pre, post := headerPaths(string(line[len("diff --git "):]))
+			pre, post = headerPaths(string(line[len("diff --git "):]))
 			if pre == "" && post == "" {
 				return false, "", exitError2{"a diff --git header does not parse; refusing the patch"}
 			}
 			if underGithub(pre) || underGithub(post) {
 				refused = true
 			}
-		case refused && (bytes.HasPrefix(line, []byte("rename from ")) || bytes.HasPrefix(line, []byte("copy from "))):
-			return false, "", exitError2{"a .github/ section renames or copies a file; refusing the patch"}
+		case !meta:
+			// A hunk body or binary payload: nothing later names a path.
+		case bytes.HasPrefix(line, []byte("@@")), bytes.HasPrefix(line, []byte("GIT binary patch")):
+			meta = false
+		case bytes.HasPrefix(line, []byte("--- ")):
+			if p := bodyPath(string(line[len("--- "):]), "a/"); p != "" {
+				if pre != "" && p != pre {
+					return false, "", exitError2{"a section's --- path disagrees with its diff --git header; refusing the patch"}
+				}
+				if underGithub(p) {
+					refused = true
+				}
+			}
+		case bytes.HasPrefix(line, []byte("+++ ")):
+			if p := bodyPath(string(line[len("+++ "):]), "b/"); p != "" {
+				if post != "" && p != post {
+					return false, "", exitError2{"a section's +++ path disagrees with its diff --git header; refusing the patch"}
+				}
+				if underGithub(p) {
+					refused = true
+				}
+			}
+		case bytes.HasPrefix(line, []byte("rename from ")), bytes.HasPrefix(line, []byte("copy from ")):
+			verb := "rename from "
+			if bytes.HasPrefix(line, []byte("copy from ")) {
+				verb = "copy from "
+			}
+			if p := bodyPath(string(line[len(verb):]), ""); p != "" {
+				if pre != "" && p != pre {
+					return false, "", exitError2{"a section's rename/copy source path disagrees with its diff --git header; refusing the patch"}
+				}
+				if underGithub(p) {
+					refused = true
+				}
+			}
+			if refused {
+				return false, "", exitError2{"a .github/ section renames or copies a file; refusing the patch"}
+			}
+		case bytes.HasPrefix(line, []byte("rename to ")), bytes.HasPrefix(line, []byte("copy to ")):
+			verb := "rename to "
+			if bytes.HasPrefix(line, []byte("copy to ")) {
+				verb = "copy to "
+			}
+			if p := bodyPath(string(line[len(verb):]), ""); p != "" {
+				if post != "" && p != post {
+					return false, "", exitError2{"a section's rename/copy target path disagrees with its diff --git header; refusing the patch"}
+				}
+				if underGithub(p) {
+					refused = true
+				}
+			}
+			if refused {
+				return false, "", exitError2{"a .github/ section renames or copies a file; refusing the patch"}
+			}
 		}
 	}
 	return refused, "", nil
+}
+
+// bodyPath cleans one path out of a `---`/`+++`/`rename from`/`rename to`
+// line: git appends a tab and a timestamp to `---`/`+++` paths when asked,
+// and that suffix is not part of the path. The rest of the cleaning —
+// /dev/null, quoting, the a/ or b/ prefix, the length cap — is patchPath's.
+func bodyPath(rest, prefix string) string {
+	if i := strings.IndexByte(rest, '\t'); i >= 0 {
+		rest = rest[:i]
+	}
+	return patchPath(rest, prefix)
 }
 
 // underGithub reports whether p is under .github/ but not .github/codeaf/:
