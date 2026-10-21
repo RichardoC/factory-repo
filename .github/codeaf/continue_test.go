@@ -30,15 +30,28 @@ func captureStdout(t *testing.T, fn func() error) (string, error) {
 	}
 	old := os.Stdout
 	os.Stdout = w
+	// Drain the pipe while fn runs: a brief can exceed the 64KB OS pipe
+	// buffer, and fn writing into a full pipe with nobody reading deadlocks
+	// the test. The read finishes before fn returns, because fn cannot
+	// return while a write is still blocked.
+	type captured struct {
+		data string
+		err  error
+	}
+	out := make(chan captured, 1)
+	go func() {
+		data, readErr := io.ReadAll(r)
+		out <- captured{string(data), readErr}
+	}()
 	runErr := fn()
 	os.Stdout = old
 	w.Close()
-	data, readErr := io.ReadAll(r)
+	got := <-out
 	r.Close()
-	if readErr != nil {
-		t.Fatal(readErr)
+	if got.err != nil {
+		t.Fatal(got.err)
 	}
-	return string(data), runErr
+	return got.data, runErr
 }
 
 // writeResult points RESULT_PATH at a result file whose stop reason is stop.
