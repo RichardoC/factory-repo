@@ -84,3 +84,8 @@ Findings written inline elsewhere in the answer (`[high] path:line - text`,
 or `[medium] the lock is held across the call`) are parsed too, but the
 section is the contract: a review whose findings never reach it is read as a
 review with none.
+
+Evidence rule: the `harness` binary on `PATH` was built from the default
+branch before this run started, so it is the pre-change build; when the diff
+touches `.github/codeaf/`, rebuild it (`go build` there) and run the built
+binary for the proofs you cite, and say which binary produced them.

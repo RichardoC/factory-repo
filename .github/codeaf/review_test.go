@@ -804,6 +804,10 @@ func TestRunReviewBrief(t *testing.T) {
 		"# The output the harness parses",                     // the output contract
 		"app/zip/queue.go:42",                                 // the concrete example bullet
 		"single word `none`",                                  // the clean-review form
+		// Issue #189: the reviewer's standing instructions say the PATH
+		// harness is the pre-change build, so a harness change is reviewed
+		// against a binary built from the diff's tree.
+		reviewHarnessPreChangeSentence,
 	} {
 		if !strings.Contains(b, want) {
 			t.Errorf("brief missing %q", want)
