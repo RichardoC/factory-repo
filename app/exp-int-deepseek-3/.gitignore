@@ -1,0 +1,3 @@
+# Built binary (go build ./... writes it here by default; same hazard as
+# app/exp-int-seed, issue #139). Never commit compiled artifacts.
+/exp-int-deepseek-3
