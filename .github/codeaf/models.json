@@ -13,7 +13,7 @@
     "plan": "big",
     "plan_note": "Big plan $90/mo. synthetic.new reports the weekly credit itself (GET /v2/quotas weeklyTokenLimit.maxCredits: $22.17 at subscription rates, regenerating about $0.44 every 3h22m), and the owner's other workloads draw on the same quota. All figures and caps here are at the API list (overage) prices, the owner's decision on 2026-10-20: CostOf prices calls at api_*; the input/output/cache_read subscription rates are reference only. weekly_credit_usd 100 is maxCredits x 4.5, the measured overage/subscription ratio for the factory's model mix (2026-10-17..19; DeepSeek alone is ~7.9x); it only paces the queue. The hard stop is synthetic.new's own percentRemaining: with overage_usd 0 the proxy refuses below min_credit_percent (25, leaving a quarter of the week for the owner's other workloads), re-reading /v2/quotas every 5 minutes. run_credit_usd 5 is about 2.5x the most expensive run seen at overage prices ($1.97). overage_usd 0 = stop rather than pay past the quota.",
     "weekly_credit_usd": 100,
-    "min_credit_percent": 25,
+    "min_credit_percent": 30,
     "run_credit_usd": 5,
     "overage_usd": 0,
     "searches_per_run": 50
