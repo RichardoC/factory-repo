@@ -552,10 +552,29 @@ func reviewTable(findings []Finding) string {
 
 // reviewLocation renders one finding's location cell: `path:line` when the
 // finding carries a location, and the fixed word `unlocated` when it does
-// not. The path is escaped and capped like every other cell, so a hostile
-// path cannot break out of the table or the comment (issue #190).
+// not, so no cell ever shows a location that names no file (issue #190).
+// The path is escaped and capped like every other cell, so a hostile path
+// cannot break out of the table or the comment.
+//
+// A finding is unlocated when its path is empty: the parser gives the
+// inline form (issue #49) no path and no line, and every located finding it
+// builds has both, so the line alone never decides.
 func reviewLocation(f Finding) string {
-	if f.Path == "" && f.Line == 0 {
+	// The path decides, not the line: every finding the parser builds
+	// without a location carries no path, so a line alone names no file.
+	// Asking for a zero line too would let any caller that filled the line
+	// in render a bare ":0" — the cell this issue exists to remove.
+	if f.Path == "" {
+		return "unlocated"
+	}
+	// A located cell is `path:line`; a zero line never renders, because a
+	// line number counts from one. Two shapes reach here with line zero:
+	// the straight-through path a test or a future caller may build, and
+	// the location-shaped text the parser drops the number from — `:0`
+	// itself parses as the path ":" (findingText accepts a `:` separator)
+	// and `0:1` as the path "0" — both of which named no file either, so
+	// they read `unlocated` rather than as a location (issue #190).
+	if f.Line <= 0 {
 		return "unlocated"
 	}
 	return escapeMD(f.Path, 200, true) + ":" + strconv.Itoa(f.Line)
