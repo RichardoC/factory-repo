@@ -285,10 +285,13 @@ restating the snapshot would delete that label. Reading live avoids it:
 
 - a label added since the snapshot (managed or not) survives the update
 - a label removed since the snapshot is not re-added
-- if an issue's live labels cannot be read, its update fails rather than
-  proceeding — writing a label set that might drop a label the sync does not own
-  is worse than deferring the update to the next run. The caller retries the
-  batch item by item, so one unreadable issue does not block the rest.
+- if an issue's live labels cannot be read — the read returns nothing for the
+  issue, or returns a truncated page of its labels (`pageInfo.hasNextPage` on
+  the labels connection) — its update fails rather than proceeding: writing a
+  label set that might drop a label the sync does not own is worse than
+  deferring the update to the next run. The caller retries the batch item by
+  item, so one unreadable issue does not block the rest; its update is counted
+  in `failed_ops`.
 
 `LINEAR_PROTECTED_LABELS` lists labels this sync must never *assert* from its
 managed set — a guard against a misconfiguration that puts a control label into

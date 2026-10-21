@@ -24,6 +24,12 @@ import (
 const (
 	titlePrefix    = "Snyk:"
 	metadataHeader = "<!-- snyk-linear-sync"
+
+	// maxLiveLabelPage is how many labels the live label read requests per
+	// issue. An issue carrying more labels than this returns a truncated
+	// page, which the read deliberately treats as unreadable rather than
+	// trusting as a complete set.
+	maxLiveLabelPage = 250
 )
 
 type Client struct {
@@ -401,9 +407,11 @@ func (c *Client) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) 
 
 	// An issue missing from the read leaves its current labels unknown, and
 	// guessing wrong deletes a label the sync does not own (a kikimora control
-	// label, or a human's). Fail the batch instead: the caller already falls
-	// back to updating each issue individually, so the rest of the batch still
-	// lands and only the unreadable issue is reported failed.
+	// label, or a human's). An issue absent from the read — missing from the
+	// response, or omitted by fetchLabelsByIssueID because its label page was
+	// truncated — is exactly that. Fail the batch instead: the caller already
+	// falls back to updating each issue individually, so the rest of the batch
+	// still lands and only the unreadable issue is reported failed.
 	for _, update := range updates {
 		if _, ok := liveLabels[update.Existing.ID]; !ok {
 			return fmt.Errorf("refusing to update Linear issue %s: its current labels could not be read, so labels the sync does not own cannot be preserved", update.Existing.Identifier)
@@ -1481,17 +1489,33 @@ func (c *Client) protectedLabelNames() map[string]struct{} {
 // caller's batch size of 10; a batch larger than the ceiling would fail the
 // request, which degrades to the caller's per-issue retry rather than silently
 // dropping labels.
+//
+// The labels side is a connection and therefore can truncate even when the
+// issue side does not. A truncated label page is not usable as the authority
+// for labels the sync does not own — a label past the page boundary
+// (including a LINEAR_PROTECTED_LABELS control label) would be absent from the
+// live read, and the update would then delete it, which is the exact failure
+// this read exists to prevent. Such an issue is therefore omitted from the
+// result, which UpdateIssues treats as unreadable and refuses. Refusing beats
+// paginating here: a nested connection cannot be paged from within this one
+// query, and an issue carrying more than maxLiveLabelPage labels is
+// pathological rather than a case worth serving. The refusal is loud (a
+// warning plus an update counted as failed) instead of silently dropping a
+// label.
+//
+// The complexity cost is roughly maxLiveLabelPage x batch size per update
+// batch, well inside Linear's per-query ceiling.
 func (c *Client) fetchLabelsByIssueID(ctx context.Context, issueIDs []string) (map[string][]model.IssueLabel, error) {
 	if len(issueIDs) == 0 {
 		return nil, nil
 	}
 
-	op := gqlclient.NewOperation(`
+	op := gqlclient.NewOperation(fmt.Sprintf(`
 query issueLabelsByID($filter: IssueFilter!, $first: Int!) {
   issues(filter: $filter, first: $first, includeArchived: true) {
     nodes {
       id
-      labels(first: 250) {
+      labels(first: %d) {
         nodes {
           id
           name
@@ -1499,10 +1523,13 @@ query issueLabelsByID($filter: IssueFilter!, $first: Int!) {
             id
           }
         }
+        pageInfo {
+          hasNextPage
+        }
       }
     }
   }
-}`)
+}`, maxLiveLabelPage))
 	op.Var("filter", linearapi.IssueFilter{
 		Id: &linearapi.IDComparator{In: issueIDs},
 	})
@@ -1520,6 +1547,9 @@ query issueLabelsByID($filter: IssueFilter!, $first: Int!) {
 							ID string `json:"id"`
 						} `json:"parent"`
 					} `json:"nodes"`
+					PageInfo struct {
+						HasNextPage bool `json:"hasNextPage"`
+					} `json:"pageInfo"`
 				} `json:"labels"`
 			} `json:"nodes"`
 		} `json:"issues"`
@@ -1530,6 +1560,16 @@ query issueLabelsByID($filter: IssueFilter!, $first: Int!) {
 
 	out := make(map[string][]model.IssueLabel, len(resp.Issues.Nodes))
 	for _, node := range resp.Issues.Nodes {
+		// A truncated label page is an incomplete picture of the issue's
+		// labels; see the function comment for why it is refused rather
+		// than paginated.
+		if node.Labels.PageInfo.HasNextPage {
+			c.log.Warn("Linear issue carries more labels than one page of the live label read; refusing to update it rather than risk deleting a label the sync does not own",
+				slog.String("issue_id", node.ID),
+				slog.Int("page_size", maxLiveLabelPage),
+			)
+			continue
+		}
 		labels := make([]model.IssueLabel, 0, len(node.Labels.Nodes))
 		for _, label := range node.Labels.Nodes {
 			groupID := ""
