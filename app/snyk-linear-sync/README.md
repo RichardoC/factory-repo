@@ -501,6 +501,33 @@ duplicate cancellations; a description change confined to the hidden metadata
 block posts no comment either.
 
 
+## Exit Status
+
+The sync exits non-zero when a state-changing Linear operation was left
+permanently unapplied, so a scheduler or CI job notices the drift instead of
+seeing a successful run that quietly dropped work.
+
+"Permanently" is the key word. Batch mutations are retried per entry, and only
+the outcome after that retry counts:
+
+- a batch that fails and whose retry lands is a **successful** run — the
+  operation applied, it just took two calls
+- a create, update, resolve or duplicate-cancellation whose retry also failed
+  is counted in `failed_ops` and **fails** the run
+
+The count appears in the `sync complete` summary log either way, and that
+summary is emitted before the exit status is decided.
+
+An interrupt is a non-zero exit too, with a different cause. Ctrl-C or SIGTERM
+cancels the context, so in-flight Linear calls are cancelled, no further jobs
+start, and the run logs `shutdown requested, cancelling in-flight calls and
+leaving the cache untouched`. The cache is **not** refreshed — the plan was
+only partly written, so a refresh would describe the fingerprints whose jobs
+never ran as reconciled (see [Cache Behavior](#cache-behavior)) — and `Run`
+returns an error wrapping the context cancellation, which becomes the process
+exit status. A signal that arrives after a run has already finished changes
+nothing.
+
 ## Logs
 
 - Console logs show startup, load progress, work progress, cache refresh, and final summary.

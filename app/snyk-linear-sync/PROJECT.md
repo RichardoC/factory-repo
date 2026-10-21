@@ -379,6 +379,20 @@ Use cache bypass when you intentionally changed the managed rendering or need a 
 go run ./cmd/snyk-linear-sync --env-file .env --bypass-cache
 ```
 
+### Exit Status
+
+`RunResult.Err` decides the process exit status, and it is deliberately narrow:
+the run fails only when state-changing work was left permanently unapplied.
+
+`FailedOps` is incremented *after* the per-item retry has itself failed, so a
+batch failure recovered by retry leaves it at zero and the run succeeds — the
+operation applied, it just took two calls. A non-zero count fails the run,
+because a run that logs a dropped ticket and then reports success means nothing
+downstream notices, and the next scheduled run reports success again.
+
+The check runs after the `sync complete` summary log, so the counts are
+reported regardless of the exit status.
+
 ## Design Boundaries
 
 If this project grows further, the next reasonable extensions would be:
