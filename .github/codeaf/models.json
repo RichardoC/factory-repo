@@ -10,7 +10,7 @@
     "max_proposals": 5
   },
   "alerts": {
-    "_comment": "Thresholds the model-stats routine alerts on (issue #131). Each field is optional: an absent block, or a field this file does not carry, uses the issue #131 value the validator in main.go fills in, so a models.json written before this block still loads and still alerts. A count-shaped field written as 0 is refused, not defaulted (a written 0 would silently disable its alert), while a written 0 reject_pct is legal and refuses nothing. Percentages are percent, not fractions: 1.0 is one percent.",
+    "_comment": "Thresholds the model-stats routine alerts on (issue #131). Each field is optional: an absent block, or a field this file does not carry, uses the issue #131 value the validator in main.go fills in, so a models.json written before this block still loads and still alerts. A count-shaped field written as 0 is refused, not defaulted (a written 0 would silently disable its alert); a percentage or ratio written as 0 means its default, the same as leaving it out. Percentages are percent, not fractions: 1.0 is one percent.",
     "hour_calls": 30,
     "ttft_p50_ratio": 2.0,
     "ttft_p50_ratio_baseline_hours": 168,
