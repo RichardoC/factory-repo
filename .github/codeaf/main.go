@@ -131,6 +131,13 @@ func main() {
 		// The PR comment body for a refused part of a patch
 		// (refusedcomment.go): reason plus the refused diff in a fence.
 		"refused-comment": runRefusedComment,
+		// Model latency and throughput (issue #131): renders the
+		// first-token, decode-rate and failure tables from the ledger
+		// rows carried in codeaf-output zips -- from a directory of
+		// downloaded zips, or from the recent runs' artifacts through
+		// the API (modelstats_cli.go). The "model-stats" routine
+		// reports the same comment on its schedule.
+		"model-stats": runModelStats,
 	}
 	command, ok := commands[os.Args[1]]
 	if !ok {
@@ -200,6 +207,229 @@ type Limits struct {
 // defaultMinCreditPercent is the floor used when min_credit_percent is unset.
 const defaultMinCreditPercent = 10
 
+// Alerts are the model-stats routine's thresholds (issue #131). They live
+// here rather than in Go because a threshold is a judgement about the
+// service, not a fact about the code: synthetic.new can degrade, a plan can
+// change, and the owner must be able to move a threshold in a reviewed
+// config file without a code change. models.json is the source of truth;
+// the defaults below only keep an old file without the block loading.
+//
+// Every field is optional: an absent block, or a field the file does not
+// carry, means the default. Percentages are percent, not fractions: 1.0 is
+// one percent.
+//
+// The count-shaped fields are pointers on purpose. encoding/json cannot tell
+// a field the file omits from one written as 0, and for a count the two mean
+// opposite things: absent is "use the issue #131 value", while a written 0
+// ("never judge an hour", "feed no completion to the decode figures", "alert
+// below no calls") is a mistake that would silently disable an alert. So nil
+// takes the default and an explicit 0 is refused, naming the field -- the
+// same treatment decode_baseline_hours gets.
+type Alerts struct {
+	// HourCalls is how many calls an hour needs before its first-token p50
+	// is judged: below it the hour's sample is too small to alert on.
+	HourCalls *int `json:"hour_calls"`
+	// TTFTp50Ratio alerts when an hour's first-token p50 is above this times
+	// the model's own trailing 7-day p50.
+	TTFTp50Ratio float64 `json:"ttft_p50_ratio"`
+	// TTFTp90Ms alerts on an hour whose first-token p90 is above this many
+	// milliseconds.
+	TTFTp90Ms int64 `json:"ttft_p90_ms"`
+	// DecodeRatio alerts when decode p50 is below this times the baseline.
+	DecodeRatio float64 `json:"decode_ratio"`
+	// DecodeMinTokens is the shortest completion whose decode tok/s feeds the
+	// decode figures: a call that produced a handful of tokens measures its
+	// own fixed overhead, not the model's throughput.
+	DecodeMinTokens *int `json:"decode_min_tokens"`
+	// StallGapMs is the silence between streamed lines that counts as a stall.
+	StallGapMs int64 `json:"stall_gap_ms"`
+	// Rate429Pct and RejectPct alert when the 429 rate or the share of rows
+	// rejected as hostile exceeds the percentage.
+	Rate429Pct float64 `json:"rate_429_pct"`
+	RejectPct  float64 `json:"reject_pct"`
+	// StallPct alerts when more than this percent of turns carry a stall.
+	StallPct float64 `json:"stall_pct"`
+	// SlotWaitsPerRun alerts when one run waited for a model slot more than
+	// this many times. Any abandoned wait alerts whatever this says.
+	SlotWaitsPerRun *int `json:"slot_waits_per_run"`
+	// WindowHours is the default window the routine reports over.
+	WindowHours *int `json:"window_hours"`
+	// TTFTp50RatioBaselineHours is how many days of a model's own history the
+	// first-token p50 ratio is measured against. The issue calls it the
+	// trailing 7-day p50; the routine reads the number from here.
+	TTFTp50RatioBaselineHours *int `json:"ttft_p50_ratio_baseline_hours"`
+	// HourCallsBaselineHours is the window a decode baseline is taken from,
+	// the decode counterpart of the trailing 7-day figure. It is nullable so
+	// that an explicit 0 is refused rather than silently defaulted: a
+	// baseline of no hours is a mistake, not a request.
+	HourCallsBaselineHours *int `json:"decode_baseline_hours"`
+}
+
+// The issue #131 thresholds, as models.json carries them. They are the
+// defaults so that a models.json written before the alerts block existed
+// still loads and still alerts.
+const (
+	defaultAlertHourCalls         = 30
+	defaultAlertTTFTp50Ratio      = 2.0
+	defaultAlertTTFTp90Ms         = 15000
+	defaultAlertDecodeRatio       = 0.7
+	defaultAlertDecodeMinTokens   = 300
+	defaultAlertStallGapMs        = 30000
+	defaultAlertRate429Pct        = 1.0
+	defaultAlertRejectPct         = 1.0
+	defaultAlertStallPct          = 5.0
+	defaultAlertSlotWaitsPerRun   = 20
+	defaultAlertWindowHours       = 72
+	defaultAlertBaselineHours     = 168
+	defaultAlertDecodeBaselineHrs = 168
+	// maxAlertHourCalls is the largest calls-in-an-hour figure that can mean
+	// anything: the factory's own account is one Big plan, and 100k calls in
+	// one hour would be a runaway, not a threshold.
+	maxAlertHourCalls = 100000
+	// maxAlertWindowHours is a year: a window no routine would ever report
+	// over, and past it the figure is a typo (a milliseconds value in an
+	// hours field, say).
+	maxAlertWindowHours = 24 * 365
+	// maxAlertGapMs is ten minutes: a silence longer than this is a hung
+	// call, reported as a cut, not a stall threshold.
+	maxAlertGapMs = 600000
+	// maxAlertDecodeTokens is ten million tokens: past a model's context
+	// length by an order of magnitude, so it is a typo, not a floor.
+	maxAlertDecodeTokens = 10000000
+)
+
+// alertDefaults is the alerts block a models.json without one gets.
+func alertDefaults() Alerts {
+	return Alerts{
+		HourCalls:                 alertInt(defaultAlertHourCalls),
+		TTFTp50Ratio:              defaultAlertTTFTp50Ratio,
+		TTFTp90Ms:                 defaultAlertTTFTp90Ms,
+		DecodeRatio:               defaultAlertDecodeRatio,
+		DecodeMinTokens:           alertInt(defaultAlertDecodeMinTokens),
+		StallGapMs:                defaultAlertStallGapMs,
+		Rate429Pct:                defaultAlertRate429Pct,
+		RejectPct:                 defaultAlertRejectPct,
+		StallPct:                  defaultAlertStallPct,
+		SlotWaitsPerRun:           alertInt(defaultAlertSlotWaitsPerRun),
+		WindowHours:               alertInt(defaultAlertWindowHours),
+		TTFTp50RatioBaselineHours: alertInt(defaultAlertBaselineHours),
+		HourCallsBaselineHours:    alertInt(defaultAlertDecodeBaselineHrs),
+	}
+}
+
+// alertInt is a pointer to a copy of v, for an alerts field whose zero value
+// means something other than "unset": a written 0 on one of these is a
+// mistake to refuse, not a default to fill, so the field has to be able to
+// say "the file did not carry it".
+func alertInt(v int) *int { return &v }
+
+// validateAlerts fills every unset alerts field with its default and refuses
+// an absurd one with a message naming the field, the way the limits block
+// does. What is "absurd" is per field: a threshold is a positive count or
+// ratio, a window and a baseline are positive and bounded, and the reject
+// rate, which the routine compares a percentage of rows against, may be 0
+// (refuse nothing) but not negative.
+//
+// A value is refused, never clamped, and the messages are built from the
+// field's own fixed name and its own number, so nothing from the file is
+// echoed back the way it was written.
+func validateAlerts(a Alerts) (Alerts, error) {
+	def := alertDefaults()
+	// Positive counts, each nullable: an absent field takes the issue #131
+	// default, and a negative, zero or too-large count is refused with a
+	// message naming the field. Zero is refused rather than defaulted because
+	// it is written down: a config that carries "hour_calls": 0 is asking to
+	// judge every hour on no sample at all, which is a mistake, not an
+	// omission. The field name is in the table so the message is built from a
+	// name this file wrote, never from anything the config carried.
+	for _, c := range []struct {
+		field **int
+		def   int
+		max   int64
+		name  string
+		what  string
+	}{
+		{&a.HourCalls, defaultAlertHourCalls, maxAlertHourCalls, "hour_calls", "calls per hour"},
+		{&a.DecodeMinTokens, defaultAlertDecodeMinTokens, maxAlertDecodeTokens, "decode_min_tokens", "tokens"},
+		{&a.SlotWaitsPerRun, defaultAlertSlotWaitsPerRun, maxAlertHourCalls, "slot_waits_per_run", "slot waits"},
+	} {
+		switch {
+		case *c.field == nil:
+			*c.field = alertInt(c.def)
+		case **c.field < 0:
+			return a, fmt.Errorf("alerts.%s must not be negative (%s)", c.name, c.what)
+		case **c.field == 0:
+			return a, fmt.Errorf("alerts.%s must be greater than 0 (%s)", c.name, c.what)
+		case int64(**c.field) > c.max:
+			return a, fmt.Errorf("alerts.%s must not exceed %d (%s)", c.name, c.max, c.what)
+		}
+	}
+	// Durations in milliseconds.
+	for _, c := range []struct {
+		field *int64
+		def   int64
+		max   int64
+		name  string
+	}{
+		{&a.TTFTp90Ms, def.TTFTp90Ms, maxAlertGapMs, "ttft_p90_ms"},
+		{&a.StallGapMs, def.StallGapMs, maxAlertGapMs, "stall_gap_ms"},
+	} {
+		switch {
+		case *c.field == 0:
+			*c.field = c.def
+		case *c.field < 0:
+			return a, fmt.Errorf("alerts.%s must not be negative", c.name)
+		case *c.field > c.max:
+			return a, fmt.Errorf("alerts.%s must not exceed %d ms", c.name, c.max)
+		}
+	}
+	// Ratios and percentages, in the field's own units: ratios are above 1,
+	// percentages are in [0, 100].
+	for _, c := range []struct {
+		field *float64
+		def   float64
+		min   float64
+		max   float64
+		name  string
+	}{
+		{&a.TTFTp50Ratio, def.TTFTp50Ratio, 1, 100, "ttft_p50_ratio"},
+		{&a.DecodeRatio, def.DecodeRatio, 0.01, 1, "decode_ratio"},
+		{&a.Rate429Pct, def.Rate429Pct, 0, 100, "rate_429_pct"},
+		{&a.RejectPct, def.RejectPct, 0, 100, "reject_pct"},
+		{&a.StallPct, def.StallPct, 0, 100, "stall_pct"},
+	} {
+		switch {
+		case *c.field == 0:
+			*c.field = c.def
+		case math.IsNaN(*c.field) || *c.field < c.min || *c.field > c.max:
+			return a, fmt.Errorf("alerts.%s must be in [%g, %g]", c.name, c.min, c.max)
+		}
+	}
+	// The three windows, in hours: nil takes the default, and what is
+	// written has to be a positive number of hours within a year. A written
+	// 0 is refused, not defaulted, for the same reason as the counts above:
+	// a window of no hours is a mistake.
+	for _, c := range []struct {
+		field **int
+		def   int
+		name  string
+	}{
+		{&a.WindowHours, defaultAlertWindowHours, "window_hours"},
+		{&a.TTFTp50RatioBaselineHours, defaultAlertBaselineHours, "ttft_p50_ratio_baseline_hours"},
+		{&a.HourCallsBaselineHours, defaultAlertDecodeBaselineHrs, "decode_baseline_hours"},
+	} {
+		switch {
+		case *c.field == nil:
+			*c.field = alertInt(c.def)
+		case **c.field <= 0:
+			return a, fmt.Errorf("alerts.%s must be positive (hours)", c.name)
+		case **c.field > maxAlertWindowHours:
+			return a, fmt.Errorf("alerts.%s must not exceed %d (hours)", c.name, maxAlertWindowHours)
+		}
+	}
+	return a, nil
+}
+
 // Queue is how many CodeAF runs the queue may have going at once. Every
 // concurrent run gets its own slice of each model's account-wide
 // max_concurrent (perRunSlots) and its own worker seat (its lane).
@@ -222,11 +452,13 @@ type Planner struct {
 	RetryMinHours int `json:"retry_min_hours"`
 }
 
-// Config is models.json: the spend caps and the models CodeAF may use.
+// Config is models.json: the spend caps, the models CodeAF may use, and the
+// thresholds the routines alert on.
 type Config struct {
 	Limits  Limits  `json:"limits"`
 	Queue   Queue   `json:"queue"`
 	Planner Planner `json:"planner"`
+	Alerts  Alerts  `json:"alerts"`
 	Models  []Model `json:"models"`
 }
 
@@ -289,6 +521,14 @@ func loadConfig(path string) (Config, error) {
 	case cfg.Planner.RetryMinHours < 0:
 		return cfg, fmt.Errorf("%s: planner.retry_min_hours must not be negative", path)
 	}
+	// The model-stats alerts (issue #131) default field by field, so a
+	// models.json that predates the block still loads; an absurd value is
+	// an error naming the field.
+	alerts, err := validateAlerts(cfg.Alerts)
+	if err != nil {
+		return cfg, fmt.Errorf("%s: %w", path, err)
+	}
+	cfg.Alerts = alerts
 	if len(cfg.Models) == 0 {
 		return cfg, fmt.Errorf("%s: no models", path)
 	}
@@ -905,12 +1145,52 @@ type LedgerLine struct {
 	// as a marker (kind "status"), so every report figure that counts calls
 	// or timing skips it, the way it skips proxy_start and search lines.
 	Status int `json:"status,omitempty"`
+	// The timing the model-stats routine (issue #131) reads: TTFTMs is the
+	// time from issuing the upstream request to the first relayed content
+	// data line -- a heartbeat comment never counts as that first byte, which
+	// is what noteData/seenData already track (issue #145). DurMs is the whole
+	// call, header wait plus stream. MaxGapMs is the longest silence between
+	// two streamed lines' arrivals. Cut marks a streaming call whose stream
+	// ended without a `data: [DONE]` line (upstream error, bare EOF, or the
+	// client going away). All four are 0/false on an old ledger line and on a
+	// call that never streamed; each is purely additive, so no existing field
+	// changes meaning.
+	TTFTMs   int64 `json:"ttft_ms,omitempty"`
+	DurMs    int64 `json:"dur_ms,omitempty"`
+	MaxGapMs int64 `json:"max_gap_ms,omitempty"`
+	Cut      bool  `json:"cut,omitempty"`
 }
 
-func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slotWait, headerWait time.Duration, chars charCounts, repaired, status int) {
+// callTiming is the per-call timing the relays measure and record carries to
+// the ledger (issue #131). It is a struct rather than more positional
+// arguments so record's signature stays readable as the ledger grows; the zero
+// value is a call that never reached the relay, so TTFTMs, DurMs, MaxGapMs and
+// Cut are all absent from the line.
+//
+// Ended is when record was reached and Dur is the whole call: passing them in
+// rather than reading time.Now() inside record keeps a test's fake clock in
+// charge of the figure, and keeps the call's end where the call actually ended
+// -- the relays are the last thing that touches the upstream stream.
+type callTiming struct {
+	TTFT   time.Duration // issue of the upstream request -> first relayed data line
+	Dur    time.Duration // setup -> the end of the call
+	MaxGap time.Duration // longest silence between two streamed lines
+	Cut    bool          // streamed: the stream ended without `data: [DONE]`
+}
+
+// timingOf builds the ledger's timing from the call's start and the current
+// moment, for a call that never reached a relay (a refusal, a 200 with no
+// body): the whole call duration is known, there is no stream to have cut.
+func timingOf(started time.Time) callTiming {
+	return callTiming{Dur: time.Since(started)}
+}
+
+func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slotWait, headerWait time.Duration, chars charCounts, repaired, status int, timing callTiming) {
 	line := LedgerLine{Time: time.Now().UTC(), Model: m.ID, Upstream: m.Upstream, Stream: stream,
 		Start: start.UTC(), SlotWaitS: slotWait.Seconds(), HeaderMs: headerWait.Milliseconds(),
-		ReasoningChars: chars.reasoning, OutputChars: chars.output, RepairedToolArgs: repaired}
+		ReasoningChars: chars.reasoning, OutputChars: chars.output, RepairedToolArgs: repaired,
+		TTFTMs: timing.TTFT.Milliseconds(), DurMs: timing.Dur.Milliseconds(),
+		MaxGapMs: timing.MaxGap.Milliseconds(), Cut: timing.Cut}
 	if status != 0 {
 		// A non-200 upstream answer is recorded as a status line (issue #140):
 		// it carries no usage and no cost, and the kind keeps it out of every
@@ -1370,7 +1650,7 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		// The refusal goes in the ledger too (issue #140): a run whose
 		// upstream kept answering 429 costs real time, and the record
 		// counts it. No usage, no cost.
-		p.record(m, nil, stream, started, slotWait, headerWait, charCounts{}, repaired, response.StatusCode)
+		p.record(m, nil, stream, started, slotWait, headerWait, charCounts{}, repaired, response.StatusCode, timingOf(started))
 		if out == nil {
 			w.Header().Set("Content-Type", response.Header.Get("Content-Type"))
 			w.WriteHeader(response.StatusCode)
@@ -1788,6 +2068,9 @@ func (p *proxy) acquire(ctx context.Context, m Model, beat func()) (func(), time
 	}
 }
 
+// relayJSON relays a non-streaming answer and records it (issue #131): with no
+// streamed lines the whole upstream wait is the header wait, so TTFTMs equals
+// header_ms and there is no gap and no cut. DurMs is the call as a whole.
 func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, started time.Time, slotWait, headerWait time.Duration, repaired int) {
 	var payload map[string]json.RawMessage
 	if err := json.NewDecoder(upstream).Decode(&payload); err != nil {
@@ -1812,7 +2095,8 @@ func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, st
 		chars.addChoices(choices, "message")
 	}
 	payload["model"], _ = json.Marshal(m.ID)
-	p.record(m, usage, false, started, slotWait, headerWait, chars, repaired, 0)
+	p.record(m, usage, false, started, slotWait, headerWait, chars, repaired, 0,
+		callTiming{TTFT: headerWait, Dur: time.Since(started)})
 	writeJSON(w, http.StatusOK, payload)
 }
 
@@ -1878,9 +2162,47 @@ func (p *proxy) relayStream(out *sseSink, upstream io.Reader, m Model, started t
 			}
 		}
 	}()
+	// Issue #131: the timing the model-stats routine reads. ttft is set at the
+	// first relayed data line and never again; last marks when the previous
+	// *complete* relayed line arrived, and the gap to the next one is the
+	// silence between streamed lines. A heartbeat comment is written by the
+	// quiet ticker, not by this loop, so it cannot move either mark -- the
+	// "first byte" is the first data line, exactly what noteData tracks
+	// (issue #145). Only a read that ended at a newline counts: ReadBytes can
+	// return a partial line without an error, and stamping that would break
+	// one silence into two and lose the longer one.
+	var ttft time.Duration
+	var last time.Time
+	var timingGap time.Duration
+	sawDone := false
+	// firstLine marks the arrival of the first content data line. It keys off
+	// ttft itself rather than the gap clock, so a preamble line cannot stop
+	// the figure being set.
+	firstLine := func() {
+		if ttft == 0 {
+			ttft = time.Since(started)
+		}
+	}
+	// sawLine stamps the gap for one complete line taken off upstream.
+	sawLine := func() {
+		now := time.Now()
+		if !last.IsZero() {
+			if gap := now.Sub(last); gap > timingGap {
+				timingGap = gap
+			}
+		}
+		last = now
+	}
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
+			// A partial line is upstream still mid-write, not a streamed
+			// line: only the newline-terminated read is stamped, and a
+			// stream that ends without a trailing newline is stamped once the
+			// error below says it is over.
+			if line[len(line)-1] == '\n' {
+				sawLine()
+			}
 			trimmed := bytes.TrimRight(line, "\r\n")
 			if data, ok := bytes.CutPrefix(trimmed, []byte("data:")); ok {
 				data = bytes.TrimSpace(data)
@@ -1893,12 +2215,21 @@ func (p *proxy) relayStream(out *sseSink, upstream io.Reader, m Model, started t
 					// Issue #145: this is the first data line the wait for
 					// upstream was really about; the header-wait heartbeat
 					// stands down from here.
+					firstLine()
 					out.noteData()
+				} else if bytes.Equal(data, []byte("[DONE]")) {
+					// A clean end: the stream said so, so it was not cut.
+					sawDone = true
 				}
 			}
 			out.line(append(trimmed, '\n'))
 		}
 		if err != nil {
+			if len(line) > 0 && line[len(line)-1] != '\n' {
+				// The stream ended mid-line: the last bytes are real and the
+				// silence before them is real, so they are stamped now.
+				sawLine()
+			}
 			if !errors.Is(err, io.EOF) {
 				log.Printf("stream from %s cut: %v", m.Upstream, err)
 			}
@@ -1907,7 +2238,11 @@ func (p *proxy) relayStream(out *sseSink, upstream io.Reader, m Model, started t
 	}
 	close(stop)
 	done.Wait()
-	p.record(m, usage, true, started, slotWait, headerWait, chars, repaired, 0)
+	// Issue #131: cut is the loop leaving without a `data: [DONE]` line --
+	// upstream's error, a bare EOF, or the client going away and cancelling
+	// the body out from under the read.
+	p.record(m, usage, true, started, slotWait, headerWait, chars, repaired, 0, callTiming{
+		TTFT: ttft, Dur: time.Since(started), MaxGap: timingGap, Cut: !sawDone})
 }
 
 // ---------------------------------------------------------------- GitHub

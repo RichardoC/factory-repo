@@ -122,15 +122,15 @@ func TestRecordOverageAccounting(t *testing.T) {
 	// The weekly credit runs out during the second call: the third is the
 	// first recorded as overage.
 	p := &proxy{ledger: filepath.Join(t.TempDir(), "l.jsonl"), runCap: 5, weekCap: 0.0003, overageCap: 0.0002}
-	p.record(m, &usage, false, time.Now(), 0, 0, charCounts{}, 0, 0)
+	p.record(m, &usage, false, time.Now(), 0, 0, charCounts{}, 0, 0, callTiming{})
 	if p.overage || p.overageApi != 0 {
 		t.Fatalf("first call counted as overage: overage=%v api=$%v", p.overage, p.overageApi)
 	}
-	p.record(m, &usage, false, time.Now(), 0, 0, charCounts{}, 0, 0)
+	p.record(m, &usage, false, time.Now(), 0, 0, charCounts{}, 0, 0, callTiming{})
 	if !p.overage || p.overageApi != 0 {
 		t.Fatalf("crossing call: overage=%v api=$%v, want the credit to run out with no overage yet", p.overage, p.overageApi)
 	}
-	p.record(m, &usage, false, time.Now(), 0, 0, charCounts{}, 0, 0)
+	p.record(m, &usage, false, time.Now(), 0, 0, charCounts{}, 0, 0, callTiming{})
 	if p.overageApi != 0.000206 {
 		t.Fatalf("overageApi = $%v, want $0.000206", p.overageApi)
 	}
@@ -260,5 +260,230 @@ func TestPerRunSlotsSweep(t *testing.T) {
 				t.Errorf("max_concurrent %d, max_parallel_runs %d: %d slots x %d = %d > %d, but loadConfig accepted", mc, mpr, slots, mpr, sum, mc)
 			}
 		}
+	}
+}
+
+// writeAlertModels writes a models.json whose alerts block is alerts ("" for
+// absent), everything else minimal and valid, and returns its path. It is
+// writePlannerModels's shape: the block under test is the only variable.
+func writeAlertModels(t *testing.T, alerts string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "models.json")
+	a := ""
+	if alerts != "" {
+		a = fmt.Sprintf(`,"alerts":%s`, alerts)
+	}
+	body := fmt.Sprintf(`{"limits":{"plan":"big","weekly_credit_usd":20,"run_credit_usd":5}%s,
+		"models":[{"id":"m","upstream":"hf:m","efforts":["high"],"max_concurrent":2,
+		"input":0.1,"output":0.25,"cache_read":0.02,"api_input":0.15,"api_cached":0.04,"api_output":0.5}]}`, a)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestAlertsConfig covers the alerts block (issue #131): the committed
+// models.json is the source of truth for every threshold, a field the file
+// does not carry takes the issue #131 default so an old models.json still
+// loads, and a bad value -- negative, zero or absurd -- is refused with a
+// message naming the field, the same handling limits, queue and planner get.
+func TestAlertsConfig(t *testing.T) {
+	// (a) The committed models.json loads, and yields every issue #131
+	// threshold. The struct defaults are deliberately NOT what this asserts:
+	// these numbers must be written in models.json, so a threshold moves by
+	// editing the reviewed config file, not by rebuilding the harness.
+	cfg, err := loadConfig("models.json")
+	if err != nil {
+		t.Fatalf("committed models.json: %v", err)
+	}
+	// The counts, the baselines and the window are pointers and the rest are
+	// values, so the table reads each through derefNum: a nil where the file
+	// must have written a number is a failure in itself (-1 is not a legal
+	// threshold, so it cannot pass for one).
+	derefNum := func(p *int) float64 {
+		if p == nil {
+			return -1
+		}
+		return float64(*p)
+	}
+	committed := []struct {
+		field string
+		got   float64
+		want  float64
+	}{
+		{"hour_calls", derefNum(cfg.Alerts.HourCalls), 30},
+		{"ttft_p50_ratio", cfg.Alerts.TTFTp50Ratio, 2.0},
+		{"ttft_p50_ratio_baseline_hours", derefNum(cfg.Alerts.TTFTp50RatioBaselineHours), 168},
+		{"ttft_p90_ms", float64(cfg.Alerts.TTFTp90Ms), 15000},
+		{"decode_ratio", cfg.Alerts.DecodeRatio, 0.7},
+		{"decode_min_tokens", derefNum(cfg.Alerts.DecodeMinTokens), 300},
+		{"stall_gap_ms", float64(cfg.Alerts.StallGapMs), 30000},
+		{"stall_pct", cfg.Alerts.StallPct, 5.0},
+		{"rate_429_pct", cfg.Alerts.Rate429Pct, 1.0},
+		{"reject_pct", cfg.Alerts.RejectPct, 1.0},
+		{"slot_waits_per_run", derefNum(cfg.Alerts.SlotWaitsPerRun), 20},
+		{"window_hours", derefNum(cfg.Alerts.WindowHours), 72},
+		{"decode_baseline_hours", derefNum(cfg.Alerts.HourCallsBaselineHours), 168},
+	}
+	for _, c := range committed {
+		if c.got != c.want {
+			t.Errorf("committed models.json alerts.%s = %v, want %v", c.field, c.got, c.want)
+		}
+	}
+	// The block is not a copy of the defaults: every field is written in the
+	// file, so main.go cannot be the only place a threshold lives.
+	raw, err := os.ReadFile("models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file struct {
+		Alerts map[string]any `json:"alerts"`
+	}
+	if err := json.Unmarshal(raw, &file); err != nil {
+		t.Fatalf("models.json: %v", err)
+	}
+	for _, p := range append([]string{"_comment"}, func() []string {
+		out := make([]string, 0, len(committed))
+		for _, c := range committed {
+			out = append(out, c.field)
+		}
+		return out
+	}()...) {
+		if _, ok := file.Alerts[p]; !ok {
+			t.Errorf("models.json alerts lacks %q: the threshold must live in the config, not only in Go", p)
+		}
+	}
+
+	// An absent block, an empty one, and a block whose fields are all
+	// legitimately zero (the float fields and reject_pct may be written as 0)
+	// take the issue #131 defaults, field by field. The count-shaped fields
+	// are deliberately NOT in this block: a written 0 there is refused, which
+	// the (b) table below pins.
+	defaults := Alerts{
+		HourCalls: alertInt(30), TTFTp50Ratio: 2.0, TTFTp90Ms: 15000, DecodeRatio: 0.7,
+		DecodeMinTokens: alertInt(300), StallGapMs: 30000, Rate429Pct: 1.0, RejectPct: 1.0,
+		StallPct: 5.0, SlotWaitsPerRun: alertInt(20), WindowHours: alertInt(72),
+		TTFTp50RatioBaselineHours: alertInt(168), HourCallsBaselineHours: alertInt(168),
+	}
+	// alertsEqual compares the pointer fields by value, so a default that
+	// arrived as a different pointer is still the same threshold.
+	alertsEqual := func(a, b Alerts) bool {
+		v := func(p *int) int {
+			if p == nil {
+				return -1
+			}
+			return *p
+		}
+		return v(a.HourCalls) == v(b.HourCalls) && v(a.DecodeMinTokens) == v(b.DecodeMinTokens) &&
+			v(a.SlotWaitsPerRun) == v(b.SlotWaitsPerRun) && v(a.WindowHours) == v(b.WindowHours) &&
+			v(a.TTFTp50RatioBaselineHours) == v(b.TTFTp50RatioBaselineHours) &&
+			v(a.HourCallsBaselineHours) == v(b.HourCallsBaselineHours) &&
+			a.TTFTp50Ratio == b.TTFTp50Ratio && a.TTFTp90Ms == b.TTFTp90Ms &&
+			a.DecodeRatio == b.DecodeRatio && a.StallGapMs == b.StallGapMs &&
+			a.Rate429Pct == b.Rate429Pct && a.RejectPct == b.RejectPct && a.StallPct == b.StallPct
+	}
+	for _, block := range []string{"", `{}`, `{"ttft_p50_ratio":0,"ttft_p90_ms":0,"decode_ratio":0,
+		"stall_gap_ms":0,"rate_429_pct":0,"reject_pct":0,"stall_pct":0}`} {
+		cfg, err := loadConfig(writeAlertModels(t, block))
+		if err != nil {
+			t.Fatalf("alerts %q: %v", block, err)
+		}
+		if got := cfg.Alerts; !alertsEqual(got, defaults) {
+			t.Errorf("alerts %q: got %+v; want the issue #131 defaults %+v", block, got, defaults)
+		}
+	}
+	// An old models.json is the real case: a file written before the alerts
+	// block existed has no block at all, and every count-shaped field comes
+	// back defaulted rather than nil.
+	old, err := loadConfig(writeAlertModels(t, ""))
+	if err != nil {
+		t.Fatalf("old models.json: %v", err)
+	}
+	for _, c := range []struct {
+		name string
+		got  *int
+		want int
+	}{
+		{"hour_calls", old.Alerts.HourCalls, 30},
+		{"decode_min_tokens", old.Alerts.DecodeMinTokens, 300},
+		{"slot_waits_per_run", old.Alerts.SlotWaitsPerRun, 20},
+		{"window_hours", old.Alerts.WindowHours, 72},
+		{"ttft_p50_ratio_baseline_hours", old.Alerts.TTFTp50RatioBaselineHours, 168},
+		{"decode_baseline_hours", old.Alerts.HourCallsBaselineHours, 168},
+	} {
+		if c.got == nil || *c.got != c.want {
+			t.Errorf("a models.json without the alerts block left %s = %v, want the issue #131 default %d", c.name, c.got, c.want)
+		}
+	}
+
+	// An explicit value is kept, and a partially set block defaults only
+	// what it does not carry.
+	cfg, err = loadConfig(writeAlertModels(t, `{"hour_calls":5,"ttft_p50_ratio":3.5,"window_hours":24,
+		"slot_waits_per_run":2,"stall_gap_ms":45000,"decode_baseline_hours":48}`))
+	if err != nil {
+		t.Fatalf("explicit alerts: %v", err)
+	}
+	wantExplicit := defaults
+	wantExplicit.HourCalls, wantExplicit.TTFTp50Ratio = alertInt(5), 3.5
+	wantExplicit.WindowHours, wantExplicit.SlotWaitsPerRun = alertInt(24), alertInt(2)
+	wantExplicit.StallGapMs, wantExplicit.HourCallsBaselineHours = 45000, alertInt(48)
+	if !alertsEqual(cfg.Alerts, wantExplicit) {
+		t.Fatalf("explicit alerts: got %+v; want the written values and the defaults for the rest %+v", cfg.Alerts, wantExplicit)
+	}
+
+	// (b) A bad value is an error naming the field. The two the issue names
+	// come first: a negative stall_gap_ms, and a zero hour_calls -- which is
+	// refused, not defaulted, because the file wrote it down (encoding/json
+	// cannot tell an absent count from a written 0, so these fields are
+	// pointers: nil is absent). Each zero below is that same case for the
+	// field.
+	for _, bad := range []struct {
+		name  string
+		block string
+		field string
+	}{
+		{"negative stall gap", `{"stall_gap_ms":-1}`, "alerts.stall_gap_ms"},
+		{"zero hour calls", `{"hour_calls":0}`, "alerts.hour_calls"},
+		{"zero decode min tokens", `{"decode_min_tokens":0}`, "alerts.decode_min_tokens"},
+		{"zero slot waits", `{"slot_waits_per_run":0}`, "alerts.slot_waits_per_run"},
+		{"zero window", `{"window_hours":0}`, "alerts.window_hours"},
+		{"zero ratio baseline", `{"ttft_p50_ratio_baseline_hours":0}`, "alerts.ttft_p50_ratio_baseline_hours"},
+		{"absurd hour calls", `{"hour_calls":1000000}`, "alerts.hour_calls"},
+		{"negative ttft p90", `{"ttft_p90_ms":-15000}`, "alerts.ttft_p90_ms"},
+		{"absurd ttft p90", `{"ttft_p90_ms":600001}`, "alerts.ttft_p90_ms"},
+		{"negative decode ratio", `{"decode_ratio":-0.7}`, "alerts.decode_ratio"},
+		{"absurd decode ratio", `{"decode_ratio":4}`, "alerts.decode_ratio"},
+		{"negative hour calls", `{"hour_calls":-30}`, "alerts.hour_calls"},
+		{"negative min tokens", `{"decode_min_tokens":-300}`, "alerts.decode_min_tokens"},
+		{"negative 429 rate", `{"rate_429_pct":-1}`, "alerts.rate_429_pct"},
+		{"absurd 429 rate", `{"rate_429_pct":101}`, "alerts.rate_429_pct"},
+		{"negative reject rate", `{"reject_pct":-0.1}`, "alerts.reject_pct"},
+		{"absent reject rate", `{"reject_pct":-100}`, "alerts.reject_pct"},
+		{"negative stall pct", `{"stall_pct":-5}`, "alerts.stall_pct"},
+		{"absurd stall pct", `{"stall_pct":500}`, "alerts.stall_pct"},
+		{"negative slot waits", `{"slot_waits_per_run":-20}`, "alerts.slot_waits_per_run"},
+		{"absurd min tokens", `{"decode_min_tokens":10000001}`, "alerts.decode_min_tokens"},
+		{"absurd slot waits", `{"slot_waits_per_run":100001}`, "alerts.slot_waits_per_run"},
+		{"negative window", `{"window_hours":-72}`, "alerts.window_hours"},
+		{"absurd window", `{"window_hours":8761}`, "alerts.window_hours"},
+		{"negative ratio baseline", `{"ttft_p50_ratio_baseline_hours":-168}`, "alerts.ttft_p50_ratio_baseline_hours"},
+		{"absurd ratio baseline", `{"ttft_p50_ratio_baseline_hours":99999}`, "alerts.ttft_p50_ratio_baseline_hours"},
+		{"zero decode baseline", `{"decode_baseline_hours":0}`, "alerts.decode_baseline_hours"},
+		{"negative decode baseline", `{"decode_baseline_hours":-1}`, "alerts.decode_baseline_hours"},
+	} {
+		t.Run(bad.name, func(t *testing.T) {
+			_, err := loadConfig(writeAlertModels(t, bad.block))
+			if err == nil {
+				t.Fatalf("alerts %s: loadConfig accepted it", bad.block)
+			}
+			if !strings.Contains(err.Error(), bad.field) {
+				t.Fatalf("alerts %s: err = %v; want a message naming %s", bad.block, err, bad.field)
+			}
+		})
+	}
+	// A valid block is accepted, including the boundary values: 0.01 is the
+	// smallest decode ratio, and an explicit 0 reject_pct refuses nothing.
+	if _, err := loadConfig(writeAlertModels(t, `{"decode_ratio":0.01,"reject_pct":0,"ttft_p50_ratio":1}`)); err != nil {
+		t.Fatalf("boundary alerts refused: %v", err)
 	}
 }

@@ -6,6 +6,7 @@
     { "name": "quota-calibration", "every_hours": 6, "kind": "check", "command": "quota-calibration" },
     { "name": "pr-sweep", "every_hours": 6, "kind": "check", "command": "pr-sweep" },
     { "name": "flaky-tests", "every_hours": 24, "kind": "check", "command": "flaky-tests" },
-    { "name": "factory-report", "every_hours": 168, "kind": "check", "command": "factory-report" }
+    { "name": "factory-report", "every_hours": 168, "kind": "check", "command": "factory-report" },
+    { "name": "model-stats", "every_hours": 24, "kind": "check", "command": "model-stats" }
   ]
 }
