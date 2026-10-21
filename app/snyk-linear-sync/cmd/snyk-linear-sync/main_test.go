@@ -92,6 +92,10 @@ func (f *failingLinear) LoadSnapshot(context.Context) ([]model.ExistingIssue, er
 	return nil, nil
 }
 
+func (f *failingLinear) ExistingFingerprints(context.Context, []string) (map[string]struct{}, error) {
+	return map[string]struct{}{}, nil
+}
+
 func (f *failingLinear) CreateIssues(context.Context, []model.DesiredIssue) ([]int, error) {
 	f.createCalls++
 	return nil, errLinearWrite
@@ -119,6 +123,10 @@ type healthyLinear struct {
 
 func (h *healthyLinear) LoadSnapshot(context.Context) ([]model.ExistingIssue, error) {
 	return nil, nil
+}
+
+func (h *healthyLinear) ExistingFingerprints(context.Context, []string) (map[string]struct{}, error) {
+	return map[string]struct{}{}, nil
 }
 
 func (h *healthyLinear) CreateIssues(_ context.Context, desired []model.DesiredIssue) ([]int, error) {
