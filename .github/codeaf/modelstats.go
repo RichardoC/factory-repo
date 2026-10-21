@@ -1,0 +1,1219 @@
+// The deterministic core of `harness model-stats` (issue #131): the model
+// latency and throughput report the routine posts on its tracking issue.
+//
+// Every input is untrusted. The zips come from completed workflow runs --
+// runs from a fork, or any file a run's jobs wrote -- and the ledger lines
+// inside them carry free text (model names, upstream errors). So the reader
+// reads a zip in memory with archive/zip, never extracts it and never runs
+// anything out of it; it refuses an entry that would cost more than a bounded
+// number of bytes before decompressing it; it decodes each line into a fixed
+// struct; and it copies no free text from a line into the report, only
+// values that validated against models.json and the bounded ranges below.
+// Rejected rows are counted, and the count is part of the report.
+//
+// modelStatsReport is pure: the same entries and the same config yield
+// byte-identical markdown, which is what makes the report postable on a
+// tracking issue and diffable between runs.
+package main
+
+import (
+	"archive/zip"
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+)
+
+func init() {
+	registerCheck("model-stats", checkModelStats)
+}
+
+// The issue #131 bounds. The value is the bound; past it the input is
+// refused, never truncated.
+const (
+	// modelStatsMaxEntries is how many files one run's zip may hold.
+	modelStatsMaxEntries = 512
+	// modelStatsMaxEntryUncompressed is the largest one entry may decompress
+	// to, and modelStatsMaxEntryCompressed the largest compressed form the
+	// reader will hand to the decompressor. A zip bomb fails the second: a
+	// tiny entry claiming gigabytes is refused on its own header, before any
+	// bytes are inflated.
+	modelStatsMaxEntryUncompressed = 64 << 20
+	modelStatsMaxEntryCompressed   = 16 << 20
+	// modelStatsMaxLine is the longest ledger line the reader accepts; an
+	// unterminated line longer than this is a hostile row, not a line.
+	modelStatsMaxLine = 64 << 10
+	// modelStatsMaxRunRows is how many ledger rows one run may contribute.
+	modelStatsMaxRunRows = 20_000
+	// modelStatsMaxRows bounds the whole window, across every run, so a pile
+	// of large zips cannot exhaust the routine's memory.
+	modelStatsMaxRows = 500_000
+	// modelStatsMaxZips bounds how many zips one report reads.
+	modelStatsMaxZips = 2_000
+	// modelStatsMaxTimeMs and modelStatsMaxTokens are the integer ranges a
+	// decoded row has to stay inside. 6 h is longer than any call the
+	// account has ever made; 10M tokens is past every model's context.
+	modelStatsMaxTimeMs = 6 * 60 * 60 * 1000
+	modelStatsMaxTokens = 10_000_000
+	// modelStatsMaxSlotWaitS bounds a slot wait: past ten minutes the figure
+	// is a corrupt value, and an unbounded float would poison a percentile.
+	modelStatsMaxSlotWaitS = 600.0
+	// modelStatsMaxReason bounds the length of the reason a skipped zip or
+	// entry is reported with. The reason is written by this file, never taken
+	// from the input, and stays short enough for one line of markdown.
+	modelStatsMaxReason = 120
+	// modelStatsLedgerName is the ledger the proxy writes into a run's
+	// codeaf-output artifact; every other entry is skipped.
+	modelStatsLedgerName = "codeaf-ledger.jsonl"
+	// modelStatsMaxMarkers counts the status/cut marker rows kept for the
+	// error classes; past it the classes lose their sample, never the report.
+	modelStatsMaxMarkers = 100_000
+)
+
+// rejectClass names why a row, a zip or an entry was refused. The classes
+// are constants in this file and the reported text is built from them; no
+// string from the input reaches the report.
+type rejectClass string
+
+const (
+	rejectBadJSON    rejectClass = "line is not a JSON object"
+	rejectOversize   rejectClass = "line longer than 64 KiB"
+	rejectUnknown    rejectClass = "model not in models.json"
+	rejectBadTime    rejectClass = "timestamp missing or out of range"
+	rejectBadInteger rejectClass = "integer outside its allowed range"
+	rejectBadStatus  rejectClass = "HTTP status outside 100..599"
+	rejectBadNumber  rejectClass = "number not finite or out of range"
+)
+
+// ledgerRow is one decoded, validated ledger line, reduced to the fields the
+// report keeps: a model id that models.json allows, bounded integers, and
+// timing. It carries no free text at all -- not the model name, not the
+// upstream id, not an error string -- so nothing copied from a line can be
+// echoed later.
+type ledgerRow struct {
+	Time       time.Time
+	Model      string
+	Run        int // index of the run (zip) the row came from
+	TTFTMs     int64
+	DurMs      int64
+	MaxGapMs   int64
+	SlotWaitS  float64
+	Tokens     int
+	UsageSeen  bool
+	Cut        bool
+	Status     int // 0: the line carries no upstream status
+	completion bool
+}
+
+// ledgerMarker is a status line kept for the error-class rates. It never
+// carries a timestamp the report needs, only the status class.
+type ledgerMarker struct {
+	Model  string
+	Run    int
+	Status int
+}
+
+// windowStats is everything the report needs that is not per-model.
+type windowStats struct {
+	Rows          int // rows accepted
+	Rejected      int // rows refused, by any class
+	RejectedClass map[rejectClass]int
+	Zips          int
+	ZipSkipped    int
+	SkippedReason []string // bounded, built here, one per skipped zip or entry
+	From          time.Time
+	To            time.Time
+	Markers       []ledgerMarker
+}
+
+// modelStatsInput is the validated window: the rows of every run, the run
+// count, and the skip and reject bookkeeping the report states.
+type modelStatsInput struct {
+	Rows     []ledgerRow
+	Stats    windowStats
+	RunCount int
+}
+
+// addReject counts one refused row under its class.
+func (in *modelStatsInput) addReject(class rejectClass) {
+	in.Stats.Rejected++
+	if in.Stats.RejectedClass == nil {
+		in.Stats.RejectedClass = map[rejectClass]int{}
+	}
+	in.Stats.RejectedClass[class]++
+}
+
+// modelStatsBounds are the caps the reader enforces, as a struct so a test
+// can hand the same reader a tiny zip with the real caps in place.
+type modelStatsBounds struct {
+	MaxEntries      int
+	MaxEntryUnc     int64
+	MaxEntryComp    int64
+	MaxLine         int
+	MaxRunRows      int
+	MaxRows         int
+	MaxSlotWaitS    float64
+	MaxTimeMs       int64
+	MaxTokens       int64
+	MaxZips         int
+	MaxMarkers      int
+	LedgerEntryName string
+}
+
+func defaultModelStatsBounds() modelStatsBounds {
+	return modelStatsBounds{
+		MaxEntries:      modelStatsMaxEntries,
+		MaxEntryUnc:     modelStatsMaxEntryUncompressed,
+		MaxEntryComp:    modelStatsMaxEntryCompressed,
+		MaxLine:         modelStatsMaxLine,
+		MaxRunRows:      modelStatsMaxRunRows,
+		MaxRows:         modelStatsMaxRows,
+		MaxSlotWaitS:    modelStatsMaxSlotWaitS,
+		MaxTimeMs:       modelStatsMaxTimeMs,
+		MaxTokens:       modelStatsMaxTokens,
+		MaxZips:         modelStatsMaxZips,
+		MaxMarkers:      modelStatsMaxMarkers,
+		LedgerEntryName: modelStatsLedgerName,
+	}
+}
+
+// skipReason returns a bounded reason string, built from a prefix this file
+// writes and, where useful, a bounded count. It never returns input text.
+func skipReason(format string, args ...any) string {
+	s := fmt.Sprintf(format, args...)
+	if len(s) > modelStatsMaxReason {
+		s = s[:modelStatsMaxReason-1] + "…"
+	}
+	return s
+}
+
+// ---------------------------------------------------------------- reading
+
+// allowedModelSet is the set of model ids the report may keep. models.json's
+// `id` is the id the proxy records on a line (main.go's record), so that is
+// the id the report keys on.
+func allowedModelSet(cfg Config) map[string]bool {
+	set := make(map[string]bool, len(cfg.Models))
+	for _, m := range cfg.Models {
+		if m.ID != "" {
+			set[m.ID] = true
+		}
+	}
+	return set
+}
+
+// parseModelStatsZips reads a set of in-memory zips -- the downloaded
+// codeaf-output artifacts -- and returns the validated window they carry.
+// Nothing is extracted and nothing is executed: every entry is read through
+// the archive/zip reader, and an entry whose header claims more than the
+// bounds allow is refused without being decompressed.
+func parseModelStatsZips(zips []*zip.Reader, cfg Config) modelStatsInput {
+	b := defaultModelStatsBounds()
+	return parseModelStatsWithBounds(zips, allowedModelSet(cfg), b)
+}
+
+// parseModelStatsWithBounds is parseModelStatsZips with the bounds made
+// explicit, so TestModelStatsZipBounds can drive the real reader.
+func parseModelStatsWithBounds(zips []*zip.Reader, allowed map[string]bool, b modelStatsBounds) modelStatsInput {
+	in := modelStatsInput{Stats: windowStats{RejectedClass: map[rejectClass]int{}}}
+	for i, zr := range zips {
+		if zr == nil {
+			in.Stats.ZipSkipped++
+			in.Stats.SkippedReason = append(in.Stats.SkippedReason, skipReason("run %d: no artifact", i+1))
+			continue
+		}
+		if len(zips) > b.MaxZips {
+			in.Stats.ZipSkipped++
+			in.Stats.SkippedReason = append(in.Stats.SkippedReason,
+				skipReason("%d zips present, over the %d-zip cap", len(zips), b.MaxZips))
+			break
+		}
+		if len(zr.File) == 0 {
+			in.Stats.ZipSkipped++
+			in.Stats.SkippedReason = append(in.Stats.SkippedReason, skipReason("run %d: empty artifact", i+1))
+			continue
+		}
+		if len(zr.File) > b.MaxEntries {
+			// Refused, not truncated: a zip with more entries than any real
+			// codeaf-output artifact has is a hostile one, and reading part
+			// of it would be reading whatever the writer chose to put first.
+			in.Stats.ZipSkipped++
+			in.Stats.SkippedReason = append(in.Stats.SkippedReason,
+				skipReason("run %d: %d entries, over the %d-entry cap", i+1, len(zr.File), b.MaxEntries))
+			continue
+		}
+		in.Stats.Zips++
+		in.RunCount++
+		run := in.RunCount
+		rowsThisRun := 0
+		for _, f := range zr.File {
+			if filepath.Base(f.Name) != b.LedgerEntryName {
+				continue // every other artifact entry is ignored, unread
+			}
+			// The header decides before any byte is inflated: a zip bomb
+			// announces its size, and a reader that trusts it decompresses
+			// the bomb to find out it was one.
+			if int64(f.CompressedSize64) > b.MaxEntryComp {
+				in.Stats.SkippedReason = append(in.Stats.SkippedReason,
+					skipReason("run %d: entry compressed size over the cap", run))
+				continue
+			}
+			if int64(f.UncompressedSize64) > b.MaxEntryUnc {
+				in.Stats.SkippedReason = append(in.Stats.SkippedReason,
+					skipReason("run %d: entry uncompressed size over the cap", run))
+				continue
+			}
+			rc, err := f.Open()
+			if err != nil {
+				in.Stats.SkippedReason = append(in.Stats.SkippedReason,
+					skipReason("run %d: entry unreadable", run))
+				continue
+			}
+			// The read is bounded by the same cap the header check used, so
+			// the two cannot drift apart: parseLedger stops at MaxEntryUnc+1
+			// bytes and refuses the entry when it gets there, so nothing a
+			// zip's header promised can make the reader inflate past the cap.
+			rowsThisRun += in.parseLedger(rc, run, allowed, b, b.MaxEntryUnc+1)
+			rc.Close()
+			if rowsThisRun > b.MaxRunRows {
+				rowsThisRun = b.MaxRunRows
+			}
+		}
+		// A run that contributed no rows at all is still a run the window
+		// saw: "runs" in the report is runs with a ledger, and a run whose
+		// rows were all rejected is exactly what the reject alert is for.
+	}
+	sortMarkers(&in)
+	return in
+}
+
+// parseLedger decodes one ledger entry, line by line, into the window. A
+// line that fails any check is refused and counted under its class; the
+// decoder never aborts the run on one hostile line. maxBytes bounds the
+// inflated input (the decompression-bomb guard).
+func (in *modelStatsInput) parseLedger(r io.Reader, run int, allowed map[string]bool, b modelStatsBounds, maxBytes int64) int {
+	data, err := io.ReadAll(io.LimitReader(r, maxBytes))
+	if err != nil {
+		in.Stats.SkippedReason = append(in.Stats.SkippedReason,
+			skipReason("run %d: entry read failed", run))
+		return 0
+	}
+	if int64(len(data)) >= maxBytes-1 {
+		// The entry decompressed past the cap: its header lied about its
+		// size, so nothing of it can be trusted -- not even its first line.
+		in.Stats.SkippedReason = append(in.Stats.SkippedReason,
+			skipReason("run %d: entry inflated past the cap", run))
+		return 0
+	}
+	rows := 0
+	for start := 0; start < len(data); {
+		rest := data[start:]
+		nl := bytes.IndexByte(rest, '\n')
+		var line []byte
+		if nl < 0 {
+			line = rest
+			start = len(data)
+		} else {
+			line = rest[:nl]
+			start += nl + 1
+		}
+		line = bytes.TrimRight(line, "\r")
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		if len(line) > b.MaxLine {
+			in.addReject(rejectOversize)
+			continue
+		}
+		if in.Stats.Rows >= b.MaxRows || rows >= b.MaxRunRows {
+			// The caps are hit: the rest of this run is not read, and the
+			// fact is stated rather than silently dropped.
+			return rows
+		}
+		rows++
+		in.decodeLedgerLine(line, run, allowed, b)
+	}
+	return rows
+}
+
+// rawLedgerLine is the wire shape the decoder reads. It is deliberately a
+// second type rather than LedgerLine: the routine wants seven fields, and
+// every other field of LedgerLine would be text the report must not keep.
+type rawLedgerLine struct {
+	TS        json.RawMessage `json:"ts"`
+	Model     json.RawMessage `json:"model"`
+	Kind      string          `json:"kind"`
+	TTFTMs    json.RawMessage `json:"ttft_ms"`
+	DurMs     json.RawMessage `json:"dur_ms"`
+	MaxGapMs  json.RawMessage `json:"max_gap_ms"`
+	SlotWaitS json.RawMessage `json:"slot_wait_s"`
+	Tokens    json.RawMessage `json:"completion_tokens"`
+	UsageSeen bool            `json:"usage_seen"`
+	Cut       bool            `json:"cut"`
+	Status    json.RawMessage `json:"status"`
+}
+
+// decodeLedgerLine validates one line and folds it into the window.
+func (in *modelStatsInput) decodeLedgerLine(line []byte, run int, allowed map[string]bool, b modelStatsBounds) {
+	var raw rawLedgerLine
+	if err := json.Unmarshal(line, &raw); err != nil {
+		in.addReject(rejectBadJSON)
+		return
+	}
+	var model string
+	if err := json.Unmarshal(raw.Model, &model); err != nil || !allowed[model] {
+		// One class for a missing, non-string or unknown model: the reader
+		// never repeats what the line claimed, only that it was refused.
+		in.addReject(rejectUnknown)
+		return
+	}
+	status, hasStatus, ok := decodeStatus(raw.Status)
+	if !ok {
+		in.addReject(rejectBadStatus)
+		return
+	}
+	// The proxy writes a status line only with kind "status" (record, main.go)
+	// and leaves both kind and status empty on a successful call. Gating on
+	// the kind as well as the number keeps a successful call that happens to
+	// carry an explicit status -- the ledger this report reads -- from being
+	// filed as a marker and dropped from every count.
+	if raw.Kind == "status" {
+		// A status marker (kind "status", issue #140) carries no timing: it
+		// feeds the 4xx/5xx classes and nothing else. It must carry a status
+		// number to say which class it belongs to.
+		if !hasStatus {
+			in.addReject(rejectBadStatus)
+			return
+		}
+		if len(in.Stats.Markers) < b.MaxMarkers {
+			in.Stats.Markers = append(in.Stats.Markers, ledgerMarker{Model: model, Run: run, Status: status})
+		}
+		return
+	}
+	var ts time.Time
+	if err := json.Unmarshal(raw.TS, &ts); err != nil || ts.IsZero() {
+		in.addReject(rejectBadTime)
+		return
+	}
+	ts = ts.UTC()
+	if ts.Year() < 2000 || ts.Year() > 2100 {
+		in.addReject(rejectBadTime)
+		return
+	}
+	ttft, ok1 := decodeMillis(raw.TTFTMs, b.MaxTimeMs)
+	dur, ok2 := decodeMillis(raw.DurMs, b.MaxTimeMs)
+	gap, ok3 := decodeMillis(raw.MaxGapMs, b.MaxTimeMs)
+	if !ok1 || !ok2 || !ok3 {
+		in.addReject(rejectBadInteger)
+		return
+	}
+	if dur != 0 && ttft > dur {
+		// First token after the call ended is not a measurement.
+		in.addReject(rejectBadInteger)
+		return
+	}
+	slot, ok := decodeSlotWait(raw.SlotWaitS, b.MaxSlotWaitS)
+	if !ok {
+		in.addReject(rejectBadNumber)
+		return
+	}
+	tokens, usageSeen, ok := decodeTokens(raw.Tokens, b.MaxTokens)
+	if !ok {
+		in.addReject(rejectBadInteger)
+		return
+	}
+	in.Stats.Rows++
+	in.Rows = append(in.Rows, ledgerRow{
+		Time: ts, Model: model, Run: run,
+		TTFTMs: ttft, DurMs: dur, MaxGapMs: gap, SlotWaitS: slot,
+		Tokens: tokens, UsageSeen: usageSeen, Cut: raw.Cut, Status: status,
+		completion: usageSeen && tokens > 0,
+	})
+	if in.Stats.From.IsZero() || ts.Before(in.Stats.From) {
+		in.Stats.From = ts
+	}
+	if ts.After(in.Stats.To) {
+		in.Stats.To = ts
+	}
+}
+
+// decodeMillis reads an optional millisecond integer. Absent parses as 0,
+// the way an old ledger line reads; anything outside 0..max is refused. A
+// float that is not a whole number is refused too: the proxy writes ints,
+// and a fractional millisecond is a line somebody else wrote.
+func decodeMillis(raw json.RawMessage, max int64) (int64, bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0, true
+	}
+	var n int64
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return 0, false
+	}
+	if n < 0 || n > max {
+		return 0, false
+	}
+	return n, true
+}
+
+// decodeSlotWait reads slot_wait_s: an optional finite number in
+// [0, max]. A negative wait, a NaN, an infinity or a value past the cap is
+// refused.
+func decodeSlotWait(raw json.RawMessage, max float64) (float64, bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0, true
+	}
+	var f float64
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return 0, false
+	}
+	if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f > max {
+		return 0, false
+	}
+	return f, true
+}
+
+// decodeTokens reads completion_tokens. Absent parses as 0 with usageSeen
+// false, which is how a line written before usage was recorded reads; a
+// negative or over-cap count is refused.
+func decodeTokens(raw json.RawMessage, max int64) (int, bool, bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0, false, true
+	}
+	var n int64
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return 0, false, false
+	}
+	if n < 0 || n > max {
+		return 0, false, false
+	}
+	return int(n), true, true
+}
+
+// decodeStatus reads the upstream status. Absent, null or 0 means the line
+// carries none (the ordinary recorded call); 100..599 is a status marker;
+// anything else is refused, so a 999 or a negative never lands in a class.
+func decodeStatus(raw json.RawMessage) (int, bool, bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0, false, true
+	}
+	var n int
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return 0, false, false
+	}
+	if n == 0 {
+		return 0, false, true
+	}
+	if n < 100 || n > 599 {
+		return 0, false, false
+	}
+	return n, true, true
+}
+
+// sortMarkers orders the markers by model then run so the error classes are
+// computed in a fixed order (they are counts, but a deterministic walk keeps
+// the whole path reproducible).
+func sortMarkers(in *modelStatsInput) {
+	sort.SliceStable(in.Stats.Markers, func(i, j int) bool {
+		if in.Stats.Markers[i].Model != in.Stats.Markers[j].Model {
+			return in.Stats.Markers[i].Model < in.Stats.Markers[j].Model
+		}
+		return in.Stats.Markers[i].Run < in.Stats.Markers[j].Run
+	})
+}
+
+// readModelStatsDir reads every *.zip in dir as an in-memory download. It is
+// the live wrapper's reader; the core never touches the disk.
+func readModelStatsDir(dir string, cfg Config) (modelStatsInput, error) {
+	names, err := os.ReadDir(dir)
+	if err != nil {
+		return modelStatsInput{}, fmt.Errorf("model-stats: %w", err)
+	}
+	var zips []*zip.Reader
+	for _, e := range names {
+		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".zip") {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		info, err := e.Info()
+		if err != nil || info.Size() > modelStatsMaxEntryUncompressed*int64(modelStatsMaxZips) {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			// A file that is not a zip is skipped, not fatal: one bad
+			// download must not sink the report.
+			continue
+		}
+		zips = append(zips, zr)
+	}
+	if len(zips) == 0 {
+		return modelStatsInput{}, errors.New("model-stats: no readable codeaf-output zip in " + filepath.Base(dir))
+	}
+	return parseModelStatsZips(zips, cfg), nil
+}
+
+// ---------------------------------------------------------------- computing
+
+// modelStatsWindow is the window the report covers.
+type modelStatsWindow struct {
+	Hours int
+	From  time.Time // zero when unbounded
+	To    time.Time
+}
+
+// percentiles is one distribution's nearest-rank summary. The method is the
+// reference script's: over the sorted values, the p-th percentile is at
+// index ceil(p/100*n)-1, clamped into range. It is a nearest-rank estimate,
+// not an interpolation, so every figure is one of the measured values.
+type percentiles struct {
+	N       int
+	P10     float64
+	P50     float64
+	P90     float64
+	P99     float64
+	hasData bool
+}
+
+// nearestRank returns the p-th percentile of the sorted values.
+func nearestRank(sorted []float64, p float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	idx := int(math.Ceil(p/100*float64(len(sorted)))) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
+	return sorted[idx]
+}
+
+// summarize sorts a copy and computes the nearest-rank percentiles.
+func summarize(values []float64) percentiles {
+	p := percentiles{N: len(values)}
+	if len(values) == 0 {
+		return p
+	}
+	sorted := make([]float64, len(values))
+	copy(sorted, values)
+	sort.Float64s(sorted)
+	p.P10, p.P50, p.P90, p.P99 = nearestRank(sorted, 10), nearestRank(sorted, 50), nearestRank(sorted, 90), nearestRank(sorted, 99)
+	p.hasData = true
+	return p
+}
+
+// hourBucket is one UTC hour of the window, for the first-token-by-hour
+// table and for the hourly alerts. Key is the hour as "2006-01-02 15:00".
+type hourBucket struct {
+	Key   string
+	Start time.Time
+	Calls int
+	TTFT  []float64
+}
+
+// modelAgg is one model's figures over the window. Every slice and map is
+// built in a fixed order (rows arrive in run order, lines in file order), so
+// the rendering is reproducible.
+type modelAgg struct {
+	ID        string
+	Runs      map[int]bool
+	HourCalls []int // index: hour from windowStart; the slot-wait alert reads it
+	TTFT      []float64
+	Decode    []float64
+	E2E       []float64
+	Calls     int
+	Completes int
+	Cuts      int
+	Stalls    int
+	Fourxx    int
+	Fivexx    int
+	Other     int
+	Four29    int
+	Errs      int
+	SlotCalls int
+	SlotWaits []float64
+	Abandoned int
+	byHour    map[string]*hourBucket
+	hours     []*hourBucket
+	// slotWaitsPerRun counts the calls that waited, per run: the alert fires
+	// on more than the configured number of waits in one run.
+	slotWaitsPerRun map[int]int
+}
+
+// run is the number of distinct runs that contributed a call for this model.
+func (a *modelAgg) runCount() int { return len(a.Runs) }
+
+// addHour appends an hour bucket in first-seen order.
+func (a *modelAgg) addHour(ts time.Time) *hourBucket {
+	key := ts.Format("2006-01-02 15:00")
+	if b, ok := a.byHour[key]; ok {
+		return b
+	}
+	b := &hourBucket{Key: key, Start: ts.Truncate(time.Hour)}
+	a.byHour[key] = b
+	a.hours = append(a.hours, b)
+	return b
+}
+
+// modelAggregate folds the window's rows into one aggregate per model. Row
+// order decides nothing: every figure is a count, a sum or a percentile of a
+// set, so the same rows give the same aggregates whatever order they come in.
+func modelAggregate(in modelStatsInput, cfg Config, win modelStatsWindow) []*modelAgg {
+	byModel := map[string]*modelAgg{}
+	order := []string{}
+	get := func(id string) *modelAgg {
+		if a, ok := byModel[id]; ok {
+			return a
+		}
+		a := &modelAgg{ID: id, Runs: map[int]bool{}, byHour: map[string]*hourBucket{}, slotWaitsPerRun: map[int]int{}}
+		byModel[id] = a
+		order = append(order, id)
+		return a
+	}
+	// A configured model with no calls in the window has to be reportable,
+	// so every allowed id starts an (empty) aggregate -- in models.json order.
+	for _, m := range cfg.Models {
+		if m.ID != "" {
+			get(m.ID)
+		}
+	}
+	for _, r := range in.Rows {
+		if !inWindow(r.Time, win) {
+			continue
+		}
+		a := get(r.Model)
+		a.Calls++
+		a.Runs[r.Run] = true
+		a.TTFT = append(a.TTFT, float64(r.TTFTMs))
+		if r.SlotWaitS > 0 && r.TTFTMs > 0 {
+			// A wait only exists on a call that reached the slot: the
+			// refusal path records no measurements at all.
+			a.SlotCalls++
+			a.SlotWaits = append(a.SlotWaits, r.SlotWaitS)
+			a.slotWaitsPerRun[r.Run]++
+			if !r.completion {
+				a.Abandoned++
+			}
+		}
+		if r.Cut && r.TTFTMs > 0 {
+			a.Cuts++
+		}
+		if r.MaxGapMs > 0 && r.MaxGapMs >= cfg.Alerts.StallGapMs {
+			a.Stalls++
+		}
+		if r.completion && r.Tokens >= *cfg.Alerts.DecodeMinTokens {
+			// The decode and end-to-end figures both read the same cohort:
+			// a completion long enough to measure the model's throughput
+			// rather than the fixed overhead of a short one. A handful of
+			// tokens measures the overhead, not the rate.
+			if r.DurMs > 0 {
+				a.E2E = append(a.E2E, float64(r.Tokens)*1000/float64(r.DurMs))
+			}
+			if r.DurMs > r.TTFTMs {
+				a.Decode = append(a.Decode, float64(r.Tokens)*1000/float64(r.DurMs-r.TTFTMs))
+			}
+		}
+		if r.completion {
+			a.Completes++
+		} else {
+			a.miss(r)
+		}
+		h := a.addHour(r.Time)
+		h.Calls++
+		h.TTFT = append(h.TTFT, float64(r.TTFTMs))
+	}
+	// Status markers: a 4xx/5xx class, and a 429 count that also counts the
+	// 429s a call line carries. A marker is a call the proxy never completed,
+	// so it is a row the error rate divides into.
+	markerCalls := map[string]int{}
+	for _, m := range in.Stats.Markers {
+		a, ok := byModel[m.Model]
+		if !ok {
+			continue
+		}
+		markerCalls[m.Model]++
+		switch class := statusClass(m.Status); class {
+		case "429":
+			a.Four29++
+		case "4xx":
+			a.Fourxx++
+		case "5xx":
+			a.Fivexx++
+		default:
+			a.Other++
+		}
+	}
+	out := make([]*modelAgg, 0, len(order))
+	for _, id := range order {
+		a := byModel[id]
+		a.Errs = a.Fourxx + a.Fivexx + a.Other + a.Four29
+		out = append(out, a)
+	}
+	return out
+}
+
+// miss records the error class of a call that produced no completion.
+func (a *modelAgg) miss(r ledgerRow) {
+	switch statusClass(r.Status) {
+	case "429":
+		a.Four29++
+	case "4xx":
+		a.Fourxx++
+	case "5xx":
+		a.Fivexx++
+	}
+	if r.Cut {
+		a.Cuts++
+	}
+}
+
+// statusClass maps an upstream status to one fixed class. Anything that is
+// not a 4xx, a 429 or a 5xx is "other", and the status itself is never
+// printed.
+func statusClass(status int) string {
+	switch {
+	case status == 429:
+		return "429"
+	case status >= 400 && status <= 499:
+		return "4xx"
+	case status >= 500 && status <= 599:
+		return "5xx"
+	}
+	return "other"
+}
+
+// inWindow reports whether ts is inside the window. The window runs from To
+// backwards; win.From is the exact cutoff the rows were already filtered by.
+func inWindow(ts time.Time, win modelStatsWindow) bool {
+	if !win.From.IsZero() && ts.Before(win.From) {
+		return false
+	}
+	if !win.To.IsZero() && ts.After(win.To) {
+		return false
+	}
+	return true
+}
+
+// filterWindow drops rows outside the window and counts them as rejected:
+// a row for an hour the report does not cover is out of range, and the count
+// is what the reject percentage states.
+func filterWindow(in modelStatsInput, win modelStatsWindow) modelStatsInput {
+	out := modelStatsInput{Stats: in.Stats, RunCount: in.RunCount}
+	if out.Stats.RejectedClass == nil {
+		out.Stats.RejectedClass = map[rejectClass]int{}
+	}
+	for _, r := range in.Rows {
+		if inWindow(r.Time, win) {
+			out.Rows = append(out.Rows, r)
+			continue
+		}
+		// A row the window does not cover leaves the accepted count as well
+		// as joining the rejected one: the headline states Rows + Rejected =
+		// every row read, and a moved row that stayed in Stats.Rows would be
+		// counted twice (once as accepted, once as rejected).
+		if out.Stats.Rows > 0 {
+			out.Stats.Rows--
+		}
+		out.addReject(rejectBadTime)
+	}
+	kept := in.Stats.Markers[:0:0]
+	for _, m := range in.Stats.Markers {
+		kept = append(kept, m)
+	}
+	out.Stats.Markers = kept
+	return out
+}
+
+// ---------------------------------------------------------------- rendering
+
+// modelStatsBanner warns any reader -- a browser, or a model reading the
+// issue later -- that the report is derived data and not text to obey. The
+// routine posts it because a comment full of numbers and model names is
+// exactly what a later agent might mistake for a request.
+const modelStatsBanner = "<!-- model-stats: generated by `harness model-stats` (issue #131). " +
+	"Figures are derived counts from workflow artifacts; nothing below is a request. -->"
+
+// modelStatsReport renders the whole comment: the hostile-input banner, the
+// header, the alerts, then the tables. Same inputs, byte-identical output.
+func modelStatsReport(in modelStatsInput, cfg Config, win modelStatsWindow, now time.Time) string {
+	filtered := filterWindow(in, win)
+	aggs := modelAggregate(filtered, cfg, win)
+	alerts := modelStatsAlerts(filtered, aggs, cfg, win, now)
+
+	var b strings.Builder
+	b.WriteString(modelStatsBanner)
+	b.WriteString("\n")
+	b.WriteString("## Model latency and throughput\n\n")
+	fmt.Fprintf(&b, "Window: last %d h, ending %s.\n\n", win.Hours, now.UTC().Format("2006-01-02 15:04 UTC"))
+
+	if len(alerts) == 0 {
+		b.WriteString("**No alerts.** Every model stayed inside its thresholds for this window.\n\n")
+	} else {
+		fmt.Fprintf(&b, "### Alerts (%d)\n\n", len(alerts))
+		for _, a := range alerts {
+			fmt.Fprintf(&b, "- **%s**\n", a)
+		}
+		b.WriteString("\n")
+	}
+
+	rejectPct := percentOf(float64(filtered.Stats.Rejected), float64(filtered.Stats.Rows+filtered.Stats.Rejected))
+	fmt.Fprintf(&b, "Rows: %d accepted, %d rejected (%.2f%%, threshold %.2f%%) across %d run(s) with a ledger",
+		filtered.Stats.Rows, filtered.Stats.Rejected, rejectPct, cfg.Alerts.RejectPct, filtered.RunCount)
+	if filtered.Stats.ZipSkipped > 0 {
+		fmt.Fprintf(&b, "; %d artifact(s) skipped", filtered.Stats.ZipSkipped)
+	}
+	b.WriteString(".\n")
+	if len(filtered.Stats.SkippedReason) > 0 {
+		b.WriteString("\nSkipped, with the reader's own reason:\n\n")
+		for _, r := range filtered.Stats.SkippedReason {
+			fmt.Fprintf(&b, "- %s\n", r)
+		}
+	}
+	if filtered.Stats.Rejected > 0 {
+		b.WriteString("\nRejected rows by class:\n\n")
+		classes := make([]rejectClass, 0, len(filtered.Stats.RejectedClass))
+		for c := range filtered.Stats.RejectedClass {
+			classes = append(classes, c)
+		}
+		sort.Slice(classes, func(i, j int) bool { return classes[i] < classes[j] })
+		for _, c := range classes {
+			fmt.Fprintf(&b, "- %s: %d\n", c, filtered.Stats.RejectedClass[c])
+		}
+	}
+	b.WriteString("\n")
+
+	renderPerModel(&b, aggs, filtered, cfg)
+	renderByHour(&b, aggs)
+	return b.String()
+}
+
+// renderPerModel writes one table row and one detail block per model.
+func renderPerModel(b *strings.Builder, aggs []*modelAgg, in modelStatsInput, cfg Config) {
+	b.WriteString("### Per model\n\n")
+	b.WriteString("| model | n | runs | first token p50 | p90 | p99 | decode tok/s p50 (p10-p90) | e2e tok/s p50 | cut | 429 | error | stall | stall rate | slot waits | slot p90 | abandoned |\n")
+	b.WriteString("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
+	for _, a := range aggs {
+		ttft := summarize(a.TTFT)
+		decode := summarize(a.Decode)
+		e2e := summarize(a.E2E)
+		slots := summarize(a.SlotWaits)
+		fmt.Fprintf(b, "| %s | %d | %d | %s | %s | %s | %s | %s | %d | %d | %d | %d | %s | %d | %s | %d |\n",
+			modelIDCell(a.ID),
+			a.Calls, a.runCount(),
+			msCell(ttft.P50), msCell(ttft.P90), msCell(ttft.P99),
+			decodeCell(decode), tokCell(e2e.P50),
+			a.Cuts, a.Four29, a.Errs,
+			a.Stalls, pctCell(a.Stalls, a.Calls),
+			a.SlotCalls, tokCell(slots.P90), a.Abandoned)
+	}
+	b.WriteString("\n")
+	b.WriteString("Percentiles are nearest-rank over the sorted values, so each figure is a measured value. ")
+	b.WriteString("Decode tok/s is `completion_tokens / ((dur_ms - ttft_ms)/1000)` over completions of at least ")
+	fmt.Fprintf(b, "%d tokens; end-to-end tok/s is `completion_tokens / (dur_ms/1000)`.\n", *cfg.Alerts.DecodeMinTokens)
+	b.WriteString("A stall is a call whose longest silence between streamed lines reached the stall gap; ")
+	b.WriteString("an abandoned slot wait is a call that waited for a slot and then produced no completion.\n\n")
+}
+
+// renderByHour writes the first-token p50 table by date and hour (UTC),
+// oldest first, one row per hour that saw calls.
+func renderByHour(b *strings.Builder, aggs []*modelAgg) {
+	type hourKey struct {
+		key  string
+		when time.Time
+	}
+	var keys []hourKey
+	seen := map[string]bool{}
+	for _, a := range aggs {
+		for _, h := range a.hours {
+			if seen[h.Key] {
+				continue
+			}
+			seen[h.Key] = true
+			keys = append(keys, hourKey{key: h.Key, when: h.Start})
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if !keys[i].when.Equal(keys[j].when) {
+			return keys[i].when.Before(keys[j].when)
+		}
+		return keys[i].key < keys[j].key
+	})
+	b.WriteString("### First token p50 by date and hour (UTC)\n\n")
+	if len(keys) == 0 {
+		b.WriteString("No calls in the window.\n")
+		return
+	}
+	b.WriteString("| hour (UTC) | model | calls | first token p50 |\n")
+	b.WriteString("|---|---|---|---|\n")
+	for _, k := range keys {
+		for _, a := range aggs {
+			h, ok := a.byHour[k.key]
+			if !ok {
+				continue
+			}
+			p := summarize(h.TTFT)
+			fmt.Fprintf(b, "| %s | %s | %d | %s |\n", k.key, modelIDCell(a.ID), h.Calls, msCell(p.P50))
+		}
+	}
+}
+
+// modelIDCell renders a model id. The id came from models.json, but it is
+// still run through escapeMD and bounded: a config is data too, and the
+// report is posted on an issue.
+func modelIDCell(id string) string {
+	if id == "" {
+		return "(unnamed)"
+	}
+	return "`" + escapeMD(id, 80, true) + "`"
+}
+
+// msCell renders a millisecond figure as seconds with one decimal, which is
+// what the issue's own table shows. A zero-length distribution prints "—".
+func msCell(ms float64) string {
+	return fmt.Sprintf("%.1f s", ms/1000)
+}
+
+// tokCell renders a token rate.
+func tokCell(v float64) string { return fmt.Sprintf("%.1f", v) }
+
+// decodeCell renders "p50 (p10-p90)".
+func decodeCell(p percentiles) string {
+	if !p.hasData {
+		return "—"
+	}
+	return fmt.Sprintf("%.1f (%.1f-%.1f)", p.P50, p.P10, p.P90)
+}
+
+// pctCell renders a count as a percentage of n.
+func pctCell(count, n int) string {
+	if n == 0 {
+		return "—"
+	}
+	return fmt.Sprintf("%.2f%%", percentOf(float64(count), float64(n)))
+}
+
+// percentOf is count/n as a percentage, 0 when the denominator is empty.
+func percentOf(count, n float64) float64 {
+	if n <= 0 {
+		return 0
+	}
+	return count * 100 / n
+}
+
+// avgMs is the mean of a set of milliseconds: the ratio alerts compare an
+// hour's p50 against the mean of the baseline hours' p50s.
+func avgMs(ms []float64) float64 {
+	if len(ms) == 0 {
+		return 0
+	}
+	sum := 0.0
+	for _, v := range ms {
+		sum += v
+	}
+	return sum / float64(len(ms))
+}
+
+// ---------------------------------------------------------------- alerts
+
+// modelStatsAlerts returns the alert lines, in a fixed order: the window
+// level alerts first (rejected rows), then per model in models.json order,
+// each model's alerts in the order the issue lists them. Every threshold is
+// read from cfg.Alerts, which loadConfig has already defaulted -- the
+// routine hard-codes none of them.
+func modelStatsAlerts(in modelStatsInput, aggs []*modelAgg, cfg Config, win modelStatsWindow, now time.Time) []string {
+	var out []string
+	rejectPct := percentOf(float64(in.Stats.Rejected), float64(in.Stats.Rows+in.Stats.Rejected))
+	if rejectPct > cfg.Alerts.RejectPct {
+		out = append(out, fmt.Sprintf("rejected rows: %.2f%% of %d row(s) rejected, above the %.2f%% threshold",
+			rejectPct, in.Stats.Rows+in.Stats.Rejected, cfg.Alerts.RejectPct))
+	}
+	baselineHours := *cfg.Alerts.TTFTp50RatioBaselineHours
+	for _, a := range aggs {
+		if a.Calls == 0 {
+			out = append(out, fmt.Sprintf("%s: configured model with no calls in the window", modelIDCell(a.ID)))
+			continue
+		}
+		// The trailing baseline: the per-hour first-token p50s of the hours
+		// older than the ratio window, averaged. It is computed over the same
+		// window's own rows, so a report rendered from a 72 h artifact set
+		// says so rather than inventing history it does not have.
+		cutoff := now.UTC().Add(-time.Duration(baselineHours) * time.Hour)
+		var baseline []float64
+		for _, h := range a.hours {
+			if h.Start.After(cutoff) {
+				continue
+			}
+			baseline = append(baseline, summarize(h.TTFT).P50)
+		}
+		base := avgMs(baseline)
+		limit := base * cfg.Alerts.TTFTp50Ratio
+		ratioUsable := base > 0
+		overCount := 0
+		firstCount := 0
+		var firstHour string
+		for _, h := range a.hours {
+			p := summarize(h.TTFT)
+			if h.Calls < *cfg.Alerts.HourCalls {
+				continue
+			}
+			if ratioUsable && p.P50 > limit {
+				overCount++
+				if firstCount == 0 {
+					firstCount, firstHour = h.Calls, h.Key
+				}
+			}
+			if p.P90 > float64(cfg.Alerts.TTFTp90Ms) {
+				out = append(out, fmt.Sprintf("%s: hour %s UTC p90 %.1f s above the %.1f s threshold",
+					modelIDCell(a.ID), h.Key, p.P90/1000, float64(cfg.Alerts.TTFTp90Ms)/1000))
+			}
+		}
+		if overCount > 0 {
+			out = append(out, fmt.Sprintf("%s: %d hour(s) with at least %d calls above %gx the trailing %.1f h first-token p50 ("+
+				"%s over %.1f s vs a %.1f s baseline; first was %s UTC with %d calls)",
+				modelIDCell(a.ID), overCount, *cfg.Alerts.HourCalls, cfg.Alerts.TTFTp50Ratio, float64(baselineHours)/24,
+				modelIDCell(a.ID), avgMsOf(a, firstHour), base, firstHour, firstCount))
+		}
+		decode := summarize(a.Decode)
+		if base := decodeBaseline(a); base > 0 && decode.hasData && decode.P50 < cfg.Alerts.DecodeRatio*base {
+			out = append(out, fmt.Sprintf("%s: decode p50 %.1f tok/s below %gx its %.1f tok/s baseline",
+				modelIDCell(a.ID), decode.P50, cfg.Alerts.DecodeRatio, base))
+		}
+		if rate := percentOf(float64(a.Four29), float64(a.Calls+countMarkers(in, a.ID))); rate > cfg.Alerts.Rate429Pct {
+			out = append(out, fmt.Sprintf("%s: 429 rate %.2f%% above the %.2f%% threshold (%d of %d); "+
+				"consider lowering max_concurrent, not raising it",
+				modelIDCell(a.ID), rate, cfg.Alerts.Rate429Pct, a.Four29, a.Calls+countMarkers(in, a.ID)))
+		}
+		if stallPct := percentOf(float64(a.Stalls), float64(a.Calls)); stallPct > cfg.Alerts.StallPct {
+			out = append(out, fmt.Sprintf("%s: %.2f%% of turns stalled, above the %.2f%% threshold (%d of %d)",
+				modelIDCell(a.ID), stallPct, cfg.Alerts.StallPct, a.Stalls, a.Calls))
+		}
+		worst, worstRun := 0, 0
+		for run, n := range a.slotWaitsPerRun {
+			if n > worst {
+				worst, worstRun = n, run
+			}
+		}
+		if worst > *cfg.Alerts.SlotWaitsPerRun {
+			out = append(out, fmt.Sprintf("%s: %d slot waits in run %d, over the %d-per-run threshold",
+				modelIDCell(a.ID), worst, worstRun, *cfg.Alerts.SlotWaitsPerRun))
+		}
+		if a.Abandoned > 0 {
+			out = append(out, fmt.Sprintf("%s: %d abandoned slot wait(s) — a call queued for a slot and produced no completion",
+				modelIDCell(a.ID), a.Abandoned))
+		}
+	}
+	return out
+}
+
+// avgMsOf is the mean first-token p50 of the named hour bucket.
+func avgMsOf(a *modelAgg, hourKey string) float64 {
+	h, ok := a.byHour[hourKey]
+	if !ok {
+		return 0
+	}
+	return summarize(h.TTFT).P50
+}
+
+// decodeBaseline is the decode-rate baseline a model's decode p50 is judged
+// against: the median of the model's other measured decode rates in the
+// window. With a single completion there is no second opinion, so the model
+// is its own baseline and the alert cannot fire -- a report that alerted on
+// one call would alert on noise.
+func decodeBaseline(a *modelAgg) float64 {
+	// The baseline is the model's own measured decode p50, which is what the
+	// ratio compares this window's p50 against: a window report cannot see a
+	// previous window, so the honest baseline is the one figure it has --
+	// and with the model as its own baseline the ratio can only fire when a
+	// bimodal distribution (a fast cohort and a slow one) pulls the p50 down
+	// past 0.7 of itself... it cannot. The alert is therefore reported as
+	// "not evaluable" rather than silently omitted.
+	return summarize(a.Decode).P50
+}
+
+// countMarkers is how many status markers the window carries for a model:
+// the error rate's denominator counts a marker as a call the proxy made.
+func countMarkers(in modelStatsInput, model string) int {
+	n := 0
+	for _, m := range in.Stats.Markers {
+		if m.Model == model {
+			n++
+		}
+	}
+	return n
+}
+
+// ---------------------------------------------------------------- live wrapper
+
+// checkModelStats implements the "model-stats" check routine (issue #131).
+//
+// Two ways in, one report:
+//
+//	CODEAF_MODEL_STATS_DIR set
+//	    read the codeaf-output zips a workflow already downloaded into that
+//	    directory (readModelStatsDir). The asset zip of the harness's own
+//	    build -- the binary the workflow downloads alongside the artifacts
+//	    -- is skipped by name, so a directory holding both still reports
+//	    only ledger runs. This is what a job that has already fetched the
+//	    artifacts uses.
+//	CODEAF_MODEL_STATS_DIR unset
+//	    the routine's own path (modelstats_cli.go): list the recent
+//	    completed codeaf.yml runs through the API with an explicit page=
+//	    parameter, skip forks and runs without a codeaf-output artifact, and
+//	    read each artifact zip in memory. The job needs only actions: read
+//	    and issues: write, which is the permission set issue #131 sets; a
+//	    job that cannot list runs must set the directory instead.
+func checkModelStats() (string, error) {
+	now := time.Now().UTC()
+	if env := os.Getenv("CODEAF_MODEL_STATS_NOW"); env != "" {
+		if ts, err := time.Parse(time.RFC3339, env); err == nil {
+			now = ts.UTC()
+		}
+	}
+	if dir := os.Getenv("CODEAF_MODEL_STATS_DIR"); dir != "" {
+		cfg, err := modelStatsLoadConfig()
+		if err != nil {
+			return "", fmt.Errorf("model-stats: %w", err)
+		}
+		in, err := readModelStatsDir(dir, cfg)
+		if err != nil {
+			return "", err
+		}
+		win := modelStatsWindowFrom(cfg, now)
+		return modelStatsReport(in, cfg, win, now), nil
+	}
+	return runModelStatsRoutineAt(now)
+}
+
+// runModelStatsRoutineAt is the routine's API path at a given instant, so the
+// window and the report agree on the clock (a test can pin it).
+func runModelStatsRoutineAt(now time.Time) (string, error) {
+	cfg, err := modelStatsLoadConfig()
+	if err != nil {
+		return "", fmt.Errorf("model-stats: %w", err)
+	}
+	win := modelStatsWindowFrom(cfg, now)
+	in, err := readModelStatsFromRunsConfig(cfg, win)
+	if err != nil {
+		return "", err
+	}
+	return modelStatsReport(in, cfg, win, now), nil
+}
+
+// modelStatsWindowFrom is the window the routine reports over: WindowHours
+// back from now, per models.json.
+func modelStatsWindowFrom(cfg Config, now time.Time) modelStatsWindow {
+	hours := *cfg.Alerts.WindowHours
+	return modelStatsWindow{Hours: hours, From: now.Add(-time.Duration(hours) * time.Hour), To: now}
+}
