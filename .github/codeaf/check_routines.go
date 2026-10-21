@@ -58,7 +58,8 @@ type quotasJSON struct {
 }
 
 // ledgerJSON is the harness proxy's ledger (main.go's LedgerLine: model,
-// usd, ts), the subscription-rate spend the calibration reads. It is the
+// usd, ts), the spend (at API list prices, like every ledger figure) the
+// calibration reads. It is the
 // shape state.go and merge.go already carry, not a new one.
 type ledgerJSON = []LedgerLine
 
@@ -68,8 +69,9 @@ type ledgerJSON = []LedgerLine
 const minIntervalDropPct = 0.1
 
 // quotaCalibration re-estimates the account's weekly credit from the drop
-// in weeklyTokenLimit.percentRemaining against the subscription-rate spend
-// recorded in between. Each consecutive pair of snapshots (sorted by ts)
+// in weeklyTokenLimit.percentRemaining against the ledger spend (API list
+// prices) recorded in between, so the estimate is in the same overage
+// dollars as weekly_credit_usd. Each consecutive pair of snapshots (sorted by ts)
 // yields spend * 100 / drop percent points; the estimate is the mean of
 // those interval figures. changed is true when the estimate drifts more
 // than 20% from the configured weekly_credit_usd — the threshold the issue

@@ -184,8 +184,8 @@ type Model struct {
 	MaxConcurrent int `json:"max_concurrent"`
 }
 
-// Limits are the Big-plan spend caps the proxy enforces, in USD of credit
-// (subscription-rate dollars) unless said otherwise. The weekly credit is
+// Limits are the Big-plan spend caps the proxy enforces, in USD at the API
+// list ("overage") prices, like every cost figure (CostOf). The weekly credit is
 // shared by every run of the week and arrives per run through the shared
 // state; OverageUSD prices extra usage past it at the API list rates.
 type Limits struct {
@@ -754,8 +754,8 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.mu.Lock()
 		spent, week, over := p.runSpent, p.weekSpent+p.runSpent, p.overageApi
 		p.mu.Unlock()
-		// run_spent_usd keeps its name (meteredRunSpend reads it) and now
-		// carries credit: subscription-rate dollars.
+		// run_spent_usd keeps its name (meteredRunSpend reads it); like
+		// every figure here it is USD at the API list (overage) prices.
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "run_spent_usd": spent,
 			"week_spent_credit_usd": week, "overage_api_usd": over})
 	case r.Method == http.MethodPost && strings.HasSuffix(path, "/chat/completions"):
