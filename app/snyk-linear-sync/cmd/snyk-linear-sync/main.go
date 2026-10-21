@@ -63,6 +63,15 @@ func run(cfg config.Config, logger *slog.Logger) error {
 	snyk.SetCache(cacheStore)
 
 	linear := linearclient.New(cfg.Linear, cfg.Sync.LinearConcurrency, logger.With("service", "linear"))
+	return runSync(ctx, cfg, logger, snyk, linear, cacheStore)
+}
+
+// runSync drives one sync run against the given clients and decides its
+// outcome: the first error Run itself reports, and otherwise RunResult.Err —
+// non-nil when state-changing Linear operations were left permanently
+// unapplied — so the process exits non-zero and a scheduler or CI job notices
+// the drift instead of seeing a successful run that quietly dropped work.
+func runSync(ctx context.Context, cfg config.Config, logger *slog.Logger, snyk syncsvc.SnykClient, linear syncsvc.LinearClient, cacheStore syncsvc.CacheStore) error {
 	service := syncsvc.New(cfg, logger.With("service", "sync"), snyk, linear, cacheStore)
 
 	result, err := service.Run(ctx)
@@ -88,7 +97,7 @@ func run(cfg config.Config, logger *slog.Logger) error {
 		slog.Int64("failed_ops", result.FailedOps),
 	)
 
-	return nil
+	return result.Err()
 }
 
 func newLogger(cfg config.Config) (*slog.Logger, func() error, error) {
