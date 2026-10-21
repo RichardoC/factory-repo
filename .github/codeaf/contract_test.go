@@ -253,7 +253,7 @@ func TestContract(t *testing.T) {
 			allowed[m.ID] = true
 		}
 		lanes := laneModels(cfg.Models)
-		for lane := 0; lane < 4; lane++ {
+		for lane := 0; lane < cfg.Queue.MaxParallelRuns; lane++ {
 			stdout, stderr, code := runHarness(t, nil, "seat-config", fmt.Sprint(lane), "")
 			if code != 0 {
 				t.Fatalf("seat-config %d: exit %d, stderr: %s", lane, code, stderr)
@@ -266,8 +266,54 @@ func TestContract(t *testing.T) {
 			if !allowed[worker] {
 				t.Errorf("seat-config %d: models.tiers.worker %q is not a models.json id", lane, worker)
 			}
+			mastermind, _ := config["models.tiers.mastermind"].(string)
+			high, _ := config["models.tiers.high"].(string)
+			// Issue #181: the three seats are allowed models, and the
+			// worker differs from the planner and the checker on every
+			// lane, so a run never has all three seats on one model. The
+			// planner and the checker may share a model (issue #222).
+			for key, id := range map[string]string{"models.tiers.worker": worker, "models.tiers.mastermind": mastermind, "models.tiers.high": high} {
+				if !allowed[id] {
+					t.Errorf("seat-config %d: %s %q is not a models.json id", lane, key, id)
+				}
+			}
+			if mastermind == worker {
+				t.Errorf("seat-config %d: mastermind %q is the worker model", lane, mastermind)
+			}
+			if high == worker {
+				t.Errorf("seat-config %d: high %q is the worker model", lane, high)
+			}
+			if worker == mastermind && worker == high && mastermind == high {
+				t.Errorf("seat-config %d: all three seats are %q", lane, worker)
+			}
+			// The lane whose worker is the model the config pins the two
+			// seats to rotates both onto the cheapest other lane model:
+			// with the committed files, lane 1 (worker
+			// deepseek-ai/deepseek-v4.1-flash) seats the planner and the
+			// checker on zai-org/glm-5.3-flash.
 			if want := lanes[lane%len(lanes)].ID; worker != want {
 				t.Errorf("seat-config %d: worker %q, want lane model %q", lane, worker, want)
+			}
+			if worker == mastermind || worker == high {
+				var rotated string
+				var cost float64
+				for _, m := range lanes {
+					if m.ID == worker {
+						continue
+					}
+					if rotated == "" || m.APIInput+m.APIOutput < cost {
+						rotated, cost = m.ID, m.APIInput+m.APIOutput
+					}
+				}
+				if rotated == "" {
+					t.Fatalf("seat-config %d: no lane model differs from the worker", lane)
+				}
+				if worker == mastermind && mastermind != rotated {
+					t.Errorf("seat-config %d: mastermind %q, want the cheapest other lane model %q", lane, mastermind, rotated)
+				}
+				if worker == high && high != rotated {
+					t.Errorf("seat-config %d: high %q, want the cheapest other lane model %q", lane, high, rotated)
+				}
 			}
 			if got := config["task.parallel"]; got != wantParallel {
 				t.Errorf("seat-config %d: task.parallel = %v, want minPerRunSlots %v", lane, got, wantParallel)
