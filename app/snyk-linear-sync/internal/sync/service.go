@@ -32,8 +32,18 @@ type LinearClient interface {
 	// CreateIssues returns the indices (into desired) of items whose alias
 	// failed, so the caller retries only those instead of the whole batch.
 	// A non-nil error means no per-alias data is available (e.g. a
-	// transport failure) and every item must be retried individually.
+	// transport failure): nothing is known per item, and the mutation may
+	// even have been committed before the response was lost. The caller
+	// must reconcile which entries landed (ExistingFingerprints) before
+	// retrying any of them.
 	CreateIssues(ctx context.Context, desired []model.DesiredIssue) ([]int, error)
+	// ExistingFingerprints reports which of the given fingerprints already
+	// have a live (non-archived) managed issue in Linear. It reconciles the
+	// ambiguous batch-create outcome: a non-nil error from CreateIssues
+	// carries no per-alias data, and a transport failure does not prove
+	// Linear rejected the mutation, so the caller asks what actually landed
+	// before retrying any item.
+	ExistingFingerprints(ctx context.Context, fingerprints []string) (map[string]struct{}, error)
 	UpdateIssues(ctx context.Context, updates []model.IssueUpdate) error
 	// PostComments returns the indices (into updates) whose comment failed
 	// to post, so the caller retries only those instead of the whole batch.
@@ -125,6 +135,26 @@ func New(cfg config.Config, logger *slog.Logger, snyk SnykClient, linear LinearC
 		linear: linear,
 		cache:  cacheStore,
 	}
+}
+
+// Err reports whether the run left state-changing work permanently unapplied,
+// so the caller can exit non-zero. A run that logs a failure but reports
+// success is worse than a noisy one: nothing downstream notices the drift, and
+// the next scheduled run reports success again.
+//
+// Only permanent failures count. FailedOps is incremented after the per-item
+// retry has itself failed, so a batch that fails and then succeeds on retry is
+// a clean run and returns nil here. The exception is an ambiguous batch create
+// whose reconciliation lookup also fails: the whole batch is counted without a
+// retry, because there is no safe way to tell which entries landed. Comment
+// failures never reach FailedOps: a
+// missing change comment leaves the synced issue state correct, and comments
+// are opt-in via LINEAR_COMMENTS, so they are logged as warnings only.
+func (r RunResult) Err() error {
+	if r.FailedOps > 0 {
+		return fmt.Errorf("sync finished with failed_ops=%d; see the error log for the Linear operation(s) that could not be applied", r.FailedOps)
+	}
+	return nil
 }
 
 // Run loads both the Snyk and the Linear snapshot, plans the work that brings
@@ -248,6 +278,33 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 					}
 				}
 			}
+		}
+	}
+
+	// An empty Snyk snapshot is not evidence that every finding went away.
+	// The documented symptom of an API key without the required project read
+	// permission, and of an outage that answers success with no results, is a
+	// silently empty project and finding list. Resolving on such a snapshot
+	// would cancel every managed ticket in one run, so refuse instead: the
+	// only safe reading of "no projects at all" alongside existing managed
+	// tickets is that the snapshot is not a truthful source right now. The
+	// trigger is deliberate: zero active *and* zero inactive projects, never
+	// zero findings. An organization whose issues are all fixed still lists
+	// its projects, and those tickets must still move to the resolved state.
+	// A brand-new deployment with no managed tickets yet is unaffected. This
+	// is not a percentage threshold: a partial listing is a separate concern.
+	if len(snykSnapshot.ProjectIDs) == 0 && len(snykSnapshot.InactiveProjectIDs) == 0 && len(existingByFingerprint) > 0 {
+		message := "the Snyk snapshot contains no projects while managed Linear issues exist; " +
+			"this is the documented symptom of an API key that cannot read projects " +
+			"(project and issue queries silently return empty results), of an outage, " +
+			"or of a SNYK_ORG_ID naming an organization the API key cannot see; " +
+			"check SNYK_ORG_ID and the Snyk API key, and Snyk status, before running the sync again"
+		if s.cfg.DryRun {
+			// A dry run must still show the plan it would have executed, but
+			// the operator has to see that a live run would refuse.
+			s.logger.Error(message)
+		} else {
+			return RunResult{}, fmt.Errorf("%s", message)
 		}
 	}
 
@@ -420,12 +477,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			// must move the ticket it parked in Backlog out again. Computed
 			// once here because both the Backlog override below and the
 			// due-date recalculation further down depend on it.
-			//
-			// With LINEAR_AWAITING_FIX_LABEL=off the metadata records no
-			// awaiting-fix label, wasAwaitingFix is always false, and the sync
-			// cannot tell its own Backlog placement from a manual one: the
-			// ticket stays in Backlog as it did before.
-			fixNowAvailable := finding.Status == model.FindingOpen && wasAwaitingFix(existing.ManagedLabels, s.cfg.Linear.Labels.AwaitingFix)
+			fixNowAvailable := finding.Status == model.FindingOpen && wasAwaitingFix(existing, s.cfg.Linear.Labels.AwaitingFix)
 			// The sync itself parked this ticket in Backlog while Snyk reported
 			// the ignore as "until fix available". That is not a manual triage
 			// decision, so neither override below may treat it as one.
@@ -647,6 +699,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 					Identity:      existing.Identity,
 					ManagedLabels: existing.ManagedLabels,
 					ClosedReason:  closedReason,
+					AwaitingFix:   existing.AwaitingFix,
 				}),
 				DueDate:       existing.DueDate,
 				State:         desiredState,
@@ -857,6 +910,74 @@ func (f *failedFingerprints) has(fp string) bool {
 	return ok
 }
 
+// createOne retries a single issue create. A per-entry failure reported
+// through the failed-index return is treated exactly like an error: the issue
+// does not exist either way, so the run must not count it as done. Ignoring
+// the indices here would let a failed retry pass silently and the run report
+// success for work that never landed.
+func (s *Service) createOne(ctx context.Context, desired model.DesiredIssue) error {
+	failed, err := s.linear.CreateIssues(ctx, []model.DesiredIssue{desired})
+	if err != nil {
+		return err
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("Linear reported the create as failed without returning an error")
+	}
+	return nil
+}
+
+// retryUnlandedCreates reconciles an ambiguous batch-create failure. Linear
+// exposes no idempotency key, so a lost response does not prove the mutation
+// was rejected: the batch may have committed server-side before the response
+// was lost, and retrying every item would duplicate those tickets until only
+// the duplicate-cancellation pass converges them away on a later run, after
+// duplicate notifications went out. It therefore asks Linear which of the
+// batch's fingerprints now have a live issue and re-creates only the rest.
+//
+// If the reconciliation query itself fails there is no safe way to tell what
+// landed, so nothing is retried: the batch is counted in FailedOps and left
+// for the next run, which creates whatever is genuinely missing — the finding
+// is still reported by Snyk and its absent ticket is missing from the next
+// Linear snapshot. Missing a ticket for one cycle is recoverable; a duplicate
+// is only undone later by the duplicate-cancellation pass.
+func (s *Service) retryUnlandedCreates(ctx context.Context, batch []model.DesiredIssue, result *RunResult, failed *failedFingerprints) {
+	fingerprints := make([]string, 0, len(batch))
+	for _, desired := range batch {
+		fingerprints = append(fingerprints, desired.Fingerprint)
+	}
+
+	landed, err := s.linear.ExistingFingerprints(ctx, fingerprints)
+	if err != nil {
+		atomic.AddInt64(&result.FailedOps, int64(len(batch)))
+		// No safe way to tell what landed, so every entry is treated as
+		// failed and kept out of the refreshed cache: the next run
+		// re-creates whatever is genuinely missing.
+		failed.add(fingerprints...)
+		s.logger.Error("could not reconcile an ambiguous batch create against Linear; not retrying, the next run will create whatever is missing",
+			slog.Int("batch_size", len(batch)),
+			slog.Any("error", err),
+		)
+		return
+	}
+
+	for _, desired := range batch {
+		if _, ok := landed[desired.Fingerprint]; ok {
+			s.logger.Info("issue was created despite the batch error, not retrying",
+				slog.String("fingerprint", desired.Fingerprint),
+			)
+			continue
+		}
+		if err := s.createOne(ctx, desired); err != nil {
+			atomic.AddInt64(&result.FailedOps, 1)
+			failed.add(desired.Fingerprint)
+			s.logger.Error("failed to create issue",
+				slog.String("fingerprint", desired.Fingerprint),
+				slog.Any("error", err),
+			)
+		}
+	}
+}
+
 // updateBatchWithFallback sends batch to Linear in one call and, when the
 // call fails, retries every item on its own. It reports whether the batch call
 // itself succeeded, counts each item that still fails in FailedOps, and records
@@ -957,22 +1078,16 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult, fa
 		}
 		failedIdx, err := s.linear.CreateIssues(ctx, job.desiredBatch)
 		if err != nil {
-			// No per-alias data at all (e.g. a transport failure): fall back
-			// to retrying every item individually, same as before.
-			s.logger.Warn("batch create failed, retrying issues individually",
+			// No per-alias data at all (e.g. a transport failure, or a 502
+			// after Linear had already committed the mutation): nothing is
+			// known per item, and retrying blindly would create a second
+			// copy of every ticket the batch landed server-side. Reconcile
+			// against Linear first; see retryUnlandedCreates.
+			s.logger.Warn("batch create failed, reconciling which issues landed before retrying",
 				slog.Int("batch_size", len(job.desiredBatch)),
 				slog.Any("error", err),
 			)
-			for _, desired := range job.desiredBatch {
-				if _, err := s.linear.CreateIssues(ctx, []model.DesiredIssue{desired}); err != nil {
-					atomic.AddInt64(&result.FailedOps, 1)
-					failed.add(desired.Fingerprint)
-					s.logger.Error("failed to create issue",
-						slog.String("fingerprint", desired.Fingerprint),
-						slog.Any("error", err),
-					)
-				}
-			}
+			s.retryUnlandedCreates(ctx, job.desiredBatch, result, failed)
 		} else if len(failedIdx) > 0 {
 			// Partial failure: the batch call told us exactly which items
 			// failed. Only retry those — the rest were already created and
@@ -1239,6 +1354,7 @@ func issueDescriptionWithIdentity(sourceCfg config.SourceConfig, managedLabels [
 		Fingerprint:   finding.Fingerprint,
 		Identity:      identity,
 		ManagedLabels: managedLabels,
+		AwaitingFix:   finding.Status == model.FindingAwaitingFix,
 	}))
 	return strings.Join(lines, "\n")
 }
@@ -1352,6 +1468,13 @@ type managedMetadata struct {
 	// resolve loop; a normal update from a live finding never carries it, so
 	// it is cleared as soon as the ticket tracks an active finding again.
 	ClosedReason string
+	// AwaitingFix marks the ticket as parked in Backlog for a finding Snyk
+	// reports as "ignored until fix available". Unlike the awaiting-fix
+	// label it is written regardless of the label configuration, so the
+	// sync can recognize its own Backlog placement even when
+	// LINEAR_AWAITING_FIX_LABEL is off. It is cleared as soon as the
+	// finding leaves the awaiting-fix state.
+	AwaitingFix bool
 }
 
 func metadataBlock(meta managedMetadata) string {
@@ -1367,6 +1490,9 @@ func metadataBlock(meta managedMetadata) string {
 	}
 	if meta.ClosedReason != "" {
 		lines = append(lines, fmt.Sprintf("closed_reason: %s", meta.ClosedReason))
+	}
+	if meta.AwaitingFix {
+		lines = append(lines, "awaiting_fix: yes")
 	}
 	lines = append(lines, "-->")
 	return strings.Join(lines, "\n")
@@ -2188,15 +2314,21 @@ func isConfiguredBacklogState(existingStateName, configuredBacklog string) bool 
 }
 
 // wasAwaitingFix reports whether the existing Linear issue was previously in
-// the awaiting-fix state, based on the managed label recorded in the metadata
-// block. This detects issues that were blocked on an upstream fix and have
+// the awaiting-fix state. It reads the awaiting_fix marker in the metadata
+// block, which the sync writes whenever a finding is in the awaiting-fix
+// state regardless of the label configuration, and also accepts the
+// configured awaiting-fix label for tickets written before the marker
+// existed. This detects issues that were blocked on an upstream fix and have
 // now become actionable.
-func wasAwaitingFix(managedLabels []string, awaitingFixLabel string) bool {
+func wasAwaitingFix(existing model.ExistingIssue, awaitingFixLabel string) bool {
+	if existing.AwaitingFix {
+		return true
+	}
 	if awaitingFixLabel == "" {
 		return false
 	}
 	normalized := model.NormalizeLabelName(awaitingFixLabel)
-	return slices.Contains(model.NormalizeManagedLabelNames(managedLabels), normalized)
+	return slices.Contains(model.NormalizeManagedLabelNames(existing.ManagedLabels), normalized)
 }
 
 // isNonTerminalModelState reports whether the desired model state is

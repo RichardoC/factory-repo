@@ -38,3 +38,13 @@ A human reviews every pull request you produce before it is merged.
   the issue's `## Done when` and, after each, the test name or command output
   that proves it, then run the issue's `## End-to-end check` and paste its
   result. A bullet you could not prove is reported as not done, never dropped.
+
+## The `harness` binary on PATH is the pre-change build
+
+The `harness` binary installed on your `PATH` was built from the default
+branch before your run started, so it does not contain the change in this
+working tree. If your change touches `.github/codeaf/`, rebuild it
+(`go build .` in `.github/codeaf/`) and run the built binary for every
+end-to-end proof; an e2e check that invokes `harness` from `PATH` silently
+proves the pre-change code. State in your answer which binary produced the
+evidence.

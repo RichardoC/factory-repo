@@ -118,28 +118,112 @@ func TestMultiHandlerWithGroupReachesAllChildren(t *testing.T) {
 	}
 }
 
-// TestMultiHandlerReturnsFirstChildError pins the current behaviour: Handle
-// returns on the first child error, so a failing console handler stops the
-// record from reaching the error-file handler. If the factory decides a
-// failing child should not short-circuit the fan-out, that is a behaviour
-// change to make in its own issue.
-func TestMultiHandlerReturnsFirstChildError(t *testing.T) {
-	wantErr := errors.New("first child failed")
-	first := &stubHandler{level: slog.LevelInfo, wantErr: wantErr}
-	second := &stubHandler{level: slog.LevelInfo}
+// TestMultiHandlerFailsIndependently pins the fan-out: a child that fails
+// does not stop the record reaching its siblings, and its error is still
+// reported. A failing console handler must not starve the error-file handler
+// of the records that explain what happened.
+func TestMultiHandlerFailsIndependently(t *testing.T) {
+	wantErr := errors.New("console child failed")
+	console := &stubHandler{level: slog.LevelInfo, wantErr: wantErr}
+	file := &stubHandler{level: slog.LevelInfo}
 
-	err := NewMultiHandler(first, second).Handle(context.Background(), testRecord(slog.LevelInfo, "boom"))
+	err := NewMultiHandler(console, file).Handle(context.Background(), testRecord(slog.LevelInfo, "boom"))
 
+	if err == nil {
+		t.Fatal("Handle error = nil; want the failing child's error")
+	}
 	if !errors.Is(err, wantErr) {
-		t.Errorf("Handle error = %v; want %v", err, wantErr)
+		t.Errorf("Handle error = %v; want it to mention %v", err, wantErr)
 	}
-	if first.calls != 1 {
-		t.Errorf("first child calls = %d; want 1", first.calls)
+	if !strings.Contains(err.Error(), wantErr.Error()) {
+		t.Errorf("Handle error = %q; want it to mention %q", err, wantErr)
 	}
-	if second.calls != 0 {
-		t.Errorf("second child calls = %d; want 0: Handle stops at the first error", second.calls)
+	if console.calls != 1 {
+		t.Errorf("console child calls = %d; want 1", console.calls)
+	}
+	if file.calls != 1 {
+		t.Errorf("file child calls = %d; want 1: a failing sibling must not stop the fan-out", file.calls)
 	}
 }
+
+// TestMultiHandlerReportsEveryChildError proves Handle joins the errors of
+// every failing enabled child rather than returning only the first, and that
+// disabled children are neither called nor reported.
+func TestMultiHandlerReportsEveryChildError(t *testing.T) {
+	consoleErr := errors.New("console child failed")
+	fileErr := errors.New("file child failed")
+	console := &stubHandler{level: slog.LevelInfo, wantErr: consoleErr}
+	file := &stubHandler{level: slog.LevelError, wantErr: fileErr}
+	disabled := &stubHandler{level: slog.LevelError + 1, wantErr: errors.New("must never be called")}
+
+	err := NewMultiHandler(console, file, disabled).Handle(context.Background(), testRecord(slog.LevelError, "boom"))
+
+	for _, wantErr := range []error{consoleErr, fileErr} {
+		if !errors.Is(err, wantErr) {
+			t.Errorf("Handle error = %v; want it to mention %v", err, wantErr)
+		}
+	}
+	if disabled.calls != 0 {
+		t.Errorf("disabled child calls = %d; want 0", disabled.calls)
+	}
+}
+
+// TestMultiHandlerReturnsNilWhenEveryChildSucceeds proves a clean fan-out
+// reports no error.
+func TestMultiHandlerReturnsNilWhenEveryChildSucceeds(t *testing.T) {
+	console, _ := newBufferHandler(slog.LevelInfo)
+	file, _ := newBufferHandler(slog.LevelInfo)
+
+	if err := NewMultiHandler(console, file).Handle(context.Background(), testRecord(slog.LevelInfo, "boom")); err != nil {
+		t.Errorf("Handle error = %v; want nil", err)
+	}
+}
+
+// TestMultiHandlerFailingConsoleStillReachesErrorFile assembles the logger
+// exactly as cmd/snyk-dast-linear-sync's newLogger does, with the console
+// child written to an always-failing writer, and proves the error record
+// still reaches the error log file while the console failure is returned.
+func TestMultiHandlerFailingConsoleStillReachesErrorFile(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "error.log")
+
+	logFile, err := os.Create(filePath)
+	if err != nil {
+		t.Fatalf("create temp file: %v", err)
+	}
+	defer logFile.Close()
+
+	writeErr := errors.New("console write failed")
+	consoleHandler := slog.NewTextHandler(failingWriter{err: writeErr}, &slog.HandlerOptions{Level: slog.LevelInfo})
+	fileHandler := slog.NewTextHandler(logFile, &slog.HandlerOptions{Level: slog.LevelError})
+
+	err = NewMultiHandler(consoleHandler, fileHandler).Handle(
+		context.Background(), testRecord(slog.LevelError, "failed"))
+
+	if err == nil {
+		t.Fatal("Handle error = nil; want the console failure to be reported")
+	}
+	if !errors.Is(err, writeErr) {
+		t.Errorf("Handle error = %v; want it to mention %v", err, writeErr)
+	}
+
+	if syncErr := logFile.Sync(); syncErr != nil {
+		t.Fatalf("sync file: %v", syncErr)
+	}
+	contents, readErr := os.ReadFile(filePath)
+	if readErr != nil {
+		t.Fatalf("read file: %v", readErr)
+	}
+	if !strings.Contains(string(contents), "msg=failed") {
+		t.Errorf("error file should carry the record despite the console failure, got:\n%s", contents)
+	}
+}
+
+// failingWriter is a writer that always fails, standing in for a closed pipe
+// or a full disk on the console side.
+type failingWriter struct{ err error }
+
+func (w failingWriter) Write([]byte) (int, error) { return 0, w.err }
 
 // TestLoggerWritesErrorsToFileAndInfoToConsole assembles the logger exactly
 // as cmd/snyk-dast-linear-sync's newLogger does -- a console TextHandler at

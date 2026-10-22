@@ -59,6 +59,16 @@ type fakeLinear struct {
 	lastOpenStatesErr   error
 	lastOpenStatesCalls [][]string
 
+	// createBatchErr makes the first (batch) create call fail with an error,
+	// simulating an ambiguous transport failure, while single-entry retries
+	// succeed. landedFingerprints is what ExistingFingerprints then reports
+	// as already present in Linear, and existingErr makes that
+	// reconciliation query itself fail.
+	createBatchErr     error
+	landedFingerprints []string
+	existingErr        error
+	existingCalls      int
+
 	// updateErr, when non-nil, makes every UpdateIssues call fail; the
 	// recording behaviour is kept so a test can still see what was attempted.
 	// createErr does the same for CreateIssues, which makes both the batch
@@ -69,6 +79,13 @@ type fakeLinear struct {
 	// that many updates fail. It models the batch-with-fallback contract: the
 	// multi-item batch call fails while every single-item retry succeeds.
 	batchErrAbove int
+	// updateFailIssueIDs, when non-empty, fails every UpdateIssues call whose
+	// batch carries one of these issue IDs — the multi-item batch call and
+	// that issue's single-item retry alike — while every other item succeeds.
+	// It mirrors a live-label-read refusal, which follows the issue rather
+	// than the call: each retry re-reads that issue's labels and refuses
+	// again.
+	updateFailIssueIDs map[string]bool
 	// updateCallBatches records the batch passed to each UpdateIssues call, in
 	// order, so a test can prove the per-item fallback actually happened (every
 	// call after the failed batch carries exactly one update) rather than
@@ -93,6 +110,24 @@ func (f *fakeLinear) LoadSnapshot(context.Context) ([]model.ExistingIssue, error
 	return f.snapshot, nil
 }
 
+func (f *fakeLinear) ExistingFingerprints(_ context.Context, fingerprints []string) (map[string]struct{}, error) {
+	f.existingCalls++
+	if f.existingErr != nil {
+		return nil, f.existingErr
+	}
+	wanted := make(map[string]struct{}, len(fingerprints))
+	for _, fingerprint := range fingerprints {
+		wanted[fingerprint] = struct{}{}
+	}
+	found := map[string]struct{}{}
+	for _, fingerprint := range f.landedFingerprints {
+		if _, ok := wanted[fingerprint]; ok {
+			found[fingerprint] = struct{}{}
+		}
+	}
+	return found, nil
+}
+
 func (f *fakeLinear) CreateIssues(ctx context.Context, desired []model.DesiredIssue) ([]int, error) {
 	if f.cancelCreate != nil {
 		cancel := f.cancelCreate
@@ -104,6 +139,9 @@ func (f *fakeLinear) CreateIssues(ctx context.Context, desired []model.DesiredIs
 		return nil, err
 	}
 	f.createCallBatches = append(f.createCallBatches, append([]model.DesiredIssue(nil), desired...))
+	if f.createBatchErr != nil && len(desired) > 1 {
+		return nil, f.createBatchErr
+	}
 	if f.createErr != nil {
 		return nil, f.createErr
 	}
@@ -132,6 +170,11 @@ func (f *fakeLinear) UpdateIssues(ctx context.Context, updates []model.IssueUpda
 	f.updateCallBatches = append(f.updateCallBatches, append([]model.IssueUpdate(nil), updates...))
 	if f.batchErrAbove > 0 && len(updates) > f.batchErrAbove {
 		return errors.New("batch update failed")
+	}
+	for _, update := range updates {
+		if f.updateFailIssueIDs[update.Existing.ID] {
+			return fmt.Errorf("refusing to update Linear issue %s: its current labels could not be read, so labels the sync does not own cannot be preserved", update.Existing.Identifier)
+		}
 	}
 	for _, update := range updates {
 		f.updated = append(f.updated, update.Desired)
@@ -4430,11 +4473,14 @@ func TestRunAwaitingFixToOpenKeepsManuallyChosenInProgress(t *testing.T) {
 	}
 }
 
-// TestRunAwaitingFixLabelOffLeavesBacklogAlone pins the documented limitation:
-// with no configured awaiting-fix label the metadata records none, so
-// wasAwaitingFix is always false and the sync cannot tell its own Backlog
-// placement from a manual move. The ticket stays in Backlog, exactly as it did
-// before this change.
+// TestRunAwaitingFixLabelOffLeavesBacklogAlone pins the backward-compatibility
+// contract for tickets written before the awaiting_fix marker existed: a
+// Backlog ticket whose metadata block carries neither the awaiting-fix label
+// (the label is off) nor the marker cannot be told apart from a manual Backlog
+// move, so the sync leaves it in Backlog. No one-time mass update fires on
+// upgrade; a legacy ticket only becomes eligible for the automatic move after
+// the sync rewrites its description (any later awaiting-fix run adds the
+// marker).
 func TestRunAwaitingFixLabelOffLeavesBacklogAlone(t *testing.T) {
 	cfg := minimalCfg()
 	cfg.Linear.States.Backlog = "Backlog"
@@ -4494,6 +4540,101 @@ func TestRunAwaitingFixLabelOffLeavesBacklogAlone(t *testing.T) {
 	}
 	if updated.State != model.StateBacklog {
 		t.Fatalf("updated state = %q, want %q", updated.State, model.StateBacklog)
+	}
+}
+
+// TestRunAwaitingFixLabelOffMarkerMovesBacklogToTodo verifies that the
+// awaiting_fix marker in the metadata block — which the sync writes whenever
+// a finding is in the awaiting-fix state, regardless of the label
+// configuration — lets the sync recognize its own Backlog placement even with
+// LINEAR_AWAITING_FIX_LABEL=off. When the fix arrives the ticket moves back to
+// Todo with a recalculated due date, and the marker is cleared.
+func TestRunAwaitingFixLabelOffMarkerMovesBacklogToTodo(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.States.Backlog = "Backlog"
+	cfg.Linear.Labels.AwaitingFix = "" // LINEAR_AWAITING_FIX_LABEL=off
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		SnykIssueID: "issue-1",
+		ProjectID:   "project-a",
+		ProjectName: "Project A",
+		IssueTitle:  "XSS in postcss",
+		IssueType:   "package_vulnerability",
+		Severity:    "high",
+		Status:      model.FindingOpen,                                      // fix is now available
+		CreatedAt:   time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC), // months ago
+	}
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings:   []model.Finding{finding},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       "Snyk: [high] XSS in postcss",
+				Description: "old body\n<!-- snyk-linear-sync\nfingerprint: snyk:project-a:issue-1\nmanaged_labels: snyk-automation\nawaiting_fix: yes\n-->",
+				DueDate:     "",        // was cleared for awaiting-fix
+				StateName:   "Backlog", // the sync parked it here for the awaiting-fix finding
+				Fingerprint: finding.Fingerprint,
+				Priority:    2,
+				// No awaiting-fix label recorded: the label is off. Only the
+				// marker can identify this as the sync's own placement.
+				ManagedLabels: []string{"snyk-automation"},
+				Labels:        []model.IssueLabel{{ID: "l1", Name: "snyk-automation"}},
+				// What extractAwaitingFix returns for the description above.
+				AwaitingFix: true,
+			},
+		},
+	}
+
+	service := New(cfg, logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.PlannedUpdates != 1 {
+		t.Fatalf("PlannedUpdates = %d, want 1", result.PlannedUpdates)
+	}
+	if len(linear.updated) != 1 {
+		t.Fatalf("updated = %d, want 1", len(linear.updated))
+	}
+	updated := linear.updated[0]
+
+	// The marker identifies the Backlog placement as the sync's own, so the
+	// manual Backlog override must not apply: the ticket moves to Todo and
+	// the update carries the state change.
+	if updated.State != model.StateTodo {
+		t.Fatalf("updated state = %q, want %q (awaiting_fix marker, fix arrived)", updated.State, model.StateTodo)
+	}
+	if updated.PreserveState {
+		t.Fatalf("updated PreserveState = true, want false (Backlog was the sync's own placement)")
+	}
+	if len(linear.updates) != 1 {
+		t.Fatalf("updates = %d, want 1", len(linear.updates))
+	}
+	if !linear.updates[0].Diff.StateChanged {
+		t.Fatalf("Diff.StateChanged = false, want true (state must be sent to Linear)")
+	}
+
+	// Due date is recalculated from fix availability, not from the months-old
+	// created_at the SLA was originally based on.
+	expectedDueDate := time.Now().AddDate(0, 0, 30)
+	expectedStr := time.Date(expectedDueDate.Year(), expectedDueDate.Month(), expectedDueDate.Day(), 0, 0, 0, 0, time.UTC).Format(time.DateOnly)
+	if updated.DueDate != expectedStr {
+		t.Fatalf("updated due date = %q, want %q (SLA from fix availability)", updated.DueDate, expectedStr)
+	}
+
+	// The marker has served its purpose and must not outlive the
+	// awaiting-fix state.
+	if strings.Contains(updated.Description, "awaiting_fix") {
+		t.Fatalf("awaiting_fix marker should be cleared once the fix arrived:\n%s", updated.Description)
 	}
 }
 
@@ -5184,6 +5325,135 @@ func TestRunBatchCreatePartialFailureRetriesOnlyFailedIssue(t *testing.T) {
 	}
 }
 
+// TestRunReconcilesAmbiguousBatchCreateBeforeRetry covers the lost-response
+// case: a transport failure does not prove Linear rejected the mutation, so
+// the entries that actually landed must not be created a second time.
+func TestRunReconcilesAmbiguousBatchCreateBeforeRetry(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint: "snyk:project-a:issue-1",
+					SnykIssueID: "issue-1",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "First finding",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					CreatedAt:   time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+				{
+					Fingerprint: "snyk:project-a:issue-2",
+					SnykIssueID: "issue-2",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "Second finding",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					CreatedAt:   time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+
+	linear := &fakeLinear{
+		// The batch create died with a transport error, but one of its two
+		// creates was committed before the response was lost.
+		createBatchErr:     errors.New("connection reset by peer"),
+		landedFingerprints: []string{"snyk:project-a:issue-1"},
+	}
+
+	service := New(minimalCfg(), logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if linear.existingCalls != 1 {
+		t.Fatalf("ExistingFingerprints calls = %d, want 1", linear.existingCalls)
+	}
+	// The batch call errored before recording anything, and the landed
+	// entry is skipped by the reconciliation, so the only create the fake
+	// ever records is the retry for the un-landed fingerprint.
+	if len(linear.created) != 1 {
+		t.Fatalf("created = %d (%#v), want 1: only the entry that did not land may be recreated", len(linear.created), linear.created)
+	}
+	if linear.created[0].Fingerprint != "snyk:project-a:issue-2" {
+		t.Fatalf("recreated %q, want the un-landed snyk:project-a:issue-2", linear.created[0].Fingerprint)
+	}
+	if len(linear.createCallBatches) != 2 {
+		t.Fatalf("CreateIssues calls = %d, want 2 (failed batch + single-item retry)", len(linear.createCallBatches))
+	}
+	retry := linear.createCallBatches[1]
+	if len(retry) != 1 || retry[0].Fingerprint != "snyk:project-a:issue-2" {
+		t.Fatalf("retry batch = %+v, want only the un-landed issue-2", retry)
+	}
+	if result.FailedOps != 0 {
+		t.Fatalf("FailedOps = %d, want 0: reconciliation and the retry both succeeded", result.FailedOps)
+	}
+}
+
+// TestRunLeavesUnreconcilableBatchForNextRun covers the other branch of the
+// ambiguous-failure contract: with no way to tell what landed, nothing is
+// retried and the whole batch is counted as failed. A missing ticket is
+// recoverable on the next run; a duplicate is only undone later by the
+// duplicate-cancellation pass.
+func TestRunLeavesUnreconcilableBatchForNextRun(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint: "snyk:project-a:issue-1",
+					SnykIssueID: "issue-1",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "First finding",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					CreatedAt:   time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+				{
+					Fingerprint: "snyk:project-a:issue-2",
+					SnykIssueID: "issue-2",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "Second finding",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					CreatedAt:   time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+
+	linear := &fakeLinear{
+		createBatchErr: errors.New("connection reset by peer"),
+		existingErr:    errors.New("lookup failed too"),
+	}
+
+	service := New(minimalCfg(), logger, snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if len(linear.created) != 0 {
+		t.Fatalf("created = %d (%#v), want 0: an unreconcilable ambiguous failure must not be retried", len(linear.created), linear.created)
+	}
+	if result.FailedOps != 2 {
+		t.Fatalf("FailedOps = %d, want 2 (the whole unreconciled batch)", result.FailedOps)
+	}
+	if len(linear.createCallBatches) != 1 {
+		t.Fatalf("CreateIssues calls = %d, want 1: no per-item retry may follow a failed reconciliation", len(linear.createCallBatches))
+	}
+}
+
 // TestRunBatchCommentPartialFailureRetriesOnlyFailedComment is the
 // PostComments equivalent: a partial comment failure must only re-post the
 // failed comment. Re-posting comments that already landed leaves duplicate
@@ -5295,6 +5565,9 @@ func storedIssue(id, identifier, stateName string, desired model.DesiredIssue) m
 		}
 		if after, ok := strings.CutPrefix(line, "closed_reason: "); ok {
 			issue.ClosedReason = after
+		}
+		if after, ok := strings.CutPrefix(line, "awaiting_fix: "); ok {
+			issue.AwaitingFix = after == "yes"
 		}
 	}
 	return issue
@@ -5683,6 +5956,53 @@ func TestMetadataBlockClosedReasonRoundTrips(t *testing.T) {
 	cleared := upsertManagedMetadata(description, managedMetadata{Fingerprint: "snyk:project-a:issue-1:pkg@1.0.0"})
 	if strings.Contains(cleared, "closed_reason") || strings.Contains(cleared, "identity:") {
 		t.Fatalf("stale metadata left behind:\n%s", cleared)
+	}
+}
+
+func TestMetadataBlockAwaitingFixRoundTrips(t *testing.T) {
+	description := upsertManagedMetadata("body", managedMetadata{
+		Fingerprint:   "snyk:project-a:issue-1",
+		ManagedLabels: []string{"snyk-automation"},
+		AwaitingFix:   true,
+	})
+	if !strings.Contains(description, "awaiting_fix: yes") {
+		t.Fatalf("awaiting_fix marker missing:\n%s", description)
+	}
+	got := storedIssue("id", "SNYK-1", "Backlog", model.DesiredIssue{Description: description})
+	if !got.AwaitingFix {
+		t.Fatalf("AwaitingFix = false, want true:\n%s", description)
+	}
+	// Rewriting the block for a finding that left the awaiting-fix state
+	// clears the marker.
+	cleared := upsertManagedMetadata(description, managedMetadata{Fingerprint: "snyk:project-a:issue-1"})
+	if strings.Contains(cleared, "awaiting_fix") {
+		t.Fatalf("stale awaiting_fix marker left behind:\n%s", cleared)
+	}
+	got = storedIssue("id", "SNYK-1", "Todo", model.DesiredIssue{Description: cleared})
+	if got.AwaitingFix {
+		t.Fatalf("AwaitingFix = true, want false after clear:\n%s", cleared)
+	}
+}
+
+// TestMetadataBlockWritesAwaitingFixMarkerWithLabelOff verifies the marker is
+// written regardless of the awaiting-fix label configuration — that
+// independence is the whole point of the marker.
+func TestMetadataBlockWritesAwaitingFixMarkerWithLabelOff(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.Labels.AwaitingFix = "" // off
+	finding := model.Finding{
+		Fingerprint: "snyk:project-a:issue-1",
+		Status:      model.FindingAwaitingFix,
+	}
+	description := issueDescription(cfg.Source, managedLabels(cfg.Linear.Labels, finding), finding)
+	if !strings.Contains(description, "awaiting_fix: yes") {
+		t.Fatalf("awaiting_fix marker missing with label off:\n%s", description)
+	}
+	// An open finding must not carry the marker.
+	finding.Status = model.FindingOpen
+	description = issueDescription(cfg.Source, managedLabels(cfg.Linear.Labels, finding), finding)
+	if strings.Contains(description, "awaiting_fix") {
+		t.Fatalf("awaiting_fix marker present for an open finding:\n%s", description)
 	}
 }
 
@@ -6695,6 +7015,64 @@ func TestExecuteJobCountsEveryItemThatFailsIndividually(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestExecuteJobCountsOneRefusedIssueWithoutBlockingTheBatch covers the refusal
+// the linear client reports when an issue's live labels cannot be read —
+// including when the label page is truncated: the multi-item batch call fails,
+// and the per-item fallback retries every item, where the refused issue fails
+// again while its batch-mates land. The refused issue counts once in FailedOps
+// and in the failed-fingerprint set; the rest of the batch is not blocked.
+func TestExecuteJobCountsOneRefusedIssueWithoutBlockingTheBatch(t *testing.T) {
+	cfg := minimalCfg()
+	batch := make([]model.IssueUpdate, 0, 3)
+	for _, ident := range []string{"SNYK-1", "SNYK-2", "SNYK-3"} {
+		existing := model.ExistingIssue{
+			ID:          "issue-" + ident,
+			Identifier:  ident,
+			StateName:   "Blog",
+			Fingerprint: "snyk:project-a:" + ident,
+		}
+		desired := model.DesiredIssue{Fingerprint: existing.Fingerprint, State: model.StateDone, PreserveState: true}
+		batch = append(batch, model.IssueUpdate{Existing: existing, Desired: desired})
+	}
+	linear := &fakeLinear{updateFailIssueIDs: map[string]bool{"issue-SNYK-2": true}}
+	service := New(cfg, discardLogger(), fakeSnyk{}, linear, nil)
+	var failed failedFingerprints
+	var result RunResult
+	if err := service.executeJob(context.Background(), job{kind: jobUpdate, updateBatch: batch}, &result, &failed); err != nil {
+		t.Fatalf("executeJob(jobUpdate) error = %v", err)
+	}
+
+	if result.FailedOps != 1 {
+		t.Fatalf("FailedOps = %d, want 1 (only the refused issue counts)", result.FailedOps)
+	}
+	if len(linear.updateCallBatches) != 4 {
+		t.Fatalf("UpdateIssues calls = %d, want 4 (one batch plus three per-item retries)", len(linear.updateCallBatches))
+	}
+	if got := len(linear.updateCallBatches[0]); got != 3 {
+		t.Fatalf("first UpdateIssues call carried %d updates, want the whole batch of 3", got)
+	}
+	for i, call := range linear.updateCallBatches[1:] {
+		if len(call) != 1 {
+			t.Fatalf("per-item retry %d carried %d updates, want 1", i, len(call))
+		}
+	}
+	// The refused issue is absent from the landed writes; its batch-mates are
+	// not blocked by it.
+	var landedIdentifiers []string
+	for _, u := range linear.updates {
+		landedIdentifiers = append(landedIdentifiers, u.Existing.Identifier)
+	}
+	if !slices.Equal(landedIdentifiers, []string{"SNYK-1", "SNYK-3"}) {
+		t.Fatalf("landed updates = %v, want SNYK-1 and SNYK-3 (SNYK-2 is refused, the rest not blocked)", landedIdentifiers)
+	}
+	if !failed.has("snyk:project-a:SNYK-2") {
+		t.Fatal("failed fingerprint set does not hold the refused issue's fingerprint")
+	}
+	if failed.has("snyk:project-a:SNYK-1") || failed.has("snyk:project-a:SNYK-3") {
+		t.Fatal("failed fingerprint set holds a fingerprint whose issue landed; only the refused issue belongs there")
 	}
 }
 

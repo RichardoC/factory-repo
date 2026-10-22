@@ -870,11 +870,20 @@ jobs:
             if [ "$early" = true ]; then
               create_args+=(--draft) # the work is unfinished
             fi
-            if ! pr_url=$(gh pr create "${create_args[@]}"); then
-              echo "::error::could not open the pull request for $BRANCH" | tee -a "$PUBLISH_ERRORS_PATH"
-              exit 1
+            # Issue #146: one transient 5xx lost #128's PR, so the create is
+            # retried on 5xx and network errors (never on a 4xx). A 504 often
+            # means the PR was created anyway, and the retry then gets a 422
+            # "already exists": look the PR up before giving up.
+            if pr_url=$("$HARNESS" gh-retry -- gh pr create "${create_args[@]}"); then
+              pr=${pr_url##*/}
+            else
+              pr=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number' || true)
+              if ! [[ "$pr" =~ ^[0-9]{1,10}$ ]]; then
+                echo "::error::could not open the pull request for $BRANCH" | tee -a "$PUBLISH_ERRORS_PATH"
+                exit 1
+              fi
+              echo "::notice::the pull request for $BRANCH already exists (#$pr); a create that timed out had opened it"
             fi
-            pr=${pr_url##*/}
             gh pr edit "$pr" --add-label "$CODEAF_LABEL"
           else
             # This run went onto an existing PR's branch (a /codeaf comment or

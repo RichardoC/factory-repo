@@ -221,7 +221,7 @@ func continuePlan(gh github, pr int, stop string) (action string, body string, u
 		return "", "", 0, nil
 	}
 	var comments []issueComment
-	if err := gh.get(fmt.Sprintf("/issues/%d/comments?per_page=100", pr), &comments); err != nil {
+	if err := gh.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", pr), &comments); err != nil {
 		return "", "", 0, err
 	}
 	// The count is the continuations already run (issue #219): continue-plan
@@ -306,7 +306,7 @@ func (g github) mergeableState(pr int) (string, error) {
 // that finished, not one that stopped early.
 func continueConflicted(gh github, pr int) (action string, body string, used int, err error) {
 	var comments []issueComment
-	if err := gh.get(fmt.Sprintf("/issues/%d/comments?per_page=100", pr), &comments); err != nil {
+	if err := gh.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", pr), &comments); err != nil {
 		return "", "", 0, err
 	}
 	// Same semantics as continuePlan (issue #219): the plain report count,

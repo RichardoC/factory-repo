@@ -35,6 +35,11 @@ const (
 	planStandingFileName = "plan-instructions.md"
 )
 
+// planHarnessPreChangeSentence is the evidence rule plan-instructions.md
+// carries (issue #189): the `harness` on PATH predates the run, so a plan
+// run grounds a proposal's Problem in the source, not in that binary.
+const planHarnessPreChangeSentence = "the `harness` binary on `PATH` was built from the default\nbranch before this run started"
+
 // planMaxProposals reads planner.max_proposals from models.json with its own
 // tiny struct — deliberately not cfg.Planner, so the plan side of the
 // planner keeps compiling however the config type moves — and answers 5
@@ -153,7 +158,7 @@ func planOpenIssues(gh github) string {
 	var b strings.Builder
 	b.WriteString("## Open issues\n\n")
 	var issues []item
-	if err := gh.get("/issues?state=open&per_page=100", &issues); err != nil {
+	if err := gh.getList("/issues?state=open&per_page=100", &issues); err != nil {
 		fmt.Fprintf(&b, "(open issues unavailable: %s)\n", escapeMD(err.Error(), 200, true))
 		return strings.TrimRight(b.String(), "\n")
 	}
@@ -182,10 +187,19 @@ func planOpenIssues(gh github) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// The three "recent" reads below (closed issues, closed pull requests, run
+// reports) are windows, not whole lists: one page of the newest items is
+// what they want, so they use the one-shot get. Through getList they would
+// walk the repository's whole history and, past maxListPages, lose the
+// section to the page-cap error.
+//
 // planClosedIssues embeds the recently closed issues' bodies nearly whole:
 // their "Out of scope" and follow-up notes are the planner's second source
 // of proposals, and a note cut at 200 runes is a note lost. Bodies are
-// untrusted text, so each is capped and read as data.
+// untrusted text — anyone can write a closed issue, and they routinely
+// quote run output — so each is both capped and escaped, the same
+// escapeMD(body, maxPlanClosedBody, false) the run reports get, so HTML,
+// mentions, code fences and forged headings in one render inert.
 func planClosedIssues(gh github) string {
 	var b strings.Builder
 	b.WriteString("## Recently closed issues\n\n")
@@ -204,7 +218,7 @@ func planClosedIssues(gh github) string {
 			b.WriteString("(no body)\n\n")
 			continue
 		}
-		b.WriteString(capBrief(it.Body, maxPlanClosedBody))
+		b.WriteString(escapeMD(it.Body, maxPlanClosedBody, false))
 		b.WriteString("\n\n")
 		shown++
 	}

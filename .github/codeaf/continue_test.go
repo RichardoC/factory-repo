@@ -7,7 +7,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -30,15 +32,28 @@ func captureStdout(t *testing.T, fn func() error) (string, error) {
 	}
 	old := os.Stdout
 	os.Stdout = w
+	// Drain the pipe while fn runs: a brief can exceed the 64KB OS pipe
+	// buffer, and fn writing into a full pipe with nobody reading deadlocks
+	// the test. The read finishes before fn returns, because fn cannot
+	// return while a write is still blocked.
+	type captured struct {
+		data string
+		err  error
+	}
+	out := make(chan captured, 1)
+	go func() {
+		data, readErr := io.ReadAll(r)
+		out <- captured{string(data), readErr}
+	}()
 	runErr := fn()
 	os.Stdout = old
 	w.Close()
-	data, readErr := io.ReadAll(r)
+	got := <-out
 	r.Close()
-	if readErr != nil {
-		t.Fatal(readErr)
+	if got.err != nil {
+		t.Fatal(got.err)
 	}
-	return string(data), runErr
+	return got.data, runErr
 }
 
 // writeResult points RESULT_PATH at a result file whose stop reason is stop.
@@ -237,6 +252,14 @@ func commentsServer(t *testing.T, comments []issueComment, status int) *httptest
 		body = "server exploded"
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The pull request under review, ready for review (issue #237): the
+		// review plan reads the draft flag before it labels, and the tests
+		// that expect a label run against a pull request that is not a
+		// draft. A draft pull request is served by its own test.
+		if r.URL.Path == "/repos/RichardoC/factory-repo/pulls/7" {
+			_, _ = io.WriteString(w, `{"number":7,"title":"t","state":"open","draft":false}`)
+			return
+		}
 		if r.URL.Path != "/repos/RichardoC/factory-repo/issues/7/comments" {
 			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
 			return
@@ -246,6 +269,339 @@ func commentsServer(t *testing.T, comments []issueComment, status int) *httptest
 	}))
 	t.Cleanup(server.Close)
 	return server
+}
+
+// pageDelay is how long the paged comment stub holds a page after the
+// first (see commentsPagesServer): long enough that a client which reads
+// the final page more than once is noticed by the request count, short
+// enough not to slow the suite.
+const pageDelay = 500 * time.Millisecond
+
+// commentsPagesServer serves issue #7's comments the way the real API
+// does: perPage per page, and a `Link: rel="next"` header while more
+// remain. The pointer it returns counts the pages served.
+//
+// Pages after the first are served slowly (pageDelay). A client that
+// follows the listing page by page reads the tail once and finishes well
+// inside the delay; a client that loops over the listing (reading it per
+// page, say to count reports) or follows the same next link twice re-reads
+// the tail and goes past the delay, so the request count it leaves behind
+// stops matching the page count. That keeps the page count in these tests
+// an assertion about the read, not about a single pass that happens to
+// append.
+func commentsPagesServer(t *testing.T, perPage int, comments []issueComment) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/RichardoC/factory-repo/issues/7/comments" {
+			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+		requests.Add(1)
+		page := 1
+		if s := r.URL.Query().Get("page"); s != "" {
+			if v, err := strconv.Atoi(s); err == nil {
+				page = v
+			}
+		}
+		if page > 1 {
+			time.Sleep(pageDelay) // the tail page is slow, as a second page in the real API can be
+		}
+		start := (page - 1) * perPage
+		if start >= len(comments) {
+			http.Error(w, "page past the end", http.StatusBadRequest)
+			return
+		}
+		end := start + perPage
+		if end > len(comments) {
+			end = len(comments)
+		}
+		var b strings.Builder
+		b.WriteString("[")
+		for i := start; i < end; i++ {
+			if i > start {
+				b.WriteString(",")
+			}
+			fmt.Fprintf(&b, `{"id":%d,"body":%q}`, comments[i].ID, comments[i].Body)
+		}
+		b.WriteString("]")
+		if end < len(comments) {
+			w.Header().Set("Link", fmt.Sprintf("<%s%s?per_page=%d&page=%d>; rel=\"next\"", serverURL(r), r.URL.Path, perPage, page+1))
+		}
+		_, _ = io.WriteString(w, b.String())
+	}))
+	t.Cleanup(server.Close)
+	return server, &requests
+}
+
+// serverURL rebuilds the request's own base URL, so the served next link
+// points back at the stub the way the real API's links point at itself.
+func serverURL(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host
+}
+
+// straddleComments builds the pull request the continuation cap straddles
+// (issue #223), in the shape the pagination has to read whole: `filler`
+// ordinary comments, then `page1Reports` of the run reports, then
+// `pastReports` more of them, so the API's page boundary falls in the
+// middle of the reports rather than before or after them. "More than 100
+// report comments across two pages" only means what it says when some
+// report is on page 1 and at least one more sits past index 100: a listing
+// that stops at the first page then sees a below-cap count, and only a read
+// that follows the next link sees every report.
+//
+// It starts with one ordinary comment whose body is hostile remote text, so
+// the assertions can show it never reaches a comment we post.
+func straddleComments(filler, page1Reports, pastReports int) []issueComment {
+	comments := []issueComment{{ID: 999, Body: "untrusted prose that must never reach a comment we post <!-- -->"}}
+	reports := 0
+	addReports := func(n int) {
+		for i := 0; i < n; i++ {
+			reports++
+			comments = append(comments, issueComment{
+				ID:   int64(reports),
+				Body: fmt.Sprintf("%s\n### CodeAF run — done\n\n| stop / ok | done / `true` |\n", reportMarker),
+			})
+		}
+	}
+	addReports(page1Reports)
+	for i := 0; i < filler; i++ {
+		comments = append(comments, issueComment{
+			ID:   int64(1000 + i),
+			Body: fmt.Sprintf("an ordinary reviewer comment, number %d", i),
+		})
+	}
+	addReports(pastReports)
+	return comments
+}
+
+// TestCountReportsAcrossPages is the issue #223 stub: the stub serves more
+// than 100 report comments across two pages — 20 of them, two on the first
+// page and 18 past index 100 — and a read that follows the next link must
+// reach them whole, so countReports sees all 20 and the cap fires.
+//
+// Its shape is what makes the test discriminate, and it is stated here so
+// the numbers stay checkable: page 1 is indices 0..99 and holds 1 ordinary
+// leading comment + the first 2 reports + 97 ordinary filler comments; the
+// LAST report is the 20th, at index 119. Index 100 — the first comment of
+// page 2 — is the last filler comment, so the API's page boundary falls
+// inside the ordinary comments and every report past it is on page 2. Page
+// 1 therefore carries 2 report comments and 18 report comments sit past
+// index 100, both non-zero, which is the straddle the bullet describes.
+//
+// A one-page read cannot pass this test: the pre-change reply (a single GET
+// of the first page, no next link followed) sees 2 reports, and
+// continuationsUsed(2) = 1 is below maxContinuations = 2, so countReports
+// under-counts, continuationCapReached is false and continuePlan answers
+// "continue" with used = 1 instead of firing the cap. `reportComments`, the
+// other stub, puts the reports first, so 100 of those fit inside page 1 and
+// the one-page read already counted 99 and fired the cap — assertion green,
+// harm untested. That is why the reports here straddle the boundary instead.
+func TestCountReportsAcrossPages(t *testing.T) {
+	perPage := 100
+	// The stub's shape in numbers, so a change to either constant still
+	// reads as the straddle it is: 20 report comments in all, 2 of them on
+	// page 1 and 18 past index 100. Below index 100 sit 1 ordinary leading
+	// comment, those 2 reports and 97 ordinary filler comments.
+	const page1Reports, page2Reports = 2, 18
+	comments := straddleComments(perPage-1-page1Reports, page1Reports, page2Reports)
+	if len(comments) <= perPage {
+		t.Fatalf("the stub serves %d comments, a first page of %d or less: no next link, nothing paged", len(comments), perPage)
+	}
+	if got := countReports(comments); got != page1Reports+page2Reports {
+		t.Fatalf("the stub serves %d report comments, want %d: more than 100 report comments across two pages", got, page1Reports+page2Reports)
+	}
+	// The straddle itself: reports on both sides of the boundary at index
+	// 100, so neither a one-page read nor a two-page read that drops the
+	// first page can see them all.
+	if got := countReports(comments[:perPage]); got != page1Reports {
+		t.Fatalf("the first page (%d comments) carries %d report comments, want %d: the reports must straddle the boundary, some on page 1", perPage, got, page1Reports)
+	}
+	if got := countReports(comments[perPage:]); got != page2Reports {
+		t.Fatalf("past index %d (%d comments) carry %d report comments, want %d: the reports must straddle the boundary, most past it", perPage, len(comments)-perPage, got, page2Reports)
+	}
+	// Discriminating: a page-1-only read is below the cap, so the
+	// pre-change, unpaged read cannot pass the assertions below.
+	if got := continuationCapReached(continuationsUsed(countReports(comments[:perPage]))); got {
+		t.Fatalf("the first page alone reaches the cap (its %d reports give used = %d); the shape must straddle the boundary, not straddle the cap", page1Reports, continuationsUsed(page1Reports))
+	}
+	server, requests := commentsPagesServer(t, perPage, comments)
+	ghEnv(t, server)
+	gh := newGitHub()
+	started := time.Now()
+	action, body, used, err := continuePlan(gh, 7, stopDeadline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := continuationsUsed(page1Reports + page2Reports); used != want {
+		t.Fatalf("used = %d, want %d: the read must see all %d report comments, the %d on page 1 and the %d past it", used, want, page1Reports+page2Reports, page1Reports, page2Reports)
+	}
+	if action != "cap" {
+		t.Fatalf("action = %q, used = %d; want the cap fired (used >= %d) — a one-page read leaves used = %d here", action, used, maxContinuations, continuationsUsed(page1Reports))
+	}
+	if want := capBody(stopDeadline); body != want {
+		t.Errorf("body = %q, want the cap comment %q", body, want)
+	}
+	// Both pages: page 2 holds every report past index 100, so a read that
+	// stops at the first page both counts too few and makes one request.
+	if n := requests.Load(); n != 2 {
+		t.Errorf("pages read = %d, want 2: the second page holds the %d reports past index %d", n, page2Reports, perPage)
+	}
+	if elapsed := time.Since(started); elapsed < pageDelay {
+		t.Errorf("continuePlan answered in %s, faster than the tail page's own %s and request count unmatched", elapsed, pageDelay)
+	}
+}
+
+// TestCountReportsSinglePage is the other issue #223 stub: a reply with no
+// `Link` header answers after one request, with nothing re-read, so the
+// single-page case is unchanged by the pagination.
+func TestCountReportsSinglePage(t *testing.T) {
+	server, requests := commentsPagesServer(t, 100, reportComments(1))
+	ghEnv(t, server)
+	gh := newGitHub()
+	action, body, used, err := continuePlan(gh, 7, stopDeadline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "continue" || used != 0 {
+		t.Fatalf("with one report, action = %q, used = %d; want continue and none used", action, used)
+	}
+	if want := continueBody(stopDeadline, 0); body != want {
+		t.Errorf("body = %q, want %q", body, want)
+	}
+	if n := requests.Load(); n != 1 {
+		t.Errorf("requests = %d, want 1: a reply with no next link needs no extra request", n)
+	}
+}
+
+// TestBriefDegradesOnListPageCap is the brief-builder half of the issue #223
+// follow-up: a list read that stops at the page cap must not kill the brief.
+// The stub below is a comments listing that always offers a next link, so a
+// getList on it can never finish reading the listing and comes back with the
+// page-cap error alone; before the fix runBrief returned that error and wrote
+// no brief at all, while its sibling reads (previousReportSection,
+// reviewFindingsSection) degraded to a note. Here the brief must still be
+// written, carry the note, and be a whole brief — the sections after the
+// conversation are still there.
+func TestBriefDegradesOnListPageCap(t *testing.T) {
+	// The stub serves the pr-mode brief (prRoutes' paths), and the comments
+	// listing always claims another page. Every other path is served as
+	// usual, so the failure under test is the page cap and nothing else.
+	comments := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		routes := prRoutes()
+		body, ok := routes[r.URL.Path]
+		if !ok {
+			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+		if r.URL.Path == "/repos/RichardoC/factory-repo/issues/7/comments" {
+			comments++
+			w.Header().Set("Link", fmt.Sprintf("<%s%s?per_page=100&page=%d>; rel=\"next\"", serverURL(r), r.URL.Path, comments+1))
+			body = `[{"id":1,"body":"a comment","user":{"login":"alice","type":"User"},"author_association":"MEMBER"}]`
+		}
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(server.Close)
+	briefPath := briefEnv(t, server, "pr", prEvent)
+
+	devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	os.Stdout = devnull
+	runErr := runBrief()
+	os.Stdout = old
+	_ = devnull.Close()
+
+	if runErr != nil {
+		t.Fatalf("runBrief with a capped comments listing: %v, want the brief to degrade instead", runErr)
+	}
+	data, err := os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief := string(data)
+	if !strings.Contains(brief, "(conversation unavailable: ") {
+		t.Errorf("the capped conversation is not degraded in the brief:\n%s", briefSection(brief, "Conversation"))
+	}
+	// The brief must still be a brief: the sections the builder appends
+	// after the conversation are there, so a capped read degraded rather
+	// than truncated the build.
+	if !strings.Contains(brief, "## Conversation") {
+		t.Error("the Conversation heading is missing from the brief")
+	}
+	if briefSection(brief, "Open review findings (after the last CodeAF push)") == "" {
+		t.Error("the brief stops after the capped read: the review-findings section is missing")
+	}
+}
+
+// TestBriefConversationDegradesOnlyOnPageCap pins the other half of the
+// contract thread() now has: the page cap degrades to a note, while a next
+// link that is not a link this client may follow still fails. Only the cap
+// means "truncated, not broken"; a malformed header is a read that did not
+// happen, and the brief says so instead of pretending it has the thread.
+func TestBriefConversationDegradesOnlyOnPageCap(t *testing.T) {
+	// nextLink is the one place the header's shape is decided, so this is
+	// where a chain of next links becomes a path (pages capped) and a
+	// malformed header becomes the error thread() re-raises.
+	t.Run("chain of next links is a page-cap path", func(t *testing.T) {
+		server, requests := nextPageForeverServer(t)
+		gh := github{api: server.URL, repo: "RichardoC/factory-repo", token: "tok", client: server.Client()}
+		conversation, err := gh.thread(7)
+		if err != nil {
+			t.Fatalf("thread on a capped listing: %v, want a note and no error", err)
+		}
+		if !strings.HasPrefix(conversation, "(conversation unavailable: ") {
+			t.Errorf("thread = %q, want the cap note", conversation)
+		}
+		if n := requests.Load(); n != maxListPages {
+			t.Errorf("pages requested = %d, want exactly maxListPages (%d)", n, maxListPages)
+		}
+	})
+	t.Run("bad next link still fails", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Link", "<:not a url>; rel=\"next\"")
+			_, _ = io.WriteString(w, `[]`)
+		}))
+		t.Cleanup(server.Close)
+		gh := github{api: server.URL, repo: "RichardoC/factory-repo", token: "tok", client: server.Client()}
+		_, err := gh.thread(7)
+		if err == nil {
+			t.Error("thread on a malformed next link: no error, want the read to fail")
+		}
+		if isPageCapError(err) {
+			t.Errorf("a malformed next link is not a page cap: %v", err)
+		}
+	})
+}
+
+// nextPageForeverServer serves a comments listing that always offers a next
+// link: a getList reading it stops at the page cap, on purpose. The counter
+// is how many pages were asked for.
+func nextPageForeverServer(t *testing.T) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		page := r.URL.Query().Get("page")
+		if page == "" {
+			page = "1"
+		}
+		n, err := strconv.Atoi(page)
+		if err != nil {
+			n = 1
+		}
+		w.Header().Set("Link", fmt.Sprintf("<%s%s?per_page=100&page=%d>; rel=\"next\"", serverURL(r), r.URL.Path, n+1))
+		_, _ = io.WriteString(w, `[{"id":1,"body":"a comment","user":{"login":"alice","type":"User"},"author_association":"MEMBER"}]`)
+	}))
+	t.Cleanup(server.Close)
+	return server, &requests
 }
 
 func TestContinuePlan(t *testing.T) {
@@ -819,7 +1175,27 @@ func TestContinuePlanContinuesADirtyPR(t *testing.T) {
 
 	t.Run("a failing pull request fetch fails the plan", func(t *testing.T) {
 		sleeps := stubSleep(t)
-		server := commentsServer(t, reportComments(1), http.StatusOK) // 404s /pulls/7
+		// This server serves the comments and nothing else, so the pull
+		// request fetch fails; commentsServer cannot stand in for it since
+		// it serves a ready pull request too (the review plan reads the
+		// draft flag, issue #237).
+		var b strings.Builder
+		b.WriteString("[")
+		for i, c := range reportComments(1) {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			fmt.Fprintf(&b, `{"id":%d,"body":%q}`, c.ID, c.Body)
+		}
+		b.WriteString("]")
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/repos/RichardoC/factory-repo/issues/7/comments" {
+				http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
+				return
+			}
+			_, _ = io.WriteString(w, b.String())
+		}))
+		t.Cleanup(server.Close)
 		ghEnv(t, server)
 		action, body, _, err := continuePlan(newGitHub(), 7, stopDone)
 		if err == nil {

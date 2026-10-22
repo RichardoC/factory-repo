@@ -107,21 +107,42 @@ func TestMultiHandlerEnabledIsAnyChild(t *testing.T) {
 	}
 }
 
-func TestMultiHandlerHandleReturnsFirstChildError(t *testing.T) {
-	wantErr := errors.New("first child failed")
-	first := &stubHandler{level: slog.LevelInfo, wantErr: wantErr}
-	second := &stubHandler{level: slog.LevelInfo}
+// A failing child must not stop the remaining children: Handle calls every
+// enabled child and joins the failures, so a broken console handler cannot
+// keep records from reaching the file.
+func TestMultiHandlerHandleCallsEveryChildAndJoinsErrors(t *testing.T) {
+	firstErr := errors.New("first child failed")
+	secondErr := errors.New("second child failed")
+	first := &stubHandler{level: slog.LevelInfo, wantErr: firstErr}
+	second := &stubHandler{level: slog.LevelInfo, wantErr: secondErr}
 
 	err := NewMultiHandler(first, second).Handle(context.Background(), testRecord(slog.LevelInfo, "boom"))
 
-	if !errors.Is(err, wantErr) {
-		t.Errorf("Handle error = %v; want %v", err, wantErr)
+	if !errors.Is(err, firstErr) {
+		t.Errorf("Handle error = %v; want it to wrap %v", err, firstErr)
+	}
+	if !errors.Is(err, secondErr) {
+		t.Errorf("Handle error = %v; want it to wrap %v", err, secondErr)
 	}
 	if first.calls != 1 {
 		t.Errorf("first child calls = %d; want 1", first.calls)
 	}
-	if second.calls != 0 {
-		t.Errorf("second child calls = %d; want 0: Handle stops at the first error", second.calls)
+	if second.calls != 1 {
+		t.Errorf("second child calls = %d; want 1: a failing sibling must not stop the remaining children", second.calls)
+	}
+
+	// A failing console handler must still let the record reach the file.
+	console := &stubHandler{level: slog.LevelInfo, wantErr: secondErr}
+	fileHandler, file := newBufferHandler(slog.LevelInfo)
+	err = NewMultiHandler(console, fileHandler).Handle(context.Background(), testRecord(slog.LevelInfo, "boom"))
+	if !errors.Is(err, secondErr) {
+		t.Errorf("Handle error = %v; want it to wrap %v", err, secondErr)
+	}
+	if console.calls != 1 {
+		t.Errorf("console child calls = %d; want 1", console.calls)
+	}
+	if !strings.Contains(file.String(), "msg=boom") {
+		t.Errorf("file child should still receive the record after the console child failed, got:\n%s", file.String())
 	}
 }
 

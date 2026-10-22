@@ -86,7 +86,11 @@ Update the Linear issue when managed fields differ:
 
 When a previously tracked finding no longer exists in Snyk but its Snyk project still exists, move the Linear issue to the resolved state.
 
-When a previously tracked finding no longer exists because its Snyk project no longer exists, cancel the Linear issue instead. When the sync itself closes an open ticket this way it records `closed_reason: project-missing` (or `project-deactivated`) in the metadata block, so a later run can tell the closure was machine-made and rebind the ticket if the project is recreated. A ticket that is already closed keeps its state and records no `closed_reason`: a `Done` ticket stays `Done`, because the project going away says nothing about how the ticket was closed.
+When a previously tracked finding no longer exists because its Snyk project no longer exists, cancel the Linear issue instead.
+
+When the sync itself closes an open ticket this way it records `closed_reason: project-missing` (or `project-deactivated`) in the metadata block, so a later run can tell the closure was machine-made and rebind the ticket if the project is recreated. A ticket that is already closed keeps its state and records no `closed_reason`: a `Done` ticket stays `Done`, because the project going away says nothing about how the ticket was closed.
+
+An empty Snyk snapshot is not trusted: if the snapshot lists no projects at all — neither active nor inactive — while managed tickets exist in Linear, the run fails with an error instead of resolving anything, and makes no Linear write and no cache refresh. A silently empty project and finding list is the documented symptom of an API key that cannot read projects, of an outage, or of `SNYK_ORG_ID` naming an organization the API key cannot see — acting on it would cancel every managed ticket in one run. In `--dry-run` the plan is still reported, with the same message logged at error level. A brand-new deployment with no managed tickets yet is not affected, and an organization whose issues are all fixed still lists its projects, so those tickets still move to the resolved state. The guard covers the "nothing at all" case only; a partial listing is not a plausibility failure.
 
 ### Reopen Guard
 
@@ -207,9 +211,11 @@ The configured label must already exist in Linear. If it does not, the run fails
 - any other value: the exact Linear label name to apply
 - the label must already exist in Linear
 
-When an issue is in the awaiting-fix state, the sync adds the configured label. When the fix becomes available and the issue moves to `Todo`, the label is removed. The label is tracked in the metadata block alongside tool and origin labels.
+When an issue is in the awaiting-fix state, the sync adds the configured label. When the fix becomes available and the issue moves to `Todo`, the label is removed. The label is tracked in the metadata block alongside tool and origin labels. The metadata block also carries an `awaiting_fix: yes` marker, written whenever the finding is in the awaiting-fix state regardless of the label configuration, and cleared when the state ends.
 
 The metadata block stores the full managed label set so the sync can remove stale tool-derived, origin-derived, and awaiting-fix labels while preserving unrelated manual labels.
+
+Because `issueUpdate` replaces the ticket's whole label set, every update batch re-reads the current labels of the issues it is about to write, immediately before the write, and carries labels the sync does not own over from that live read rather than from the run's opening snapshot. An issue whose labels that read cannot deliver is refused instead of guessed at: this covers an issue absent from the response and one returned with a truncated labels page (`pageInfo.hasNextPage`), where a label past the page boundary — including a `LINEAR_PROTECTED_LABELS` control label — would be absent from the read and then deleted by the update. The refusal is not paginated away: a nested connection cannot be paged from within this one query, and the sync's own cap of 250 labels per issue makes a truncating ticket pathological rather than a case worth serving. The caller retries the batch item by item, so only the refused issue fails; its update is counted in `failed_ops`.
 
 `LINEAR_UNSUBSCRIBE_ACTOR` is an optional operator control for notification behavior.
 
@@ -269,7 +275,7 @@ The `ignored until fix available` state is distinct from other ignored states be
 
 When a user manually moves a managed open ticket from `Todo` to `Backlog` in Linear, subsequent syncs preserve the `Backlog` state instead of overriding it back to `Todo`. This prevents the automation from fighting intentional user triage decisions. The override matches the configured `LINEAR_STATE_BACKLOG` value with case-insensitive normalization.
 
-The override does not apply to a ticket the sync itself parked in `Backlog` for an `ignored until fix available` finding: that placement is the sync's own, not a manual move. When the fix becomes available Snyk flips `ignored=false`, the next run moves the ticket to `Todo` with a recalculated due date, and the change comment says why. Only the `Backlog` state the sync chose is overridden this way — if a person moved the awaiting-fix ticket to some other non-terminal state (for example `In Progress`), the general manual non-terminal state override below still preserves their choice. This detection needs the awaiting-fix label recorded in the metadata block: with `LINEAR_AWAITING_FIX_LABEL=off` there is no label, the sync cannot tell its own `Backlog` placement from a manual one, and the ticket stays in `Backlog` as before.
+The override does not apply to a ticket the sync itself parked in `Backlog` for an `ignored until fix available` finding: that placement is the sync's own, not a manual move. When the fix becomes available Snyk flips `ignored=false`, the next run moves the ticket to `Todo` with a recalculated due date, and the change comment says why. Only the `Backlog` state the sync chose is overridden this way — if a person moved the awaiting-fix ticket to some other non-terminal state (for example `In Progress`), the general manual non-terminal state override below still preserves their choice. The detection reads the `awaiting_fix` marker in the metadata block, which the sync writes regardless of the label configuration, so it works with `LINEAR_AWAITING_FIX_LABEL=off` too. Tickets written before the marker existed carry neither marker nor label and keep the old behavior: the sync cannot tell its own `Backlog` placement from a manual one, and the ticket stays in `Backlog` when the fix arrives, until the sync rewrites its description in a later awaiting-fix run.
 
 ### Manual Non-Terminal State Override
 
@@ -309,6 +315,49 @@ It uses:
 - SQLite caching
 
 The cache is critical for steady-state performance. A healthy steady-state run should do little or no work when nothing has changed.
+
+### Batch Failure Handling
+
+Linear mutations are batched, one GraphQL alias per entry, so a create batch can
+fail in two ways that need different handling to avoid duplicating tickets:
+
+- **Per-alias failure.** The response carries `success: false`, or omits the
+  alias, while the other aliases succeeded. Only the reported entries are
+  retried; retrying the batch would duplicate the ones that already exist.
+- **Ambiguous failure.** No aliases were decoded at all, so nothing is known per
+  entry. This covers a transport-level failure and equally a GraphQL failure
+  that returned no data, such as a 502 arriving after Linear had already
+  committed the mutation. Crucially it does *not* prove Linear rejected the
+  mutation, and Linear exposes no idempotency key to make the retry safe: the
+  sync therefore reconciles first. `ExistingFingerprints` asks Linear which of
+  the batch's fingerprints now have a live issue, and only the rest are
+  re-created. That reconciliation query is scoped exactly like the snapshot
+  (team plus the identity arms: the title prefix and the managed label), so a
+  shared team cannot be paged through during the retry path. The metadata block
+  that carries the fingerprint is deliberately *not* used as a query predicate:
+  Linear does not apply `description` comparators, and filtering on them
+  silently widens the query to every issue in the team (the same trap the
+  sibling snyk-dast-linear-sync hit). The fingerprint check still runs on each
+  decoded description, so the scope governs which issues are read, not what
+  counts as a match.
+
+  If the reconciliation query itself fails, nothing is retried: the batch is
+  counted in `FailedOps` and left for the next run, which creates whatever is
+  genuinely missing. The finding is still reported by Snyk either way; if its
+  issue was never created it is absent from the next Linear snapshot and gets
+  created then. Missing a ticket for one cycle is recoverable; a duplicate is
+  only undone later by the duplicate-cancellation pass, after duplicate
+  notifications have gone out.
+
+A residual race remains by construction: a write that lands between the
+reconciliation query and the retry still duplicates. The
+duplicate-cancellation pass converges that case on a later run.
+
+Update, resolve and duplicate-cancel batches keep their item-by-item fallback:
+those writes set state, so re-applying one that already landed converges instead
+of duplicating. Change comments also have no fingerprint to reconcile against;
+an ambiguous comment-batch failure retries each comment individually, accepting
+a possible duplicate notification comment over a missing one.
 
 ## SQLite Cache
 
@@ -372,6 +421,23 @@ Use cache bypass when you intentionally changed the managed rendering or need a 
 ```bash
 go run ./cmd/snyk-linear-sync --env-file .env --bypass-cache
 ```
+
+### Exit Status
+
+`RunResult.Err` decides the process exit status, and it is deliberately narrow:
+the run fails only when state-changing work was left permanently unapplied.
+
+`FailedOps` is incremented *after* the per-item retry has itself failed, so a
+batch failure recovered by retry leaves it at zero and the run succeeds — the
+operation applied, it just took two calls. The exception is an ambiguous batch
+create whose reconciliation lookup also fails: the whole batch is counted
+without a retry, because there is no safe way to tell which entries landed. A
+non-zero count fails the run,
+because a run that logs a dropped ticket and then reports success means nothing
+downstream notices, and the next scheduled run reports success again.
+
+The check runs after the `sync complete` summary log, so the counts are
+reported regardless of the exit status.
 
 ## Design Boundaries
 

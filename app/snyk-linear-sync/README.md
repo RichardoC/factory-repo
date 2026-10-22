@@ -22,6 +22,7 @@ github.com/tesslio/snyk-linear-sync
 - Ensures a configurable managed label is applied to all managed issues, unless label management is explicitly turned off.
 - Moves stale issues to the configured resolved state when the finding is no longer present but the Snyk project still exists.
 - Cancels managed Linear issues when their Snyk project no longer exists, such as after project deletion.
+- Fails the run instead of cancelling everything when the Snyk snapshot lists no projects at all (neither active nor inactive) while managed issues exist, so a Snyk outage, a revoked key or a wrong `SNYK_ORG_ID` cannot mass-cancel the board.
 - Rebinds a ticket to its finding when Snyk recreates the project under a new project ID (see [Project Recreation](#project-recreation)), instead of cancelling it and creating a copy.
 - Reopens a ticket that was closed while Snyk kept reporting the exact same occurrence as open, instead of creating a duplicate (see [Reopen Guard](#reopen-guard)).
 - Uses a local SQLite cache to skip unchanged findings and unchanged Linear issues on steady-state runs.
@@ -127,7 +128,13 @@ CI enforces all of these: `gofmt -l`, `go fix` + `git diff --exit-code`,
 - Stores a human-facing Snyk UI link in the Linear description.
 - Keeps the Snyk REST API link as a secondary reference.
 - Includes repository, project reference, target file, and source location details when Snyk provides them.
-- Batches Linear create and update mutations to reduce request pressure.
+- Batches Linear create and update mutations to reduce request pressure. When a
+  create batch fails without per-item information (a transport failure, or a
+  lost response after Linear committed the mutation), the sync first asks
+  Linear which of the batch's fingerprints already have a live ticket and
+  re-creates only the rest, so a lost response does not duplicate tickets. If
+  that lookup also fails, the batch is left for the next run rather than
+  blindly retried.
 - Retries and backs off on Linear rate limiting.
 - Normalizes common Linear markdown rewrites when comparing descriptions so steady-state runs do not churn, and ignores the scanned commit and line numbers of Snyk Code findings, so a rescan that changes nothing else does not rewrite every ticket of the repository. The commit and line links on a ticket are refreshed when anything else about its finding changes.
 
@@ -257,9 +264,10 @@ When an issue is in the awaiting-fix state, the sync:
 - places the issue in `Backlog` with no due date
 - adds the configured awaiting-fix label
 - renders `Status: ignored (no fix available)` in the description
-- removes the awaiting-fix label when a fix becomes available and the issue moves to `Todo`
+- writes an `awaiting_fix: yes` marker into the metadata block
+- removes the awaiting-fix label and clears the marker when a fix becomes available and the issue moves to `Todo`
 
-Setting `LINEAR_AWAITING_FIX_LABEL=off` has one limitation besides the missing label: the metadata block records no awaiting-fix label, so a later run cannot tell a `Backlog` placement the sync made itself from one a person made by hand. An "ignored until fix available" ticket in `Backlog` therefore stays in `Backlog` when its fix arrives. Keep the label enabled (the default) for the automatic move back to `Todo`.
+The `awaiting_fix` marker is written regardless of the label configuration, so even with `LINEAR_AWAITING_FIX_LABEL=off` a later run can tell a `Backlog` placement the sync made itself from one a person made by hand: when the fix arrives, the ticket still moves back to `Todo` with a recalculated due date. Tickets written before the marker existed carry no `awaiting_fix` line; they keep the old behavior (they stay in `Backlog` once the fix arrives) until the sync rewrites their description in a later awaiting-fix run — no one-time mass update happens on upgrade. Keep the label enabled (the default) to make these tickets filterable.
 
 When tool, origin, or awaiting-fix label mapping is enabled, the sync manages the global automation label plus the derived label set recorded in the metadata block.
 
@@ -283,10 +291,13 @@ restating the snapshot would delete that label. Reading live avoids it:
 
 - a label added since the snapshot (managed or not) survives the update
 - a label removed since the snapshot is not re-added
-- if an issue's live labels cannot be read, its update fails rather than
-  proceeding — writing a label set that might drop a label the sync does not own
-  is worse than deferring the update to the next run. The caller retries the
-  batch item by item, so one unreadable issue does not block the rest.
+- if an issue's live labels cannot be read — the read returns nothing for the
+  issue, or returns a truncated page of its labels (`pageInfo.hasNextPage` on
+  the labels connection) — its update fails rather than proceeding: writing a
+  label set that might drop a label the sync does not own is worse than
+  deferring the update to the next run. The caller retries the batch item by
+  item, so one unreadable issue does not block the rest; its update is counted
+  in `failed_ops`.
 
 `LINEAR_PROTECTED_LABELS` lists labels this sync must never *assert* from its
 managed set — a guard against a misconfiguration that puts a control label into
@@ -362,6 +373,7 @@ be trusted to select which issues to load.
 - fixed (or resolved/disappeared) -> `Done`
 - missing finding in an existing active Snyk project -> `Done`
 - missing finding because the Snyk project no longer exists -> `Cancelled`
+- Snyk snapshot lists no projects at all (active and inactive both empty) while managed issues exist -> the run fails with an error and writes nothing (`--dry-run` still reports the plan and logs the refusal at error level)
 - Snyk project is inactive (de-activated) -> `Cancelled`
 
 The configured Linear state names are resolved by name first, then by workflow type where possible.
@@ -494,6 +506,39 @@ for creates, for tickets moved to `Done`/`Cancelled` by the resolve loop, or for
 duplicate cancellations; a description change confined to the hidden metadata
 block posts no comment either.
 
+
+## Exit Status
+
+The sync exits non-zero when a state-changing Linear operation was left
+permanently unapplied, so a scheduler or CI job notices the drift instead of
+seeing a successful run that quietly dropped work.
+
+"Permanently" is the key word. Batch mutations are retried per entry, and only
+the outcome after that retry counts:
+
+- a batch that fails and whose retry lands is a **successful** run — the
+  operation applied, it just took two calls
+- a create, update, resolve or duplicate-cancellation whose retry also failed
+  is counted in `failed_ops` and **fails** the run
+
+Ambiguous batch creates are the exception to "the outcome after that retry":
+if the reconciliation lookup that decides what landed fails too, the whole
+batch is counted in `failed_ops` without a retry — there is no safe way to
+tell which entries landed, so every one is treated as unapplied and left for
+the next run (see [Current Behavior](#current-behavior)).
+
+The count appears in the `sync complete` summary log either way, and that
+summary is emitted before the exit status is decided.
+
+An interrupt is a non-zero exit too, with a different cause. Ctrl-C or SIGTERM
+cancels the context, so in-flight Linear calls are cancelled, no further jobs
+start, and the run logs `shutdown requested, cancelling in-flight calls and
+leaving the cache untouched`. The cache is **not** refreshed — the plan was
+only partly written, so a refresh would describe the fingerprints whose jobs
+never ran as reconciled (see [Cache Behavior](#cache-behavior)) — and `Run`
+returns an error wrapping `context.Canceled`/`context.DeadlineExceeded`, which
+becomes the process exit status. A signal that arrives after a run has already
+finished changes nothing.
 
 ## Logs
 

@@ -87,10 +87,9 @@ maintainer's approval, like any other change under `.github/`.
   length of the job and sits between CodeAF and [synthetic.new](https://synthetic.new).
   It:
   - serves CodeAF an OpenRouter-style `/models` catalog containing only the models in
-    [`models.json`](.github/codeaf/models.json), at synthetic.new's **subscription
-    rates** — the prices that draw down the weekly credit, so CodeAF's estimates and
-    model routing see what usage really costs against the quota; the same file also
-    carries each model's API list rates (`api_*`), what overage past the quota costs
+    [`models.json`](.github/codeaf/models.json), at synthetic.new's **API list
+    ("overage") prices** (`api_*`), the prices every figure and cap in the factory
+    uses; the same file also keeps each model's subscription rates, for reference only
     (both checked 2026-10-17, [synthetic.new/pricing](https://synthetic.new/pricing));
   - adds `usage.cost` to every response, which is where CodeAF's spend accounting
     reads cost from;
@@ -111,9 +110,9 @@ maintainer's approval, like any other change under `.github/`.
   allow only 2 calls to each model at once; since the October 2026 pricing
   change concurrency is by plan priority instead, and the factory sets its
   own per-model cap (`max_concurrent`, 8):
-  - the worker runs on **GLM-5.3-Flash** ($0.10 in / $0.25 out per M tokens at
-    subscription rates);
-  - the planner and checker run on **DeepSeek-V4.1-Flash** ($0.06 / $0.30).
+  - the worker runs on **GLM-5.3-Flash** ($0.15 in / $0.50 out per M tokens at
+    the API list prices the factory quotes);
+  - the planner and checker run on **DeepSeek-V4.1-Flash** ($0.60 / $1.20).
   - CodeAF's `task.parallel` is set per run to that run's slice of the
     worker model's `max_concurrent` (below).
   - The proxy enforces the limit per model (`max_concurrent` in
@@ -169,16 +168,24 @@ The synthetic.new account is on the **Big** plan ($90/mo). Usage draws down a
 **weekly credit** at the subscription rates, and the credit regenerates 2% of its
 total every 202 minutes (~3.4 h) — a full refill in about a week. Past the quota,
 usage is billed at the **API list prices**, up to `limits.overage_usd`; at 0 (the
-default) the factory stops rather than pay beyond the $90. The Big plan's weekly
-credit is not published, so `weekly_credit_usd` (22, an estimate from `/v2/quotas`) is a conservative
-**assumption** — calibrate it from `GET /v2/quotas`'s `subscription.limit` once
-its units are known. `run_credit_usd` (5) caps one run; the weekly credit and the
-overage cap are shared by every run of the week through the shared state, and are
-sized so several overlapping runs (`task.parallel` 2) can share the week.
+default) the factory stops rather than pay beyond the $90. `GET /v2/quotas`
+reports the weekly credit (`weeklyTokenLimit.maxCredits`, $22.17 at subscription
+rates) and what is left of it (`percentRemaining`). The owner's other workloads
+share the same quota.
+
+**Every figure and cap is at the API list ("overage") prices** (the owner's
+decision, 2026-10-20): a call is priced at `api_input`/`api_cached`/`api_output`,
+and the subscription rates in `models.json` are kept for reference only. On the
+factory's model mix that is about 4.5× the subscription credit (DeepSeek ~7.9×),
+so `weekly_credit_usd` is 100 (maxCredits × 4.5, used only to pace the queue)
+and `run_credit_usd` (5) caps one run, about 2.5× the most expensive run seen.
+The hard stop is synthetic.new's own `percentRemaining`: the proxy refuses below
+`min_credit_percent` (25), which leaves a quarter of the week for the other
+workloads.
 
 What the harness does with it:
-- the catalog prices CodeAF sees are the subscription rates — the credit;
-  `api_input`/`api_cached`/`api_output` in the same file price the overage;
+- the catalog prices CodeAF sees are the API list prices, the same ones the
+  proxy caps on;
 - the shared state carries the rolling 7-day credit spend; `harness state load`
   outputs the day's and the week's figure, and the queue starts a run only while the
   rolling week is under 75% of the weekly credit (`CODEAF_WEEK_SPENT_USD` — an
@@ -339,8 +346,8 @@ any in-flight run whose area is unknown, still conflicts with everything.
 rolling-week spend reaches 75% of `limits.weekly_credit_usd`, and all
 concurrent runs draw that budget down together.
 
-**Pricing.** At the subscription rates, DeepSeek-V4.1-Flash has the cheapest
-input price (0.06 USD/M tokens), so a non-zero lane can spend less credit
+**Pricing.** DeepSeek-V4.1-Flash has the cheapest cached-input price
+(0.03 USD/M tokens at API prices), so a non-zero lane can spend less
 per ticket — but it is a weaker model (`role: mid`), so the rotation trades
 a little quality on busy days for no model contention.
 
@@ -514,6 +521,69 @@ following each app's README TODO list. Proposals that would change
 maintainer's approval (the `codeaf-harness` environment, see *Limits worth
 knowing*).
 
+## Routines
+
+Recurring factory activities — checking synthetic.new's prices and models,
+deciding whether to take a CodeAF upgrade, recalibrating the weekly credit —
+are **routines**: one mechanism, configured in one trusted file,
+[`routines.json`](.github/codeaf/routines.json) (issue #117). The file sits
+next to `models.json`, is validated on load, and unknown keys or bad values
+fail with a message naming the field. Each routine carries:
+
+- **`name`** — lowercase, digits and dashes, at most 32 characters. It names
+  the run title (`CodeAF routine <name> (lane N)`), the dispatch input and
+  the proposal label (`routine:<name>`).
+- **`every_hours`** — the cooldown: a routine is due when no run of that
+  name has started within this many hours. The cooldown is read off each
+  run's `createdAt` stamp; a run whose stamp is missing or unparseable
+  counts as inside the cooldown, never outside it (fail closed).
+- **`kind`** — either:
+  - **`check`**: a deterministic harness command (`command`), run by the
+    routines workflow. No model runs, no secret beyond `GITHUB_TOKEN`, and
+    it reads the network only for public data. It renders its report
+    itself; a check routine may update one tracking issue per routine with
+    its latest result, built from validated data only — never model text.
+  - **`agent`**: a read-only CodeAF run whose brief is a template under
+    [`routines/`](.github/codeaf/routines/) (`brief`), capped per run by
+    **`max_usd`** like `run_credit_usd`. Like a plan run it writes no
+    patch: its proposals go through the planner's path and open as issues
+    labelled `codeaf-proposed` (plus `routine:<name>`), deduped against
+    the open issues — **never** `codeaf-queued`. A person, or Claude acting
+    for the owner, promotes them.
+
+A routine is due only when the same guards as any run hold: the rolling
+week's spend under the queue's threshold, and a free lane under
+`queue.max_parallel_runs`. `harness routines-due issues.json runs.json`
+prints one `routine=<name> lane=<n>` line per due routine. **Not wired yet:**
+no workflow calls it. A dedicated read-only routines workflow, on an hourly
+schedule, and `codeaf.yml`'s routine mode are a maintainer's hand edit,
+because the workflow policy freezes the CodeAF workflows. A routine dispatch is gated like every
+other dispatch: `routine=<name>` must name a routine in `routines.json`,
+and refuses any issue, pr, review, plan or profile input beside it.
+
+**How to add a routine.** Add one object to the `routines` array in
+`routines.json`:
+
+- for a **check** routine, add `"kind": "check"` and `"command": "<name>"`,
+  then implement a Go function in `.github/codeaf/` that renders the report
+  and register it with `registerCheck("<name>", fn)` in an `init` — the
+  same pattern `check_modelprices.go` uses. `TestRoutineCatalog` fails if a
+  committed command is not registered.
+- for an **agent** routine, add `"kind": "agent"`, `"brief":
+  "routines/<file>.md"` (a template under `.github/codeaf/routines/`,
+  read-only instructions ending in the output contract) and `"max_usd"` —
+  the per-run credit cap, enforced by the proxy. `TestRoutineCatalog`
+  fails if the template file is missing.
+
+Defined in `routines.json` (they run once the workflow is wired): `model-prices` (daily check of the synthetic.new catalog
+against `models.json`), `codeaf-upgrade` (daily agent run that classifies
+upstream CodeAF changes as take/hold/skip and proposes the bump),
+`quota-calibration` (6h check that re-estimates `weekly_credit_usd` from
+the ledger and the quota drops), `pr-sweep` (6h check on open `codeaf/*`
+PRs that are red, conflicted or carry an unaddressed review finding),
+`flaky-tests` (daily `go test -race -count=10` over every module) and
+`factory-report` (weekly report on the tracking issue).
+
 ## Limits worth knowing
 
 - The agent has a shell on the runner, so treat it as having the same access as any
@@ -618,7 +688,7 @@ knowing*).
   with is executed with a write token.
 - **Shared state.** Every run starts from one shared bundle:
   - CodeAF's memory db, router events and model ratings;
-  - the rolling 7-day credit spend — credit at subscription rates, from the runs
+  - the rolling 7-day spend — at API list prices, from the runs
     merged so far. The weekly credit regenerates continuously (2% of the total every
     ~202 minutes), and this rolling sum is what stands in for the refill; `state
     load` outputs both the day's and the week's figure.
@@ -669,9 +739,9 @@ knowing*).
 - Configuration lives in files, not workflow variables:
   - [`models.json`](.github/codeaf/models.json): the spend caps (`limits`: the plan,
     the weekly credit, the per-run credit and the overage cap) and the allowed models
-    with their prices (USD per million tokens: the `input`/`output`/`cache_read`
-    subscription rates draw down the weekly credit, `api_input`/`api_cached`/`api_output`
-    are the API list rates overage is billed at), how many calls
+    with their prices (USD per million tokens: `api_input`/`api_cached`/`api_output`
+    are the API list rates every figure and cap uses; the `input`/`output`/`cache_read`
+    subscription rates are reference only), how many calls
     each may have in flight (`max_concurrent`), and the reasoning efforts each
     model accepts (`efforts`; a request for an unlisted effort goes to the next
     one the model lists, `enabled: false` to its lowest, so nothing is sent raw

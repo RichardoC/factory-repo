@@ -1,0 +1,12 @@
+{
+  "_comment": "Factory routines (issue #117): recurring activities run on a schedule, one mechanism, one file. Validated on load; unknown keys and bad values fail. kind check = a deterministic harness command (no model, GITHUB_TOKEN only); kind agent = a read-only CodeAF run with a brief from routines/, capped by max_usd, filing codeaf-proposed issues only. Cooldowns are the number of hours after the routine's last run before it is due again.",
+  "routines": [
+    { "name": "model-prices", "every_hours": 24, "kind": "check", "command": "model-prices" },
+    { "name": "codeaf-upgrade", "every_hours": 24, "kind": "agent", "brief": "routines/codeaf-upgrade.md", "max_usd": 0.5 },
+    { "name": "quota-calibration", "every_hours": 6, "kind": "check", "command": "quota-calibration" },
+    { "name": "pr-sweep", "every_hours": 6, "kind": "check", "command": "pr-sweep" },
+    { "name": "flaky-tests", "every_hours": 24, "kind": "check", "command": "flaky-tests" },
+    { "name": "factory-report", "every_hours": 168, "kind": "check", "command": "factory-report" },
+    { "name": "model-stats", "every_hours": 24, "kind": "check", "command": "model-stats" }
+  ]
+}

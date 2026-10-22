@@ -50,8 +50,10 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -66,7 +68,7 @@ func main() {
 	log.SetFlags(0)
 	log.SetPrefix("harness: ")
 	if len(os.Args) < 2 {
-		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|plan-check|plan-brief|plan-report|ref-check|merge-default|search|metrics|gh-retry")
+		log.Fatal("usage: harness proxy|gate|next|seat-config|brief|summary|state|report|pr-mode|continue-plan|review-brief|review-config|review-report|plan-check|plan-brief|plan-report|ref-check|routines-due|routine-brief|routine-check|merge-default|search|metrics|gh-retry")
 	}
 	commands := map[string]func() error{
 		"proxy":         runProxy,
@@ -90,6 +92,14 @@ func main() {
 		// plan run this tick? plan-brief and plan-report, the run side of
 		// the planner, are separate commands.
 		"plan-check": runPlanCheck,
+		// Factory routines (issue #117): routines-due decides which
+		// routines' cooldowns have passed (the routines workflow calls it
+		// on its schedule and on every queue tick); routine-brief builds
+		// an agent routine's read-only brief; routine-check runs a check
+		// command and prints its report for the tracking issue.
+		"routines-due":  runRoutinesDue,
+		"routine-brief": runRoutineBrief,
+		"routine-check": runRoutineCheck,
 		// The planner run side (issue #61): the plan run brief, and the
 		// publish-side report that parses its proposals.
 		"plan-brief":  runPlanBrief,
@@ -113,8 +123,8 @@ func main() {
 		// maintainer's approval (workflowpolicy.go).
 		"workflow-policy": runWorkflowPolicy,
 		// Retry a GitHub CLI write call on transient upstream failures --
-		// 5xx or a network error, never 4xx (issue #146). Meant for the
-		// publish job's write calls (gh-retry -- gh ...); not wired yet.
+		// 5xx or a network error, never 4xx (issue #146). The publish job
+		// runs its gh pr create through it: gh-retry -- gh ...
 		"gh-retry": runGhRetry,
 		// Splitting a patch the policy refused (patchsplit.go): the part
 		// under .github/ outside .github/codeaf/ goes to REFUSED for a
@@ -123,6 +133,13 @@ func main() {
 		// The PR comment body for a refused part of a patch
 		// (refusedcomment.go): reason plus the refused diff in a fence.
 		"refused-comment": runRefusedComment,
+		// Model latency and throughput (issue #131): renders the
+		// first-token, decode-rate and failure tables from the ledger
+		// rows carried in codeaf-output zips -- from a directory of
+		// downloaded zips, or from the recent runs' artifacts through
+		// the API (modelstats_cli.go). The "model-stats" routine
+		// reports the same comment on its schedule.
+		"model-stats": runModelStats,
 	}
 	command, ok := commands[os.Args[1]]
 	if !ok {
@@ -143,10 +160,12 @@ func main() {
 // ---------------------------------------------------------------- models
 
 // Model is one row of models.json. Prices are USD per million tokens.
-// Input/Output/CacheRead are the synthetic.new SUBSCRIPTION rates: they price
-// the credit a call draws down the weekly quota. The API* fields are the API
-// list rates: what the same call costs once the quota is gone and overage
-// begins.
+// The API* fields are the API list ("overage") rates, and they are the
+// prices the factory quotes and caps on: the ledger, the run and weekly
+// caps, the reports and the catalog CodeAF budgets from (the owner's
+// decision, 2026-10-20). Input/Output/CacheRead are the synthetic.new
+// SUBSCRIPTION rates, the credit a call draws down the weekly quota; they
+// are kept for reference and are not used for any figure or cap.
 type Model struct {
 	ID              string   `json:"id"`       // what CodeAF sees
 	Upstream        string   `json:"upstream"` // the synthetic.new model id
@@ -167,8 +186,8 @@ type Model struct {
 	MaxConcurrent int `json:"max_concurrent"`
 }
 
-// Limits are the Big-plan spend caps the proxy enforces, in USD of credit
-// (subscription-rate dollars) unless said otherwise. The weekly credit is
+// Limits are the Big-plan spend caps the proxy enforces, in USD at the API
+// list ("overage") prices, like every cost figure (CostOf). The weekly credit is
 // shared by every run of the week and arrives per run through the shared
 // state; OverageUSD prices extra usage past it at the API list rates.
 type Limits struct {
@@ -189,6 +208,229 @@ type Limits struct {
 
 // defaultMinCreditPercent is the floor used when min_credit_percent is unset.
 const defaultMinCreditPercent = 10
+
+// Alerts are the model-stats routine's thresholds (issue #131). They live
+// here rather than in Go because a threshold is a judgement about the
+// service, not a fact about the code: synthetic.new can degrade, a plan can
+// change, and the owner must be able to move a threshold in a reviewed
+// config file without a code change. models.json is the source of truth;
+// the defaults below only keep an old file without the block loading.
+//
+// Every field is optional: an absent block, or a field the file does not
+// carry, means the default. Percentages are percent, not fractions: 1.0 is
+// one percent.
+//
+// The count-shaped fields are pointers on purpose. encoding/json cannot tell
+// a field the file omits from one written as 0, and for a count the two mean
+// opposite things: absent is "use the issue #131 value", while a written 0
+// ("never judge an hour", "feed no completion to the decode figures", "alert
+// below no calls") is a mistake that would silently disable an alert. So nil
+// takes the default and an explicit 0 is refused, naming the field -- the
+// same treatment decode_baseline_hours gets.
+type Alerts struct {
+	// HourCalls is how many calls an hour needs before its first-token p50
+	// is judged: below it the hour's sample is too small to alert on.
+	HourCalls *int `json:"hour_calls"`
+	// TTFTp50Ratio alerts when an hour's first-token p50 is above this times
+	// the model's own trailing 7-day p50.
+	TTFTp50Ratio float64 `json:"ttft_p50_ratio"`
+	// TTFTp90Ms alerts on an hour whose first-token p90 is above this many
+	// milliseconds.
+	TTFTp90Ms int64 `json:"ttft_p90_ms"`
+	// DecodeRatio alerts when decode p50 is below this times the baseline.
+	DecodeRatio float64 `json:"decode_ratio"`
+	// DecodeMinTokens is the shortest completion whose decode tok/s feeds the
+	// decode figures: a call that produced a handful of tokens measures its
+	// own fixed overhead, not the model's throughput.
+	DecodeMinTokens *int `json:"decode_min_tokens"`
+	// StallGapMs is the silence between streamed lines that counts as a stall.
+	StallGapMs int64 `json:"stall_gap_ms"`
+	// Rate429Pct and RejectPct alert when the 429 rate or the share of rows
+	// rejected as hostile exceeds the percentage.
+	Rate429Pct float64 `json:"rate_429_pct"`
+	RejectPct  float64 `json:"reject_pct"`
+	// StallPct alerts when more than this percent of turns carry a stall.
+	StallPct float64 `json:"stall_pct"`
+	// SlotWaitsPerRun alerts when one run waited for a model slot more than
+	// this many times. Any abandoned wait alerts whatever this says.
+	SlotWaitsPerRun *int `json:"slot_waits_per_run"`
+	// WindowHours is the default window the routine reports over.
+	WindowHours *int `json:"window_hours"`
+	// TTFTp50RatioBaselineHours is how many days of a model's own history the
+	// first-token p50 ratio is measured against. The issue calls it the
+	// trailing 7-day p50; the routine reads the number from here.
+	TTFTp50RatioBaselineHours *int `json:"ttft_p50_ratio_baseline_hours"`
+	// HourCallsBaselineHours is the window a decode baseline is taken from,
+	// the decode counterpart of the trailing 7-day figure. It is nullable so
+	// that an explicit 0 is refused rather than silently defaulted: a
+	// baseline of no hours is a mistake, not a request.
+	HourCallsBaselineHours *int `json:"decode_baseline_hours"`
+}
+
+// The issue #131 thresholds, as models.json carries them. They are the
+// defaults so that a models.json written before the alerts block existed
+// still loads and still alerts.
+const (
+	defaultAlertHourCalls         = 30
+	defaultAlertTTFTp50Ratio      = 2.0
+	defaultAlertTTFTp90Ms         = 15000
+	defaultAlertDecodeRatio       = 0.7
+	defaultAlertDecodeMinTokens   = 300
+	defaultAlertStallGapMs        = 30000
+	defaultAlertRate429Pct        = 1.0
+	defaultAlertRejectPct         = 1.0
+	defaultAlertStallPct          = 5.0
+	defaultAlertSlotWaitsPerRun   = 20
+	defaultAlertWindowHours       = 72
+	defaultAlertBaselineHours     = 168
+	defaultAlertDecodeBaselineHrs = 168
+	// maxAlertHourCalls is the largest calls-in-an-hour figure that can mean
+	// anything: the factory's own account is one Big plan, and 100k calls in
+	// one hour would be a runaway, not a threshold.
+	maxAlertHourCalls = 100000
+	// maxAlertWindowHours is a year: a window no routine would ever report
+	// over, and past it the figure is a typo (a milliseconds value in an
+	// hours field, say).
+	maxAlertWindowHours = 24 * 365
+	// maxAlertGapMs is ten minutes: a silence longer than this is a hung
+	// call, reported as a cut, not a stall threshold.
+	maxAlertGapMs = 600000
+	// maxAlertDecodeTokens is ten million tokens: past a model's context
+	// length by an order of magnitude, so it is a typo, not a floor.
+	maxAlertDecodeTokens = 10000000
+)
+
+// alertDefaults is the alerts block a models.json without one gets.
+func alertDefaults() Alerts {
+	return Alerts{
+		HourCalls:                 alertInt(defaultAlertHourCalls),
+		TTFTp50Ratio:              defaultAlertTTFTp50Ratio,
+		TTFTp90Ms:                 defaultAlertTTFTp90Ms,
+		DecodeRatio:               defaultAlertDecodeRatio,
+		DecodeMinTokens:           alertInt(defaultAlertDecodeMinTokens),
+		StallGapMs:                defaultAlertStallGapMs,
+		Rate429Pct:                defaultAlertRate429Pct,
+		RejectPct:                 defaultAlertRejectPct,
+		StallPct:                  defaultAlertStallPct,
+		SlotWaitsPerRun:           alertInt(defaultAlertSlotWaitsPerRun),
+		WindowHours:               alertInt(defaultAlertWindowHours),
+		TTFTp50RatioBaselineHours: alertInt(defaultAlertBaselineHours),
+		HourCallsBaselineHours:    alertInt(defaultAlertDecodeBaselineHrs),
+	}
+}
+
+// alertInt is a pointer to a copy of v, for an alerts field whose zero value
+// means something other than "unset": a written 0 on one of these is a
+// mistake to refuse, not a default to fill, so the field has to be able to
+// say "the file did not carry it".
+func alertInt(v int) *int { return &v }
+
+// validateAlerts fills every unset alerts field with its default and refuses
+// an absurd one with a message naming the field, the way the limits block
+// does. What is "absurd" is per field: a threshold is a positive count or
+// ratio, a window and a baseline are positive and bounded, and the reject
+// rate, which the routine compares a percentage of rows against, may be 0
+// (refuse nothing) but not negative.
+//
+// A value is refused, never clamped, and the messages are built from the
+// field's own fixed name and its own number, so nothing from the file is
+// echoed back the way it was written.
+func validateAlerts(a Alerts) (Alerts, error) {
+	def := alertDefaults()
+	// Positive counts, each nullable: an absent field takes the issue #131
+	// default, and a negative, zero or too-large count is refused with a
+	// message naming the field. Zero is refused rather than defaulted because
+	// it is written down: a config that carries "hour_calls": 0 is asking to
+	// judge every hour on no sample at all, which is a mistake, not an
+	// omission. The field name is in the table so the message is built from a
+	// name this file wrote, never from anything the config carried.
+	for _, c := range []struct {
+		field **int
+		def   int
+		max   int64
+		name  string
+		what  string
+	}{
+		{&a.HourCalls, defaultAlertHourCalls, maxAlertHourCalls, "hour_calls", "calls per hour"},
+		{&a.DecodeMinTokens, defaultAlertDecodeMinTokens, maxAlertDecodeTokens, "decode_min_tokens", "tokens"},
+		{&a.SlotWaitsPerRun, defaultAlertSlotWaitsPerRun, maxAlertHourCalls, "slot_waits_per_run", "slot waits"},
+	} {
+		switch {
+		case *c.field == nil:
+			*c.field = alertInt(c.def)
+		case **c.field < 0:
+			return a, fmt.Errorf("alerts.%s must not be negative (%s)", c.name, c.what)
+		case **c.field == 0:
+			return a, fmt.Errorf("alerts.%s must be greater than 0 (%s)", c.name, c.what)
+		case int64(**c.field) > c.max:
+			return a, fmt.Errorf("alerts.%s must not exceed %d (%s)", c.name, c.max, c.what)
+		}
+	}
+	// Durations in milliseconds.
+	for _, c := range []struct {
+		field *int64
+		def   int64
+		max   int64
+		name  string
+	}{
+		{&a.TTFTp90Ms, def.TTFTp90Ms, maxAlertGapMs, "ttft_p90_ms"},
+		{&a.StallGapMs, def.StallGapMs, maxAlertGapMs, "stall_gap_ms"},
+	} {
+		switch {
+		case *c.field == 0:
+			*c.field = c.def
+		case *c.field < 0:
+			return a, fmt.Errorf("alerts.%s must not be negative", c.name)
+		case *c.field > c.max:
+			return a, fmt.Errorf("alerts.%s must not exceed %d ms", c.name, c.max)
+		}
+	}
+	// Ratios and percentages, in the field's own units: ratios are above 1,
+	// percentages are in [0, 100].
+	for _, c := range []struct {
+		field *float64
+		def   float64
+		min   float64
+		max   float64
+		name  string
+	}{
+		{&a.TTFTp50Ratio, def.TTFTp50Ratio, 1, 100, "ttft_p50_ratio"},
+		{&a.DecodeRatio, def.DecodeRatio, 0.01, 1, "decode_ratio"},
+		{&a.Rate429Pct, def.Rate429Pct, 0, 100, "rate_429_pct"},
+		{&a.RejectPct, def.RejectPct, 0, 100, "reject_pct"},
+		{&a.StallPct, def.StallPct, 0, 100, "stall_pct"},
+	} {
+		switch {
+		case *c.field == 0:
+			*c.field = c.def
+		case math.IsNaN(*c.field) || *c.field < c.min || *c.field > c.max:
+			return a, fmt.Errorf("alerts.%s must be in [%g, %g]", c.name, c.min, c.max)
+		}
+	}
+	// The three windows, in hours: nil takes the default, and what is
+	// written has to be a positive number of hours within a year. A written
+	// 0 is refused, not defaulted, for the same reason as the counts above:
+	// a window of no hours is a mistake.
+	for _, c := range []struct {
+		field **int
+		def   int
+		name  string
+	}{
+		{&a.WindowHours, defaultAlertWindowHours, "window_hours"},
+		{&a.TTFTp50RatioBaselineHours, defaultAlertBaselineHours, "ttft_p50_ratio_baseline_hours"},
+		{&a.HourCallsBaselineHours, defaultAlertDecodeBaselineHrs, "decode_baseline_hours"},
+	} {
+		switch {
+		case *c.field == nil:
+			*c.field = alertInt(c.def)
+		case **c.field <= 0:
+			return a, fmt.Errorf("alerts.%s must be positive (hours)", c.name)
+		case **c.field > maxAlertWindowHours:
+			return a, fmt.Errorf("alerts.%s must not exceed %d (hours)", c.name, maxAlertWindowHours)
+		}
+	}
+	return a, nil
+}
 
 // Queue is how many CodeAF runs the queue may have going at once. Every
 // concurrent run gets its own slice of each model's account-wide
@@ -212,11 +454,13 @@ type Planner struct {
 	RetryMinHours int `json:"retry_min_hours"`
 }
 
-// Config is models.json: the spend caps and the models CodeAF may use.
+// Config is models.json: the spend caps, the models CodeAF may use, and the
+// thresholds the routines alert on.
 type Config struct {
 	Limits  Limits  `json:"limits"`
 	Queue   Queue   `json:"queue"`
 	Planner Planner `json:"planner"`
+	Alerts  Alerts  `json:"alerts"`
 	Models  []Model `json:"models"`
 }
 
@@ -279,6 +523,14 @@ func loadConfig(path string) (Config, error) {
 	case cfg.Planner.RetryMinHours < 0:
 		return cfg, fmt.Errorf("%s: planner.retry_min_hours must not be negative", path)
 	}
+	// The model-stats alerts (issue #131) default field by field, so a
+	// models.json that predates the block still loads; an absurd value is
+	// an error naming the field.
+	alerts, err := validateAlerts(cfg.Alerts)
+	if err != nil {
+		return cfg, fmt.Errorf("%s: %w", path, err)
+	}
+	cfg.Alerts = alerts
 	if len(cfg.Models) == 0 {
 		return cfg, fmt.Errorf("%s: no models", path)
 	}
@@ -361,12 +613,13 @@ func (u Usage) reasoningTokens() (int, bool) {
 }
 
 // CostOf prices one call: uncached input, cached input and output (which
-// includes reasoning tokens) at the model's per-million SUBSCRIPTION rates.
-// This is the credit the call draws down the weekly quota, and the cost the
-// ledger and the report carry.
+// includes reasoning tokens) at the model's per-million API list ("overage")
+// rates. It is the cost the ledger, the caps and the report carry; quoting
+// the overage price, not the cheaper subscription credit, is the owner's
+// decision (2026-10-20). The weekly quota itself is enforced from
+// synthetic.new's own percentRemaining, not from these figures.
 func CostOf(m Model, u Usage) float64 {
-	cached := u.cached()
-	return (float64(u.PromptTokens-cached)*m.Input + float64(cached)*m.CacheRead + float64(u.CompletionTokens)*m.Output) / 1e6
+	return ApiCostOf(m, u)
 }
 
 // ApiCostOf prices the same call at the model's API list rates (api_*): what
@@ -503,8 +756,8 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.mu.Lock()
 		spent, week, over := p.runSpent, p.weekSpent+p.runSpent, p.overageApi
 		p.mu.Unlock()
-		// run_spent_usd keeps its name (meteredRunSpend reads it) and now
-		// carries credit: subscription-rate dollars.
+		// run_spent_usd keeps its name (meteredRunSpend reads it); like
+		// every figure here it is USD at the API list (overage) prices.
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "run_spent_usd": spent,
 			"week_spent_credit_usd": week, "overage_api_usd": over})
 	case r.Method == http.MethodPost && strings.HasSuffix(path, "/chat/completions"):
@@ -563,6 +816,22 @@ func perToken(perMillion float64) string {
 	return strconv.FormatFloat(perMillion/1e6, 'f', 12, 64)
 }
 
+// firstEffortAboveNone picks the first effort that actually enables
+// reasoning, for a catalog row whose default_enabled is true: "none" and
+// "minimal" mean reasoning off. Falls back to efforts[0] when every effort
+// disables reasoning (or the list is empty), so the row still has an effort.
+func firstEffortAboveNone(efforts []string) string {
+	for _, e := range efforts {
+		if e != "none" && e != "minimal" {
+			return e
+		}
+	}
+	if len(efforts) == 0 {
+		return ""
+	}
+	return efforts[0]
+}
+
 func catalog(models []Model) map[string][]catalogRow {
 	rows := make([]catalogRow, 0, len(models))
 	for _, m := range models {
@@ -572,15 +841,20 @@ func catalog(models []Model) map[string][]catalogRow {
 		row.Created = 1760000000
 		row.Architecture.Input = m.InputModalities
 		row.Architecture.Output = []string{"text"}
-		row.Pricing.Prompt = perToken(m.Input)
-		row.Pricing.Completion = perToken(m.Output)
+		// The overage prices, the same ones the proxy caps on (CostOf).
+		row.Pricing.Prompt = perToken(m.APIInput)
+		row.Pricing.Completion = perToken(m.APIOutput)
 		row.Pricing.Request = "0"
-		row.Pricing.InputCacheRead = perToken(m.CacheRead)
+		row.Pricing.InputCacheRead = perToken(m.APICached)
 		row.SupportedParameters = []string{"tools", "tool_choice", "reasoning", "include_reasoning",
 			"response_format", "structured_outputs", "temperature", "top_p", "max_tokens", "stop", "seed"}
 		row.Reasoning.DefaultEnabled = true
 		row.Reasoning.SupportedEfforts = m.Efforts
-		row.Reasoning.DefaultEffort = m.Efforts[0]
+		// When reasoning is on by default, the default effort must be an
+		// effort above "none"/"minimal": Efforts[0] can be "none" (the
+		// DeepSeek-V4.1-Flash rows), which would advertise reasoning
+		// enabled with a default that turns it off (issue #236).
+		row.Reasoning.DefaultEffort = firstEffortAboveNone(m.Efforts)
 		row.HuggingFaceID = strings.TrimPrefix(m.Upstream, "hf:")
 		rows = append(rows, row)
 	}
@@ -873,12 +1147,52 @@ type LedgerLine struct {
 	// as a marker (kind "status"), so every report figure that counts calls
 	// or timing skips it, the way it skips proxy_start and search lines.
 	Status int `json:"status,omitempty"`
+	// The timing the model-stats routine (issue #131) reads: TTFTMs is the
+	// time from issuing the upstream request to the first relayed content
+	// data line -- a heartbeat comment never counts as that first byte, which
+	// is what noteData/seenData already track (issue #145). DurMs is the whole
+	// call, header wait plus stream. MaxGapMs is the longest silence between
+	// two streamed lines' arrivals. Cut marks a streaming call whose stream
+	// ended without a `data: [DONE]` line (upstream error, bare EOF, or the
+	// client going away). All four are 0/false on an old ledger line and on a
+	// call that never streamed; each is purely additive, so no existing field
+	// changes meaning.
+	TTFTMs   int64 `json:"ttft_ms,omitempty"`
+	DurMs    int64 `json:"dur_ms,omitempty"`
+	MaxGapMs int64 `json:"max_gap_ms,omitempty"`
+	Cut      bool  `json:"cut,omitempty"`
 }
 
-func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slotWait, headerWait time.Duration, chars charCounts, repaired, status int) {
+// callTiming is the per-call timing the relays measure and record carries to
+// the ledger (issue #131). It is a struct rather than more positional
+// arguments so record's signature stays readable as the ledger grows; the zero
+// value is a call that never reached the relay, so TTFTMs, DurMs, MaxGapMs and
+// Cut are all absent from the line.
+//
+// Ended is when record was reached and Dur is the whole call: passing them in
+// rather than reading time.Now() inside record keeps a test's fake clock in
+// charge of the figure, and keeps the call's end where the call actually ended
+// -- the relays are the last thing that touches the upstream stream.
+type callTiming struct {
+	TTFT   time.Duration // issue of the upstream request -> first relayed data line
+	Dur    time.Duration // setup -> the end of the call
+	MaxGap time.Duration // longest silence between two streamed lines
+	Cut    bool          // streamed: the stream ended without `data: [DONE]`
+}
+
+// timingOf builds the ledger's timing from the call's start and the current
+// moment, for a call that never reached a relay (a refusal, a 200 with no
+// body): the whole call duration is known, there is no stream to have cut.
+func timingOf(started time.Time) callTiming {
+	return callTiming{Dur: time.Since(started)}
+}
+
+func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slotWait, headerWait time.Duration, chars charCounts, repaired, status int, timing callTiming) {
 	line := LedgerLine{Time: time.Now().UTC(), Model: m.ID, Upstream: m.Upstream, Stream: stream,
 		Start: start.UTC(), SlotWaitS: slotWait.Seconds(), HeaderMs: headerWait.Milliseconds(),
-		ReasoningChars: chars.reasoning, OutputChars: chars.output, RepairedToolArgs: repaired}
+		ReasoningChars: chars.reasoning, OutputChars: chars.output, RepairedToolArgs: repaired,
+		TTFTMs: timing.TTFT.Milliseconds(), DurMs: timing.Dur.Milliseconds(),
+		MaxGapMs: timing.MaxGap.Milliseconds(), Cut: timing.Cut}
 	if status != 0 {
 		// A non-200 upstream answer is recorded as a status line (issue #140):
 		// it carries no usage and no cost, and the kind keeps it out of every
@@ -1338,7 +1652,7 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		// The refusal goes in the ledger too (issue #140): a run whose
 		// upstream kept answering 429 costs real time, and the record
 		// counts it. No usage, no cost.
-		p.record(m, nil, stream, started, slotWait, headerWait, charCounts{}, repaired, response.StatusCode)
+		p.record(m, nil, stream, started, slotWait, headerWait, charCounts{}, repaired, response.StatusCode, timingOf(started))
 		if out == nil {
 			w.Header().Set("Content-Type", response.Header.Get("Content-Type"))
 			w.WriteHeader(response.StatusCode)
@@ -1756,6 +2070,9 @@ func (p *proxy) acquire(ctx context.Context, m Model, beat func()) (func(), time
 	}
 }
 
+// relayJSON relays a non-streaming answer and records it (issue #131): with no
+// streamed lines the whole upstream wait is the header wait, so TTFTMs equals
+// header_ms and there is no gap and no cut. DurMs is the call as a whole.
 func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, started time.Time, slotWait, headerWait time.Duration, repaired int) {
 	var payload map[string]json.RawMessage
 	if err := json.NewDecoder(upstream).Decode(&payload); err != nil {
@@ -1780,7 +2097,8 @@ func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, st
 		chars.addChoices(choices, "message")
 	}
 	payload["model"], _ = json.Marshal(m.ID)
-	p.record(m, usage, false, started, slotWait, headerWait, chars, repaired, 0)
+	p.record(m, usage, false, started, slotWait, headerWait, chars, repaired, 0,
+		callTiming{TTFT: headerWait, Dur: time.Since(started)})
 	writeJSON(w, http.StatusOK, payload)
 }
 
@@ -1846,9 +2164,47 @@ func (p *proxy) relayStream(out *sseSink, upstream io.Reader, m Model, started t
 			}
 		}
 	}()
+	// Issue #131: the timing the model-stats routine reads. ttft is set at the
+	// first relayed data line and never again; last marks when the previous
+	// *complete* relayed line arrived, and the gap to the next one is the
+	// silence between streamed lines. A heartbeat comment is written by the
+	// quiet ticker, not by this loop, so it cannot move either mark -- the
+	// "first byte" is the first data line, exactly what noteData tracks
+	// (issue #145). Only a read that ended at a newline counts: ReadBytes can
+	// return a partial line without an error, and stamping that would break
+	// one silence into two and lose the longer one.
+	var ttft time.Duration
+	var last time.Time
+	var timingGap time.Duration
+	sawDone := false
+	// firstLine marks the arrival of the first content data line. It keys off
+	// ttft itself rather than the gap clock, so a preamble line cannot stop
+	// the figure being set.
+	firstLine := func() {
+		if ttft == 0 {
+			ttft = time.Since(started)
+		}
+	}
+	// sawLine stamps the gap for one complete line taken off upstream.
+	sawLine := func() {
+		now := time.Now()
+		if !last.IsZero() {
+			if gap := now.Sub(last); gap > timingGap {
+				timingGap = gap
+			}
+		}
+		last = now
+	}
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
+			// A partial line is upstream still mid-write, not a streamed
+			// line: only the newline-terminated read is stamped, and a
+			// stream that ends without a trailing newline is stamped once the
+			// error below says it is over.
+			if line[len(line)-1] == '\n' {
+				sawLine()
+			}
 			trimmed := bytes.TrimRight(line, "\r\n")
 			if data, ok := bytes.CutPrefix(trimmed, []byte("data:")); ok {
 				data = bytes.TrimSpace(data)
@@ -1861,12 +2217,21 @@ func (p *proxy) relayStream(out *sseSink, upstream io.Reader, m Model, started t
 					// Issue #145: this is the first data line the wait for
 					// upstream was really about; the header-wait heartbeat
 					// stands down from here.
+					firstLine()
 					out.noteData()
+				} else if bytes.Equal(data, []byte("[DONE]")) {
+					// A clean end: the stream said so, so it was not cut.
+					sawDone = true
 				}
 			}
 			out.line(append(trimmed, '\n'))
 		}
 		if err != nil {
+			if len(line) > 0 && line[len(line)-1] != '\n' {
+				// The stream ended mid-line: the last bytes are real and the
+				// silence before them is real, so they are stamped now.
+				sawLine()
+			}
 			if !errors.Is(err, io.EOF) {
 				log.Printf("stream from %s cut: %v", m.Upstream, err)
 			}
@@ -1875,7 +2240,11 @@ func (p *proxy) relayStream(out *sseSink, upstream io.Reader, m Model, started t
 	}
 	close(stop)
 	done.Wait()
-	p.record(m, usage, true, started, slotWait, headerWait, chars, repaired, 0)
+	// Issue #131: cut is the loop leaving without a `data: [DONE]` line --
+	// upstream's error, a bare EOF, or the client going away and cancelling
+	// the body out from under the read.
+	p.record(m, usage, true, started, slotWait, headerWait, chars, repaired, 0, callTiming{
+		TTFT: ttft, Dur: time.Since(started), MaxGap: timingGap, Cut: !sawDone})
 }
 
 // ---------------------------------------------------------------- GitHub
@@ -1903,7 +2272,12 @@ type item struct {
 	Comments    int             `json:"comments"`
 	CreatedAt   string          `json:"created_at"`
 	PullRequest json.RawMessage `json:"pull_request"` // present on issues that are PRs
-	Head        struct {
+	// Draft is the pull request's draft flag, present only on the JSON the
+	// pulls API returns (/pulls/N); the issues-list JSON leaves it unset. The
+	// review reads it to withhold the pass label while a run that stopped
+	// early keeps its pull request a draft (issue #237).
+	Draft bool `json:"draft"`
+	Head  struct {
 		Ref string `json:"ref"`
 		// SHA is the head commit SHA, present on the JSON the pulls API
 		// returns (/pulls/N); the issues-list JSON does not carry it. The
@@ -1968,23 +2342,159 @@ func newGitHub() github {
 	}
 }
 
-func (g github) get(path string, into any) error {
+// doGet performs one GET against the repository API and returns the open
+// response with the status checked, so the one-shot get and the paged
+// getList share a single request path.
+func (g github) doGet(path string) (*http.Response, error) {
 	request, err := http.NewRequest(http.MethodGet, g.api+"/repos/"+g.repo+path, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	request.Header.Set("Authorization", "Bearer "+g.token)
 	request.Header.Set("Accept", "application/vnd.github+json")
 	response, err := g.client.Do(request)
 	if err != nil {
+		return nil, err
+	}
+	if response.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		return nil, fmt.Errorf("GET %s: %s: %.300s", path, response.Status, data)
+	}
+	return response, nil
+}
+
+// get sends one GET and decodes the reply. On a paged listing that stops
+// at the API's own page size (100 items by default): the list reads the
+// harness makes go through getList instead, which follows the next pages
+// (issue #223).
+func (g github) get(path string, into any) error {
+	response, err := g.doGet(path)
+	if err != nil {
 		return err
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		data, _ := io.ReadAll(response.Body)
-		return fmt.Errorf("GET %s: %s: %.300s", path, response.Status, data)
-	}
 	return json.NewDecoder(response.Body).Decode(into)
+}
+
+// maxListPages caps how many pages a paged list read follows (issue #223):
+// with per_page=100 that is a thousand items, more than any list the
+// harness reads tells apart, and it bounds a listing that keeps offering a
+// next page. A read that stops at the cap is truncated, so it comes back
+// as an error: the caller treats the list as unread, which for the area
+// guard means conflicting with everything rather than making do with the
+// first pages.
+const maxListPages = 10
+
+// errMaxListPages is getList's page-cap sentinel: the listing is truncated,
+// not broken, so a brief-building read can degrade on it (isPageCapError)
+// while every other getList failure keeps its meaning.
+var errMaxListPages = errors.New("page cap")
+
+// nextLink returns the URL of the rel="next" link in a `Link` header, or ""
+// when the header offers none. The header is untrusted data; it is only
+// parsed here, and listNext decides whether it may be followed.
+func nextLink(h string) string {
+	for _, link := range strings.Split(h, ",") {
+		part := strings.TrimSpace(link)
+		if !strings.HasPrefix(part, "<") {
+			continue
+		}
+		end := strings.Index(part, ">")
+		if end < 0 {
+			continue
+		}
+		for _, param := range strings.Split(part[end+1:], ";") {
+			key, value, ok := strings.Cut(strings.TrimSpace(param), "=")
+			if !ok || strings.TrimSpace(key) != "rel" {
+				continue
+			}
+			if strings.Trim(strings.TrimSpace(value), `"'`) == "next" {
+				return part[1:end]
+			}
+		}
+	}
+	return ""
+}
+
+// listNext reduces a next link to the path the next page is read with. The
+// link is untrusted data: it is followed only when it leads back to this
+// API and this repository's prefix, and anything else — another host, a
+// relative link outside /repos/<repo>/, an unparseable URL — is an error,
+// because a listing that cannot be continued safely is a truncated one.
+func (g github) listNext(h string) (string, error) {
+	next := nextLink(h)
+	if next == "" {
+		return "", nil
+	}
+	u, err := url.Parse(next)
+	if err != nil {
+		return "", fmt.Errorf("next link %q: %v", next, err)
+	}
+	if base, err := url.Parse(g.api); err == nil && u.Host != "" && u.Host != base.Host {
+		return "", fmt.Errorf("next link %q leaves the API host", next)
+	}
+	uri := u.RequestURI() // path and query, never a scheme or host
+	prefix := "/repos/" + g.repo + "/"
+	if !strings.HasPrefix(uri, prefix) {
+		return "", fmt.Errorf("next link %q leaves the repository", next)
+	}
+	// The prefix ends with the repository's separator, so what follows it
+	// is the path below /repos/<repo> without its leading slash — which
+	// doGet expects, like the one-shot paths it is handed.
+	return "/" + strings.TrimPrefix(uri, prefix), nil
+}
+
+// isPageCapError reports whether err is getList's page-cap error, the one
+// case a brief-building list read degrades on (issue #223 follow-up): the
+// listing is truncated, not broken, so a note is worth more than a failed
+// brief. Any other failure — a malformed page, a next link that leaves the
+// repository, a transport error — is a real error and keeps failing.
+func isPageCapError(err error) bool {
+	return errors.Is(err, errMaxListPages)
+}
+
+// getList reads a paged list — issue and PR comments, reviews, review
+// comments, pull request files, commits and the timeline (issue #223) —
+// following GitHub's `Link: rel="next"` header page by page, up to
+// maxListPages pages, and appending every page into the slice `into` points
+// to. A reply that offers no next link answers after one request, exactly
+// like get. Hitting the page cap, or a next link that does not stay inside
+// this repository's API, returns an error instead of a silent partial
+// list, so a truncated listing never looks like a complete one.
+func (g github) getList(path string, into any) error {
+	slice := reflect.ValueOf(into)
+	if slice.Kind() != reflect.Ptr || slice.Elem().Kind() != reflect.Slice {
+		return fmt.Errorf("github.getList: %T is not a pointer to a slice", into)
+	}
+	all := slice.Elem()
+	first := path
+	for pages := 0; path != ""; pages++ {
+		if pages == maxListPages {
+			return fmt.Errorf("%w: GET %s stopped after %d pages, the listing may be truncated", errMaxListPages, first, maxListPages)
+		}
+		response, err := g.doGet(path)
+		if err != nil {
+			return err
+		}
+		data, err := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if err != nil {
+			return err
+		}
+		page := reflect.New(all.Type())
+		if err := json.Unmarshal(data, page.Interface()); err != nil {
+			return err
+		}
+		all = reflect.AppendSlice(all, page.Elem())
+		next, err := g.listNext(response.Header.Get("Link"))
+		if err != nil {
+			return err
+		}
+		path = next
+	}
+	slice.Elem().Set(all)
+	return nil
 }
 
 // post sends a JSON body to the API and decodes the reply, when into is not
@@ -2010,6 +2520,36 @@ func (g github) post(path string, body, into any) error {
 	if response.StatusCode < 200 || response.StatusCode > 299 {
 		reply, _ := io.ReadAll(response.Body)
 		return fmt.Errorf("POST %s: %s: %.300s", path, response.Status, reply)
+	}
+	if into != nil {
+		return json.NewDecoder(response.Body).Decode(into)
+	}
+	return nil
+}
+
+// patch sends a JSON body as a PATCH request and decodes the reply, when
+// into is not nil. The queue uses it to edit a hold comment whose reason
+// changed in place (issue #235); everything else the harness reads.
+func (g github) patch(path string, body, into any) error {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequest(http.MethodPatch, g.api+"/repos/"+g.repo+path, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Authorization", "Bearer "+g.token)
+	request.Header.Set("Accept", "application/vnd.github+json")
+	request.Header.Set("Content-Type", "application/json")
+	response, err := g.client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		reply, _ := io.ReadAll(response.Body)
+		return fmt.Errorf("PATCH %s: %s: %.300s", path, response.Status, reply)
 	}
 	if into != nil {
 		return json.NewDecoder(response.Body).Decode(into)
@@ -2161,6 +2701,47 @@ func Decide(name string, ev event, labelName string, lookupPR, lookupIssue func(
 		// each concurrent run a different model. The input is untrusted,
 		// so only its digits are read; anything else is lane 0.
 		lane := dispatchLane(ev.Inputs["lane"])
+		// A routine run (issue #117) is dispatched by the routines
+		// workflow with the routine's name in the `routine` input. Like a
+		// plan run it is read-only: it proposes issues and writes no patch
+		// and no PR. The input is untrusted, so only a name that matches
+		// routineNameRe and is present in the validated routines.json runs;
+		// if routines.json cannot be loaded, skip — fail closed, a routine
+		// the config cannot vouch for never runs. It accepts no other
+		// target: an issue, pr, review, plan or profile input alongside it
+		// is skipped rather than silently demoted to that mode. The
+		// decision carries the validated lane, the default branch as base,
+		// and no number, no branch and no profile — every workflow step
+		// that reads one must treat all three as empty.
+		if raw := ev.Inputs["routine"]; raw != "" {
+			switch {
+			case ev.Inputs["issue"] != "" || ev.Inputs["pr"] != "" ||
+				ev.Inputs["review"] != "" || ev.Inputs["plan"] != "" ||
+				ev.Inputs["profile"] != "":
+				return skip("a routine dispatch takes no issue, pr, review, plan or profile input"), nil
+			case !routineNameRe.MatchString(raw):
+				return skip(fmt.Sprintf("routine input %q does not match %s", raw, routineNameRe)), nil
+			}
+			routines, err := LoadRoutines()
+			if err != nil {
+				return skip(fmt.Sprintf("routines.json cannot be loaded: %v", err)), nil
+			}
+			known := false
+			for _, r := range routines {
+				if r.Name == raw {
+					known = true
+					break
+				}
+			}
+			if !known {
+				return skip(fmt.Sprintf("routine %q is not in routines.json", raw)), nil
+			}
+			if _, err := runID(); err != nil {
+				return Decision{}, err
+			}
+			return Decision{Run: true, Reason: "routine dispatch", Mode: "routine",
+				Base: ev.Repository.DefaultBranch, Lane: lane}, nil
+		}
 		// A plan run (issue #61) is dispatched by the queue's planner
 		// step with plan=true and nothing else but the lane: the run reads
 		// the repository and proposes issues, and writes no patch and no
@@ -2365,9 +2946,30 @@ func lastN[T any](items []T, n int) []T {
 	return items
 }
 
+// thread renders the recent comments on the issue or PR for the brief.
+// Anyone who can comment contributes here, so logins and bodies are
+// untrusted text and render escaped (issue #234): a comment cannot forge
+// brief structure, HTML or the run-report marker.
+//
+// maxThreadLogin and maxThreadBody cap the comment logins, associations
+// and bodies, in runes, in #233 style.
+const (
+	maxThreadLogin = 80
+	maxThreadBody  = 4000
+)
+
 func (g github) thread(number int) (string, error) {
 	var comments []issueComment
-	if err := g.get(fmt.Sprintf("/issues/%d/comments?per_page=100", number), &comments); err != nil {
+	if err := g.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", number), &comments); err != nil {
+		// Issue #223 follow-up: a listing that only hits the page cap is
+		// truncated, not broken. The brief builder's other reads degrade to
+		// an "(... unavailable: ...)" note and keep building (see
+		// previousReportSection); the conversation does the same here, so a
+		// very long thread costs the thread, never the whole brief. A bad
+		// next link, a malformed page or a transport error still fails.
+		if isPageCapError(err) {
+			return fmt.Sprintf("(conversation unavailable: %s)", escapeMD(err.Error(), 200, true)), nil
+		}
 		return "", err
 	}
 	var b strings.Builder
@@ -2376,7 +2978,14 @@ func (g github) thread(number int) (string, error) {
 		if c.User.Type == "Bot" && strings.Contains(body, reportMarker) {
 			body = "(CodeAF run report omitted)"
 		}
-		fmt.Fprintf(&b, "**@%s** (%s):\n%s\n\n", c.User.Login, c.AuthorAssociation, body)
+		// Issue #234: logins and bodies are untrusted text and render
+		// escaped, like reviewFindingsSection and the #233 fix in
+		// planbrief.go. oneLine is false so multi-line bodies stay
+		// readable, and the marker check above stays on the raw body.
+		fmt.Fprintf(&b, "**@%s** (%s):\n%s\n\n",
+			escapeMD(c.User.Login, maxThreadLogin, true),
+			escapeMD(c.AuthorAssociation, maxThreadLogin, true),
+			escapeMD(body, maxThreadBody, false))
 	}
 	if b.Len() == 0 {
 		return "(no comments)", nil
@@ -2409,6 +3018,15 @@ func budgetLine() string {
 // maxBriefBytes bounds the whole brief: every section is capped on its own,
 // but a crafted target body, thread or dependency list still adds up.
 const maxBriefBytes = 100000
+
+// harnessBinaryPreChangeHeading is the heading, without its `## ` marker, of
+// the fixed paragraph instructions.md carries (issue #189), and the
+// argument of briefSection. The `harness` binary on the run job's PATH is
+// built from the default branch before the agent starts, so a worker that
+// "proves" a .github/codeaf/ change by running it proves the pre-change
+// code; the brief says so, and the test pins it to the standing
+// instructions rather than to a section runBrief adds.
+const harnessBinaryPreChangeHeading = "The `harness` binary on PATH is the pre-change build"
 
 // capBrief truncates s at max bytes without splitting a UTF-8 rune and
 // appends a note line; the note counts against the cap.
@@ -2538,7 +3156,7 @@ func previousReportSection(gh github, number int) string {
 	var b strings.Builder
 	b.WriteString("## The previous CodeAF report\n")
 	var comments []issueComment
-	if err := gh.get(fmt.Sprintf("/issues/%d/comments?per_page=100", number), &comments); err != nil {
+	if err := gh.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", number), &comments); err != nil {
 		fmt.Fprintf(&b, "\n(previous CodeAF report unavailable: %s)\n", escapeMD(err.Error(), 200, true))
 		return b.String()
 	}
@@ -2590,7 +3208,7 @@ type finding struct {
 // commit it returns the zero time, which includes every finding.
 func (g github) prBotCutoff(number int) (time.Time, error) {
 	var commits []prCommit
-	if err := g.get(fmt.Sprintf("/pulls/%d/commits?per_page=100", number), &commits); err != nil {
+	if err := g.getList(fmt.Sprintf("/pulls/%d/commits?per_page=100", number), &commits); err != nil {
 		return time.Time{}, err
 	}
 	cutoff := time.Time{}
@@ -2615,7 +3233,7 @@ func (g github) prBotCutoff(number int) (time.Time, error) {
 // brief.
 func (g github) reviewFindings(number int, cutoff time.Time, triggerCommentID, triggerReviewID int64) (items []finding, notes []string) {
 	var comments []issueComment
-	if err := g.get(fmt.Sprintf("/issues/%d/comments?per_page=100", number), &comments); err != nil {
+	if err := g.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", number), &comments); err != nil {
 		notes = append(notes, err.Error())
 	}
 	for _, c := range comments {
@@ -2630,7 +3248,7 @@ func (g github) reviewFindings(number int, cutoff time.Time, triggerCommentID, t
 	}
 
 	var reviews []comment
-	if err := g.get(fmt.Sprintf("/pulls/%d/reviews?per_page=100", number), &reviews); err != nil {
+	if err := g.getList(fmt.Sprintf("/pulls/%d/reviews?per_page=100", number), &reviews); err != nil {
 		notes = append(notes, err.Error())
 	}
 	for _, r := range reviews {
@@ -2648,7 +3266,7 @@ func (g github) reviewFindings(number int, cutoff time.Time, triggerCommentID, t
 	}
 
 	var inline []reviewComment
-	if err := g.get(fmt.Sprintf("/pulls/%d/comments?per_page=100", number), &inline); err != nil {
+	if err := g.getList(fmt.Sprintf("/pulls/%d/comments?per_page=100", number), &inline); err != nil {
 		notes = append(notes, err.Error())
 	}
 	for _, c := range inline {
@@ -2803,7 +3421,7 @@ func depsFromBody(body string) []int {
 // answered the first error comes back.
 func (g github) mergedPRForIssue(n int) (int, pull, error) {
 	var events []timelineEvent
-	if err := g.get(fmt.Sprintf("/issues/%d/timeline?per_page=100", n), &events); err != nil {
+	if err := g.getList(fmt.Sprintf("/issues/%d/timeline?per_page=100", n), &events); err != nil {
 		return 0, pull{}, err
 	}
 	best, bestAt, firstErr := 0, time.Time{}, error(nil)
@@ -2858,7 +3476,7 @@ func dependencyBullet(gh github, n int) string {
 	}
 	line += fmt.Sprintf(" — merged as PR #%d %s", m, escapeMD(pr.Title, 200, true))
 	var files []prFile
-	if err := gh.get(fmt.Sprintf("/pulls/%d/files?per_page=100", m), &files); err != nil {
+	if err := gh.getList(fmt.Sprintf("/pulls/%d/files?per_page=100", m), &files); err != nil {
 		return line + " (unavailable: " + escapeMD(err.Error(), 200, true) + ")\n"
 	}
 	var b strings.Builder
@@ -2972,8 +3590,11 @@ func runBrief() error {
 			}
 		}
 		var reviews []reviewComment
-		if err := gh.get(fmt.Sprintf("/pulls/%d/comments?per_page=100", number), &reviews); err != nil {
-			return err
+		if err := gh.getList(fmt.Sprintf("/pulls/%d/comments?per_page=100", number), &reviews); err != nil {
+			// Issue #223 follow-up: a capped listing is truncated, not
+			// broken — degrade to a note like the reads above rather than
+			// failing the brief.
+			parts = append(parts, fmt.Sprintf("(inline review comments unavailable: %s)", escapeMD(err.Error(), 200, true)))
 		}
 		if len(reviews) > 0 {
 			var b strings.Builder
@@ -2987,12 +3608,22 @@ func runBrief() error {
 				if line != nil {
 					where = strconv.Itoa(*line)
 				}
-				fmt.Fprintf(&b, "- `%s` line %s, @%s: %s\n", c.Path, where, c.User.Login, c.Body)
+				// Issue #234: paths, logins and bodies are untrusted text
+				// and render escaped, like reviewFindingsSection; the
+				// body keeps its newlines so it stays readable.
+				fmt.Fprintf(&b, "- `%s` line %s, @%s: %s\n",
+					escapeMD(c.Path, 200, true),
+					where,
+					escapeMD(c.User.Login, maxThreadLogin, true),
+					escapeMD(c.Body, maxThreadBody, false))
 			}
 			parts = append(parts, b.String())
 		}
 		thread, err := gh.thread(number)
 		if err != nil {
+			// thread() already degrades the page cap; what is left here
+			// (a bad next link, a transport error) still fails the brief,
+			// as before.
 			return err
 		}
 		parts = append(parts, "## Conversation\n\n"+thread)
@@ -3756,8 +4387,8 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 			weekBefore, weekKnown = v, true
 		}
 	}
-	// apiCost is what this run would have cost at the API list rates;
-	// overage is the part of it spent past the weekly credit. apiPrice uses
+	// overage is the part of this run, at the API list rates, spent past the
+	// weekly credit. apiPrice uses
 	// the ledger's APICostUSD when the line carries one (the source this
 	// proxy wrote); lines written before the field existed carry only
 	// tokens, and are re-priced from them at the config's api_* rates.
@@ -3781,7 +4412,7 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 		}{CachedTokens: l.CachedTokens}
 		return ApiCostOf(m, usage)
 	}
-	var apiCost, overage float64
+	var overage float64
 	totals := map[string]*modelTotals{}
 	for _, l := range lines {
 		if l.Kind != "" {
@@ -3808,10 +4439,8 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 		if !l.UsageSeen {
 			t.unpriced++
 		}
-		api := apiPrice(id, l)
-		apiCost += api
 		if over {
-			overage += api
+			overage += apiPrice(id, l)
 		}
 		week += l.CostUSD
 		if week >= cfg.Limits.WeeklyCreditUSD {
@@ -3935,16 +4564,16 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 	fmt.Fprintf(&b, "| seats | worker %s, planner %s, checker %s (allowed: %s; no escalation) |\n",
 		seat(result.Model), seat(result.PlanModel), seat(result.CheckModel), strings.Join(allowed, ", "))
 	fmt.Fprintf(&b, "| CodeAF's own spend figure | %s (plan estimate %s) |\n", money(result.SpendUSD), money(result.EstUSD))
-	// The Big-plan metered row (issue #59): what the proxy records is credit
-	// — subscription-rate dollars — plus the same calls at API list prices
-	// and the overage past the weekly credit. previousReportSection looks
-	// this exact label up for continuations, so the label must not change.
+	// The Big-plan metered row (issue #59): what the proxy records, priced at
+	// the overage (API list) rates the factory quotes (CostOf), plus the
+	// overage past the weekly credit. previousReportSection looks this exact
+	// label up for continuations, so the label must not change.
 	weekCell := "?"
 	if weekKnown {
 		weekCell = money(weekBefore + total)
 	}
-	fmt.Fprintf(&b, "| metered by proxy (from its ledger) | **%s** credit this run · %s this week (cap $%s/run, $%s/week) · %s at API prices · %s overage |\n",
-		money(total), weekCell, trimNumber(cfg.Limits.RunCreditUSD), trimNumber(cfg.Limits.WeeklyCreditUSD), money(apiCost), money(overage))
+	fmt.Fprintf(&b, "| metered by proxy (from its ledger) | **%s** this run at overage prices · %s this week (cap $%s/run, $%s/week) · %s overage |\n",
+		money(total), weekCell, trimNumber(cfg.Limits.RunCreditUSD), trimNumber(cfg.Limits.WeeklyCreditUSD), money(overage))
 	// The quota state synthetic.new reported at proxy start, re-parsed from
 	// the ledger's "quotas" marker. Omitted when the marker is absent or
 	// its body does not parse; the units are undocumented, so the row says
@@ -4071,7 +4700,7 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 			p, known := prices[id]
 			inPrice, cachedPrice, outPrice := "—", "—", "—"
 			if known {
-				inPrice, cachedPrice, outPrice = trimNumber(p.Input), trimNumber(p.CacheRead), trimNumber(p.Output)
+				inPrice, cachedPrice, outPrice = trimNumber(p.APIInput), trimNumber(p.APICached), trimNumber(p.APIOutput)
 			}
 			cost := money(t.cost)
 			if t.unpriced > 0 {
