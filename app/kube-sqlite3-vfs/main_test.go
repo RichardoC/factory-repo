@@ -236,6 +236,7 @@ func TestJournalModeValidation(t *testing.T) {
 		{in: "truncate", want: "TRUNCATE"},                  // accepted, lower case
 		{in: "PERSIST", want: "PERSIST"},                    // accepted
 		{in: "persist", want: "PERSIST"},                    // accepted, lower case
+		{in: " truncate ", want: "TRUNCATE"},                // accepted, surrounding space trimmed
 		{in: "MEMORY", wantErr: "cannot be rolled back"},    // refused: crash-safety (issue #68)
 		{in: "memory", wantErr: "cannot be rolled back"},    // refused, lower case
 		{in: "OFF", wantErr: "cannot be rolled back"},       // refused: crash-safety (issue #68)

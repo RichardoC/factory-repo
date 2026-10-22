@@ -58,11 +58,12 @@ const journalModes = "DELETE, TRUNCATE, PERSIST"
 // pod, a killed process — leaves a half-written database that no opener
 // can roll back.
 func journalModeName(mode string) (string, error) {
-	switch strings.ToUpper(strings.TrimSpace(mode)) {
+	name := strings.ToUpper(strings.TrimSpace(mode))
+	switch name {
 	case "":
 		return "DELETE", nil
 	case "DELETE", "TRUNCATE", "PERSIST":
-		return strings.ToUpper(mode), nil
+		return name, nil
 	case "MEMORY", "OFF":
 		return "", fmt.Errorf("--journal-mode %s is not allowed: its rollback journal never reaches the VFS, so a crash mid-transaction leaves a half-written database that cannot be rolled back — the database is very likely corrupted (issue #68); use one of %s", strings.TrimSpace(mode), journalModes)
 	case "WAL":
