@@ -659,22 +659,25 @@ func TestReviewTableUnlocated(t *testing.T) {
 		}
 	}
 
-	// A half-built finding reaches the renderer only straight through, and
-	// it must not render a location either: `a.go:0` names no file, and
-	// neither does the `:0` a caller filling the line into an unlocated
-	// finding would post.
-	for _, f := range []Finding{
-		{Severity: "low", Path: ":", Line: 0},     // an empty path with a zero line
-		{Severity: "low", Path: "a.go", Line: 0},  // a path with no line at all
-		{Severity: "low", Path: "a.go", Line: -1}, // a negative line is not a line
-		{Severity: "high", Path: "", Line: 12},    // an unlocated finding a caller filled a line into
+	// A half-built finding reaches the renderer only straight through. A
+	// path that names no file (":" or digits) and an empty path never render
+	// a location; a real path with no line keeps the path, so a file-level
+	// finding still says which file, and never renders `:0`.
+	for _, tc := range []struct {
+		f    Finding
+		want string
+	}{
+		{Finding{Severity: "low", Path: ":", Line: 0}, "unlocated"},  // an empty path with a zero line
+		{Finding{Severity: "low", Path: "a.go", Line: 0}, "a.go"},    // a path with no line at all
+		{Finding{Severity: "low", Path: "a.go", Line: -1}, "a.go"},   // a negative line is not a line
+		{Finding{Severity: "high", Path: "", Line: 12}, "unlocated"}, // an unlocated finding a caller filled a line into
+		{Finding{Severity: "low", Path: "0", Line: 0}, "unlocated"},  // `0:1`-shaped text names no file
 	} {
-		cell := reviewLocation(f)
-		if cell != "unlocated" {
-			t.Errorf("reviewLocation(%+v) = %q, want unlocated", f, cell)
+		if cell := reviewLocation(tc.f); cell != tc.want {
+			t.Errorf("reviewLocation(%+v) = %q, want %q", tc.f, cell, tc.want)
 		}
-		if got := reviewTable([]Finding{f}); strings.Contains(got, ":0") || strings.Contains(got, "a.go:") {
-			t.Errorf("reviewTable(%+v) still renders a location for no file: %q", f, got)
+		if got := reviewTable([]Finding{tc.f}); strings.Contains(got, ":0") || strings.Contains(got, "a.go:") {
+			t.Errorf("reviewTable(%+v) renders a zero or empty line: %q", tc.f, got)
 		}
 	}
 

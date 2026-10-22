@@ -574,8 +574,14 @@ func reviewLocation(f Finding) string {
 	// itself parses as the path ":" (findingText accepts a `:` separator)
 	// and `0:1` as the path "0" — both of which named no file either, so
 	// they read `unlocated` rather than as a location (issue #190).
+	// A path that is only separators and digits (":", "0") names no file
+	// and reads `unlocated`; a real path with no line keeps its path, so a
+	// file-level finding still says which file.
 	if f.Line <= 0 {
-		return "unlocated"
+		if strings.Trim(f.Path, ":0123456789") == "" {
+			return "unlocated"
+		}
+		return escapeMD(f.Path, 200, true)
 	}
 	return escapeMD(f.Path, 200, true) + ":" + strconv.Itoa(f.Line)
 }
