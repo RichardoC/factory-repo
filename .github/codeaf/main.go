@@ -2773,6 +2773,18 @@ func lastN[T any](items []T, n int) []T {
 	return items
 }
 
+// thread renders the recent comments on the issue or PR for the brief.
+// Anyone who can comment contributes here, so logins and bodies are
+// untrusted text and render escaped (issue #234): a comment cannot forge
+// brief structure, HTML or the run-report marker.
+//
+// maxThreadLogin and maxThreadBody cap the comment logins, associations
+// and bodies, in runes, in #233 style.
+const (
+	maxThreadLogin = 80
+	maxThreadBody  = 4000
+)
+
 func (g github) thread(number int) (string, error) {
 	var comments []issueComment
 	if err := g.get(fmt.Sprintf("/issues/%d/comments?per_page=100", number), &comments); err != nil {
@@ -2784,7 +2796,14 @@ func (g github) thread(number int) (string, error) {
 		if c.User.Type == "Bot" && strings.Contains(body, reportMarker) {
 			body = "(CodeAF run report omitted)"
 		}
-		fmt.Fprintf(&b, "**@%s** (%s):\n%s\n\n", c.User.Login, c.AuthorAssociation, body)
+		// Issue #234: logins and bodies are untrusted text and render
+		// escaped, like reviewFindingsSection and the #233 fix in
+		// planbrief.go. oneLine is false so multi-line bodies stay
+		// readable, and the marker check above stays on the raw body.
+		fmt.Fprintf(&b, "**@%s** (%s):\n%s\n\n",
+			escapeMD(c.User.Login, maxThreadLogin, true),
+			escapeMD(c.AuthorAssociation, maxThreadLogin, true),
+			escapeMD(body, maxThreadBody, false))
 	}
 	if b.Len() == 0 {
 		return "(no comments)", nil
@@ -3404,7 +3423,14 @@ func runBrief() error {
 				if line != nil {
 					where = strconv.Itoa(*line)
 				}
-				fmt.Fprintf(&b, "- `%s` line %s, @%s: %s\n", c.Path, where, c.User.Login, c.Body)
+				// Issue #234: paths, logins and bodies are untrusted text
+				// and render escaped, like reviewFindingsSection; the
+				// body keeps its newlines so it stays readable.
+				fmt.Fprintf(&b, "- `%s` line %s, @%s: %s\n",
+					escapeMD(c.Path, 200, true),
+					where,
+					escapeMD(c.User.Login, maxThreadLogin, true),
+					escapeMD(c.Body, maxThreadBody, false))
 			}
 			parts = append(parts, b.String())
 		}
