@@ -322,7 +322,7 @@ func commentsPagesServer(t *testing.T, perPage int, comments []issueComment) (*h
 			if i > start {
 				b.WriteString(",")
 			}
-			fmt.Fprintf(&b, `{"id":%d,"body":%q}`, comments[i].ID, comments[i].Body)
+			fmt.Fprintf(&b, `{"id":%d,"body":%q,"user":{"login":%q}}`, comments[i].ID, comments[i].Body, comments[i].User.Login)
 		}
 		b.WriteString("]")
 		if end < len(comments) {
@@ -365,6 +365,7 @@ func straddleComments(filler, page1Reports, pastReports int) []issueComment {
 			comments = append(comments, issueComment{
 				ID:   int64(reports),
 				Body: fmt.Sprintf("%s\n### CodeAF run — done\n\n| stop / ok | done / `true` |\n", reportMarker),
+				User: user{Login: planReportBotLogin},
 			})
 		}
 	}
@@ -380,34 +381,35 @@ func straddleComments(filler, page1Reports, pastReports int) []issueComment {
 }
 
 // TestCountReportsAcrossPages is the issue #223 stub: the stub serves more
-// than 100 report comments across two pages — 20 of them, two on the first
-// page and 18 past index 100 — and a read that follows the next link must
+// than 100 report comments across two pages — 20 of them, one on the first
+// page and 19 past index 100 — and a read that follows the next link must
 // reach them whole, so countReports sees all 20 and the cap fires.
 //
 // Its shape is what makes the test discriminate, and it is stated here so
 // the numbers stay checkable: page 1 is indices 0..99 and holds 1 ordinary
-// leading comment + the first 2 reports + 97 ordinary filler comments; the
-// LAST report is the 20th, at index 119. Index 100 — the first comment of
-// page 2 — is the last filler comment, so the API's page boundary falls
-// inside the ordinary comments and every report past it is on page 2. Page
-// 1 therefore carries 2 report comments and 18 report comments sit past
-// index 100, both non-zero, which is the straddle the bullet describes.
+// leading comment + the first report + 98 ordinary filler comments; the
+// LAST report is the 20th, at index 118. Index 100 — the first comment of
+// page 2 — is the second report, so every report past the first is on
+// page 2. Page 1 therefore carries 1 report comment and 19 report comments
+// sit past index 100, both non-zero, which is the straddle the bullet
+// describes.
 //
 // A one-page read cannot pass this test: the pre-change reply (a single GET
-// of the first page, no next link followed) sees 2 reports, and
-// continuationsUsed(2) = 1 is below maxContinuations = 2, so countReports
-// under-counts, continuationCapReached is false and continuePlan answers
-// "continue" with used = 1 instead of firing the cap. `reportComments`, the
+// of the first page, no next link followed) sees 1 report, and used = 1
+// (continuePlan counts every earlier report, issue #219) is below
+// maxContinuations = 2, so countReports under-counts,
+// continuationCapReached is false and continuePlan answers "continue" with
+// used = 1 instead of firing the cap. `reportComments`, the
 // other stub, puts the reports first, so 100 of those fit inside page 1 and
 // the one-page read already counted 99 and fired the cap — assertion green,
 // harm untested. That is why the reports here straddle the boundary instead.
 func TestCountReportsAcrossPages(t *testing.T) {
 	perPage := 100
 	// The stub's shape in numbers, so a change to either constant still
-	// reads as the straddle it is: 20 report comments in all, 2 of them on
-	// page 1 and 18 past index 100. Below index 100 sit 1 ordinary leading
-	// comment, those 2 reports and 97 ordinary filler comments.
-	const page1Reports, page2Reports = 2, 18
+	// reads as the straddle it is: 20 report comments in all, 1 of them on
+	// page 1 and 19 past index 100. Below index 100 sit 1 ordinary leading
+	// comment, that report and 98 ordinary filler comments.
+	const page1Reports, page2Reports = 1, 19
 	comments := straddleComments(perPage-1-page1Reports, page1Reports, page2Reports)
 	if len(comments) <= perPage {
 		t.Fatalf("the stub serves %d comments, a first page of %d or less: no next link, nothing paged", len(comments), perPage)
@@ -426,8 +428,8 @@ func TestCountReportsAcrossPages(t *testing.T) {
 	}
 	// Discriminating: a page-1-only read is below the cap, so the
 	// pre-change, unpaged read cannot pass the assertions below.
-	if got := continuationCapReached(continuationsUsed(countReports(comments[:perPage]))); got {
-		t.Fatalf("the first page alone reaches the cap (its %d reports give used = %d); the shape must straddle the boundary, not straddle the cap", page1Reports, continuationsUsed(page1Reports))
+	if got := continuationCapReached(countReports(comments[:perPage])); got {
+		t.Fatalf("the first page alone reaches the cap (its %d reports give used = %d); the shape must straddle the boundary, not straddle the cap", page1Reports, page1Reports)
 	}
 	server, requests := commentsPagesServer(t, perPage, comments)
 	ghEnv(t, server)
@@ -437,11 +439,11 @@ func TestCountReportsAcrossPages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := continuationsUsed(page1Reports + page2Reports); used != want {
+	if want := page1Reports + page2Reports; used != want {
 		t.Fatalf("used = %d, want %d: the read must see all %d report comments, the %d on page 1 and the %d past it", used, want, page1Reports+page2Reports, page1Reports, page2Reports)
 	}
 	if action != "cap" {
-		t.Fatalf("action = %q, used = %d; want the cap fired (used >= %d) — a one-page read leaves used = %d here", action, used, maxContinuations, continuationsUsed(page1Reports))
+		t.Fatalf("action = %q, used = %d; want the cap fired (used >= %d) — a one-page read leaves used = %d here", action, used, maxContinuations, page1Reports)
 	}
 	if want := capBody(stopDeadline); body != want {
 		t.Errorf("body = %q, want the cap comment %q", body, want)
@@ -467,10 +469,11 @@ func TestCountReportsSinglePage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if action != "continue" || used != 0 {
-		t.Fatalf("with one report, action = %q, used = %d; want continue and none used", action, used)
+	// One earlier report means one earlier run (issue #219): used = 1.
+	if action != "continue" || used != 1 {
+		t.Fatalf("with one report, action = %q, used = %d; want continue and one used", action, used)
 	}
-	if want := continueBody(stopDeadline, 0); body != want {
+	if want := continueBody(stopDeadline, 1); body != want {
 		t.Errorf("body = %q, want %q", body, want)
 	}
 	if n := requests.Load(); n != 1 {
