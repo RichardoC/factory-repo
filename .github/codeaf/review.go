@@ -535,14 +535,55 @@ func safeReviewPath(path string) string {
 // backticks, anything else escaped), the location and the text through
 // escapeMD — so a hostile answer cannot inject markdown, mention anyone, or
 // carry a raw HTML comment into the posted comment.
+//
+// A finding with no location — the inline form (issue #49) — has no file to
+// name, so its location cell reads `unlocated` instead of the `:0` that a
+// path:line of the empty path would otherwise render (issue #190): a fix run
+// and a reader both read `:0` as a location, and it names no file.
 func reviewTable(findings []Finding) string {
 	var b strings.Builder
 	b.WriteString("| severity | location | finding |\n|---|---|---|\n")
 	for _, f := range findings {
-		fmt.Fprintf(&b, "| %s | %s:%d | %s |\n",
-			tokenCell(f.Severity, 200), escapeMD(f.Path, 200, true), f.Line, escapeMD(f.Text, 200, true))
+		fmt.Fprintf(&b, "| %s | %s | %s |\n",
+			tokenCell(f.Severity, 200), reviewLocation(f), escapeMD(f.Text, 200, true))
 	}
 	return b.String()
+}
+
+// reviewLocation renders one finding's location cell: `path:line` when the
+// finding carries a location, and the fixed word `unlocated` when it does
+// not, so no cell ever shows a location that names no file (issue #190).
+// The path is escaped and capped like every other cell, so a hostile path
+// cannot break out of the table or the comment.
+//
+// A finding is unlocated when its path is empty: the parser gives the
+// inline form (issue #49) no path and no line, and every located finding it
+// builds has both, so the line alone never decides.
+func reviewLocation(f Finding) string {
+	// The path decides, not the line: every finding the parser builds
+	// without a location carries no path, so a line alone names no file.
+	// Asking for a zero line too would let any caller that filled the line
+	// in render a bare ":0" — the cell this issue exists to remove.
+	if f.Path == "" {
+		return "unlocated"
+	}
+	// A located cell is `path:line`; a zero line never renders, because a
+	// line number counts from one. Two shapes reach here with line zero:
+	// the straight-through path a test or a future caller may build, and
+	// the location-shaped text the parser drops the number from — `:0`
+	// itself parses as the path ":" (findingText accepts a `:` separator)
+	// and `0:1` as the path "0" — both of which named no file either, so
+	// they read `unlocated` rather than as a location (issue #190).
+	// A path that is only separators and digits (":", "0") names no file
+	// and reads `unlocated`; a real path with no line keeps its path, so a
+	// file-level finding still says which file.
+	if f.Line <= 0 {
+		if strings.Trim(f.Path, ":0123456789") == "" {
+			return "unlocated"
+		}
+		return escapeMD(f.Path, 200, true)
+	}
+	return escapeMD(f.Path, 200, true) + ":" + strconv.Itoa(f.Line)
 }
 
 // reviewFooter ends the review comment: the reviewer model, the sanitized
