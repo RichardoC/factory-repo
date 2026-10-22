@@ -853,7 +853,8 @@ func TestPRRunWithUnknownAreasStillBlocks(t *testing.T) {
 
 // TestHoldCommentIsPostedOnce covers the hold comment (issue #132) against a
 // fake API: the first call posts the marker comment, the second — with the
-// comment present — posts nothing.
+// same-hold comment present — posts nothing (issue #235: the marker carries
+// the hold's reason hash, so only a comment whose hash matches counts).
 func TestHoldCommentIsPostedOnce(t *testing.T) {
 	posts := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -861,7 +862,7 @@ func TestHoldCommentIsPostedOnce(t *testing.T) {
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues/7/comments":
 			body := "[]"
 			if posts > 0 {
-				body = `[{"body":"an earlier note <!-- codeaf-queue-hold -->"}]`
+				body = fmt.Sprintf(`[{"body":%q}]`, holdCommentBody(7))
 			}
 			fmt.Fprint(w, body)
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/issues/7/comments":
@@ -876,8 +877,11 @@ func TestHoldCommentIsPostedOnce(t *testing.T) {
 	g := github{api: server.URL, repo: "o/r", token: "t", client: &http.Client{Timeout: 5 * time.Second}}
 
 	body := holdCommentBody(7)
-	if !strings.Contains(body, queueHoldMarker) || !strings.Contains(body, "area:harness") || strings.Contains(body, "untrusted") {
+	if !strings.Contains(body, queueHoldMarkerPrefix) || !strings.Contains(body, "area:harness") || strings.Contains(body, "untrusted") {
 		t.Fatalf("holdCommentBody = %q", body)
+	}
+	if want := holdReasonHash(holdCommentReason); holdReasonOf(body) != want {
+		t.Fatalf("holdCommentBody marker hash = %q; want %q", holdReasonOf(body), want)
 	}
 	if err := ensureHoldComment(g, 7); err != nil {
 		t.Fatal(err)
@@ -890,6 +894,83 @@ func TestHoldCommentIsPostedOnce(t *testing.T) {
 	}
 	if posts != 1 {
 		t.Fatalf("second call posted again (%d posts); want the marker to stop it", posts)
+	}
+}
+
+// TestHoldCommentUpdatesWhenReasonChanges covers the stale hold (issue #235):
+// an issue first held for no area label, then given one but still missing its
+// `## Done when` bullets, has its hold comment edited in place with the new
+// reason — a PATCH on the same comment, never a second comment — and a
+// repeat of the new hold does nothing at all.
+func TestHoldCommentUpdatesWhenReasonChanges(t *testing.T) {
+	posts, patches := 0, 0
+	current := ""
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues/7/comments":
+			if current == "" {
+				fmt.Fprint(w, `[]`)
+			} else {
+				fmt.Fprintf(w, `[{"id":42,"body":%q}]`, current)
+			}
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/issues/7/comments":
+			posts++
+			var body struct {
+				Body string `json:"body"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("post body: %v", err)
+			}
+			current = body.Body
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{"id":42}`)
+		case r.Method == http.MethodPatch && r.URL.Path == "/repos/o/r/issues/comments/42":
+			patches++
+			var body struct {
+				Body string `json:"body"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("patch body: %v", err)
+			}
+			current = body.Body
+			fmt.Fprint(w, `{"id":42}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	g := github{api: server.URL, repo: "o/r", token: "t", client: &http.Client{Timeout: 5 * time.Second}}
+
+	areaBody := holdCommentBody(7)
+	notReadyBody := notReadyHoldCommentBody(7, []string{"a `## Done when` section with bullets"})
+	if holdReasonOf(areaBody) == holdReasonOf(notReadyBody) {
+		t.Fatalf("the two hold bodies share a marker hash (%s); want the reasons to differ", holdReasonOf(areaBody))
+	}
+
+	// Hold A: no area label. Posted as a new comment.
+	if err := ensureHoldCommentBody(g, 7, areaBody); err != nil {
+		t.Fatal(err)
+	}
+	if posts != 1 || patches != 0 {
+		t.Fatalf("after hold A: %d posts, %d patches; want 1 post, 0 patches", posts, patches)
+	}
+	// Hold B: the area label arrived, the `## Done when` bullets did not.
+	// The same comment is edited in place, not posted again.
+	if err := ensureHoldCommentBody(g, 7, notReadyBody); err != nil {
+		t.Fatal(err)
+	}
+	if posts != 1 || patches != 1 {
+		t.Fatalf("after hold B: %d posts, %d patches; want the comment edited in place (1 post, 1 patch)", posts, patches)
+	}
+	if current != notReadyBody {
+		t.Fatalf("edited comment = %q; want the hold B body %q", current, notReadyBody)
+	}
+	// Hold B again: nothing to do, the same hold is already on the issue.
+	if err := ensureHoldCommentBody(g, 7, notReadyBody); err != nil {
+		t.Fatal(err)
+	}
+	if posts != 1 || patches != 1 {
+		t.Fatalf("after hold B repeat: %d posts, %d patches; want no further calls", posts, patches)
 	}
 }
 

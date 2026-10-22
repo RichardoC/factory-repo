@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1160,23 +1162,68 @@ func ensureAreaLabels(g github, logf func(string, ...any)) error {
 	return nil
 }
 
-// queueHoldMarker marks the comment the queue posts on an issue it holds for
-// want of an area label (issue #132); the marker keeps repeat ticks from
-// posting the comment twice.
-const queueHoldMarker = "<!-- codeaf-queue-hold -->"
+// holdCommentReason is the reason string hashed into the area hold's marker:
+// the two hold comments (issue #235) must hash to different reasons, so a
+// hold that changes kind can be told from the comment already on the issue.
+const holdCommentReason = "no-area-label"
+
+// queueHoldMarkerPrefix begins the hidden marker the queue's hold comments
+// carry (issue #132): "<!-- codeaf-queue-hold <hash> -->", where <hash> is
+// holdReasonHash of what the hold is for (issue #235). Comments posted
+// before issue #235 carry the reason-less "<!-- codeaf-queue-hold -->";
+// ensureHoldCommentBody treats one as a stale hold and edits it.
+const queueHoldMarkerPrefix = "<!-- codeaf-queue-hold "
+
+// holdMarkerRe finds a hold marker in a comment body and captures its reason
+// hash; the hash group is empty for a reason-less marker. Comments are
+// untrusted data: only a six-hex hash is accepted, and anything else —
+// someone quoting the marker, prose in the hash's place — counts as a
+// marker without a matching reason, which is edited in place like a stale
+// hold (issue #235).
+var holdMarkerRe = regexp.MustCompile(`codeaf-queue-hold(?:[ \t]+([0-9a-f]{6}))?[ \t]*-->`)
+
+// holdReasonHash hashes a hold reason to the six hex characters its comment
+// marker carries (issue #235): short enough to skim, and no issue text —
+// untrusted data — goes into a marker, because the reasons hashed here are
+// the queue's own fixed strings.
+func holdReasonHash(reason string) string {
+	sum := sha256.Sum256([]byte(reason))
+	return hex.EncodeToString(sum[:])[:6]
+}
+
+// holdMarker is the full marker comment holdCommentBody and
+// notReadyHoldCommentBody prefix their text with: the prefix plus the
+// reason's hash, so a hold whose reason changed carries a different marker
+// than the one already on the issue (issue #235).
+func holdMarker(reason string) string {
+	return queueHoldMarkerPrefix + holdReasonHash(reason) + " -->"
+}
+
+// holdReasonOf returns the reason hash inside body's hold marker, or "" when
+// body carries no hold marker at all (issue #235).
+func holdReasonOf(body string) string {
+	m := holdMarkerRe.FindStringSubmatch(body)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
 
 // holdCommentBody is the comment's fixed text, built from the issue number
 // alone: no issue text — untrusted data — goes into it.
 func holdCommentBody(n int) string {
-	return fmt.Sprintf("%s\nCodeAF's queue is holding this issue (#%d): it carries no `area:harness` or `area:app/<name>` label and its body names no path under one. Add an area label to queue it (see [running several tickets at once](https://github.com/RichardoC/factory-repo#running-several-tickets-at-once-issue-60)).", queueHoldMarker, n)
+	return fmt.Sprintf("%s\nCodeAF's queue is holding this issue (#%d): it carries no `area:harness` or `area:app/<name>` label and its body names no path under one. Add an area label to queue it (see [running several tickets at once](https://github.com/RichardoC/factory-repo#running-several-tickets-at-once-issue-60)).", holdMarker(holdCommentReason), n)
 }
 
 // notReadyHoldCommentBody is the comment the queue posts on an issue held
 // because it is not ready (issue #136). The missing names are the gate's
 // own fixed strings — issue #132's rule that no issue text goes into these
-// comments holds here too.
+// comments holds here too. The marker hashes the missing list, so a hold
+// whose missing set changes — an issue that gains its `## Done when`
+// bullets but still lacks its end-to-end check, say — is a new hold, not
+// the old one (issue #235).
 func notReadyHoldCommentBody(n int, missing []string) string {
-	return fmt.Sprintf("%s\nCodeAF's queue is holding this issue (#%d): it is not ready to run. Missing: %s. Add what is missing — a `## Done when` section with bullets, a `## End-to-end check` section, an `area:` label (see the issue template) — and the next queue tick will start it.", queueHoldMarker, n, strings.Join(missing, ", "))
+	return fmt.Sprintf("%s\nCodeAF's queue is holding this issue (#%d): it is not ready to run. Missing: %s. Add what is missing — a `## Done when` section with bullets, a `## End-to-end check` section, an `area:` label (see the issue template) — and the next queue tick will start it.", holdMarker(strings.Join(missing, ", ")), n, strings.Join(missing, ", "))
 }
 
 // queueRepickMarker begins the hidden comment the queue posts when it
@@ -1331,18 +1378,30 @@ func ensureHoldComment(g github, n int) error {
 }
 
 // ensureHoldCommentBody posts body as the hold comment on issue n unless a
-// comment carrying the marker is already there; the marker keeps repeat
-// ticks from posting the comment twice.
+// comment carrying the same hold is already there (issue #235): the marker
+// in the comment carries the hold's reason hash, and only a comment whose
+// hash matches body's counts as the same hold — the marker keeps repeat
+// ticks from posting the comment twice. A comment whose marker names a
+// different reason — an issue first held for no area label, then given one
+// but still missing its `## Done when` bullets — is a stale hold: it is
+// edited in place with the new body, never left behind and never doubled.
 func ensureHoldCommentBody(g github, n int, body string) error {
 	var comments []struct {
+		ID   int64  `json:"id"`
 		Body string `json:"body"`
 	}
 	if err := g.get(fmt.Sprintf("/issues/%d/comments?per_page=100", n), &comments); err != nil {
 		return err
 	}
+	want := holdReasonOf(body)
 	for _, c := range comments {
-		if strings.Contains(c.Body, queueHoldMarker) {
-			return nil
+		if m := holdMarkerRe.FindStringSubmatch(c.Body); m != nil {
+			if want != "" && m[1] == want {
+				return nil
+			}
+			// Same comment slot, different hold: one hold comment per
+			// issue, updated to what the hold is now.
+			return g.patch(fmt.Sprintf("/issues/comments/%d", c.ID), map[string]string{"body": body}, nil)
 		}
 	}
 	return g.post(fmt.Sprintf("/issues/%d/comments", n), map[string]string{"body": body}, nil)

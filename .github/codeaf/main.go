@@ -2384,6 +2384,36 @@ func (g github) post(path string, body, into any) error {
 	return nil
 }
 
+// patch sends a JSON body as a PATCH request and decodes the reply, when
+// into is not nil. The queue uses it to edit a hold comment whose reason
+// changed in place (issue #235); everything else the harness reads.
+func (g github) patch(path string, body, into any) error {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequest(http.MethodPatch, g.api+"/repos/"+g.repo+path, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Authorization", "Bearer "+g.token)
+	request.Header.Set("Accept", "application/vnd.github+json")
+	request.Header.Set("Content-Type", "application/json")
+	response, err := g.client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		reply, _ := io.ReadAll(response.Body)
+		return fmt.Errorf("PATCH %s: %s: %.300s", path, response.Status, reply)
+	}
+	if into != nil {
+		return json.NewDecoder(response.Body).Decode(into)
+	}
+	return nil
+}
+
 // diff fetches a pull request's diff (issue #32): the review brief embeds
 // it, so the reviewer reads what changed without touching git. The diff
 // format comes from the Accept header, and the body is returned as text.
