@@ -1385,16 +1385,28 @@ func ensureHoldComment(g github, n int) error {
 // different reason — an issue first held for no area label, then given one
 // but still missing its `## Done when` bullets — is a stale hold: it is
 // edited in place with the new body, never left behind and never doubled.
+//
+// Only the queue's own bot comments count: comments are untrusted data, so
+// a person quoting the marker — even quoting the whole hold body — is not
+// the queue's hold. Such a comment is ignored entirely, never patched over
+// and never mistaken for a hold already on the issue, so the queue posts
+// and edits its own comment and leaves the human's alone.
 func ensureHoldCommentBody(g github, n int, body string) error {
 	var comments []struct {
 		ID   int64  `json:"id"`
 		Body string `json:"body"`
+		User struct {
+			Type string `json:"type"`
+		} `json:"user"`
 	}
 	if err := g.get(fmt.Sprintf("/issues/%d/comments?per_page=100", n), &comments); err != nil {
 		return err
 	}
 	want := holdReasonOf(body)
 	for _, c := range comments {
+		if c.User.Type != "Bot" {
+			continue
+		}
 		if m := holdMarkerRe.FindStringSubmatch(c.Body); m != nil {
 			if want != "" && m[1] == want {
 				return nil
