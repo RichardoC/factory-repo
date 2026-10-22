@@ -779,13 +779,20 @@ func reviewerModel(cfg Config, workerID string) (Model, error) {
 //     at the cap, report-only and a person takes over;
 //   - a finished review with an unrecognized severity: report-only, and the
 //     pass label is withheld because the scale was not understood;
+//   - a finished review whose pull request is still a draft (issue #237):
+//     report-only, and the pass label is withheld because a draft is the
+//     pull request whose worker run stopped early — ready for review is
+//     what a `done` stop marks — so the work under review is not known
+//     finished, and no clean review over the diff alone may say otherwise.
+//     A person or a continuation can finish the work and mark the pull
+//     request ready, and the review can then run again;
 //   - otherwise: label — a clean pass.
 //
 // The comment body is built only from fixed sentences, counters and findings
 // whose remote-derived strings are escaped and capped; it never carries the
 // run-report marker, so it is never mistaken for a run report, and no raw
-// answer text reaches it unescaped. A failing comments fetch is an error,
-// like continuePlan.
+// answer text reaches it unescaped. A failing comments or pull request
+// fetch is an error, like continuePlan.
 func reviewPlan(gh github, pr int, result Result, haveResult bool, findings []Finding, sawSection bool) (action string, body string, used int, err error) {
 	stop := sanitizeStop(result.Stop)
 	blocking := blockingFindings(findings)
@@ -819,6 +826,26 @@ func reviewPlan(gh github, pr int, result Result, haveResult bool, findings []Fi
 			return "report-only", reviewReportBody(
 				"The review found nothing blocking, but the pass label is withheld because at least one severity "+
 					"was not recognized (high, medium or low are); a maintainer reads the findings below and decides.",
+				findings, result.Model, stop), 0, nil
+		}
+		// A draft pull request never takes the pass label (issue #237): a
+		// pull request is marked ready only when the run that produced the
+		// patch stopped `done`, so a draft is the one whose worker run
+		// stopped early — the work under review is not known finished, and
+		// no clean review over the diff says otherwise. The review itself is
+		// reported (advisory findings included), exactly as the
+		// unrecognized-severity case above is; only the label waits, until a
+		// person or a continuation finishes the work and the pull request
+		// is ready for review.
+		var pull item
+		if err := gh.get(fmt.Sprintf("/pulls/%d", pr), &pull); err != nil {
+			return "", "", 0, err
+		}
+		if pull.Draft {
+			return "report-only", reviewReportBody(
+				"Nothing blocking was found, but the pass label is withheld because the pull request is still a draft: "+
+					"the run that produced the patch stopped early, so the work under review is not known to be finished. "+
+					"A person who continues or finishes the work can mark the pull request ready, and the review can then run again.",
 				findings, result.Model, stop), 0, nil
 		}
 		verdict := fmt.Sprintf("Nothing blocking was found: the %s label was added, so a person or a merge rule can merge with confidence.",

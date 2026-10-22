@@ -874,6 +874,70 @@ func TestReviewPlan(t *testing.T) {
 	}
 }
 
+// TestReviewPlanWithholdsPassLabelWhenWorkerRunNotDone covers the review
+// half of issue #237, as the maintainer triage narrowed it: the queue no
+// longer re-picks a capped or unknown-stop pull request into a review run
+// (#217 closed that path), so what decides whether a clean review may stamp
+// codeaf-review-passed on work whose worker run stopped early is the pull
+// request itself. An early-stopped run publishes its patch as a draft, and
+// only a `done` stop (pr-mode) marks a pull request ready for review — a
+// draft under review means the work is not known finished, and no clean
+// review over the diff alone may say it is. The label is withheld exactly
+// as an unrecognized severity withholds it: report-only, verdict naming why.
+func TestReviewPlanWithholdsPassLabelWhenWorkerRunNotDone(t *testing.T) {
+	// A clean review: the reviewer stopped done and no findings were parsed
+	// from its answer or the run record.
+	result := Result{Stop: stopDone, Model: "deepseek-ai/deepseek-v4.1-flash"}
+
+	// The pull request whose worker run stopped early: it stays a draft
+	// (pr-mode prints ready=false for every stop that is not done), and the
+	// review that comes back clean must not add the pass label to it.
+	draft := reviewServer(t, map[string]string{
+		"/repos/RichardoC/factory-repo/pulls/7": `{"number":7,"title":"t","state":"open","draft":true}`,
+	}, "", nil)
+	ghEnv(t, draft)
+	action, body, used, err := reviewPlan(newGitHub(), 7, result, true, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "report-only" || used != 0 {
+		t.Fatalf("draft: action = %q, used = %d, want report-only/0", action, used)
+	}
+	for _, want := range []string{"still a draft", "stopped early", "not known to be finished"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("draft body does not say %q: %q", want, body)
+		}
+	}
+	if strings.Contains(body, reviewPassedLabel) || strings.Contains(body, "merge with confidence") {
+		t.Errorf("draft body still grants the pass label: %q", body)
+	}
+	assertReviewBodyClean(t, body)
+
+	// The same clean review on a pull request that was published ready —
+	// the worker run ended done — still labels, so the withhold is not a
+	// blanket one.
+	ready := commentsServer(t, reportComments(1), http.StatusOK)
+	ghEnv(t, ready)
+	action, body, used, err = reviewPlan(newGitHub(), 7, result, true, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "label" || used != 0 {
+		t.Fatalf("ready: action = %q, used = %d, want label/0", action, used)
+	}
+	if !strings.Contains(body, reviewPassedLabel) {
+		t.Errorf("ready body does not add the pass label: %q", body)
+	}
+
+	// The pull request fetch is decisive: a failing one is an error like a
+	// failing comments fetch, never a silent label.
+	failing := reviewServer(t, nil, "", nil)
+	ghEnv(t, failing)
+	if _, _, _, err := reviewPlan(newGitHub(), 7, result, true, nil, false); err == nil {
+		t.Error("a failing pull request fetch must return an error")
+	}
+}
+
 // TestReviewTableUnlocated renders the findings table for an unlocated
 // finding — the inline form (issue #49) whose path and line are empty — and
 // pins the whole table, because that cell used to render as `:0` (issue
@@ -1502,6 +1566,35 @@ func TestRunReviewReport(t *testing.T) {
 		if !strings.Contains(string(data), reviewPassedLabel) {
 			t.Errorf("clean comment does not name the label: %q", data)
 		}
+	})
+
+	t.Run("a draft pull request withholds the label (issue #237)", func(t *testing.T) {
+		// The worker run that produced the patch stopped early and left the
+		// pull request a draft; the review of the diff comes back clean, and
+		// the report must not hand the pass label to unfinished work.
+		server := reviewServer(t, map[string]string{
+			"/repos/RichardoC/factory-repo/pulls/7": `{"number":7,"title":"t","state":"open","draft":true}`,
+		}, "", nil)
+		ghEnv(t, server)
+		setArgs("7")
+		writeReviewResult(t, stopDone, "## Findings\n\n")
+		reviewLedger(t)
+		t.Setenv("REVIEW_COMMENT_PATH", comment)
+		out, err := captureStdout(t, runReviewReport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != "action=report-only\nused=0\nblocking=0\n" {
+			t.Errorf("stdout = %q, want the withheld label", out)
+		}
+		data, err := os.ReadFile(comment)
+		if err != nil {
+			t.Fatalf("comment not written: %v", err)
+		}
+		if strings.Contains(string(data), reviewPassedLabel) || !strings.Contains(string(data), "still a draft") {
+			t.Errorf("comment = %q, want the draft verdict and no label", data)
+		}
+		assertReviewBodyClean(t, string(data))
 	})
 
 	t.Run("an early stop with blocking findings starts a fix run", func(t *testing.T) {

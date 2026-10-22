@@ -474,11 +474,26 @@ func TestContract(t *testing.T) {
 
 	t.Run("review-report", func(t *testing.T) {
 		needContractBin(t)
+		// Issue #237: the review plan reads the pull request before it
+		// labels, so a contract review runs against a served pull request
+		// that is ready for review. The diff fetch stays best-effort: a
+		// server without it just means the findings are parsed without one.
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/repos/o/r/pulls/7" {
+				_, _ = fmt.Fprint(w, `{"number":7,"title":"t","state":"open","draft":false}`)
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
 		comment := filepath.Join(t.TempDir(), "review-comment.md")
 		stdout, stderr, code := runHarness(t, map[string]string{
 			"RESULT_PATH":         contractFixture(t, "codeaf-result.json"),
 			"LEDGER_PATH":         contractFixture(t, "codeaf-ledger.jsonl"),
 			"REVIEW_COMMENT_PATH": comment,
+			"GITHUB_API_URL":      server.URL,
+			"GITHUB_REPOSITORY":   "o/r",
+			"GITHUB_TOKEN":        "tok",
 		}, "review-report", "7")
 		if code != 0 {
 			t.Fatalf("review-report: exit %d, stderr: %s", code, stderr)
