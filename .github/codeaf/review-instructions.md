@@ -86,15 +86,21 @@ section is the contract: a review whose findings never reach it is read as a
 review with none.
 
 End your answer with the section and the section only. A code fence is where
-a review quotes rather than reports, so a fenced finding is read as a quote
-and is not counted in two cases: it restates the example bullet above (the
+a review quotes rather than reports, and a fenced finding is dropped only as
+a quote, in exactly two cases. It restates the example bullet above (the
 `[high] app/zip/queue.go:42` one — a path this repository does not have, so
-an echo of it is text, not a finding), or the pull request's diff does not
-touch the path it names. A fenced finding that is neither — a real finding
-written inside a fence, on a path the diff changes — is kept and blocks.
-Nothing outside a fence is ever dropped this way, and neither case applies
-when the harness could not read the diff. Report in prose outside a fence,
-or in the section, to be sure your findings are read.
+an echo of it is text, not a finding), which holds whether or not the
+harness could read the diff. Or the harness read the diff and the diff does
+not touch the path the finding names — a location no hunk changes cannot be
+fixed by this pull request — so that case applies only when the diff is in
+hand. Anything else inside a fence is a report and is kept, even a real
+finding on a path the diff does not change, and nothing outside a fence is
+ever dropped this way. A fence that never closes is not a quote at all, so
+nothing in it is dropped for naming an unchanged path; remember the closing
+delimiter anyway, and write a real report outside a fence or in the
+section. A finding written in the `## Findings` section is
+always read. Report in prose outside a fence, or in the section, to be sure
+your findings are read.
 
 Evidence rule: the `harness` binary on `PATH` was built from the default
 branch before this run started, so it is the pre-change build; when the diff
