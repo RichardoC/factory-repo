@@ -736,7 +736,7 @@ func allocDiffShares(secs []diffSection, budget int, share []int) {
 			short = append(short, i)
 		}
 	}
-	sort.Slice(short, func(a, b int) bool { return secs[short[a]].body > secs[short[b]].body })
+	sort.SliceStable(short, func(a, b int) bool { return len(secs[short[a]].body) > len(secs[short[b]].body) })
 	for len(short) > 0 && remaining > 0 {
 		per := remaining / len(short)
 		if per == 0 {
