@@ -2270,7 +2270,12 @@ type item struct {
 	Comments    int             `json:"comments"`
 	CreatedAt   string          `json:"created_at"`
 	PullRequest json.RawMessage `json:"pull_request"` // present on issues that are PRs
-	Head        struct {
+	// Draft is the pull request's draft flag, present only on the JSON the
+	// pulls API returns (/pulls/N); the issues-list JSON leaves it unset. The
+	// review reads it to withhold the pass label while a run that stopped
+	// early keeps its pull request a draft (issue #237).
+	Draft bool `json:"draft"`
+	Head  struct {
 		Ref string `json:"ref"`
 		// SHA is the head commit SHA, present on the JSON the pulls API
 		// returns (/pulls/N); the issues-list JSON does not carry it. The
