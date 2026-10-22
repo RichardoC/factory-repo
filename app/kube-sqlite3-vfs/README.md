@@ -89,6 +89,17 @@ All four commands (`main`, `db-upload`, `db-download`, `file-create`) share:
 store in the cluster, defaulting to `file2.db`. (`db-upload` and
 `db-download` are demo tools with fixed remote name `file2.db`.)
 
+`main` (the writer) additionally takes `--journal-mode MODE` (issue #120),
+the SQLite rollback journal mode it opens its database with — `DELETE` (the
+default), `TRUNCATE` or `PERSIST`, matched case-insensitively. The default is
+the measured trade-off documented with the benchmarks below. `MEMORY` and
+`OFF` are refused before any cluster work, with the crash-safety reason from
+issue #68: their rollback journal never reaches the VFS, so a crash
+mid-transaction leaves a half-written database that cannot be rolled back.
+`WAL` is refused too: it needs SQLite's shared-memory `-shm` file, which this
+ConfigMap-backed VFS cannot store. Any other value is refused as unknown,
+naming the accepted modes.
+
 Every command prints an error to stderr and exits non-zero; none of them
 panics on an ordinary error.
 
@@ -141,7 +152,7 @@ What is still **not** crash-safe:
 * **No WAL.** `_journal=MEMORY` is no longer the default anywhere in this project, but `-wal` is still reported inaccessible, so WAL mode cannot be selected; the rollback journal above is the only durability mechanism.
 * **The limits below still stand** — a paused process can lose its lease, clocks must be roughly synchronised, every process touching the database must run this version, and sector writes are gated only by lease loss, not by lock level.
 
-The default journal mode is **`_journal=DELETE`**, chosen over `TRUNCATE` and `PERSIST` by API calls per commit. All three store the journal out of memory; the difference is entirely what happens at commit. `DELETE` issues one `xDelete`, which this VFS turns into one LIST of the journal's sectors plus one Delete per sector (and one Delete of the journal's lockfile) — after which the journal is gone and no later transaction pays for it. `TRUNCATE` and `PERSIST` keep the journal on the cluster, so every later write transaction pays again: a header rewrite through `xWrite` (one UPDATE per touched sector) plus the `xAccess` and `xOpen` that rediscover and reopen the file. Measured with `go test ./pkg/vfs -run ZZZ -bench BenchmarkSQLiteInsert1000Rows -benchtime 10x`: a committed 1000-row transaction costs **25.00 api-calls/op with `_journal=MEMORY`** and **65.00 api-calls/op with `_journal=DELETE`** — a delta of 40 API calls for the journal writes plus its deletion, paid once per commit (see the benchmarks below).
+The default journal mode is **`_journal=DELETE`**, and the writer takes it as a flag (`--journal-mode`, issue #120). All crash-safe modes (`DELETE`, `TRUNCATE`, `PERSIST`) store the journal through this VFS; `MEMORY` and `OFF` are refused (issue #68, above). Measured against each other (issue #120, full table below), `TRUNCATE` and `PERSIST` are actually the **cheaper** modes — the earlier argument here, that they would pay a header rewrite plus extra `xAccess`/`xOpen` on every later transaction where `DELETE` pays one deletion at commit, is not what the API-call counter shows. What a commit costs is not the whole story, though: `DELETE` is the default because of what it leaves behind. After clean commits and close (measured over the fake clientset), `DELETE` leaves **no journal state at all**, `TRUNCATE` leaves the journal's lockfile ConfigMap behind permanently (one per database, never reclaimed), and `PERSIST` leaves the journal's sector ConfigMaps too — cluster storage nothing ever cleans up. The clean post-commit layout is what issue #68's recovery story is built on ("no journal sectors" is exactly what `Access` reports for a recovered file), so the ~4 API calls per transaction that `TRUNCATE` would save are traded for a cluster that holds no journal artifacts between transactions. Deployments that prefer the saving can set `--journal-mode=TRUNCATE`; the trade-off is measured and written down rather than argued.
 
 **Concurrent access between processes is now guarded by real mutual exclusion (issue #47) — under the limits listed below.** The lock ConfigMap no longer stores one bare level written blindly. Every transition is a compare-and-swap: the holder state is read, the new state is decided from what was read, and the Update carries the `resourceVersion` just read, so two processes can never overwrite each other's holdings; on a 409 Conflict the state is re-read and the decision re-made, never forced. A missing lockfile is created with Create, and `AlreadyExists` from that Create is treated as "re-read". Each file — generated once per `Open`, and per `NewFile` — carries a holder id (a UUID) and every lock operation acts as that holder, so a process can tell its own locks from another process's; `Close` releases them. The stored state expresses sqlite's model: any number of SHARED holders, at most one writer at a time (RESERVED, PENDING or EXCLUSIVE), and EXCLUSIVE only once no other holder remains. A transition another process has made impossible — a second RESERVED, EXCLUSIVE while other SHARED holders remain — returns SQLITE_BUSY (`sqlite3vfs.BusyError`) instead of blocking; sqlite retries on its own schedule. The aggregate `lock` key still holds the highest level any live holder has, so a reader of the old single-level format still sees a meaningful value. The #19 cache rules are unchanged: caches are dropped before any downgrade is written, and a file never adopts the ConfigMap's stored state as its own lock.
 
@@ -222,6 +233,63 @@ The WARNINGS section above describes the new locking guarantees: compare-and-swa
 The read and write paths are untouched — their api-calls/op is identical, because the sector path still makes no lock calls at all (`BenchmarkSequentialReadLocked` stays at 0). Everything that moved is the CAS itself: a transition that writes now GETs the lock ConfigMap first, where the old code wrote blindly. `BenchmarkLockUnlockShared`'s acquire + release cycle goes 2 → 4 (one GET + one UPDATE per transition). The insert transaction performs five lock transitions — SHARED, RESERVED, EXCLUSIVE, back to SHARED, NONE — costing +5 GETs, and its EXCLUSIVE climb is now two CAS steps (claim PENDING, then acquire EXCLUSIVE once no other holder remains) where the old code wrote EXCLUSIVE in a single blind UPDATE, another +1 GET +1 UPDATE: 17 → 24. `BenchmarkLockUnlockExclusive` is new and has no before number; its three transitions (PENDING claim, EXCLUSIVE acquire, downgrade to SHARED) cost 6. The extra GET and the JSON round-trip of the holder state also show in CPU terms: `BenchmarkLockUnlockShared` went from ~12.9k–14.7k ns/op and 127 allocs/op before to ~20k–41k ns/op across seven runs (median of the five `-count 5` runs ~30k) and 170 allocs/op. The on-cluster rollback journal costs 40 extra API calls per committed transaction. `BenchmarkSQLiteInsert1000RowsJournalDelete` is `BenchmarkSQLiteInsert1000Rows` verbatim — same 64 KiB pages, same CREATE TABLE before ClearActions, same 1000-row prepared-insert transaction, same `api-calls/op` accounting and same multi-sector assertion — except that it opens the database with `_journal=DELETE` instead of `_journal=MEMORY` (`openSQLDBWithJournal`; the existing benchmark's DSN helper is untouched). Its journal is therefore a real file through the VFS: SQLite writes and later deletes the `<db>-journal` sector ConfigMaps, and those calls land in the count. Measured with `go test ./pkg/vfs -run ZZZ -bench BenchmarkSQLiteInsert1000Rows -benchtime 10x`: `_journal=MEMORY` 25.00 api-calls/op, `_journal=DELETE` 65.00 api-calls/op (exact, identical across `-count 3` runs). The delta is the journal header and page writes plus the journal's deletion — the price of a rollback that can actually be rolled back after a crash.
 
 What did not change: `CheckReservedLock` costs the same as before (zero calls while this file holds RESERVED or better locally, one GET otherwise), and a lock transition for a level already held still makes no lock API call.
+
+## Benchmarks (issue #120): every journal mode, one and ten transactions
+
+`BenchmarkSQLiteInsert1000RowsJournalModes` runs the module's committed
+1000-row insert workload (64 KiB pages, the transaction spanning several
+sectors) under each journal mode — `DELETE`, `TRUNCATE`, `PERSIST` and
+`MEMORY` — once for a single committed transaction and once for ten
+consecutive committed transactions. One benchmark iteration is one unit of
+`api-calls/op`: one transaction for the `transactions=01` sub-benchmarks, the
+whole ten-transaction sequence for `transactions=10`; `api-calls/tx`
+restates the ten-transaction numbers per single transaction so they compare
+directly with the one-transaction rows. The sub-benchmark also asserts
+`PRAGMA journal_mode` reports the mode it was asked to measure, so a mode
+SQLite silently ignored could not masquerade as a number.
+
+```
+go test ./pkg/vfs -run ZZZ -bench 'BenchmarkSQLiteInsert' -benchtime 10x -count 3
+```
+
+api-calls/op and api-calls/tx were identical across all three runs (the
+metric is exact); ns/op is the median of the three.
+
+| Sub-benchmark (`BenchmarkSQLiteInsert1000RowsJournalModes/...`) | api-calls/op (1 tx) | api-calls/op (10 tx) | api-calls/tx (10 tx) | ns/op median |
+| --- | --- | --- | --- | --- |
+| `journal=DELETE/transactions=01`   | 65.00 | —     | —     | 3,662,953 |
+| `journal=DELETE/transactions=10`   | —     | 832.0 | 83.20 | 45,912,698 |
+| `journal=TRUNCATE/transactions=01` | 61.00 | —     | —     | 3,409,148 |
+| `journal=TRUNCATE/transactions=10` | —     | 792.0 | 79.20 | 49,047,410 |
+| `journal=PERSIST/transactions=01`  | 62.00 | —     | —     | 3,757,908 |
+| `journal=PERSIST/transactions=10`  | —     | 783.0 | 78.30 | 59,008,417 |
+| `journal=MEMORY/transactions=01`   | 25.00 | —     | —     | 2,988,410 |
+| `journal=MEMORY/transactions=10`   | —     | 261.0 | 26.10 | 39,598,961 |
+| `BenchmarkSQLiteInsert1000Rows` (the pre-existing MEMORY baseline) | 25.00 | — | — | 3,233,790 |
+
+What the table says, in before/after terms for the issue #68-era numbers:
+
+* `MEMORY` costs 25.00 API calls per committed transaction against the
+  crash-safe modes' 61.00–65.00 — the delta is the rollback journal that can
+  actually be rolled back after a crash, and it is the price #68 chose to
+  pay.
+* The earlier claim that `TRUNCATE`/`PERSIST` would cost **more** per
+  transaction than `DELETE` is refuted: they measure ~4 calls/transaction
+  **cheaper** (61.00/62.00 vs 65.00 for one transaction; 79.20/78.30 vs
+  83.20 over ten). Where DELETE pays one LIST plus one Delete per journal
+  sector plus the journal lockfile's Delete at every commit, `TRUNCATE`'s
+  `xTruncate` deletes the journal's sectors directly — no LIST, no lockfile
+  call. `PERSIST` skips the per-transaction journal writes almost entirely
+  once the journal is warm (its journal sectors survive commit), which is
+  why it edges `TRUNCATE` at ten transactions.
+* The ten-transaction rows are where the per-transaction costs show up, and
+  they confirm the ranking holds across consecutive transactions: no mode's
+  cost per transaction grows with the count.
+* `DELETE` stays the default anyway (see the journal-mode paragraph in the
+  WARNINGS section): it is the only mode that leaves no journal state on the
+  cluster after a clean commit — `TRUNCATE` leaves the journal's lockfile
+  ConfigMap, `PERSIST` leaves its journal sectors. `MEMORY` remains
+  refusable-only: 25.00 calls buys no crash safety at all.
 
 ## Go 1.27 and dependencies (issue #9)
 

@@ -192,12 +192,13 @@ func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Lo
 
 	// The journal mode is DELETE, not MEMORY (issue #68): MEMORY leaves no
 	// on-cluster record of an uncommitted transaction, so a crash cannot be
-	// rolled back. Click through the same reasoning as main.go: DELETE pays
-	// one xDelete at commit (one LIST + one Delete per journal sector),
-	// where TRUNCATE/PERSIST keep the file and pay a header rewrite plus
-	// extra xAccess/xOpen on later transactions. The measured api-calls/op
-	// for a committed 1000-row transaction is 25.00 with _journal=MEMORY
-	// and 65.00 with _journal=DELETE (module README, BenchmarkSQLiteInsert1000Rows).
+	// rolled back. DELETE measures 65.00 api-calls/op for a committed
+	// 1000-row transaction against MEMORY's 25.00; TRUNCATE and PERSIST
+	// measure slightly cheaper still (61.00/62.00), but leave journal
+	// state on the cluster after a clean commit where DELETE leaves
+	// nothing, which is why DELETE is the project-wide default — the full
+	// measured table is in the module README (issue #120,
+	// BenchmarkSQLiteInsert1000RowsJournalModes).
 	//
 	// This connection is read-only (`mode=ro` and `_query_only=true`), and
 	// that changes what it can and cannot do, so it is stated here rather
