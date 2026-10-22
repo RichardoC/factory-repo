@@ -358,14 +358,45 @@ func TestRunPlanBriefDegradesOnPageCap(t *testing.T) {
 	brief := string(data)
 	for _, want := range []string{
 		"(open issues unavailable:",
-		"(recently closed issues unavailable:",
-		"(recently closed pull requests unavailable:",
-		"(recent run reports unavailable:",
 		"page cap",
 		"# Output contract",
 	} {
 		if !strings.Contains(brief, want) {
 			t.Errorf("brief missing %q", want)
 		}
+	}
+	// The windowed reads take one page and never meet the cap.
+	for _, unwanted := range []string{
+		"(recently closed issues unavailable:",
+		"(recently closed pull requests unavailable:",
+		"(recent run reports unavailable:",
+	} {
+		if strings.Contains(brief, unwanted) {
+			t.Errorf("brief has %q: a windowed read followed the next link", unwanted)
+		}
+	}
+}
+
+// TestRunPlanBriefWindowedReadsTakeOnePage proves the recent-items reads
+// stay one request each: the closed issues, closed pull requests and run
+// reports are windows of the newest items, and a repository with more
+// history than maxListPages pages must not lose them to the page cap.
+func TestRunPlanBriefWindowedReadsTakeOnePage(t *testing.T) {
+	var windowed atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("state") == "closed" || r.URL.Path == "/repos/RichardoC/factory-repo/issues/comments" {
+			windowed.Add(1)
+		}
+		// The next link keeps the query, so a followed page is counted too.
+		w.Header().Set("Link", fmt.Sprintf("<%s%s&page=2>; rel=\"next\"", serverURL(r), r.URL.RequestURI()))
+		_, _ = io.WriteString(w, `[]`)
+	}))
+	t.Cleanup(server.Close)
+	planBriefEnv(t, server)
+	if err := runPlanBrief(); err != nil {
+		t.Fatalf("runPlanBrief: %v", err)
+	}
+	if n := windowed.Load(); n != 3 {
+		t.Errorf("windowed requests = %d, want 3 (one page each)", n)
 	}
 }

@@ -187,6 +187,12 @@ func planOpenIssues(gh github) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// The three "recent" reads below (closed issues, closed pull requests, run
+// reports) are windows, not whole lists: one page of the newest items is
+// what they want, so they use the one-shot get. Through getList they would
+// walk the repository's whole history and, past maxListPages, lose the
+// section to the page-cap error.
+//
 // planClosedIssues embeds the recently closed issues' bodies nearly whole:
 // their "Out of scope" and follow-up notes are the planner's second source
 // of proposals, and a note cut at 200 runes is a note lost. Bodies are
@@ -195,7 +201,7 @@ func planClosedIssues(gh github) string {
 	var b strings.Builder
 	b.WriteString("## Recently closed issues\n\n")
 	var issues []item
-	if err := gh.getList("/issues?state=closed&sort=updated&per_page=20", &issues); err != nil {
+	if err := gh.get("/issues?state=closed&sort=updated&per_page=20", &issues); err != nil {
 		fmt.Fprintf(&b, "(recently closed issues unavailable: %s)\n", escapeMD(err.Error(), 200, true))
 		return strings.TrimRight(b.String(), "\n")
 	}
@@ -226,7 +232,7 @@ func planClosedPulls(gh github) string {
 	var b strings.Builder
 	b.WriteString("## Recently closed pull requests\n\n")
 	var pulls []item
-	if err := gh.getList("/pulls?state=closed&sort=updated&per_page=20", &pulls); err != nil {
+	if err := gh.get("/pulls?state=closed&sort=updated&per_page=20", &pulls); err != nil {
 		fmt.Fprintf(&b, "(recently closed pull requests unavailable: %s)\n", escapeMD(err.Error(), 200, true))
 		return strings.TrimRight(b.String(), "\n")
 	}
@@ -258,7 +264,7 @@ func planRunReports(gh github) string {
 	var b strings.Builder
 	b.WriteString("## Recent CodeAF run reports\n\n")
 	var comments []planComment
-	if err := gh.getList("/issues/comments?sort=created&direction=desc&per_page=100", &comments); err != nil {
+	if err := gh.get("/issues/comments?sort=created&direction=desc&per_page=100", &comments); err != nil {
 		fmt.Fprintf(&b, "(recent run reports unavailable: %s)\n", escapeMD(err.Error(), 200, true))
 		return strings.TrimRight(b.String(), "\n")
 	}
