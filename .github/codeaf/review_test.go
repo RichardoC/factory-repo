@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // writeReviewResult points RESULT_PATH at a result file with the given stop
@@ -1318,7 +1319,7 @@ func TestRunReviewBrief(t *testing.T) {
 		t.Errorf("the degrade note is missing: %q", data)
 	}
 
-	// A huge diff is capped, with a note.
+	// A huge headerless blob is capped as a plain prefix, with the byte-count note.
 	big := strings.Repeat("+ line of a hostile diff\n", 4000) // ~96KB
 	routes["/repos/RichardoC/factory-repo/issues/3"] = `{"number":3,"title":"The task","body":"x"}`
 	ghEnv(t, reviewServer(t, routes, big, nil))
@@ -1333,6 +1334,34 @@ func TestRunReviewBrief(t *testing.T) {
 	}
 	if !strings.Contains(string(data), fmt.Sprintf("(diff truncated at %d bytes)", maxReviewDiffBytes)) {
 		t.Errorf("the diff cap note is missing")
+	}
+
+	// A multi-file diff past the cap (issue #231) keeps every file header,
+	// names the clipped files in the note and points the reviewer at the
+	// checkout, so no file drops out of the brief unseen.
+	multi := diffFile("app/one.go", 2000) + diffFile("app/two.go", 2000) + diffFile("app/three.go", 2000)
+	if len(multi) <= maxReviewDiffBytes {
+		t.Fatalf("test diff must exceed the cap: %d bytes", len(multi))
+	}
+	ghEnv(t, reviewServer(t, routes, multi, nil))
+	briefPath = filepath.Join(t.TempDir(), "multi-capped.md")
+	t.Setenv("BRIEF_PATH", briefPath)
+	if _, err := captureStdout(t, runReviewBrief); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{
+		"diff --git a/app/one.go b/app/one.go",
+		"diff --git a/app/two.go b/app/two.go",
+		"diff --git a/app/three.go b/app/three.go",
+		"read the full content of app/one.go, app/two.go, app/three.go on the checked-out PR head branch",
+	} {
+		if !strings.Contains(string(data), p) {
+			t.Errorf("the capped brief lost %q", p)
+		}
 	}
 
 	// Required inputs are refused loudly.
@@ -2041,5 +2070,178 @@ func TestParseFindingsFenceGuardDoesNotDropUnfenced(t *testing.T) {
 		if len(blockingFindings(findings)) != 1 {
 			t.Errorf("unfenced %q stopped blocking", bullet)
 		}
+	}
+}
+
+// diffFile builds one file's section of a unified diff: a `diff --git`
+// header and `lines` body lines, each naming the file so a clipped section
+// is recognisable.
+func diffFile(path string, lines int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n@@ -1,3 +%d @@\n",
+		path, path, path, path, lines+1)
+	for i := 0; i < lines; i++ {
+		fmt.Fprintf(&b, "+ %s line %d\n", path, i)
+	}
+	return b.String()
+}
+
+// Issue #231: the review diff cap is file-aware. A six-file diff past the
+// cap keeps every `diff --git` header, stays within the cap, names the
+// clipped files in the note, and every file still contributes content.
+func TestCapDiffKeepsEveryFileHeader(t *testing.T) {
+	var files []string
+	for i := 0; i < 6; i++ {
+		files = append(files, diffFile(fmt.Sprintf("app/f%d.go", i), 3000))
+	}
+	diff := strings.Join(files, "")
+	if len(diff) <= maxReviewDiffBytes {
+		t.Fatalf("test diff must exceed the cap: %d bytes", len(diff))
+	}
+	got := capDiff(diff, maxReviewDiffBytes)
+	if len(got) > maxReviewDiffBytes {
+		t.Errorf("capped diff is %d bytes, over the %d cap", len(got), maxReviewDiffBytes)
+	}
+	for i := 0; i < 6; i++ {
+		header := fmt.Sprintf("diff --git a/app/f%d.go b/app/f%d.go", i, i)
+		if !strings.Contains(got, header) {
+			t.Errorf("capped diff lost file %d's header %q", i, header)
+		}
+	}
+	// Six equal ~120KB sections cannot all fit, so every file is clipped
+	// and every one of them must be named in the truncation note, with the
+	// instruction to read them on the checkout.
+	if !strings.Contains(got, "read the full content of") {
+		t.Errorf("truncation note missing the read-on-checkout instruction: %q", got[len(got)-300:])
+	}
+	if !strings.Contains(got, "on the checked-out PR head branch") {
+		t.Errorf("truncation note missing the checkout pointer")
+	}
+	for i := 0; i < 6; i++ {
+		if !strings.Contains(got, fmt.Sprintf("app/f%d.go", i)) {
+			t.Errorf("truncation note does not name clipped file app/f%d.go", i)
+		}
+		if !strings.Contains(got, fmt.Sprintf("+ app/f%d.go line 0", i)) {
+			t.Errorf("file %d contributes no content after the cap", i)
+		}
+	}
+}
+
+// Issue #231: one file larger than the whole cap is truncated with its
+// name in the note, its header still kept.
+func TestCapDiffSingleOversizedFile(t *testing.T) {
+	diff := diffFile("app/big.go", 8000) // ~100KB, over the cap alone
+	if len(diff) <= maxReviewDiffBytes {
+		t.Fatalf("test diff must exceed the cap: %d bytes", len(diff))
+	}
+	got := capDiff(diff, maxReviewDiffBytes)
+	if len(got) > maxReviewDiffBytes {
+		t.Errorf("capped diff is %d bytes, over the %d cap", len(got), maxReviewDiffBytes)
+	}
+	if !strings.Contains(got, "diff --git a/app/big.go b/app/big.go") {
+		t.Errorf("capped diff lost the file's header")
+	}
+	if !strings.Contains(got, "+ app/big.go line 0") {
+		t.Errorf("the oversized file contributes no content after the cap")
+	}
+	if !strings.Contains(got, "read the full content of app/big.go on the checked-out PR head branch") {
+		t.Errorf("truncation note does not name the clipped file or point at the checkout: %q", got[len(got)-200:])
+	}
+}
+
+// The file-aware cap leaves diffs at or under the cap untouched, keeps a
+// multi-file diff with room for every file identical, and falls back to a
+// plain prefix cap for a diff with no file headers at all.
+func TestCapDiffAllocationEdges(t *testing.T) {
+	small := diffFile("app/s.go", 3) + diffFile("app/t.go", 3)
+	if got := capDiff(small, len(small)); got != small {
+		t.Errorf("a diff at the cap was altered: %q", got)
+	}
+	if got := capDiff(small, maxReviewDiffBytes); got != small {
+		t.Errorf("a diff under the cap was altered: %q", got)
+	}
+	two := diffFile("app/a.go", 900) + diffFile("app/b.go", 900) // ~23KB
+	got := capDiff(two, 12000)
+	if len(got) != 12000 {
+		t.Errorf("capped diff is %d bytes, want exactly the 12000 cap", len(got))
+	}
+	for _, p := range []string{"diff --git a/app/a.go b/app/a.go", "diff --git a/app/b.go b/app/b.go", "+ app/a.go line 0", "+ app/b.go line 0"} {
+		if !strings.Contains(got, p) {
+			t.Errorf("capped two-file diff lost %q", p)
+		}
+	}
+	if !strings.Contains(got, "read the full content of app/a.go, app/b.go on the checked-out PR head branch") {
+		t.Errorf("truncation note does not name both clipped files")
+	}
+	// A headerless blob caps as a plain prefix with the original note.
+	blob := strings.Repeat("+ plain body line\n", 8000)
+	got = capDiff(blob, 60000)
+	if len(got) > 60000 {
+		t.Errorf("headerless cap is %d bytes, over the cap", len(got))
+	}
+	if !strings.Contains(got, "(diff truncated at 60000 bytes)") {
+		t.Errorf("headerless cap lost the byte-count note")
+	}
+	// The cap never splits a UTF-8 rune, in any file's body.
+	utf := diffFile("app/utf.go", 100) + strings.Repeat("+ éééé\n", 20000)
+	got = capDiff(utf, maxReviewDiffBytes)
+	if len(got) > maxReviewDiffBytes {
+		t.Errorf("utf8 cap is %d bytes, over the cap", len(got))
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("capped diff split a UTF-8 rune")
+	}
+}
+
+// Issue #231 review: a diff that keeps one file whole while clipping another
+// used to panic — the rune-backoff loop indexed the body at the cut before
+// the cut < len(body) guard, and a file whose body fit its share put the cut
+// at exactly len(body). The mixed shape is the one that crashed in review.
+func TestCapDiffMixedWholeAndClippedFile(t *testing.T) {
+	diff := diffFile("app/small.go", 3) + diffFile("app/huge.go", 4000)
+	got := capDiff(diff, maxReviewDiffBytes)
+	if len(got) > maxReviewDiffBytes {
+		t.Errorf("mixed cap is %d bytes, over the 60000 cap", len(got))
+	}
+	for _, p := range []string{"diff --git a/app/small.go b/app/small.go", "diff --git a/app/huge.go b/app/huge.go"} {
+		if !strings.Contains(got, p) {
+			t.Errorf("mixed cap lost %q", p)
+		}
+	}
+	// The small file's whole body is kept; the huge one is clipped and named.
+	if !strings.Contains(got, "+ app/small.go line 2") {
+		t.Errorf("the file kept whole lost content:\n%s", got)
+	}
+	if !strings.Contains(got, "read the full content of app/huge.go on the checked-out PR head branch") {
+		t.Errorf("truncation note does not name the clipped file:\n%s", got[len(got)-300:])
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("mixed cap split a UTF-8 rune")
+	}
+	// A file with an empty body (a rename or mode change, no hunks) is not a
+	// special case either: its share is zero and its body is empty.
+	rename := "diff --git a/app/old.go b/app/new.go\nsimilarity index 100%\nrename from app/old.go\nrename to app/new.go\n"
+	if got := capDiff(rename+diffFile("app/huge.go", 4000), maxReviewDiffBytes); len(got) > maxReviewDiffBytes || !strings.Contains(got, "diff --git a/app/old.go b/app/new.go") {
+		t.Errorf("rename-only section broke the cap: len %d", len(got))
+	}
+	// Forty files far past a cap that still fits their headers: the note
+	// names at most capDiffMaxNoteFiles files and counts the rest, and the
+	// total stays within the cap.
+	var many strings.Builder
+	for i := 0; i < 40; i++ {
+		many.WriteString(diffFile(fmt.Sprintf("app/f%02d.go", i), 100))
+	}
+	manyDiff := capDiff(many.String(), 6000)
+	if len(manyDiff) > 6000 {
+		t.Errorf("many-file cap is %d bytes, over the 6000 cap", len(manyDiff))
+	}
+	if !strings.Contains(manyDiff, "and 10 more") {
+		t.Errorf("many-file note does not count the files past its limit:\n%s", manyDiff[len(manyDiff)-400:])
+	}
+	// A diff whose headers alone exceed the cap has no sections to preserve:
+	// it falls back to the plain prefix cap, still bounded and still noting
+	// the byte count.
+	if got := capDiff(many.String(), 200); len(got) > 200 || !strings.Contains(got, "(diff truncated at 200 bytes)") {
+		t.Errorf("header-over-cap fallback is not a bounded prefix cap: len %d", len(got))
 	}
 }

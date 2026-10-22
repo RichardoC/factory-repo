@@ -1030,12 +1030,227 @@ const reviewOutputContract = "# The output the harness parses\n\n" +
 	"When the review is clean, end with the section holding the single word `none` and nothing else:\n\n" +
 	"## Findings\n\nnone\n"
 
-// capDiff caps the diff embedded in the review brief without splitting a
-// UTF-8 rune, noting the truncation; the note counts against the cap.
+// capDiffFloorBytes is the smallest body budget a file's section keeps when
+// the cap forces allocation: every file in the diff contributes some
+// content, even a many-file patch larger than the whole cap (issue #231).
+const capDiffFloorBytes = 1024
+
+// capDiffMaxNoteFiles bounds how many clipped file names the truncation
+// note lists; past that the note says how many more there are, so a diff
+// with thousands of files cannot grow the note without bound.
+const capDiffMaxNoteFiles = 30
+
+// diffSection is one file's slice of a unified diff: its `diff --git`
+// header line (newline included) and the body up to the next header.
+type diffSection struct {
+	header string // the `diff --git a/x b/x` line, newline included
+	body   string // everything up to the next `diff --git` line
+	name   string // the file's path, from the header's b/ side
+}
+
+// splitDiffSections splits a unified diff at every `diff --git ` line. A
+// diff with no such line yields no sections; text before the first header
+// is kept as its own section with no name, so a leading run of context is
+// never dropped silently either.
+func splitDiffSections(diff string) []diffSection {
+	start := 0
+	if !strings.HasPrefix(diff, "diff --git ") {
+		i := strings.Index(diff, "\ndiff --git ")
+		if i < 0 {
+			return nil
+		}
+		start = i + 1
+	}
+	var secs []diffSection
+	for start < len(diff) {
+		end := strings.Index(diff[start:], "\ndiff --git ")
+		if end < 0 {
+			end = len(diff)
+		} else {
+			end += start
+		}
+		sec := diff[start:end]
+		hl := strings.IndexByte(sec, '\n')
+		var s diffSection
+		if hl < 0 {
+			s.header = sec
+		} else {
+			s.header, s.body = sec[:hl+1], sec[hl+1:]
+		}
+		if strings.HasPrefix(s.header, "diff --git ") {
+			// The header line reads `diff --git a/old b/new`; the b/ side
+			// names the file. Quoted paths (spaces in the name) keep the
+			// whole remainder, which still names the file.
+			s.name = strings.TrimSuffix(s.header[len("diff --git "):], "\n")
+			if i := strings.LastIndexByte(s.name, ' '); i >= 0 {
+				bpath := s.name[i+1:]
+				if strings.HasPrefix(bpath, "b/") {
+					s.name = bpath[len("b/"):]
+				}
+			}
+		}
+		secs = append(secs, s)
+		start = end + 1
+	}
+	return secs
+}
+
+// allocDiffShares fills share[i] with the body bytes section i may keep
+// within budget: every file keeps a floor of content (scaled down when
+// even the floors do not fit), a file whose whole body fits is kept whole,
+// and the leftovers are redistributed to the files still short, largest
+// first.
+func allocDiffShares(secs []diffSection, budget int, share []int) {
+	for i := range share {
+		share[i] = 0
+	}
+	n := len(secs)
+	if n == 0 {
+		return
+	}
+	floor := capDiffFloorBytes
+	if floor*n > budget {
+		floor = budget / n
+	}
+	remaining := budget
+	for i, s := range secs {
+		k := min(len(s.body), floor)
+		if k > remaining {
+			k = max(remaining, 0)
+		}
+		share[i] = k
+		remaining -= k
+	}
+	// Redistribution: the files still short split what is left equally,
+	// largest first, until the budget runs out.
+	short := make([]int, 0, n)
+	for i, s := range secs {
+		if share[i] < len(s.body) {
+			short = append(short, i)
+		}
+	}
+	sort.SliceStable(short, func(a, b int) bool { return len(secs[short[a]].body) > len(secs[short[b]].body) })
+	for len(short) > 0 && remaining > 0 {
+		per := remaining / len(short)
+		if per == 0 {
+			// Crumbs only: one byte to each of the largest files, in
+			// order, until the budget is gone.
+			for _, i := range short {
+				if remaining == 0 {
+					break
+				}
+				share[i]++
+				remaining--
+			}
+			break
+		}
+		next := make([]int, 0, len(short))
+		for _, i := range short {
+			add := min(len(secs[i].body)-share[i], per)
+			share[i] += add
+			remaining -= add
+			if share[i] < len(secs[i].body) {
+				next = append(next, i)
+			}
+		}
+		short = next
+	}
+}
+
+// diffTruncationNote is what the capped diff ends with: the byte count the
+// note always carried, plus the clipped files and the instruction to read
+// them on the checked-out PR head branch (the maintainer's reduction of
+// issue #231 — the review run has the checkout, so named files can be read
+// even though the brief cannot carry them).
+func diffTruncationNote(max int, clipped []string) string {
+	note := fmt.Sprintf("(diff truncated at %d bytes)\n", max)
+	if len(clipped) == 0 {
+		return note
+	}
+	named := clipped
+	extra := 0
+	if len(named) > capDiffMaxNoteFiles {
+		extra = len(named) - capDiffMaxNoteFiles
+		named = named[:capDiffMaxNoteFiles]
+	}
+	note = fmt.Sprintf("(diff truncated at %d bytes; not all of every file is shown — read the full content of %s on the checked-out PR head branch",
+		max, strings.Join(named, ", "))
+	if extra > 0 {
+		note += fmt.Sprintf(" and %d more", extra)
+	}
+	return note + ")\n"
+}
+
+// capDiff caps the diff embedded in the review brief. The cap is file-aware
+// (issue #231): the diff is split into per-file sections, every `diff --git`
+// header line is always kept, and the byte budget (the note included) is
+// allocated across the files so each one contributes some content, the
+// leftovers going to the largest files first. Sections whose body is cut
+// short are named in the note. A diff too large even for its headers, or
+// with no file headers at all, falls back to a plain prefix cap. The result
+// never splits a UTF-8 rune and never exceeds max bytes.
 func capDiff(diff string, max int) string {
 	if len(diff) <= max {
 		return diff
 	}
+	secs := splitDiffSections(diff)
+	headerBytes := 0
+	for _, s := range secs {
+		headerBytes += len(s.header)
+	}
+	if len(secs) == 0 || headerBytes >= max {
+		// No per-file sections to preserve — cap the text itself.
+		return capDiffPrefix(diff, max)
+	}
+	share := make([]int, len(secs))
+	contentBudget := max - headerBytes
+	for round := 0; round < 16; round++ {
+		allocDiffShares(secs, contentBudget, share)
+		var b strings.Builder
+		var clipped []string
+		for i, s := range secs {
+			cut := share[i]
+			if cut > len(s.body) {
+				cut = len(s.body) // a file short of its share is kept whole
+			}
+			// Back off to a rune boundary, never splitting one; a cut at
+			// the end of the body has nothing to back off from.
+			for cut > 0 && cut < len(s.body) && !utf8.RuneStart(s.body[cut]) {
+				cut-- // never split a rune
+			}
+			b.WriteString(s.header)
+			if cut < len(s.body) {
+				b.WriteString(s.body[:cut])
+				if s.name != "" {
+					clipped = append(clipped, s.name)
+				}
+			} else {
+				b.WriteString(s.body)
+			}
+		}
+		out := b.String()
+		note := diffTruncationNote(max, clipped)
+		if len(out) > 0 && out[len(out)-1] != '\n' {
+			out += "\n" // a clipped body may end mid-line
+		}
+		out += note
+		if len(out) <= max {
+			return out
+		}
+		// The note names more clipped files than this round's budget left
+		// room for: shrink the content budget and re-allocate.
+		contentBudget -= len(out) - max
+		if contentBudget < 0 {
+			break
+		}
+	}
+	// Degenerate shapes (headers plus note past the cap): a bounded prefix
+	// keeps the total within max, as before issue #231.
+	return capDiffPrefix(diff, max)
+}
+
+// capDiffPrefix is the pre-#231 plain cap: a byte prefix with a note.
+func capDiffPrefix(diff string, max int) string {
 	note := fmt.Sprintf("\n(diff truncated at %d bytes)\n", max)
 	cut := max - len(note)
 	if cut < 0 {
