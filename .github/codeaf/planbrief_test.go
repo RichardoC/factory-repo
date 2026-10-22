@@ -5,11 +5,13 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -276,5 +278,94 @@ func TestRunPlanBriefOutputContractCounts(t *testing.T) {
 	}
 	if !strings.Contains(string(data), fmt.Sprintf("Write up to %d proposals", 2)) {
 		t.Error("the output contract does not carry the configured cap")
+	}
+}
+
+// TestRunPlanBriefOpenIssuesFollowsPages proves the one open-issues read
+// reaches past the first page (issue #223 follow-up): the stub serves two
+// pages of open issues, the first carrying a `Link: rel="next"` header, and
+// the brief must show the issue that only page 2 has. A one-shot get would
+// stop after page 1 and lose it.
+func TestRunPlanBriefOpenIssuesFollowsPages(t *testing.T) {
+	var pages atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/RichardoC/factory-repo/issues" {
+			// The other three list reads answer an empty page and no next
+			// link: this test is about the open-issues read alone.
+			_, _ = io.WriteString(w, `[]`)
+			return
+		}
+		q := r.URL.Query()
+		switch q.Get("page") {
+		case "":
+			// The first request is the given path itself, query params and
+			// all: getList starts from it and only the next link adds a page.
+			if q.Get("state") != "open" || q.Get("per_page") != "100" {
+				http.Error(w, "first request changed the query: "+r.URL.RequestURI(), http.StatusBadRequest)
+				return
+			}
+			pages.Add(1)
+			w.Header().Set("Link", fmt.Sprintf("<%s/repos/RichardoC/factory-repo/issues?state=open&per_page=100&page=2>; rel=\"next\"", serverURL(r)))
+			_, _ = io.WriteString(w, `[{"number":11,"title":"First page issue","body":"one"}]`)
+		case "2":
+			pages.Add(1)
+			_, _ = io.WriteString(w, `[{"number":12,"title":"Second page issue","body":"two"}]`)
+		default:
+			http.Error(w, "unexpected page: "+r.URL.RequestURI(), http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(server.Close)
+	briefPath := planBriefEnv(t, server)
+	if err := runPlanBrief(); err != nil {
+		t.Fatalf("runPlanBrief: %v", err)
+	}
+	data, err := os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief := string(data)
+	if !strings.Contains(brief, "#11 — First page issue") {
+		t.Error("the first page's issue is missing from the brief")
+	}
+	if !strings.Contains(brief, "#12 — Second page issue") {
+		t.Error("the second page's issue is missing: the open-issues read stopped at page 1")
+	}
+	if n := pages.Load(); n != 2 {
+		t.Errorf("pages served = %d, want exactly 2 (the next link was not followed, or followed too far)", n)
+	}
+}
+
+// TestRunPlanBriefDegradesOnPageCap proves the degrade path survives the
+// move to getList: a listing that keeps offering a next page comes back as
+// getList's page-cap error, and the brief must render the section as a note
+// and finish, never fail the build (the note text the section has always
+// used is `(... unavailable: ...)`).
+func TestRunPlanBriefDegradesOnPageCap(t *testing.T) {
+	forever := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Link", fmt.Sprintf("<%s%s?per_page=100&page=2>; rel=\"next\"", serverURL(r), r.URL.Path))
+		_, _ = io.WriteString(w, `[]`)
+	})
+	server := httptest.NewServer(forever)
+	t.Cleanup(server.Close)
+	briefPath := planBriefEnv(t, server)
+	if err := runPlanBrief(); err != nil {
+		t.Fatalf("a capped list read must not fail the brief: %v", err)
+	}
+	data, err := os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief := string(data)
+	for _, want := range []string{
+		"(open issues unavailable:",
+		"(recently closed issues unavailable:",
+		"(recently closed pull requests unavailable:",
+		"(recent run reports unavailable:",
+		"page cap",
+		"# Output contract",
+	} {
+		if !strings.Contains(brief, want) {
+			t.Errorf("brief missing %q", want)
+		}
 	}
 }

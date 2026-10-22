@@ -2381,6 +2381,11 @@ func (g github) get(path string, into any) error {
 // first pages.
 const maxListPages = 10
 
+// errMaxListPages is getList's page-cap sentinel: the listing is truncated,
+// not broken, so a brief-building read can degrade on it (isPageCapError)
+// while every other getList failure keeps its meaning.
+var errMaxListPages = errors.New("page cap")
+
 // nextLink returns the URL of the rel="next" link in a `Link` header, or ""
 // when the header offers none. The header is untrusted data; it is only
 // parsed here, and listNext decides whether it may be followed.
@@ -2435,6 +2440,15 @@ func (g github) listNext(h string) (string, error) {
 	return "/" + strings.TrimPrefix(uri, prefix), nil
 }
 
+// isPageCapError reports whether err is getList's page-cap error, the one
+// case a brief-building list read degrades on (issue #223 follow-up): the
+// listing is truncated, not broken, so a note is worth more than a failed
+// brief. Any other failure — a malformed page, a next link that leaves the
+// repository, a transport error — is a real error and keeps failing.
+func isPageCapError(err error) bool {
+	return errors.Is(err, errMaxListPages)
+}
+
 // getList reads a paged list — issue and PR comments, reviews, review
 // comments, pull request files, commits and the timeline (issue #223) —
 // following GitHub's `Link: rel="next"` header page by page, up to
@@ -2452,7 +2466,7 @@ func (g github) getList(path string, into any) error {
 	first := path
 	for pages := 0; path != ""; pages++ {
 		if pages == maxListPages {
-			return fmt.Errorf("GET %s: stopped after %d pages, the listing may be truncated", first, maxListPages)
+			return fmt.Errorf("%w: GET %s stopped after %d pages, the listing may be truncated", errMaxListPages, first, maxListPages)
 		}
 		response, err := g.doGet(path)
 		if err != nil {
@@ -2900,6 +2914,15 @@ func lastN[T any](items []T, n int) []T {
 func (g github) thread(number int) (string, error) {
 	var comments []issueComment
 	if err := g.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", number), &comments); err != nil {
+		// Issue #223 follow-up: a listing that only hits the page cap is
+		// truncated, not broken. The brief builder's other reads degrade to
+		// an "(... unavailable: ...)" note and keep building (see
+		// previousReportSection); the conversation does the same here, so a
+		// very long thread costs the thread, never the whole brief. A bad
+		// next link, a malformed page or a transport error still fails.
+		if isPageCapError(err) {
+			return fmt.Sprintf("(conversation unavailable: %s)", escapeMD(err.Error(), 200, true)), nil
+		}
 		return "", err
 	}
 	var b strings.Builder
@@ -3514,7 +3537,10 @@ func runBrief() error {
 		}
 		var reviews []reviewComment
 		if err := gh.getList(fmt.Sprintf("/pulls/%d/comments?per_page=100", number), &reviews); err != nil {
-			return err
+			// Issue #223 follow-up: a capped listing is truncated, not
+			// broken — degrade to a note like the reads above rather than
+			// failing the brief.
+			parts = append(parts, fmt.Sprintf("(inline review comments unavailable: %s)", escapeMD(err.Error(), 200, true)))
 		}
 		if len(reviews) > 0 {
 			var b strings.Builder
@@ -3534,6 +3560,9 @@ func runBrief() error {
 		}
 		thread, err := gh.thread(number)
 		if err != nil {
+			// thread() already degrades the page cap; what is left here
+			// (a bad next link, a transport error) still fails the brief,
+			// as before.
 			return err
 		}
 		parts = append(parts, "## Conversation\n\n"+thread)

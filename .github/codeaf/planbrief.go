@@ -158,7 +158,7 @@ func planOpenIssues(gh github) string {
 	var b strings.Builder
 	b.WriteString("## Open issues\n\n")
 	var issues []item
-	if err := gh.get("/issues?state=open&per_page=100", &issues); err != nil {
+	if err := gh.getList("/issues?state=open&per_page=100", &issues); err != nil {
 		fmt.Fprintf(&b, "(open issues unavailable: %s)\n", escapeMD(err.Error(), 200, true))
 		return strings.TrimRight(b.String(), "\n")
 	}
@@ -195,7 +195,7 @@ func planClosedIssues(gh github) string {
 	var b strings.Builder
 	b.WriteString("## Recently closed issues\n\n")
 	var issues []item
-	if err := gh.get("/issues?state=closed&sort=updated&per_page=20", &issues); err != nil {
+	if err := gh.getList("/issues?state=closed&sort=updated&per_page=20", &issues); err != nil {
 		fmt.Fprintf(&b, "(recently closed issues unavailable: %s)\n", escapeMD(err.Error(), 200, true))
 		return strings.TrimRight(b.String(), "\n")
 	}
@@ -226,7 +226,7 @@ func planClosedPulls(gh github) string {
 	var b strings.Builder
 	b.WriteString("## Recently closed pull requests\n\n")
 	var pulls []item
-	if err := gh.get("/pulls?state=closed&sort=updated&per_page=20", &pulls); err != nil {
+	if err := gh.getList("/pulls?state=closed&sort=updated&per_page=20", &pulls); err != nil {
 		fmt.Fprintf(&b, "(recently closed pull requests unavailable: %s)\n", escapeMD(err.Error(), 200, true))
 		return strings.TrimRight(b.String(), "\n")
 	}
@@ -258,7 +258,7 @@ func planRunReports(gh github) string {
 	var b strings.Builder
 	b.WriteString("## Recent CodeAF run reports\n\n")
 	var comments []planComment
-	if err := gh.get("/issues/comments?sort=created&direction=desc&per_page=100", &comments); err != nil {
+	if err := gh.getList("/issues/comments?sort=created&direction=desc&per_page=100", &comments); err != nil {
 		fmt.Fprintf(&b, "(recent run reports unavailable: %s)\n", escapeMD(err.Error(), 200, true))
 		return strings.TrimRight(b.String(), "\n")
 	}
