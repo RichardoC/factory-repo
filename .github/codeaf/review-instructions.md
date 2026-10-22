@@ -85,6 +85,13 @@ or `[medium] the lock is held across the call`) are parsed too, but the
 section is the contract: a review whose findings never reach it is read as a
 review with none.
 
+End your answer with the section and the section only: anything inside a
+code fence is read as a quote, so a fenced copy of this contract does not
+count as a finding — the harness drops the contract's own example bullet
+when it appears in a fence, and a fenced finding whose path the pull
+request's diff does not touch. Report in prose outside a fence, or in the
+section, to be sure your findings are read.
+
 Evidence rule: the `harness` binary on `PATH` was built from the default
 branch before this run started, so it is the pre-change build; when the diff
 touches `.github/codeaf/`, rebuild it (`go build` there) and run the built

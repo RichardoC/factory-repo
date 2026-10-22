@@ -337,6 +337,141 @@ func TestParseFindings(t *testing.T) {
 	}
 }
 
+// TestParseFindingsFencedContractEcho: the harness's own output contract
+// echoes back in a fence (issue #224) — the exact phantom that minted a
+// blocking finding on app/zip/queue.go and started a fix run against a file
+// that does not exist. The echo is inert because the bullet is the
+// contract's example, whether or not the diff is known, and the unfenced
+// echo keeps the issue #49 leniency unchanged.
+func TestParseFindingsFencedContractEcho(t *testing.T) {
+	// The reviewer quotes the contract the brief ended with, then answers.
+	// The fence is exactly where a reviewer quotes output — and it is also
+	// what the brief's own diff section uses, so the check must not depend
+	// on the fence's info string.
+	fenced := "Here is the output contract I was given, quoted verbatim:\n\n" +
+		"```markdown\n" + reviewOutputContract + "```\n\n" +
+		"## Findings\n\nnone\n"
+	known := diffPaths("diff --git a/app/queue/main.go b/app/queue/main.go\n" +
+		"--- a/app/queue/main.go\n+++ b/app/queue/main.go\n" +
+		"@@ -1,0 +1,1 @@\n+package main\n")
+
+	t.Run("fenced echo is inert", func(t *testing.T) {
+		// The whole contract, echoed inside a fence: the example bullet is
+		// dropped, and only it, because the second bullet carries no false
+		// location — the spell-out is what makes a bullet a phantom.
+		for _, tc := range []struct {
+			name   string
+			answer string
+			known  map[string]bool
+		}{
+			{"with the diff known", fenced, known},
+			{"without the diff", fenced, nil},
+			{"bare fence", "```\n- [high] app/zip/queue.go:42 - the mutex is released twice under the error path, so a second request deadlocks\n```\n", known},
+		} {
+			findings, _ := parseFindingsIn(tc.answer, tc.known)
+			for _, f := range findings {
+				if f.Path == contractExamplePath && f.Line == contractExampleLine {
+					t.Errorf("%s: the contract's example bullet was kept: %+v", tc.name, f)
+				}
+			}
+			if blocking := blockingFindings(findings); len(blocking) != 0 {
+				t.Errorf("%s: blocking = %+v, want none — the echo must start no fix run", tc.name, blocking)
+			}
+		}
+	})
+
+	t.Run("the unfenced echo is unchanged", func(t *testing.T) {
+		// Issue #49's leniency is deliberate: an unfenced echo still parses
+		// as a finding, so this issue cannot widen into dropping prose.
+		unfenced := "Here is the output contract I was given:\n\n" + reviewOutputContract + "\n## Findings\n\nnone\n"
+		findings, _ := parseFindingsIn(unfenced, known)
+		if got := blockingFindings(findings); len(got) == 0 {
+			t.Fatalf("the unfenced contract echo no longer blocks: %+v", findings)
+		}
+		for _, f := range findings {
+			if f.Path == contractExamplePath && f.Line == contractExampleLine && f.fenced {
+				t.Errorf("an unfenced finding was marked fenced: %+v", f)
+			}
+		}
+	})
+}
+
+// TestParseFindingsFencedRealFindingKept: the maintainer's rule is not "skip
+// every fenced line" (issue #224). A reviewer who reports inside a fence is
+// reporting, so a fenced finding whose path the diff touches is kept and
+// still blocks.
+func TestParseFindingsFencedRealFindingKept(t *testing.T) {
+	diff := "diff --git a/app/queue/main.go b/app/queue/main.go\n" +
+		"--- a/app/queue/main.go\n+++ b/app/queue/main.go\n" +
+		"@@ -1,0 +1,1 @@\n+package main\n"
+	known := diffPaths(diff)
+	if known == nil {
+		t.Fatal("diffPaths dropped a real diff")
+	}
+	answer := "## Findings\n\n```\n" +
+		"- [high] app/queue/main.go:42 - the lock is held across the send\n" +
+		"```\n"
+	findings, sawSection := parseFindingsIn(answer, known)
+	if !sawSection || len(findings) != 1 {
+		t.Fatalf("parse = %d findings, sawSection %t, want 1/true: %+v", len(findings), sawSection, findings)
+	}
+	if got := blockingFindings(findings); len(got) != 1 {
+		t.Errorf("blocking = %+v, want the fenced real finding", got)
+	}
+	// The location a quote names but the diff never touches is dropped.
+	quoted := "## Findings\n\n```\n" +
+		"- [high] app/elsewhere/other.go:7 - a finding about another change\n" +
+		"```\n"
+	if findings, _ := parseFindingsIn(quoted, known); len(findings) != 0 {
+		t.Errorf("a fenced path outside the diff = %+v, want none", findings)
+	}
+	// With no diff known the same text is kept: the parser never guesses.
+	if findings, _ := parseFindingsIn(quoted, nil); len(findings) != 1 {
+		t.Errorf("no diff known = %+v, want the finding kept", findings)
+	}
+}
+
+// TestParseFindingsFenceState: a fence is tracked, not guessed from the
+// line, so prose after a closing fence parses again, and a fence delimiter
+// is never itself read as a finding.
+func TestParseFindingsFenceState(t *testing.T) {
+	answer := "```\n- [high] app/a.go:1 - quoted\n```\n" +
+		"- [high] app/outside.go:2 - reported after the fence\n"
+	if findings, _ := parseFindingsIn(answer, map[string]bool{"app/a.go": true, "app/outside.go": true}); len(findings) != 2 {
+		// app/a.go is in the diff, so its fenced finding is kept; the
+		// prose finding after the fence is kept too.
+		t.Errorf("fence state = %+v, want both findings", findings)
+	}
+	// The delimiter line itself carries a bullet-shaped string and must not
+	// be parsed: it flips the state and is skipped.
+	if findings, _ := parseFindingsIn("```[high] app/fence.go:9 - not a finding\n", nil); len(findings) != 0 {
+		t.Errorf("a fence delimiter produced findings: %+v", findings)
+	}
+	// A tilde fence works the same way.
+	if findings, _ := parseFindingsIn("~~~\n- [high] app/zip/queue.go:42 - x\n~~~\n", map[string]bool{"app/z.go": true}); len(findings) != 0 {
+		t.Errorf("tilde fence = %+v, want none", findings)
+	}
+}
+
+// TestContractExampleConstants: the phantom's identity is the contract's own
+// first bullet, so the constants dropQuotedFinding compares against must
+// stay in step with reviewOutputContract and with what a parse of it yields.
+func TestContractExampleConstants(t *testing.T) {
+	field := fmt.Sprintf("[%s] %s:%d - %s",
+		contractExampleSeverity, contractExamplePath, contractExampleLine, contractExampleText)
+	if !strings.Contains(reviewOutputContract, field) {
+		t.Fatalf("reviewOutputContract no longer holds %q", field)
+	}
+	f, ok := parseFinding("- " + field)
+	if !ok {
+		t.Fatalf("the contract's example bullet no longer parses: %q", field)
+	}
+	if f.Severity != contractExampleSeverity || f.Path != contractExamplePath ||
+		f.Line != contractExampleLine || f.Text != contractExampleText {
+		t.Fatalf("a parse of the contract's example = %+v, want the constants", f)
+	}
+}
+
 // TestDoneWhenFindingIsActionable pins the format the review brief's
 // acceptance-criteria bullet tells the reviewer to quote (issue #136):
 // "[high] done-when: <bullet>". It carries no path:line location, so the
