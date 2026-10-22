@@ -168,41 +168,131 @@ func fenceDelimiter(line string) bool {
 	return i >= 3
 }
 
-// dropQuotedFinding reports whether a finding is quoted text rather than a
-// report (issue #224). Nothing unfenced is ever dropped — the issue #49
-// leniency stands, so an unfenced echo of the contract still parses — and a
-// fenced finding is dropped only when it is certainly a quote: it is the
-// output contract's own example bullet, or its location is one the PR's
-// diff does not touch. A fenced finding that survives is a real report and
-// is kept, because dropping it would be a false pass.
+// dropQuotedFinding reports whether a fenced finding is quoted text rather
+// than a report (issue #224). Nothing unfenced is ever dropped — the issue
+// #49 leniency stands, so an unfenced echo of the contract still parses —
+// and a fenced finding is dropped only when it is certainly a quote:
+//
+//   - it restates the output contract's own example (contractExampleFinding):
+//     the one bullet in the brief that spells out a file that does not exist.
+//     The test is not an exact string compare but a field-wise match that
+//     tolerates the incidental differences of an echo — a line number nudged
+//     in a paraphrase, whitespace, case, markdown emphasis, a trailing stop —
+//     because a quote of the example is a quote however slightly the
+//     reviewer reprinted it;
+//   - the PR's diff is in hand and does not touch its path: a location no
+//     hunk changes cannot be fixed here, so it is text about another change.
+//
+// A fenced finding that is none of these is a real report and is kept, even
+// on a path outside the diff, because the reviewer's answer is the only
+// signal there is and a false pass costs it.
 func dropQuotedFinding(f Finding, known map[string]bool) bool {
 	if !f.fenced {
 		return false
 	}
-	if f.Severity == contractExampleSeverity && f.Path == contractExamplePath &&
-		f.Line == contractExampleLine && f.Text == contractExampleText {
+	if contractExampleFinding(f) {
 		return true // the phantom: the brief's example echoed back
 	}
-	// A path the diff does not touch cannot be fixed: such a finding
-	// quotes something other than this pull request, so it is dropped. An
-	// unlocated finding names no file at all and is judged by the rule
-	// above alone.
+	// A path the diff does not touch cannot be fixed by this pull request.
+	// The verdict is only drawn when the diff is known: with no diff in hand
+	// the parser cannot tell a quote about another file from a real report
+	// about one, and the failure to read the diff must never lose findings.
 	if known != nil && f.Path != "" && !pathInDiff(f.Path, known) {
 		return true
 	}
 	return false
 }
 
+// contractExampleFinding reports whether a fenced finding restates the
+// output contract's own example bullet (issue #224). The match is exact on
+// the severity and the path — an echo reprints the `[high]
+// app/zip/queue.go` the brief spelled out, and a genuine finding about
+// app/zip/queue.go is not a thing this repository has — and tolerant on the
+// two fields a reviewer reprints with incidental changes: the location on
+// the line, and the text's case, whitespace and trailing punctuation or
+// markdown emphasis.
+func contractExampleFinding(f Finding) bool {
+	if !strings.EqualFold(f.Severity, contractExampleSeverity) {
+		return false
+	}
+	path, text := strings.TrimSpace(f.Path), f.Text
+	if path == "" {
+		// A bullet without a line number (`[high] app/zip/queue.go - text`)
+		// parses as an unlocated finding: the location never completed, so
+		// the whole `app/zip/queue.go - text` sits in Text. Take the
+		// example's path off the front when it is there, so an echo that
+		// dropped the line number is recognised as the same quote.
+		if !strings.HasPrefix(text, contractExamplePath) {
+			return false
+		}
+		text = strings.TrimLeft(strings.TrimPrefix(text, contractExamplePath), ":- \t")
+		return f.Line == 0 && equalQuotedText(text, contractExampleText)
+	}
+	if path != contractExamplePath {
+		return false
+	}
+	// The line number is where a paraphrase drifts: an echo that renumbers
+	// the example's line (43 for 42) is the same quote. Only a location
+	// that is unset or within a step of the example's is read as the echo;
+	// a plausible other line is left to the diff filter below.
+	if f.Line != 0 && abs(f.Line-contractExampleLine) > contractExampleLineSlack {
+		return false
+	}
+	return equalQuotedText(text, contractExampleText)
+}
+
+// contractExampleLineSlack bounds how far an echo may nudge the example's
+// line number and still be read as the same quote (issue #224 finding 1).
+const contractExampleLineSlack = 1
+
+// equalQuotedText reports whether text restates quoted is the same as quote
+// after the normalisation an echo tolerates: surrounding whitespace,
+// internal runs of whitespace, ASCII case, markdown emphasis markers, and
+// trailing sentence punctuation. A reviewer reprinting a bullet is not
+// expected to reproduce its bytes.
+func equalQuotedText(text, quoted string) bool {
+	return normalizeQuotedText(text) == normalizeQuotedText(quoted)
+}
+
+// normalizeQuotedText folds the incidental differences an echo tolerates
+// (issue #224): ASCII case, runs of whitespace, the markdown emphasis and
+// code markers a reprint may wrap a word in, and trailing sentence
+// punctuation. It is deliberately conservative — it never removes
+// characters that could carry meaning.
+func normalizeQuotedText(s string) string {
+	s = strings.ToLower(s)
+	s = strings.NewReplacer("`", "", "*", "", "_", "").Replace(s)
+	s = strings.Join(strings.Fields(s), " ")
+	return strings.TrimRight(s, ".!,;:\"'")
+}
+
+// abs is the absolute value for the small line-number slack next to the
+// contract's example line (issue #224).
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
 // pathInDiff reports whether the diff touches the finding's path. The test
-// is a substring one on purpose: diffstat answers with the files a patch
-// changes, and a hunk line inside a diff quotes the same path as a
-// `path:line` location, so a substring covers both the file a finding names
-// and a finding read out of an echoed hunk. It errs toward keeping a
-// finding, which is the safe direction: a false pass costs a reviewer's
-// answer, a signal the maintainer asked never to lose.
+// is a substring one on purpose, in both directions: diffstat answers with
+// the files a patch changes, and a hunk line inside a diff quotes the same
+// path as a `path:line` location, so a substring covers both the file a
+// finding names and a finding read out of an echoed hunk. A renamed file
+// answers to both of its paths because diffPaths kept both.
+//
+// It errs toward keeping a finding, which is the safe direction: a false
+// pass costs a reviewer's answer, a signal the maintainer asked never to
+// lose. A finding is only ever judged against a diff that is in hand, and
+// an exact path match is checked first so an unusual path that happens to
+// be a substring of a diff path still matches itself.
 func pathInDiff(path string, known map[string]bool) bool {
+	if known[path] {
+		return true
+	}
 	for p := range known {
-		if strings.Contains(p, path) {
+		if strings.Contains(p, path) || strings.Contains(path, p) {
 			return true
 		}
 	}

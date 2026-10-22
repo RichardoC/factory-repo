@@ -85,12 +85,16 @@ or `[medium] the lock is held across the call`) are parsed too, but the
 section is the contract: a review whose findings never reach it is read as a
 review with none.
 
-End your answer with the section and the section only: anything inside a
-code fence is read as a quote, so a fenced copy of this contract does not
-count as a finding — the harness drops the contract's own example bullet
-when it appears in a fence, and a fenced finding whose path the pull
-request's diff does not touch. Report in prose outside a fence, or in the
-section, to be sure your findings are read.
+End your answer with the section and the section only. A code fence is where
+a review quotes rather than reports, so a fenced finding is read as a quote
+and is not counted in two cases: it restates the example bullet above (the
+`[high] app/zip/queue.go:42` one — a path this repository does not have, so
+an echo of it is text, not a finding), or the pull request's diff does not
+touch the path it names. A fenced finding that is neither — a real finding
+written inside a fence, on a path the diff changes — is kept and blocks.
+Nothing outside a fence is ever dropped this way, and neither case applies
+when the harness could not read the diff. Report in prose outside a fence,
+or in the section, to be sure your findings are read.
 
 Evidence rule: the `harness` binary on `PATH` was built from the default
 branch before this run started, so it is the pre-change build; when the diff

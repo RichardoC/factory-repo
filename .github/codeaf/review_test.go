@@ -1080,6 +1080,40 @@ func TestRunReviewReport(t *testing.T) {
 	findings := "- [high] app/x/main.go:42 - the mutex is released twice\n- [medium] app/y/x.go:7 - missing error check\n"
 	comment := filepath.Join(t.TempDir(), "nested", "review-comment.md")
 
+	t.Run("a fenced contract echo starts no fix run", func(t *testing.T) {
+		// Issue #224, end to end: the reviewer echoes the output contract
+		// inside a fence, and the report must read no finding out of it — the
+		// phantom HIGH on app/zip/queue.go used to count as blocking and
+		// start a fix run against a file that does not exist.
+		diffBody := "diff --git a/app/x/main.go b/app/x/main.go\n" +
+			"--- a/app/x/main.go\n+++ b/app/x/main.go\n" +
+			"@@ -1,2 +1,3 @@\n context\n-removed\n+added\n"
+		server := reviewServer(t, map[string]string{
+			"/repos/RichardoC/factory-repo/pulls/7": `{"number":7,"title":"Review target","body":"The change.\n\nCloses #3","state":"open","head":{"ref":"codeaf/issue-3-42"},"base":{"ref":"main"}}`,
+		}, diffBody, nil)
+		t.Cleanup(server.Close)
+		ghEnv(t, server)
+		setArgs("7")
+		writeReviewResult(t, stopDone, "Here is the contract I was given:\n\n```markdown\n"+
+			reviewOutputContract+"```\n\n## Findings\n\nnone\n")
+		reviewLedger(t)
+		t.Setenv("REVIEW_COMMENT_PATH", comment)
+		out, err := captureStdout(t, runReviewReport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != "action=label\nused=0\nblocking=0\n" {
+			t.Errorf("the fenced echo still blocks: stdout = %q", out)
+		}
+		data, err := os.ReadFile(comment)
+		if err != nil {
+			t.Fatalf("comment not written: %v", err)
+		}
+		if strings.HasPrefix(string(data), command+" fix:") {
+			t.Errorf("the fenced echo started a fix run: %q", data)
+		}
+	})
+
 	t.Run("a blocking review starts a fix run", func(t *testing.T) {
 		server := commentsServer(t, reportComments(1), http.StatusOK)
 		ghEnv(t, server)
@@ -1613,4 +1647,124 @@ func TestDecideDispatchReview(t *testing.T) {
 			t.Fatalf("Decide = %+v, want the continuation path", got)
 		}
 	})
+}
+
+// TestParseFindingsFencedContractEchoParaphrased: the phantom is not only the
+// exact echo (issue #224, follow-up finding 1). A reviewer who reprints the
+// contract's example bullet with the incidental differences a reprint
+// tolerates — a nudged line number, different spacing, a trailing stop — is
+// still quoting the brief's own bullet, and must still mint no finding, in
+// either the section or inline, with or without the diff in hand. The
+// example is the one bullet in the brief that spells out app/zip/queue.go,
+// a file this repository does not have.
+func TestParseFindingsFencedContractEchoParaphrased(t *testing.T) {
+	known := diffPaths("diff --git a/app/queue/main.go b/app/queue/main.go\n" +
+		"--- a/app/queue/main.go\n+++ b/app/queue/main.go\n" +
+		"@@ -1,0 +1,1 @@\n+package main\n")
+	for _, tc := range []struct {
+		name, bullet string
+	}{
+		{"the example itself", "- [high] app/zip/queue.go:42 - the mutex is released twice under the error path, so a second request deadlocks"},
+		{"line nudged by one", "- [high] app/zip/queue.go:43 - the mutex is released twice under the error path, so a second request deadlocks"},
+		{"severity case", "- [HIGH] app/zip/queue.go:42 - the mutex is released twice under the error path, so a second request deadlocks"},
+		{"trailing stop", "- [high] app/zip/queue.go:42 - The mutex is released twice under the error path, so a second request deadlocks."},
+		{"collapsed spacing", "- [high] app/zip/queue.go:42 - the mutex is released   twice under the error path, so a second request deadlocks"},
+		{"no line number at all", "- [high] app/zip/queue.go - the mutex is released twice under the error path, so a second request deadlocks"},
+		{"markdown emphasis", "- [high] app/zip/queue.go:42 - the mutex is released twice under the error path, so a second request `deadlocks`"},
+	} {
+		for _, answer := range []string{
+			"```\n" + tc.bullet + "\n```\n",                // bare fence, inline pass
+			"## Findings\n\n```\n" + tc.bullet + "\n```\n", // in the section under a fence
+			"```markdown\n" + tc.bullet + "\n```\n## Findings\n\nnone\n",
+		} {
+			for _, k := range []map[string]bool{known, nil} {
+				findings, _ := parseFindingsIn(answer, k)
+				for _, f := range findings {
+					if strings.EqualFold(f.Severity, "high") && f.Path == contractExamplePath {
+						t.Errorf("%s: the paraphrased echo was kept: %+v", tc.name, f)
+					}
+				}
+				if got := blockingFindings(findings); len(got) != 0 {
+					t.Errorf("%s: blocking = %+v, want none — a quoted example must never start a fix run", tc.name, got)
+				}
+			}
+		}
+	}
+	// The guard must not swallow a finding that only shares the path.
+	real := "```\n- [high] app/zip/queue.go:42 - the goroutine leaks on shutdown\n```\n"
+	findings, _ := parseFindingsIn(real, nil)
+	if len(findings) != 1 || findings[0].Text != "the goroutine leaks on shutdown" {
+		t.Errorf("a fenced finding on the example path with different text = %+v, want it kept", findings)
+	}
+}
+
+// TestParseFindingsFencedOutsideDiffIsAQuote: the maintainer's second rule
+// (issue #224, follow-up finding 2) — a fenced finding whose path the PR's
+// diff does not touch is read as a quote about another change, not a report,
+// and is dropped. The test distinguishes it from a real finding about a file
+// the PR does not modify: the drop happens *only when the diff is known*. With
+// no diff in hand nothing outside a fence changes and nothing fenced is
+// judged by path, because the parser cannot tell a quote about another file
+// from a real report about one — and losing that report is a false pass.
+func TestParseFindingsFencedOutsideDiffIsAQuote(t *testing.T) {
+	known := diffPaths("diff --git a/app/queue/main.go b/app/queue/main.go\n" +
+		"--- a/app/queue/main.go\n+++ b/app/queue/main.go\n" +
+		"@@ -1,0 +1,1 @@\n+package main\n")
+	if known == nil {
+		t.Fatal("diffPaths dropped a real diff")
+	}
+	// A fenced report about a file the PR changes: kept, and it blocks.
+	if f, _ := parseFindingsIn("```\n- [high] app/queue/main.go:7 - the lock is held across the send\n```\n", known); len(f) != 1 {
+		t.Errorf("a fenced finding on a diff path = %+v, want it kept", f)
+	} else if len(blockingFindings(f)) != 1 {
+		t.Errorf("a fenced finding on a diff path stopped blocking: %+v", f)
+	}
+	// A fenced finding about a file the PR does not touch: a quote, dropped.
+	quoted := "```\n- [high] app/contracts/worker.go:9 - the retry loop never backs off\n```\n"
+	if f, _ := parseFindingsIn(quoted, known); len(f) != 0 {
+		t.Errorf("a fenced finding outside the diff = %+v, want it dropped as a quote", f)
+	}
+	// The identical text with no diff in hand is a report: kept. This is the
+	// distinction the finding asked the tests to pin.
+	if f, _ := parseFindingsIn(quoted, nil); len(f) != 1 {
+		t.Errorf("outside the diff with no diff known = %+v, want it kept", f)
+	}
+	// Unfenced, the same absent path is never dropped: issue #49 leniency.
+	unfenced := "- [high] app/contracts/worker.go:9 - the retry loop never backs off\n"
+	if f, _ := parseFindingsIn(unfenced, known); len(f) != 1 {
+		t.Errorf("an unfenced finding outside the diff = %+v, want it kept", f)
+	}
+	// A diff that touches nothing parseable leaves every finding alone.
+	if f, _ := parseFindingsIn(quoted, diffPaths("")); len(f) != 1 {
+		t.Errorf("an unparseable diff dropped a finding = %+v, want it kept", f)
+	}
+}
+
+// TestParseFindingsFenceGuardDoesNotDropUnfenced: the whole fence machinery
+// is inert outside a fence (issue #224). Every bullet the paraphrase guard
+// and the diff filter would drop when fenced is kept when unfenced — the
+// issue #49 leniency the maintainer asked to preserve, pinned to the same
+// text the fenced cases drop.
+func TestParseFindingsFenceGuardDoesNotDropUnfenced(t *testing.T) {
+	known := diffPaths("diff --git a/app/queue/main.go b/app/queue/main.go\n" +
+		"--- a/app/queue/main.go\n+++ b/app/queue/main.go\n" +
+		"@@ -1,0 +1,1 @@\n+package main\n")
+	for _, bullet := range []string{
+		"- [high] app/zip/queue.go:42 - the mutex is released twice under the error path, so a second request deadlocks",
+		"- [high] app/zip/queue.go:43 - the mutex is released twice under the error path, so a second request deadlocks",
+		"- [high] app/contracts/worker.go:9 - the retry loop never backs off",
+	} {
+		answer := "## Findings\n\n" + bullet + "\n"
+		findings, _ := parseFindingsIn(answer, known)
+		if len(findings) != 1 {
+			t.Errorf("unfenced %q = %+v, want it kept", bullet, findings)
+			continue
+		}
+		if findings[0].fenced {
+			t.Errorf("unfenced %q was marked fenced", bullet)
+		}
+		if len(blockingFindings(findings)) != 1 {
+			t.Errorf("unfenced %q stopped blocking", bullet)
+		}
+	}
 }
