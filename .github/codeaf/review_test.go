@@ -338,6 +338,316 @@ func TestParseFindings(t *testing.T) {
 	}
 }
 
+// TestParseFindingsFencedContractEcho: the harness's own output contract
+// echoes back in a fence (issue #224) — the exact phantom that minted a
+// blocking finding on app/zip/queue.go and started a fix run against a file
+// that does not exist. The echo is inert because the bullet is the
+// contract's example, whether or not the diff is known, and the unfenced
+// echo keeps the issue #49 leniency unchanged.
+func TestParseFindingsFencedContractEcho(t *testing.T) {
+	// The reviewer quotes the contract the brief ended with, then answers.
+	// The fence is exactly where a reviewer quotes output — and it is also
+	// what the brief's own diff section uses, so the check must not depend
+	// on the fence's info string.
+	fenced := "Here is the output contract I was given, quoted verbatim:\n\n" +
+		"```markdown\n" + reviewOutputContract + "```\n\n" +
+		"## Findings\n\nnone\n"
+	known := diffPaths("diff --git a/app/queue/main.go b/app/queue/main.go\n" +
+		"--- a/app/queue/main.go\n+++ b/app/queue/main.go\n" +
+		"@@ -1,0 +1,1 @@\n+package main\n")
+
+	t.Run("fenced echo is inert", func(t *testing.T) {
+		// The whole contract, echoed inside a fence: the example bullet is
+		// dropped, and only it, because the second bullet carries no false
+		// location — the spell-out is what makes a bullet a phantom.
+		for _, tc := range []struct {
+			name   string
+			answer string
+			known  map[string]bool
+		}{
+			{"with the diff known", fenced, known},
+			{"without the diff", fenced, nil},
+			{"bare fence", "```\n- [high] app/zip/queue.go:42 - the mutex is released twice under the error path, so a second request deadlocks\n```\n", known},
+		} {
+			findings, _ := parseFindingsIn(tc.answer, tc.known)
+			for _, f := range findings {
+				if f.Path == contractExamplePath && f.Line == contractExampleLine {
+					t.Errorf("%s: the contract's example bullet was kept: %+v", tc.name, f)
+				}
+			}
+			if blocking := blockingFindings(findings); len(blocking) != 0 {
+				t.Errorf("%s: blocking = %+v, want none — the echo must start no fix run", tc.name, blocking)
+			}
+		}
+	})
+
+	t.Run("the unfenced echo is unchanged", func(t *testing.T) {
+		// Issue #49's leniency is deliberate: an unfenced echo still parses
+		// as a finding, so this issue cannot widen into dropping prose.
+		unfenced := "Here is the output contract I was given:\n\n" + reviewOutputContract + "\n## Findings\n\nnone\n"
+		findings, _ := parseFindingsIn(unfenced, known)
+		if got := blockingFindings(findings); len(got) == 0 {
+			t.Fatalf("the unfenced contract echo no longer blocks: %+v", findings)
+		}
+		for _, f := range findings {
+			if f.Path == contractExamplePath && f.Line == contractExampleLine && f.fenced {
+				t.Errorf("an unfenced finding was marked fenced: %+v", f)
+			}
+		}
+	})
+}
+
+// TestParseFindingsFencedRealFindingKept: the maintainer's rule is not "skip
+// every fenced line" (issue #224). A reviewer who reports inside a fence is
+// reporting, so a fenced finding whose path the diff touches is kept and
+// still blocks.
+func TestParseFindingsFencedRealFindingKept(t *testing.T) {
+	diff := "diff --git a/app/queue/main.go b/app/queue/main.go\n" +
+		"--- a/app/queue/main.go\n+++ b/app/queue/main.go\n" +
+		"@@ -1,0 +1,1 @@\n+package main\n"
+	known := diffPaths(diff)
+	if known == nil {
+		t.Fatal("diffPaths dropped a real diff")
+	}
+	answer := "## Findings\n\n```\n" +
+		"- [high] app/queue/main.go:42 - the lock is held across the send\n" +
+		"```\n"
+	findings, sawSection := parseFindingsIn(answer, known)
+	if !sawSection || len(findings) != 1 {
+		t.Fatalf("parse = %d findings, sawSection %t, want 1/true: %+v", len(findings), sawSection, findings)
+	}
+	if got := blockingFindings(findings); len(got) != 1 {
+		t.Errorf("blocking = %+v, want the fenced real finding", got)
+	}
+	// The location a quote names but the diff never touches is dropped.
+	quoted := "## Findings\n\n```\n" +
+		"- [high] app/elsewhere/other.go:7 - a finding about another change\n" +
+		"```\n"
+	if findings, _ := parseFindingsIn(quoted, known); len(findings) != 0 {
+		t.Errorf("a fenced path outside the diff = %+v, want none", findings)
+	}
+	// With no diff known the same text is kept: the parser never guesses.
+	if findings, _ := parseFindingsIn(quoted, nil); len(findings) != 1 {
+		t.Errorf("no diff known = %+v, want the finding kept", findings)
+	}
+}
+
+// TestParseFindingsFenceState: a fence is tracked, not guessed from the
+// line, so prose after a closing fence parses again. A delimiter line is not
+// opaque (issue #224 follow-up finding review.go:120): the section and inline
+// passes still run on it, judged with the state the line opens, so a finding
+// written on a delimiter line is kept — as the parser before the fence
+// tracking kept it.
+func TestParseFindingsFenceState(t *testing.T) {
+	answer := "```\n- [high] app/a.go:1 - quoted\n```\n" +
+		"- [high] app/outside.go:2 - reported after the fence\n"
+	if findings, _ := parseFindingsIn(answer, map[string]bool{"app/a.go": true, "app/outside.go": true}); len(findings) != 2 {
+		// app/a.go is in the diff, so its fenced finding is kept; the
+		// prose finding after the fence is kept too.
+		t.Errorf("fence state = %+v, want both findings", findings)
+	}
+	// A finding on the opening delimiter line: the line opens the fence, and
+	// it is parsed, so the bullet written on it is kept (the regression this
+	// work order fixes — the state used to `continue` past the whole line).
+	onDelimiter := "```- [high] app/fence.go:9 - the bullet shares the delimiter line\n"
+	findings, _ := parseFindingsIn(onDelimiter, nil)
+	if len(findings) != 1 || findings[0].Path != "app/fence.go" {
+		t.Errorf("a finding on a delimiter line = %+v, want it kept", findings)
+	} else if findings[0].fenced {
+		t.Errorf("a finding on the opening delimiter line was marked fenced: %+v", findings[0])
+	}
+	// A finding written on the line that closes a fence is judged with the
+	// state the line opens — the fence — so it is quoted text and the filters
+	// read it as such; a bullet on an opening delimiter line is prose, and
+	// nothing unfenced is ever dropped. The judgement is asserted through the
+	// fenced flag parseFindingsIn sets, because a witness answer that carried
+	// the same bullet would be read by its (possibly desynced) state rather
+	// than by the rule under test.
+	// (A bullet on the closing delimiter line is judged with the state the line
+	// opens — the fence — so it is fenced text; the flag is what parseFindingsIn
+	// sets for that line, and the test pins the two states a delimiter line can
+	// be read in.)
+	closer := parseProbeFinding("- [high] app/closed.go:9 - on the closing delimiter line", true)
+	if !closer.fenced {
+		t.Errorf("a finding on a closing delimiter line is not read as fenced text: %+v", closer)
+	}
+	opener := parseProbeFinding("```- [high] app/fence.go:9 - the bullet shares the delimiter line", false)
+	if opener.fenced || dropQuotedFinding(opener, nil) {
+		t.Errorf("a finding on an opening delimiter line was dropped: %+v", opener)
+	}
+	// A tilde fence works the same way, and its findings are fenced too.
+	if findings, _ := parseFindingsIn("~~~\n- [high] app/zip/queue.go:42 - x\n~~~\n", map[string]bool{"app/z.go": true}); len(findings) != 0 {
+		t.Errorf("tilde fence = %+v, want none", findings)
+	}
+	// The markers are not interchangeable: a backtick fence is not closed by
+	// a tilde run. The rule is pinned calls to fenceRun.closes, not on a parse,
+	// because the same parse cannot tell a run that failed to close the fence
+	// from one that closed it and so left the following delimiter to open a
+	// new one — what a syntactic parse of a quoted diff can see is stated in
+	// TestParseFindingsFenceDesync.
+	compat := fenceRun{open: true, marker: '`', indent: 0, length: 3}
+	if compat.closes('~', 0, 3) {
+		t.Error("a tilde run closed a backtick fence")
+	}
+	if compat.closes('`', 0, 2) {
+		t.Error("a shorter run closed the fence it cannot close")
+	}
+	if compat.closes('`', 4, 3) {
+		t.Error("a delimiter indented further than the fence closed it")
+	}
+	if !compat.closes('`', 0, 3) {
+		t.Error("a matching run no longer closes the fence it opened")
+	}
+	// The indent is part of the match, not a bound: a fence opened three
+	// spaces in is closed by a delimiter three spaces in, and not by one at
+	// the margin (the start of an indented block, in the block-quote case).
+	indented := fenceRun{open: true, marker: '`', indent: 3, length: 3}
+	if !indented.closes('`', 3, 3) {
+		t.Error("an indented fence is no longer closed by its own indentation")
+	}
+	if indented.closes('`', 0, 3) {
+		t.Error("a delimiter at another indentation closed an indented fence")
+	}
+}
+
+// parseProbeFinding reads one bullet the way parseFindingsIn would read it
+// on a line whose fence state is already settled, so the tests can assert the
+// judgement itself (fenced, and what dropQuotedFinding then does with it)
+// without depending on how an answer happens to leave the state.
+func parseProbeFinding(line string, fenced bool) Finding {
+	f, ok := parseFinding(line)
+	if !ok {
+		return Finding{}
+	}
+	f.fenced = fenced
+	return f
+}
+
+// TestParseFindingsFenceDesync: an echoed or unterminated fence must not
+// desync the state for the prose that follows (issue #224 follow-up finding
+// review.go:118). Only a run at least as long as the one that opened the
+// fence, of the same marker character and not indented further, closes it;
+// everything else is text inside the fence.
+func TestParseFindingsFenceDesync(t *testing.T) {
+	known := map[string]bool{"app/queue/main.go": true}
+	// The desynced fence: an indented line inside the fence opens a backtick
+	// run, and a later bare delimiter leaves a fence OPEN over the prose.
+	// Before the fix, inFence was false again at the prose line only because
+	// the indented line had toggled it — a state the quoted line chose.
+	desynced := strings.Join([]string{
+		"```",
+		"    ```go",
+		"        code from a quoted diff hunk",
+		"```",
+		"## Findings",
+		"- [high] app/queue/main.go:42 - the mutex is released twice",
+	}, "\n") + "\n"
+	findings, _ := parseFindingsIn(desynced, known)
+	if len(blockingFindings(findings)) != 1 {
+		t.Errorf("prose after a desynced fence = %+v, want the HIGH kept and blocking", findings)
+	}
+	// The consequence the follow-up finding named: before the fix the same
+	// answer, with the same diff, left blockingFindings empty, so the review
+	// plan of a finished review returned the pass label (a false pass that
+	// silently merges the HIGH) instead of the fix run the finding demands.
+	// blockingFindings is what reviewPlan reads to choose between them, so
+	// asserting it is the plan-level assertion.
+	for _, f := range findings {
+		if f.fenced && !strings.Contains(desynced, f.Text) {
+			t.Errorf("a finding the fence does not contain was marked fenced: %+v", f)
+		}
+	}
+	// The same answer with the indented line removed parses the same way:
+	// the quoted hunk changes nothing about the prose.
+	clean := strings.Join([]string{
+		"```",
+		"        code from a quoted diff hunk",
+		"```",
+		"## Findings",
+		"- [high] app/queue/main.go:42 - the mutex is released twice",
+	}, "\n") + "\n"
+	plain, _ := parseFindingsIn(clean, known)
+	if len(blockingFindings(plain)) != 1 || plain[0].fenced {
+		t.Errorf("a plain fence changed the prose result = %+v", plain)
+	}
+
+	// An unterminated fence: the closing delimiter the reviewer forgot leaves
+	// the fence open, and the section written after it must still parse.
+	unterminated := "```\nquoted output the reviewer never closed\n" +
+		"## Findings\n\n- [high] app/queue/main.go:42 - the mutex is released twice\n"
+	// A fence opened and never closed contains everything after it, so the
+	// section is read as fenced text — but it is not a quote: the path filter
+	// is not applied to an unconfirmed region, so the finding is kept and
+	// blocks even though its path is one the diff does not touch. That is the
+	// false pass this rule removes: with the filters read as a quote, the
+	// finding was dropped and the review ended with the pass label.
+	open, _ := parseFindingsIn(unterminated, known)
+	if len(blockingFindings(open)) != 1 {
+		t.Errorf("an unterminated fence swallowed the prose that follows: %+v", open)
+	} else if !open[0].fenced || open[0].quoted {
+		t.Errorf("a finding after an unterminated fence = %+v, want it fenced and not read as a quote", open[0])
+	}
+	// The same answer about a path the diff does not touch is kept too: the
+	// unterminated fence never earned the right to call it a quote.
+	untouched := "```\nquoted output the reviewer never closed\n" +
+		"## Findings\n\n- [high] app/elsewhere/other.go:7 - a finding about another change\n"
+	if findings, _ := parseFindingsIn(untouched, known); len(blockingFindings(findings)) != 1 {
+		t.Errorf("an unterminated fence dropped a finding on an untouched path: %+v", findings)
+	}
+	// A bullet inside the fence, on a path the diff does not touch, is the
+	// quote the rule is for — but only once the reviewer closed the fence.
+	// The two states differ in exactly that, with everything else equal.
+	inFence := "```\n- [high] app/elsewhere/other.go:7 - a finding about another change"
+	if findings, _ := parseFindingsIn(inFence+"\n", known); len(blockingFindings(findings)) != 1 {
+		t.Errorf("an unterminated fence dropped a fenced finding: %+v", findings)
+	}
+	if findings, _ := parseFindingsIn(inFence+"\n```\n", known); len(findings) != 0 {
+		t.Errorf("a closed fence no longer drops an untouched path: %+v", findings)
+	}
+	// With no diff in hand the unterminated block is kept as well: a failed
+	// diff read never loses a finding.
+	if findings, _ := parseFindingsIn(unterminated, nil); len(blockingFindings(findings)) != 1 {
+		t.Errorf("an unterminated fence swallowed the prose with no diff known: %+v", findings)
+	}
+
+	// A shorter run inside the fence does not close the longer one that
+	// opened it.
+	shorter := "````\n```\n## Findings\n\n- [high] app/queue/main.go:42 - the mutex is released twice\n"
+	if findings, _ := parseFindingsIn(shorter, known); len(blockingFindings(findings)) != 1 {
+		t.Errorf("a shorter run closed the fence: %+v", findings)
+	}
+	// A four-space indentation is an indented code block, not a fence: it
+	// neither opens nor closes one.
+	indented := "    ```\n## Findings\n\n- [high] app/queue/main.go:42 - the mutex is released twice\n"
+	if findings, _ := parseFindingsIn(indented, known); len(blockingFindings(findings)) != 1 {
+		t.Errorf("an indented code block toggled the fence state: %+v", findings)
+	}
+	// The same indented line inside a fence does not close it either.
+	insideIndented := "```\n    ```\n## Findings\n\n- [high] app/queue/main.go:42 - the mutex is released twice\n"
+	if findings, _ := parseFindingsIn(insideIndented, known); len(blockingFindings(findings)) != 1 {
+		t.Errorf("an indented delimiter inside a fence closed it: %+v", findings)
+	}
+}
+
+// TestContractExampleConstants: the phantom's identity is the contract's own
+// first bullet, so the constants dropQuotedFinding compares against must
+// stay in step with reviewOutputContract and with what a parse of it yields.
+func TestContractExampleConstants(t *testing.T) {
+	field := fmt.Sprintf("[%s] %s:%d - %s",
+		contractExampleSeverity, contractExamplePath, contractExampleLine, contractExampleText)
+	if !strings.Contains(reviewOutputContract, field) {
+		t.Fatalf("reviewOutputContract no longer holds %q", field)
+	}
+	f, ok := parseFinding("- " + field)
+	if !ok {
+		t.Fatalf("the contract's example bullet no longer parses: %q", field)
+	}
+	if f.Severity != contractExampleSeverity || f.Path != contractExamplePath ||
+		f.Line != contractExampleLine || f.Text != contractExampleText {
+		t.Fatalf("a parse of the contract's example = %+v, want the constants", f)
+	}
+}
+
 // TestDoneWhenFindingIsActionable pins the format the review brief's
 // acceptance-criteria bullet tells the reviewer to quote (issue #136):
 // "[high] done-when: <bullet>". It carries no path:line location, so the
@@ -894,6 +1204,106 @@ func TestRunReviewBrief(t *testing.T) {
 		}
 	}
 
+	// Issue #224, doc honesty: the fence paragraph in review-instructions.md
+	// states the two cases the parser drops a fenced finding in, so parse the
+	// answer forms it names and hold the paragraph to what the code does. Each
+	// case here is one sentence of that paragraph: the contract echo is dropped
+	// with no diff in hand and with one, the path test needs the diff, a fenced
+	// finding that is neither case is kept, nothing unfenced is dropped, and a
+	// finding in the `## Findings` section is always read.
+	diffKnown := map[string]bool{"app/x/main.go": true}
+	echo := "- [high] app/zip/queue.go:42 - " + contractExampleText + "\n"
+	// The paragraph is the other half of the contract: read it out of the same
+	// file runReviewBrief reads, so a later edit that restores the false
+	// caveat — `neither case applies when the harness could not read the
+	// diff` — fails here instead of shipping. The echo case needs no diff,
+	// and the paragraph must say so.
+	doc, err := os.ReadFile(filepath.Join(harnessDir(), "review-instructions.md"))
+	if err != nil {
+		t.Fatalf("review-instructions.md not readable: %v", err)
+	}
+	for _, want := range []string{
+		"which holds whether or not the\nharness could read the diff",     // the echo needs no diff
+		"the harness read the diff and the diff does\nnot touch the path", // the path case needs the diff
+		"nothing outside a fence is\never dropped",                        // nothing unfenced is dropped
+		"`## Findings` section is\nalways read",                           // the section is always read
+	} {
+		if !strings.Contains(string(doc), want) {
+			t.Errorf("the fence paragraph no longer states %q", want)
+		}
+	}
+	if strings.Contains(string(doc), "neither case applies when the\nharness could not read the diff") {
+		t.Error("the fence paragraph restores the false no-diff caveat")
+	}
+
+	for name, tc := range map[string]struct {
+		answer     string
+		known      map[string]bool
+		wantBlocks int
+	}{
+		"fenced contract echo, diff not read": {
+			"```markdown\n" + echo + "```\n\n## Findings\n\nnone\n", nil, 0},
+		"fenced contract echo, diff read": {
+			"```markdown\n" + echo + "```\n\n## Findings\n\nnone\n", diffKnown, 0},
+		"fenced finding on a path the diff does not touch, diff read": {
+			"```\n- [high] app/other/main.go:7 - a real bug in an untouched file\n```\n", diffKnown, 0},
+		"fenced finding on a path the diff does not touch, no diff in hand": {
+			"```\n- [high] app/other/main.go:7 - a real bug in an untouched file\n```\n", nil, 1},
+		"fenced finding on a path the diff changes": {
+			"```\n- [high] app/x/main.go:42 - a real bug on a changed path\n```\n", diffKnown, 1},
+		"unfenced contract echo": {
+			echo, diffKnown, 1},
+		"finding in the findings section": {
+			"## Findings\n\n- [high] app/x/main.go:42 - a real bug on a changed path\n", nil, 1},
+	} {
+		findings, _ := parseFindingsIn(tc.answer, tc.known)
+		if got := len(blockingFindings(findings)); got != tc.wantBlocks {
+			t.Errorf("%s: blockingFindings = %d, want %d: %+v", name, got, tc.wantBlocks, findings)
+		}
+	}
+
+	// An unterminated fence is not a quote (issue #224 follow up), so it
+	// cannot be the reason a report about an unchanged path is dropped: the
+	// paragraph says so, and no finding is lost when the closing delimiter
+	// never arrives. Every line after the opening marker is judged fenced —
+	// that is what a fence that never closes means — so the answer must still
+	// carry the finding under the section written after it.
+	for name, answer := range map[string]string{
+		"section after the fence": "I quoted the hunk:\n```\n+ the hunk\n" +
+			"## Findings\n\n- [high] app/other/main.go:7 - a real bug in an untouched file\n",
+		"bullet inline after the fence": "I quoted the hunk:\n```\n+ the hunk\n\n" +
+			"- [high] app/other/main.go:7 - a real bug in an untouched file\n",
+	} {
+		findings, sawSection := parseFindingsIn(answer, diffKnown)
+		if got := len(blockingFindings(findings)); got != 1 {
+			t.Errorf("%s: blockingFindings = %d, want 1: %+v", name, got, findings)
+		}
+		if name == "section after the fence" && !sawSection {
+			t.Errorf("%s: the findings section after an unterminated fence was missed", name)
+		}
+	}
+	// A section header written inside a properly closed fence still opens the
+	// section — the reviewer wrote it, and the section is the contract — but
+	// it does not free the bullets under it from the fence rules: a finding
+	// inside the closed fence is judged as quoted text, so this one, whose
+	// path the diff does not touch, is dropped while an identical bullet
+	// outside the fence is read.
+	headerInFence := "```\n## Findings\n\n- [high] app/other/main.go:7 - a real bug in an untouched file\n```\n"
+	if findings, sawSection := parseFindingsIn(headerInFence, diffKnown); len(findings) != 0 || !sawSection {
+		t.Errorf("a header inside a closed fence = %+v sawSection=%t, want the section seen and its fenced finding dropped", findings, sawSection)
+	}
+	// The same header inside a fence that never closes is not a quote, so the
+	// finding under it is read and blocks.
+	headerInOpenFence := "```\n## Findings\n\n- [high] app/other/main.go:7 - a real bug in an untouched file\n"
+	if findings, sawSection := parseFindingsIn(headerInOpenFence, diffKnown); len(blockingFindings(findings)) != 1 || !sawSection {
+		t.Errorf("a header inside an unterminated fence = %+v sawSection=%t, want the finding read", findings, sawSection)
+	}
+	// The same header outside any fence opens the section, and its finding is
+	// read whatever the diff says: the section is the contract.
+	if findings, sawSection := parseFindingsIn("## Findings\n\n- [high] app/other/main.go:7 - a real bug in an untouched file\n", diffKnown); len(findings) != 1 || !sawSection {
+		t.Errorf("a section finding outside a fence = %+v sawSection=%t, want it read", findings, sawSection)
+	}
+
 	// A failing issue fetch degrades to a note and never fails the brief.
 	delete(routes, "/repos/RichardoC/factory-repo/issues/3")
 	briefPath = filepath.Join(t.TempDir(), "degraded.md")
@@ -973,6 +1383,40 @@ func TestRunReviewReport(t *testing.T) {
 
 	findings := "- [high] app/x/main.go:42 - the mutex is released twice\n- [medium] app/y/x.go:7 - missing error check\n"
 	comment := filepath.Join(t.TempDir(), "nested", "review-comment.md")
+
+	t.Run("a fenced contract echo starts no fix run", func(t *testing.T) {
+		// Issue #224, end to end: the reviewer echoes the output contract
+		// inside a fence, and the report must read no finding out of it — the
+		// phantom HIGH on app/zip/queue.go used to count as blocking and
+		// start a fix run against a file that does not exist.
+		diffBody := "diff --git a/app/x/main.go b/app/x/main.go\n" +
+			"--- a/app/x/main.go\n+++ b/app/x/main.go\n" +
+			"@@ -1,2 +1,3 @@\n context\n-removed\n+added\n"
+		server := reviewServer(t, map[string]string{
+			"/repos/RichardoC/factory-repo/pulls/7": `{"number":7,"title":"Review target","body":"The change.\n\nCloses #3","state":"open","head":{"ref":"codeaf/issue-3-42"},"base":{"ref":"main"}}`,
+		}, diffBody, nil)
+		t.Cleanup(server.Close)
+		ghEnv(t, server)
+		setArgs("7")
+		writeReviewResult(t, stopDone, "Here is the contract I was given:\n\n```markdown\n"+
+			reviewOutputContract+"```\n\n## Findings\n\nnone\n")
+		reviewLedger(t)
+		t.Setenv("REVIEW_COMMENT_PATH", comment)
+		out, err := captureStdout(t, runReviewReport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != "action=label\nused=0\nblocking=0\n" {
+			t.Errorf("the fenced echo still blocks: stdout = %q", out)
+		}
+		data, err := os.ReadFile(comment)
+		if err != nil {
+			t.Fatalf("comment not written: %v", err)
+		}
+		if strings.HasPrefix(string(data), command+" fix:") {
+			t.Errorf("the fenced echo started a fix run: %q", data)
+		}
+	})
 
 	t.Run("a blocking review starts a fix run", func(t *testing.T) {
 		server := commentsServer(t, reportComments(1), http.StatusOK)
@@ -1507,6 +1951,126 @@ func TestDecideDispatchReview(t *testing.T) {
 			t.Fatalf("Decide = %+v, want the continuation path", got)
 		}
 	})
+}
+
+// TestParseFindingsFencedContractEchoParaphrased: the phantom is not only the
+// exact echo (issue #224, follow-up finding 1). A reviewer who reprints the
+// contract's example bullet with the incidental differences a reprint
+// tolerates — a nudged line number, different spacing, a trailing stop — is
+// still quoting the brief's own bullet, and must still mint no finding, in
+// either the section or inline, with or without the diff in hand. The
+// example is the one bullet in the brief that spells out app/zip/queue.go,
+// a file this repository does not have.
+func TestParseFindingsFencedContractEchoParaphrased(t *testing.T) {
+	known := diffPaths("diff --git a/app/queue/main.go b/app/queue/main.go\n" +
+		"--- a/app/queue/main.go\n+++ b/app/queue/main.go\n" +
+		"@@ -1,0 +1,1 @@\n+package main\n")
+	for _, tc := range []struct {
+		name, bullet string
+	}{
+		{"the example itself", "- [high] app/zip/queue.go:42 - the mutex is released twice under the error path, so a second request deadlocks"},
+		{"line nudged by one", "- [high] app/zip/queue.go:43 - the mutex is released twice under the error path, so a second request deadlocks"},
+		{"severity case", "- [HIGH] app/zip/queue.go:42 - the mutex is released twice under the error path, so a second request deadlocks"},
+		{"trailing stop", "- [high] app/zip/queue.go:42 - The mutex is released twice under the error path, so a second request deadlocks."},
+		{"collapsed spacing", "- [high] app/zip/queue.go:42 - the mutex is released   twice under the error path, so a second request deadlocks"},
+		{"no line number at all", "- [high] app/zip/queue.go - the mutex is released twice under the error path, so a second request deadlocks"},
+		{"markdown emphasis", "- [high] app/zip/queue.go:42 - the mutex is released twice under the error path, so a second request `deadlocks`"},
+	} {
+		for _, answer := range []string{
+			"```\n" + tc.bullet + "\n```\n",                // bare fence, inline pass
+			"## Findings\n\n```\n" + tc.bullet + "\n```\n", // in the section under a fence
+			"```markdown\n" + tc.bullet + "\n```\n## Findings\n\nnone\n",
+		} {
+			for _, k := range []map[string]bool{known, nil} {
+				findings, _ := parseFindingsIn(answer, k)
+				for _, f := range findings {
+					if strings.EqualFold(f.Severity, "high") && f.Path == contractExamplePath {
+						t.Errorf("%s: the paraphrased echo was kept: %+v", tc.name, f)
+					}
+				}
+				if got := blockingFindings(findings); len(got) != 0 {
+					t.Errorf("%s: blocking = %+v, want none — a quoted example must never start a fix run", tc.name, got)
+				}
+			}
+		}
+	}
+	// The guard must not swallow a finding that only shares the path.
+	real := "```\n- [high] app/zip/queue.go:42 - the goroutine leaks on shutdown\n```\n"
+	findings, _ := parseFindingsIn(real, nil)
+	if len(findings) != 1 || findings[0].Text != "the goroutine leaks on shutdown" {
+		t.Errorf("a fenced finding on the example path with different text = %+v, want it kept", findings)
+	}
+}
+
+// TestParseFindingsFencedOutsideDiffIsAQuote: the maintainer's second rule
+// (issue #224, follow-up finding 2) — a fenced finding whose path the PR's
+// diff does not touch is read as a quote about another change, not a report,
+// and is dropped. The test distinguishes it from a real finding about a file
+// the PR does not modify: the drop happens *only when the diff is known*. With
+// no diff in hand nothing outside a fence changes and nothing fenced is
+// judged by path, because the parser cannot tell a quote about another file
+// from a real report about one — and losing that report is a false pass.
+func TestParseFindingsFencedOutsideDiffIsAQuote(t *testing.T) {
+	known := diffPaths("diff --git a/app/queue/main.go b/app/queue/main.go\n" +
+		"--- a/app/queue/main.go\n+++ b/app/queue/main.go\n" +
+		"@@ -1,0 +1,1 @@\n+package main\n")
+	if known == nil {
+		t.Fatal("diffPaths dropped a real diff")
+	}
+	// A fenced report about a file the PR changes: kept, and it blocks.
+	if f, _ := parseFindingsIn("```\n- [high] app/queue/main.go:7 - the lock is held across the send\n```\n", known); len(f) != 1 {
+		t.Errorf("a fenced finding on a diff path = %+v, want it kept", f)
+	} else if len(blockingFindings(f)) != 1 {
+		t.Errorf("a fenced finding on a diff path stopped blocking: %+v", f)
+	}
+	// A fenced finding about a file the PR does not touch: a quote, dropped.
+	quoted := "```\n- [high] app/contracts/worker.go:9 - the retry loop never backs off\n```\n"
+	if f, _ := parseFindingsIn(quoted, known); len(f) != 0 {
+		t.Errorf("a fenced finding outside the diff = %+v, want it dropped as a quote", f)
+	}
+	// The identical text with no diff in hand is a report: kept. This is the
+	// distinction the finding asked the tests to pin.
+	if f, _ := parseFindingsIn(quoted, nil); len(f) != 1 {
+		t.Errorf("outside the diff with no diff known = %+v, want it kept", f)
+	}
+	// Unfenced, the same absent path is never dropped: issue #49 leniency.
+	unfenced := "- [high] app/contracts/worker.go:9 - the retry loop never backs off\n"
+	if f, _ := parseFindingsIn(unfenced, known); len(f) != 1 {
+		t.Errorf("an unfenced finding outside the diff = %+v, want it kept", f)
+	}
+	// A diff that touches nothing parseable leaves every finding alone.
+	if f, _ := parseFindingsIn(quoted, diffPaths("")); len(f) != 1 {
+		t.Errorf("an unparseable diff dropped a finding = %+v, want it kept", f)
+	}
+}
+
+// TestParseFindingsFenceGuardDoesNotDropUnfenced: the whole fence machinery
+// is inert outside a fence (issue #224). Every bullet the paraphrase guard
+// and the diff filter would drop when fenced is kept when unfenced — the
+// issue #49 leniency the maintainer asked to preserve, pinned to the same
+// text the fenced cases drop.
+func TestParseFindingsFenceGuardDoesNotDropUnfenced(t *testing.T) {
+	known := diffPaths("diff --git a/app/queue/main.go b/app/queue/main.go\n" +
+		"--- a/app/queue/main.go\n+++ b/app/queue/main.go\n" +
+		"@@ -1,0 +1,1 @@\n+package main\n")
+	for _, bullet := range []string{
+		"- [high] app/zip/queue.go:42 - the mutex is released twice under the error path, so a second request deadlocks",
+		"- [high] app/zip/queue.go:43 - the mutex is released twice under the error path, so a second request deadlocks",
+		"- [high] app/contracts/worker.go:9 - the retry loop never backs off",
+	} {
+		answer := "## Findings\n\n" + bullet + "\n"
+		findings, _ := parseFindingsIn(answer, known)
+		if len(findings) != 1 {
+			t.Errorf("unfenced %q = %+v, want it kept", bullet, findings)
+			continue
+		}
+		if findings[0].fenced {
+			t.Errorf("unfenced %q was marked fenced", bullet)
+		}
+		if len(blockingFindings(findings)) != 1 {
+			t.Errorf("unfenced %q stopped blocking", bullet)
+		}
+	}
 }
 
 // diffFile builds one file's section of a unified diff: a `diff --git`
