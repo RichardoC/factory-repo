@@ -190,7 +190,10 @@ func planOpenIssues(gh github) string {
 // planClosedIssues embeds the recently closed issues' bodies nearly whole:
 // their "Out of scope" and follow-up notes are the planner's second source
 // of proposals, and a note cut at 200 runes is a note lost. Bodies are
-// untrusted text, so each is capped and read as data.
+// untrusted text — anyone can write a closed issue, and they routinely
+// quote run output — so each is both capped and escaped, the same
+// escapeMD(body, maxPlanClosedBody, false) the run reports get, so HTML,
+// mentions, code fences and forged headings in one render inert.
 func planClosedIssues(gh github) string {
 	var b strings.Builder
 	b.WriteString("## Recently closed issues\n\n")
@@ -209,7 +212,7 @@ func planClosedIssues(gh github) string {
 			b.WriteString("(no body)\n\n")
 			continue
 		}
-		b.WriteString(capBrief(it.Body, maxPlanClosedBody))
+		b.WriteString(escapeMD(it.Body, maxPlanClosedBody, false))
 		b.WriteString("\n\n")
 		shown++
 	}
