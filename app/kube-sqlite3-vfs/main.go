@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/RichardoC/kube-sqlite3-vfs/pkg/vfs"
 	"github.com/google/uuid"
@@ -27,9 +28,10 @@ import (
 
 // Options are the command's flags.
 type Options struct {
-	KubeConfig string `long:"kubeconfig" description:"(optional) absolute path to the kubeconfig file"`
-	Verbose    bool   `long:"verbosity" short:"v" description:"Log at debug level rather than info"`
-	Retries    int    `long:"retries" description:"Number of retries for API calls" default:"1"`
+	KubeConfig  string `long:"kubeconfig" description:"(optional) absolute path to the kubeconfig file"`
+	JournalMode string `long:"journal-mode" description:"SQLite rollback journal mode: DELETE (default), TRUNCATE or PERSIST. MEMORY and OFF are refused: their journal never reaches the VFS, so a crashed writer cannot be recovered (issue #68)" default:"DELETE"`
+	Verbose     bool   `long:"verbosity" short:"v" description:"Log at debug level rather than info"`
+	Retries     int    `long:"retries" description:"Number of retries for API calls" default:"1"`
 }
 
 // newLogger returns the process logger: debug-level text logging with -v,
@@ -39,6 +41,47 @@ func newLogger(verbose bool) *slog.Logger {
 		return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	}
 	return slog.New(slog.NewJSONHandler(os.Stderr, nil))
+}
+
+// journalModes the writer accepts. DELETE, TRUNCATE and PERSIST all store
+// the rollback journal through this VFS as sector ConfigMaps, so a crash
+// mid-transaction leaves a journal the next opener can roll back. MEMORY
+// and OFF do not, and WAL needs the shared-memory -shm file this VFS cannot
+// store, so all three are refused.
+const journalModes = "DELETE, TRUNCATE, PERSIST"
+
+// journalModeName validates a --journal-mode value and returns the
+// canonical (upper-case) name for the DSN. The empty value is the flag's
+// default, DELETE, so a programmatically built Options behaves like the
+// parsed one. MEMORY and OFF are refused with the crash-safety reason from
+// issue #68: their journal never reaches the VFS, so a crash — an evicted
+// pod, a killed process — leaves a half-written database that no opener
+// can roll back.
+func journalModeName(mode string) (string, error) {
+	name := strings.ToUpper(strings.TrimSpace(mode))
+	switch name {
+	case "":
+		return "DELETE", nil
+	case "DELETE", "TRUNCATE", "PERSIST":
+		return name, nil
+	case "MEMORY", "OFF":
+		return "", fmt.Errorf("--journal-mode %s is not allowed: its rollback journal never reaches the VFS, so a crash mid-transaction leaves a half-written database that cannot be rolled back — the database is very likely corrupted (issue #68); use one of %s", strings.TrimSpace(mode), journalModes)
+	case "WAL":
+		return "", fmt.Errorf("--journal-mode WAL is not supported: it needs SQLite's shared-memory -shm file, which this ConfigMap-backed VFS cannot store; use one of %s", journalModes)
+	default:
+		return "", fmt.Errorf("unknown --journal-mode %q (accepted: %s)", mode, journalModes)
+	}
+}
+
+// writerDSN builds the DSN the writer opens, with journalMode validated by
+// journalModeName: the chosen mode is carried to SQLite as the _journal DSN
+// parameter, exactly the way the flag reaches the database.
+func writerDSN(journalMode string) (string, error) {
+	mode, err := journalModeName(journalMode)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("file2.db?_journal=%s&_cache_size=-256&vfs=kube-sqlite3-vfs", mode), nil
 }
 
 func main() {
@@ -54,11 +97,19 @@ func main() {
 
 	logger.Info("Got config", "opts", opts)
 
+	// Refuse an unusable --journal-mode before any cluster work — the
+	// validation in runWithClient would otherwise only fire after the
+	// kubeconfig has been read and a clientset built.
+	if _, err := journalModeName(opts.JournalMode); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
 	// The only two os.Exit calls in the process are the flag-parse failure
-	// above and this one, both before or after run has returned: the old
-	// fatal() exited from the middle of the work, skipping the deferred
-	// db.Close and stmt.Close. A failure now unwinds through run's defers
-	// and leaves the exit code to main.
+	// above, the journal-mode refusal above, and this one, all before or
+	// after run has returned: the old fatal() exited from the middle of the
+	// work, skipping the deferred db.Close and stmt.Close. A failure now
+	// unwinds through run's defers and leaves the exit code to main.
 	if err := run(opts, logger); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -100,6 +151,14 @@ func newClientset(kubeconfigFlag string) (kubernetes.Interface, error) {
 // so the tests can drive it — the error paths included — with the fake
 // clientset, and it returns the first failure to its caller.
 func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Logger) error {
+	// Refuse an unusable journal mode before any cluster work: writing a
+	// database that cannot be recovered after a crash is worse than not
+	// writing it at all.
+	dsn, err := writerDSN(opts.JournalMode)
+	if err != nil {
+		return err
+	}
+
 	vfsN := vfs.NewVFS(context.Background(), clientset, "test", logger, opts.Retries)
 
 	// Register the custom kube-sqlite3-vfs VFS with sqlite. The name
@@ -123,30 +182,34 @@ func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Lo
 	// back by the next opener: `Access` answers from cluster truth, and
 	// `Delete` removes every journal sector with one xDelete per file.
 	//
-	// DELETE over TRUNCATE/PERSIST, by API calls per commit. All three
-	// store the journal out of memory, so the difference is entirely in
-	// what happens at the end of the transaction:
+	// DELETE as the default, by measurement and by what is left behind. All
+	// three crash-safe modes store the journal through this VFS; the
+	// difference is what a commit costs and what it leaves. Measured with
+	// `go test ./pkg/vfs -run ZZZ -bench BenchmarkSQLiteInsert1000RowsJournalModes -benchtime 10x -count 3`
+	// on the fake clientset (issue #120, full table in the module README):
+	// a committed 1000-row transaction costs 65.00 api-calls/op with
+	// _journal=DELETE, 61.00 with TRUNCATE and 62.00 with PERSIST; over ten
+	// consecutive transactions the per-transaction costs are 83.20, 79.20
+	// and 78.30. So TRUNCATE and PERSIST measure ~4 API calls per
+	// transaction CHEAPER than DELETE — the README's earlier argument that
+	// they would pay more per transaction is not what the counter shows:
+	// DELETE pays one LIST plus one Delete per journal sector plus the
+	// lockfile's Delete at every commit, while TRUNCATE's xTruncate deletes
+	// the journal's sectors directly, with no LIST and no lockfile write.
 	//
-	//   - DELETE issues one xDelete at commit; the VFS turns that into one
-	//     LIST of the journal's sectors plus one Delete per sector (plus
-	//     one Delete of the journal's lockfile), after which the journal
-	//     is gone and no later transaction pays anything for it.
-	//   - TRUNCATE and PERSIST keep the journal file on the cluster, so
-	//     the next write transaction reuses it and pays again: a header
-	//     rewrite through xWrite (one UPDATE per touched sector), plus the
-	//     xAccess that SQLite performs to discover the file and the xOpen
-	//     that reopens it. Those are per-transaction costs that DELETE pays
-	//     exactly once, at commit.
-	//
-	// Measured on the fake clientset with
-	// `go test ./pkg/vfs -run ZZZ -bench BenchmarkSQLiteInsert1000Rows -benchtime 10x`
-	// (see the module README): a committed 1000-row transaction costs 25.00
-	// api-calls/op with _journal=MEMORY and 65.00 api-calls/op with
-	// _journal=DELETE — a delta of 40 API calls for the journal writes
-	// plus its deletion. That is the price of a rollback that can actually
-	// be rolled back after a crash, paid once per commit; TRUNCATE/PERSIST
-	// would add the header rewrite and the extra xAccess/xOpen on every
-	// later transaction without buying anything this VFS needs.
+	// DELETE stays the default anyway, for what the API-call counter does
+	// not see: what a commit leaves on the cluster. Measured over the fake
+	// clientset after clean commits and close, DELETE leaves no journal
+	// state at all, TRUNCATE leaves the journal's lockfile ConfigMap behind
+	// permanently (one per database, never cleaned up), and PERSIST leaves
+	// the journal's sector ConfigMaps too — cluster storage that nothing
+	// ever reclaims. A clean on-cluster layout after every commit is what
+	// issue #68's recovery story is built on: "no journal sectors" is
+	// exactly the state Access reports for a recovered file, and stray
+	// journal artifacts are one less thing a debugging operator has to
+	// reason about. TRUNCATE remains available through --journal-mode for
+	// deployments that would rather trade the leftover lockfile for the ~4
+	// API calls per transaction.
 	//
 	// A database written by an older build with _journal=MEMORY is still
 	// an ordinary SQLite database in DELETE mode on the cluster: the
@@ -154,7 +217,7 @@ func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Lo
 	// depends on it, and the "no journal sectors" state is exactly what
 	// `Access` already reports for a name with no sectors — so such a
 	// database opens here and recovers normally.
-	db, err := sql.Open("sqlite3", "file2.db?_journal=DELETE&_cache_size=-256&vfs=kube-sqlite3-vfs")
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}

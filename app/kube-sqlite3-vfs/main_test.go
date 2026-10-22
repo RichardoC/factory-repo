@@ -216,3 +216,122 @@ func TestRunWithClientFailsOnCommitError(t *testing.T) {
 		t.Fatal("runWithClient succeeded despite injected sector write failures")
 	}
 }
+
+// TestJournalModeValidation covers --journal-mode's validation: the modes a
+// writer may run under (DELETE, TRUNCATE, PERSIST, case-insensitively, and
+// the flag's empty default, which is DELETE), the modes it must refuse with
+// the crash-safety reason from issue #68 (MEMORY, OFF — their journal never
+// reaches the VFS, so a crashed writer cannot be rolled back), WAL (needs
+// the shared-memory -shm file this VFS cannot store) and an unknown value.
+func TestJournalModeValidation(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    string
+		wantErr string
+	}{
+		{in: "", want: "DELETE"},                            // the flag's default
+		{in: "DELETE", want: "DELETE"},                      // accepted, canonical case
+		{in: "delete", want: "DELETE"},                      // accepted, sqlite is case-insensitive
+		{in: "TRUNCATE", want: "TRUNCATE"},                  // accepted
+		{in: "truncate", want: "TRUNCATE"},                  // accepted, lower case
+		{in: "PERSIST", want: "PERSIST"},                    // accepted
+		{in: "persist", want: "PERSIST"},                    // accepted, lower case
+		{in: " truncate ", want: "TRUNCATE"},                // accepted, surrounding space trimmed
+		{in: "MEMORY", wantErr: "cannot be rolled back"},    // refused: crash-safety (issue #68)
+		{in: "memory", wantErr: "cannot be rolled back"},    // refused, lower case
+		{in: "OFF", wantErr: "cannot be rolled back"},       // refused: crash-safety (issue #68)
+		{in: "WAL", wantErr: "shared-memory -shm"},          // refused: no -shm through this VFS
+		{in: "bogus", wantErr: "unknown --journal-mode"},    // refused: not a mode
+		{in: "bogus", wantErr: "DELETE, TRUNCATE, PERSIST"}, // refused: names the accepted modes
+	}
+	for _, tc := range cases {
+		got, err := journalModeName(tc.in)
+		if tc.wantErr != "" {
+			if err == nil {
+				t.Errorf("journalModeName(%q) = %q, want error mentioning %q", tc.in, got, tc.wantErr)
+				continue
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("journalModeName(%q) error = %q, want it to mention %q", tc.in, err, tc.wantErr)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("journalModeName(%q): %v", tc.in, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("journalModeName(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestWriterDSNCarriesJournalMode shows that the chosen mode reaches the
+// SQLite DSN: the DSN the writer opens carries _journal=<mode>, and a
+// refused mode produces no DSN at all.
+func TestWriterDSNCarriesJournalMode(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{in: "", want: "file2.db?_journal=DELETE"}, // the flag's default
+		{in: "DELETE", want: "file2.db?_journal=DELETE"},
+		{in: "TRUNCATE", want: "file2.db?_journal=TRUNCATE"},
+		{in: "PERSIST", want: "file2.db?_journal=PERSIST"},
+	} {
+		dsn, err := writerDSN(tc.in)
+		if err != nil {
+			t.Fatalf("writerDSN(%q): %v", tc.in, err)
+		}
+		if dsn != tc.want+"&_cache_size=-256&vfs=kube-sqlite3-vfs" {
+			t.Errorf("writerDSN(%q) = %q, want it to carry %q", tc.in, dsn, tc.want)
+		}
+	}
+	for _, mode := range []string{"MEMORY", "OFF", "WAL", "bogus"} {
+		if dsn, err := writerDSN(mode); err == nil {
+			t.Errorf("writerDSN(%q) = %q, want an error: a refused mode must not produce a DSN", mode, dsn)
+		}
+	}
+}
+
+// TestRunWithClientHonoursJournalModeFlag drives the writer with
+// --journal-mode=TRUNCATE end to end over the fake clientset: the mode in
+// the DSN is one SQLite accepts over this VFS (a refused or mangled DSN
+// parameter fails the open), the 1000 rows still commit, and the committed
+// database reads back through a fresh TRUNCATE-mode connection.
+func TestRunWithClientHonoursJournalModeFlag(t *testing.T) {
+	fcs := fake.NewSimpleClientset()
+
+	if err := runWithClient(fcs, Options{Retries: 1, JournalMode: "TRUNCATE"}, testLogger()); err != nil {
+		t.Fatalf("runWithClient with --journal-mode=TRUNCATE: %v", err)
+	}
+
+	db, err := sql.Open("sqlite3", "file2.db?_query_only=true&_journal=TRUNCATE&mode=ro&vfs=kube-sqlite3-vfs")
+	if err != nil {
+		t.Fatalf("reopen database over the VFS in TRUNCATE mode: %v", err)
+	}
+	defer db.Close()
+
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM books").Scan(&count); err != nil {
+		t.Fatalf("count books over the VFS: %v", err)
+	}
+	if count != 1000 {
+		t.Errorf("row count after a TRUNCATE-mode run = %d, want 1000", count)
+	}
+}
+
+// TestRunWithClientRefusesMemoryJournalMode shows the refusal at the run's
+// front door: a writer asked for _journal=MEMORY fails before any cluster
+// work, with the crash-safety reason from issue #68 in the error.
+func TestRunWithClientRefusesMemoryJournalMode(t *testing.T) {
+	fcs := fake.NewSimpleClientset()
+
+	err := runWithClient(fcs, Options{Retries: 1, JournalMode: "MEMORY"}, testLogger())
+	if err == nil {
+		t.Fatal("runWithClient succeeded with --journal-mode=MEMORY, want a crash-safety refusal")
+	}
+	if !strings.Contains(err.Error(), "cannot be rolled back") {
+		t.Errorf("error = %q, want it to give the crash-safety reason (issue #68)", err)
+	}
+	if cms := listConfigMaps(t, fcs, "data=sector"); len(cms) != 0 {
+		t.Errorf("a refused run wrote %d sector ConfigMaps, want 0: the refusal must come before any cluster work", len(cms))
+	}
+}
