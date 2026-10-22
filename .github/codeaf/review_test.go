@@ -563,6 +563,143 @@ func TestReviewPlan(t *testing.T) {
 	}
 }
 
+// TestReviewTableUnlocated renders the findings table for an unlocated
+// finding — the inline form (issue #49) whose path and line are empty — and
+// pins the whole table, because that cell used to render as `:0` (issue
+// #190): a location a fix run and a reader both read, naming no file. The
+// word `unlocated` is the explicit fallback, and no `:0` may appear
+// anywhere in the table.
+func TestReviewTableUnlocated(t *testing.T) {
+	answer := "## Findings\n\n" +
+		"- [medium] service.go wc -l 1200, split it\n" +
+		"- [high] app/x/main.go:42 - the mutex is released twice\n"
+	findings, sawSection := parseFindings(answer)
+	if !sawSection || len(findings) != 2 {
+		t.Fatalf("parse = %d findings, sawSection %t, want 2/true: %+v", len(findings), sawSection, findings)
+	}
+	// The first finding carries no location at all; the second does.
+	if findings[0].Path != "" || findings[0].Line != 0 {
+		t.Fatalf("first finding is not unlocated: %+v", findings[0])
+	}
+	if findings[1].Path != "app/x/main.go" || findings[1].Line != 42 {
+		t.Fatalf("second finding lost its location: %+v", findings[1])
+	}
+
+	table := reviewTable(findings)
+	want := "| severity | location | finding |\n|---|---|---|\n" +
+		"| `medium` | unlocated | service.go wc -l 1200, split it |\n" +
+		"| `high` | app/x/main.go:42 | the mutex is released twice |\n"
+	if table != want {
+		t.Errorf("unlocated table =\n%q\nwant\n%q", table, want)
+	}
+	if strings.Contains(table, ":0") {
+		t.Errorf("the table renders :0 for an unlocated finding: %q", table)
+	}
+	assertReviewBodyClean(t, table)
+
+	// The whole comment — table, command line and footer — carries no `:0`.
+	t.Setenv("RESULT_PATH", "")
+	t.Setenv("LEDGER_PATH", "")
+	t.Setenv("TRAJECTORY_PATH", "")
+	blocking := blockingFindings(findings)
+	if len(blocking) != 2 {
+		t.Fatalf("blocking = %d findings, want 2: %+v", len(blocking), blocking)
+	}
+	body := reviewFixBody(blocking, findings, 0, "zai-org/glm-5.3-flash", stopDone)
+	if !strings.Contains(body, "| `medium` | unlocated |") {
+		t.Errorf("the fix comment does not name the unlocated finding: %q", body)
+	}
+	if strings.Contains(body, ":0") {
+		t.Errorf("the fix comment renders :0: %q", body)
+	}
+	assertReviewBodyClean(t, body)
+
+	// A located finding still renders its own path and line unchanged.
+	if got := reviewTable([]Finding{{Severity: stopDone, Path: "a.go", Line: 7}}); !strings.Contains(got, "| a.go:7 |") {
+		t.Errorf("a located finding stopped rendering its location: %q", got)
+	}
+
+	// The parser is the only thing that builds findings, and it builds two
+	// shapes: a location — a path and a line counting from one, both set —
+	// or the inline form with neither. `parseFinding` refuses a path that
+	// is empty (i > 0), refuses a line that does not count from one (n > 0)
+	// and refuses a zero line, so no parse can yield a path with line zero
+	// and none can yield a bare line (issue #190 review). The renderer keys
+	// on the path alone; the line alone never decides.
+	located := []string{"app/x/main.go:9", "0:1", "README.md:1"}
+	for _, loc := range located {
+		got, ok := parseFinding("[low] " + loc + " - text")
+		if !ok {
+			t.Errorf("parseFinding(%q) dropped a location-shaped finding", "[low] "+loc+" - text")
+			continue
+		}
+		if got.Path == "" || got.Line <= 0 {
+			t.Errorf("parseFinding(%q) built an incomplete location: %+v", "[low] "+loc+" - text", got)
+		}
+	}
+	// A location the parser refuses — an empty path, a zero line — is not
+	// read as a located finding; the text-only fallback stores it as the
+	// inline form, with no path and no line, and it renders unlocated.
+	for _, loc := range []string{":0", "a.go:0", ":"} {
+		line := "[low] " + loc + " - text"
+		if got, ok := parseFinding(line); ok {
+			t.Errorf("parseFinding(%q) read a refused location as a location: %+v", line, got)
+		}
+		var f Finding
+		for _, g := range parseInlineFindings(line) {
+			if g.Path == "" {
+				f = g
+			}
+		}
+		if f.Path != "" || f.Line != 0 {
+			t.Errorf("parseInlineFindings(%q) did not store it as the inline form: %+v", line, f)
+		}
+		if got := reviewLocation(f); got != "unlocated" {
+			t.Errorf("reviewLocation(%q finding) = %q, want unlocated", line, got)
+		}
+	}
+
+	// A half-built finding reaches the renderer only straight through. A
+	// path that names no file (":" or digits) and an empty path never render
+	// a location; a real path with no line keeps the path, so a file-level
+	// finding still says which file, and never renders `:0`.
+	for _, tc := range []struct {
+		f    Finding
+		want string
+	}{
+		{Finding{Severity: "low", Path: ":", Line: 0}, "unlocated"},  // an empty path with a zero line
+		{Finding{Severity: "low", Path: "a.go", Line: 0}, "a.go"},    // a path with no line at all
+		{Finding{Severity: "low", Path: "a.go", Line: -1}, "a.go"},   // a negative line is not a line
+		{Finding{Severity: "high", Path: "", Line: 12}, "unlocated"}, // an unlocated finding a caller filled a line into
+		{Finding{Severity: "low", Path: "0", Line: 0}, "unlocated"},  // `0:1`-shaped text names no file
+	} {
+		if cell := reviewLocation(tc.f); cell != tc.want {
+			t.Errorf("reviewLocation(%+v) = %q, want %q", tc.f, cell, tc.want)
+		}
+		if got := reviewTable([]Finding{tc.f}); strings.Contains(got, ":0") || strings.Contains(got, "a.go:") {
+			t.Errorf("reviewTable(%+v) renders a zero or empty line: %q", tc.f, got)
+		}
+	}
+
+	// Nothing in a rendered findings comment can carry `:0`, whatever the
+	// findings are: the location cell is the only place a line number is
+	// written.
+	all := []Finding{
+		{Severity: "medium", Text: "no location at all"},
+		{Severity: "low", Path: ":", Line: 0, Text: "a colon and no line"},
+		{Severity: "high", Path: "svc.go", Line: 0, Text: "no line number"},
+		{Severity: "low", Path: "ok.go", Line: 3, Text: "located"},
+	}
+	comment := reviewFixBody(blockingFindings(all), all, 0, "zai-org/glm-5.3-flash", stopDone)
+	if strings.Contains(comment, ":0") {
+		t.Errorf("the fix comment renders :0: %q", comment)
+	}
+	if !strings.Contains(comment, "| `low` | ok.go:3 | located |") {
+		t.Errorf("the located finding lost its location in the comment: %q", comment)
+	}
+	assertReviewBodyClean(t, comment)
+}
+
 // assertReviewBodyClean checks the invariants every review comment must
 // hold: no report marker, and no unescaped hostile text.
 func assertReviewBodyClean(t *testing.T, body string) {
