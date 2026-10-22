@@ -199,6 +199,14 @@ func commentsServer(t *testing.T, comments []issueComment, status int) *httptest
 		body = "server exploded"
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The pull request under review, ready for review (issue #237): the
+		// review plan reads the draft flag before it labels, and the tests
+		// that expect a label run against a pull request that is not a
+		// draft. A draft pull request is served by its own test.
+		if r.URL.Path == "/repos/RichardoC/factory-repo/pulls/7" {
+			_, _ = io.WriteString(w, `{"number":7,"title":"t","state":"open","draft":false}`)
+			return
+		}
 		if r.URL.Path != "/repos/RichardoC/factory-repo/issues/7/comments" {
 			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
 			return
@@ -1110,7 +1118,27 @@ func TestContinuePlanContinuesADirtyPR(t *testing.T) {
 
 	t.Run("a failing pull request fetch fails the plan", func(t *testing.T) {
 		sleeps := stubSleep(t)
-		server := commentsServer(t, reportComments(1), http.StatusOK) // 404s /pulls/7
+		// This server serves the comments and nothing else, so the pull
+		// request fetch fails; commentsServer cannot stand in for it since
+		// it serves a ready pull request too (the review plan reads the
+		// draft flag, issue #237).
+		var b strings.Builder
+		b.WriteString("[")
+		for i, c := range reportComments(1) {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			fmt.Fprintf(&b, `{"id":%d,"body":%q}`, c.ID, c.Body)
+		}
+		b.WriteString("]")
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/repos/RichardoC/factory-repo/issues/7/comments" {
+				http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
+				return
+			}
+			_, _ = io.WriteString(w, b.String())
+		}))
+		t.Cleanup(server.Close)
 		ghEnv(t, server)
 		action, body, _, err := continuePlan(newGitHub(), 7, stopDone)
 		if err == nil {

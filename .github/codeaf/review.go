@@ -42,6 +42,21 @@ type Finding struct {
 	Line       int
 	Text       string
 	Recognized bool // Severity is one of high, medium or low
+
+	// fenced marks a finding read from inside a markdown code fence (issue
+	// #224). Unset means the finding was read from prose, where nothing is
+	// ever dropped. It is parser-internal: it says how the finding was
+	// found, not what it is, so nothing renders it.
+	fenced bool
+
+	// quoted marks a fenced finding whose fence the parser saw closed
+	// (issue #224 follow up): a quoted region is a fence that ends where
+	// the reviewer wrote it to end. A fence left open — the reviewer never
+	// wrote the closing delimiter — is not a confirmed quote, however much
+	// it looks like one: only a match against the contract's own example
+	// bullet can drop a finding inside it, never the path filter. Like
+	// fenced it is parser-internal.
+	quoted bool
 }
 
 var (
@@ -76,10 +91,67 @@ var (
 // The same finding found by both passes is kept once. Findings are capped at
 // maxReviewFindings; text and path are never truncated at parse time — the
 // comment renderer escapes and caps them.
+//
+// The pass is fenced-code aware (issue #224): a finding read from inside a
+// ``` or ~~~ fence is dropped when it is quoted text and kept when it is a
+// report. parseFindingsIn carries that rule, and this wrapper asks for it
+// with no diff in hand.
 func parseFindings(answer string) (findings []Finding, sawSection bool) {
+	return parseFindingsIn(answer, nil)
+}
+
+// parseFindingsIn is parseFindings with the pull request's changed paths
+// known (issue #224). known is the set of paths the PR's diff touches, or
+// nil when the diff is not at hand — a review with no known paths behaves
+// exactly as before this issue.
+//
+// Fenced code is where a reviewer quotes rather than reports: the echoed
+// output contract, the patch itself, another tool's output. The fence state
+// is tracked by the run that opened it, so a quoted line that merely looks
+// like a delimiter does not desync it — only a run of the same marker, at
+// least as long, at the same indentation closes the fence — and a delimiter
+// line is itself parsed, judged with the state it opens. A finding that
+// falls inside a fence is dropped when it is a quote and kept when it is a
+// report:
+//
+//   - it is a phantom echo of the harness's own contract when its bullet is
+//     exactly the example bullet reviewOutputContract embeds — the only
+//     bullet in the brief that spells out a file that does not exist;
+//   - it is not real when the PR's diff does not touch its path — a file no
+//     hunk changes is quoted text, not a place to fix;
+//   - anything else is kept, because a reviewer may put a real finding in a
+//     fence and dropping it would be a false pass.
+//
+// Outside a fence nothing is dropped: the unfenced leniency of issue #49
+// stands, contract echo and absent path included.
+func parseFindingsIn(answer string, known map[string]bool) (findings []Finding, sawSection bool) {
 	inSection := false
-	for _, raw := range strings.Split(answer, "\n") {
-		line := strings.TrimLeft(strings.TrimSuffix(raw, "\r"), " \t")
+	// The fences the answer holds, computed once over the whole answer
+	// before any finding is read. A quoted region is delimited by its
+	// opening and its closing line, and whether the reviewer wrote the
+	// closing line is known only after the region ends, while the findings
+	// sit between the two (issue #224 follow up). So the state a finding on
+	// a line is judged with is looked up from the fences that cover that
+	// line, and a fence that never closes covers the rest of the answer as
+	// an unconfirmed region rather than as a quote.
+	spans := parseFences(strings.Split(answer, "\n"))
+	for i, raw := range strings.Split(answer, "\n") {
+		line := strings.TrimSuffix(raw, "\r")
+		// The fence state the lines of this answer are read in, and the
+		// region a finding on this line falls in: a fence the parser saw
+		// opened earlier, and the one the reviewer saw closed. A line that
+		// is itself a delimiter is judged with the state it toggles to — a
+		// closing delimiter line ends the region it is in, an opening
+		// delimiter line starts it — which is the state the line opens, the
+		// one the parser has when it reads the bullet written beside the
+		// marker.
+		inFence, quoted := fenceStateAt(spans, i)
+		if _, span := fenceAt(spans, i); span != nil && span.open == i {
+			// The line opens a fence: the lines after it are fenced, but the
+			// bullet written beside the marker itself is prose — the state
+			// the line opens with (issue #224).
+			inFence, quoted = false, false
+		}
 		switch {
 		case reviewSectionHeader.MatchString(line):
 			sawSection = true
@@ -90,12 +162,16 @@ func parseFindings(answer string) (findings []Finding, sawSection bool) {
 			continue
 		}
 		if inSection {
-			if f, ok := parseFinding(line); ok && !duplicateFinding(findings, f) {
-				findings = append(findings, f)
+			if f, ok := parseFinding(line); ok {
+				f.fenced, f.quoted = inFence, quoted
+				if !dropQuotedFinding(f, known) && !duplicateFinding(findings, f) {
+					findings = append(findings, f)
+				}
 			}
 		}
 		for _, f := range parseInlineFindings(line) {
-			if !duplicateFinding(findings, f) {
+			f.fenced, f.quoted = inFence, quoted
+			if !dropQuotedFinding(f, known) && !duplicateFinding(findings, f) {
 				findings = append(findings, f)
 			}
 		}
@@ -104,6 +180,310 @@ func parseFindings(answer string) (findings []Finding, sawSection bool) {
 		}
 	}
 	return findings, sawSection
+}
+
+// fenceSpan is one code fence in the answer: the lines its delimiters sit on
+// and whether the reviewer wrote the closing one. From its opening line to
+// its closing line inclusive its lines are inside the fence; an unclosed
+// fence runs from its opening line to the end of the answer.
+type fenceSpan struct {
+	open, close int  // line indices: close is -1 when the fence never closes
+	closed      bool // the reviewer wrote the closing delimiter
+}
+
+// covers reports whether the line at index i is inside this fence.
+func (s fenceSpan) covers(i int) bool {
+	return i >= s.open && (s.close < 0 || i <= s.close)
+}
+
+// parseFences finds the code fences in the answer's lines (issue #224 follow
+// up), before any finding is parsed: a fence opens on a delimiter line that
+// is not already inside one and closes on the first later delimiter line
+// that repeats its marker, is at least as long as the run that opened it and
+// is indented no further (fenceRun.closes). A delimiter line that cannot
+// close the fence it is in is text the fence quotes — an indented sample out
+// of a diff hunk, a shorter run — and does not desync the state. A fence
+// whose closing delimiter never arrives is returned with closed=false: it
+// runs to the end of the answer, and the rule that reads it — an unterminated
+// fence is not a confirmed quote — is applied by the caller.
+func parseFences(lines []string) []fenceSpan {
+	var spans []fenceSpan
+	var open *fenceSpan
+	var run fenceRun
+	for i, raw := range lines {
+		line := strings.TrimSuffix(raw, "\r")
+		marker, indent, ok := fenceDelimiter(line)
+		if ok == 0 {
+			continue
+		}
+		length := fenceRunLength(strings.TrimLeft(line, " \t"))
+		switch {
+		case open == nil:
+			run = fenceRun{open: true, marker: marker, indent: indent, length: length}
+			spans = append(spans, fenceSpan{open: i, close: -1})
+			open = &spans[len(spans)-1]
+		case !run.closes(marker, indent, length):
+			// A delimiter that cannot close the fence it is in is quoted
+			// text, not a toggle: the fence state stays where it was.
+		default:
+			open.close, open.closed = i, true
+			open, run = nil, fenceRun{}
+		}
+	}
+	return spans
+}
+
+// fenceAt returns the fence covering the line at index i, and whether the
+// line is inside a fence at all. The fences are disjoint, so the first cover
+// is the only one.
+func fenceAt(spans []fenceSpan, i int) (bool, *fenceSpan) {
+	for j := range spans {
+		if spans[j].covers(i) {
+			return true, &spans[j]
+		}
+	}
+	return false, nil
+}
+
+// fenceStateAt reports the fence state of the line at index i: whether it is
+// inside a fence at all, and whether it is inside one the reviewer closed —
+// the region the path filter may read as a quote.
+func fenceStateAt(spans []fenceSpan, i int) (inFence, quoted bool) {
+	if in, s := fenceAt(spans, i); in {
+		return true, s.closed
+	}
+	return false, false
+}
+
+// fenceRun is the code fence the parser is inside, as the run that opened it
+// (issue #224 follow up): the run's marker character, its indentation in
+// spaces, and its length. A zero fenceRun is "not in a fence".
+type fenceRun struct {
+	open   bool
+	marker byte
+	indent int
+	length int
+}
+
+// closes reports whether a delimiter line ends this fence, and so whether the
+// fence state is toggled rather than a quoted line read as a delimiter. It
+// follows the CommonMark rules for the run it is in: the closing delimiter
+// repeats the opening marker character, is at least as long as the run that
+// opened the fence, and is indented no further than the delimiter that opened
+// it. A line that only looks like a delimiter — a shorter run, another
+// marker, an indented sample out of a quoted diff hunk — is text inside the
+// fence and leaves the state alone, which is what keeps a fence the reviewer
+// wrote from being closed by the code it quotes.
+func (f fenceRun) closes(marker byte, indent, length int) bool {
+	return marker == f.marker && length >= f.length && indent == f.indent
+}
+
+// fenceDelimiter reports whether a line opens or closes a markdown code
+// fence (issue #224): three or more backticks or tildes, indented at most
+// three spaces as CommonMark allows — the indent rule stated here is the one
+// the code applies, and a deeper indentation is an indented code block, text
+// inside the fence. The marker and the run's length are returned for the
+// caller to judge against the fence it is in: fenceDelimiter alone does not
+// say that a line toggles the state, only that it looks like a delimiter.
+func fenceDelimiter(line string) (marker byte, indent, ok int) {
+	indent = 0
+	for indent < len(line) && (line[indent] == ' ' || line[indent] == '\t') {
+		indent++ // a tab counts as one column, the same leniency as the rest of the parser
+	}
+	if indent > 3 { // CommonMark: a fence may be indented at most three spaces
+		return 0, 0, 0
+	}
+	if len(line) < indent+3 || (line[indent] != '`' && line[indent] != '~') {
+		return 0, 0, 0
+	}
+	marker = line[indent]
+	if fenceRunLength(line[indent:]) < 3 {
+		return 0, 0, 0
+	}
+	return marker, indent, 1
+}
+
+// fenceRunLength is the length of the run of marker characters a fence
+// delimiter opens with: the line has been trimmed of its indentation and
+// fenceDelimiter has already checked that the run is three characters or
+// more.
+func fenceRunLength(line string) int {
+	i := 0
+	for i < len(line) && line[i] == line[0] {
+		i++
+	}
+	return i
+}
+
+// dropQuotedFinding reports whether a fenced finding is quoted text rather
+// than a report (issue #224). Nothing unfenced is ever dropped — the issue
+// #49 leniency stands, so an unfenced echo of the contract still parses —
+// and a fenced finding is dropped only when it is certainly a quote:
+//
+//   - it restates the output contract's own example (contractExampleFinding):
+//     the one bullet in the brief that spells out a file that does not exist.
+//     The test is not an exact string compare but a field-wise match that
+//     tolerates the incidental differences of an echo — a line number nudged
+//     in a paraphrase, whitespace, case, markdown emphasis, a trailing stop —
+//     because a quote of the example is a quote however slightly the
+//     reviewer reprinted it;
+//   - the PR's diff is in hand and does not touch its path: a location no
+//     hunk changes cannot be fixed here, so it is text about another change.
+//
+// The second test reads a region the parser saw closed, and only that
+// (Finding.quoted): a fence left open is not a confirmed quote — the
+// reviewer may have gone on to write the real report under it, every line
+// judged fenced because the closing delimiter never arrived — so the verdict
+// on its path is not drawn, and only the contract echo above can drop
+// anything inside it. The first test holds in either state: an echo of the
+// brief's example is a quote whether or not the reviewer forgot a delimiter.
+//
+// A fenced finding that is none of these is a real report and is kept, even
+// on a path outside the diff, because the reviewer's answer is the only
+// signal there is and a false pass costs it.
+func dropQuotedFinding(f Finding, known map[string]bool) bool {
+	if !f.fenced {
+		return false
+	}
+	if contractExampleFinding(f) {
+		return true // the phantom: the brief's example echoed back
+	}
+	if !f.quoted {
+		// An open fence: the region ran on without its delimiter, so the
+		// text inside it is not a quote the parser can trust, and dropping a
+		// report that happens to sit on a path outside the diff would be the
+		// false pass this rule exists to prevent.
+		return false
+	}
+	// A path the diff does not touch cannot be fixed by this pull request.
+	// The verdict is only drawn when the diff is known: with no diff in hand
+	// the parser cannot tell a quote about another file from a real report
+	// about one, and the failure to read the diff must never lose findings.
+	if known != nil && f.Path != "" && !pathInDiff(f.Path, known) {
+		return true
+	}
+	return false
+}
+
+// contractExampleFinding reports whether a fenced finding restates the
+// output contract's own example bullet (issue #224). The match is exact on
+// the severity and the path — an echo reprints the `[high]
+// app/zip/queue.go` the brief spelled out, and a genuine finding about
+// app/zip/queue.go is not a thing this repository has — and tolerant on the
+// two fields a reviewer reprints with incidental changes: the location on
+// the line, and the text's case, whitespace and trailing punctuation or
+// markdown emphasis.
+func contractExampleFinding(f Finding) bool {
+	if !strings.EqualFold(f.Severity, contractExampleSeverity) {
+		return false
+	}
+	path, text := strings.TrimSpace(f.Path), f.Text
+	if path == "" {
+		// A bullet without a line number (`[high] app/zip/queue.go - text`)
+		// parses as an unlocated finding: the location never completed, so
+		// the whole `app/zip/queue.go - text` sits in Text. Take the
+		// example's path off the front when it is there, so an echo that
+		// dropped the line number is recognised as the same quote.
+		if !strings.HasPrefix(text, contractExamplePath) {
+			return false
+		}
+		text = strings.TrimLeft(strings.TrimPrefix(text, contractExamplePath), ":- \t")
+		return f.Line == 0 && equalQuotedText(text, contractExampleText)
+	}
+	if path != contractExamplePath {
+		return false
+	}
+	// The line number is where a paraphrase drifts: an echo that renumbers
+	// the example's line (43 for 42) is the same quote. Only a location
+	// that is unset or within a step of the example's is read as the echo;
+	// a plausible other line is left to the diff filter below.
+	if f.Line != 0 && abs(f.Line-contractExampleLine) > contractExampleLineSlack {
+		return false
+	}
+	return equalQuotedText(text, contractExampleText)
+}
+
+// contractExampleLineSlack bounds how far an echo may nudge the example's
+// line number and still be read as the same quote (issue #224 finding 1).
+const contractExampleLineSlack = 1
+
+// equalQuotedText reports whether text restates quoted is the same as quote
+// after the normalisation an echo tolerates: surrounding whitespace,
+// internal runs of whitespace, ASCII case, markdown emphasis markers, and
+// trailing sentence punctuation. A reviewer reprinting a bullet is not
+// expected to reproduce its bytes.
+func equalQuotedText(text, quoted string) bool {
+	return normalizeQuotedText(text) == normalizeQuotedText(quoted)
+}
+
+// normalizeQuotedText folds the incidental differences an echo tolerates
+// (issue #224): ASCII case, runs of whitespace, the markdown emphasis and
+// code markers a reprint may wrap a word in, and trailing sentence
+// punctuation. It is deliberately conservative — it never removes
+// characters that could carry meaning.
+func normalizeQuotedText(s string) string {
+	s = strings.ToLower(s)
+	s = strings.NewReplacer("`", "", "*", "", "_", "").Replace(s)
+	s = strings.Join(strings.Fields(s), " ")
+	return strings.TrimRight(s, ".!,;:\"'")
+}
+
+// abs is the absolute value for the small line-number slack next to the
+// contract's example line (issue #224).
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+// pathInDiff reports whether the diff touches the finding's path. The test
+// is a substring one on purpose, in both directions: diffstat answers with
+// the files a patch changes, and a hunk line inside a diff quotes the same
+// path as a `path:line` location, so a substring covers both the file a
+// finding names and a finding read out of an echoed hunk. A renamed file
+// answers to both of its paths because diffPaths kept both.
+//
+// It errs toward keeping a finding, which is the safe direction: a false
+// pass costs a reviewer's answer, a signal the maintainer asked never to
+// lose. A finding is only ever judged against a diff that is in hand, and
+// an exact path match is checked first so an unusual path that happens to
+// be a substring of a diff path still matches itself.
+func pathInDiff(path string, known map[string]bool) bool {
+	if known[path] {
+		return true
+	}
+	for p := range known {
+		if strings.Contains(p, path) || strings.Contains(path, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// diffPaths is the set of paths a pull request's diff touches, for
+// parseFindingsIn. A renamed file answers to both of its paths, and an
+// unparseable diff yields nil rather than an empty set: with no paths known
+// the parser keeps every finding, which is the behaviour of the review that
+// has no diff in hand.
+func diffPaths(diff string) map[string]bool {
+	if strings.TrimSpace(diff) == "" {
+		return nil
+	}
+	diffs, _ := diffstat([]byte(diff))
+	if len(diffs) == 0 {
+		return nil
+	}
+	known := make(map[string]bool, len(diffs))
+	for _, d := range diffs {
+		path := d.Path
+		if i := strings.Index(path, " \u2192 "); i >= 0 {
+			known[path[:i]] = true
+			path = path[i+len(" \u2192 "):]
+		}
+		known[path] = true
+	}
+	return known
 }
 
 // inlineSeverityToken is a bracketed single word anywhere in a line, the
@@ -399,13 +779,20 @@ func reviewerModel(cfg Config, workerID string) (Model, error) {
 //     at the cap, report-only and a person takes over;
 //   - a finished review with an unrecognized severity: report-only, and the
 //     pass label is withheld because the scale was not understood;
+//   - a finished review whose pull request is still a draft (issue #237):
+//     report-only, and the pass label is withheld because a draft is the
+//     pull request whose worker run stopped early — ready for review is
+//     what a `done` stop marks — so the work under review is not known
+//     finished, and no clean review over the diff alone may say otherwise.
+//     A person or a continuation can finish the work and mark the pull
+//     request ready, and the review can then run again;
 //   - otherwise: label — a clean pass.
 //
 // The comment body is built only from fixed sentences, counters and findings
 // whose remote-derived strings are escaped and capped; it never carries the
 // run-report marker, so it is never mistaken for a run report, and no raw
-// answer text reaches it unescaped. A failing comments fetch is an error,
-// like continuePlan.
+// answer text reaches it unescaped. A failing comments or pull request
+// fetch is an error, like continuePlan.
 func reviewPlan(gh github, pr int, result Result, haveResult bool, findings []Finding, sawSection bool) (action string, body string, used int, err error) {
 	stop := sanitizeStop(result.Stop)
 	blocking := blockingFindings(findings)
@@ -439,6 +826,26 @@ func reviewPlan(gh github, pr int, result Result, haveResult bool, findings []Fi
 			return "report-only", reviewReportBody(
 				"The review found nothing blocking, but the pass label is withheld because at least one severity "+
 					"was not recognized (high, medium or low are); a maintainer reads the findings below and decides.",
+				findings, result.Model, stop), 0, nil
+		}
+		// A draft pull request never takes the pass label (issue #237): a
+		// pull request is marked ready only when the run that produced the
+		// patch stopped `done`, so a draft is the one whose worker run
+		// stopped early — the work under review is not known finished, and
+		// no clean review over the diff says otherwise. The review itself is
+		// reported (advisory findings included), exactly as the
+		// unrecognized-severity case above is; only the label waits, until a
+		// person or a continuation finishes the work and the pull request
+		// is ready for review.
+		var pull item
+		if err := gh.get(fmt.Sprintf("/pulls/%d", pr), &pull); err != nil {
+			return "", "", 0, err
+		}
+		if pull.Draft {
+			return "report-only", reviewReportBody(
+				"Nothing blocking was found, but the pass label is withheld because the pull request is still a draft: "+
+					"the run that produced the patch stopped early, so the work under review is not known to be finished. "+
+					"A person who continues or finishes the work can mark the pull request ready, and the review can then run again.",
 				findings, result.Model, stop), 0, nil
 		}
 		verdict := fmt.Sprintf("Nothing blocking was found: the %s label was added, so a person or a merge rule can merge with confidence.",
@@ -626,6 +1033,19 @@ func reviewFooter(model, stop string) string {
 
 // ---------------------------------------------------------------- commands
 
+// The output contract's own example bullet, spelled out as the fields a
+// parse of it yields (issue #224). It is the one bullet in the brief that
+// names a file which does not exist, so a reviewer that echoes the contract
+// back in a fence mints exactly this finding — the phantom a blocking
+// verdict used to be built on. The constants below must stay in step with
+// the first bullet of reviewOutputContract, and a test pins them to it.
+const (
+	contractExampleSeverity = "high"
+	contractExamplePath     = "app/zip/queue.go"
+	contractExampleLine     = 42
+	contractExampleText     = "the mutex is released twice under the error path, so a second request deadlocks"
+)
+
 // reviewOutputContract restates, at the end of the review brief, the one
 // part of the answer the harness parses (issue #32).
 const reviewOutputContract = "# The output the harness parses\n\n" +
@@ -637,12 +1057,227 @@ const reviewOutputContract = "# The output the harness parses\n\n" +
 	"When the review is clean, end with the section holding the single word `none` and nothing else:\n\n" +
 	"## Findings\n\nnone\n"
 
-// capDiff caps the diff embedded in the review brief without splitting a
-// UTF-8 rune, noting the truncation; the note counts against the cap.
+// capDiffFloorBytes is the smallest body budget a file's section keeps when
+// the cap forces allocation: every file in the diff contributes some
+// content, even a many-file patch larger than the whole cap (issue #231).
+const capDiffFloorBytes = 1024
+
+// capDiffMaxNoteFiles bounds how many clipped file names the truncation
+// note lists; past that the note says how many more there are, so a diff
+// with thousands of files cannot grow the note without bound.
+const capDiffMaxNoteFiles = 30
+
+// diffSection is one file's slice of a unified diff: its `diff --git`
+// header line (newline included) and the body up to the next header.
+type diffSection struct {
+	header string // the `diff --git a/x b/x` line, newline included
+	body   string // everything up to the next `diff --git` line
+	name   string // the file's path, from the header's b/ side
+}
+
+// splitDiffSections splits a unified diff at every `diff --git ` line. A
+// diff with no such line yields no sections; text before the first header
+// is kept as its own section with no name, so a leading run of context is
+// never dropped silently either.
+func splitDiffSections(diff string) []diffSection {
+	start := 0
+	if !strings.HasPrefix(diff, "diff --git ") {
+		i := strings.Index(diff, "\ndiff --git ")
+		if i < 0 {
+			return nil
+		}
+		start = i + 1
+	}
+	var secs []diffSection
+	for start < len(diff) {
+		end := strings.Index(diff[start:], "\ndiff --git ")
+		if end < 0 {
+			end = len(diff)
+		} else {
+			end += start
+		}
+		sec := diff[start:end]
+		hl := strings.IndexByte(sec, '\n')
+		var s diffSection
+		if hl < 0 {
+			s.header = sec
+		} else {
+			s.header, s.body = sec[:hl+1], sec[hl+1:]
+		}
+		if strings.HasPrefix(s.header, "diff --git ") {
+			// The header line reads `diff --git a/old b/new`; the b/ side
+			// names the file. Quoted paths (spaces in the name) keep the
+			// whole remainder, which still names the file.
+			s.name = strings.TrimSuffix(s.header[len("diff --git "):], "\n")
+			if i := strings.LastIndexByte(s.name, ' '); i >= 0 {
+				bpath := s.name[i+1:]
+				if strings.HasPrefix(bpath, "b/") {
+					s.name = bpath[len("b/"):]
+				}
+			}
+		}
+		secs = append(secs, s)
+		start = end + 1
+	}
+	return secs
+}
+
+// allocDiffShares fills share[i] with the body bytes section i may keep
+// within budget: every file keeps a floor of content (scaled down when
+// even the floors do not fit), a file whose whole body fits is kept whole,
+// and the leftovers are redistributed to the files still short, largest
+// first.
+func allocDiffShares(secs []diffSection, budget int, share []int) {
+	for i := range share {
+		share[i] = 0
+	}
+	n := len(secs)
+	if n == 0 {
+		return
+	}
+	floor := capDiffFloorBytes
+	if floor*n > budget {
+		floor = budget / n
+	}
+	remaining := budget
+	for i, s := range secs {
+		k := min(len(s.body), floor)
+		if k > remaining {
+			k = max(remaining, 0)
+		}
+		share[i] = k
+		remaining -= k
+	}
+	// Redistribution: the files still short split what is left equally,
+	// largest first, until the budget runs out.
+	short := make([]int, 0, n)
+	for i, s := range secs {
+		if share[i] < len(s.body) {
+			short = append(short, i)
+		}
+	}
+	sort.SliceStable(short, func(a, b int) bool { return len(secs[short[a]].body) > len(secs[short[b]].body) })
+	for len(short) > 0 && remaining > 0 {
+		per := remaining / len(short)
+		if per == 0 {
+			// Crumbs only: one byte to each of the largest files, in
+			// order, until the budget is gone.
+			for _, i := range short {
+				if remaining == 0 {
+					break
+				}
+				share[i]++
+				remaining--
+			}
+			break
+		}
+		next := make([]int, 0, len(short))
+		for _, i := range short {
+			add := min(len(secs[i].body)-share[i], per)
+			share[i] += add
+			remaining -= add
+			if share[i] < len(secs[i].body) {
+				next = append(next, i)
+			}
+		}
+		short = next
+	}
+}
+
+// diffTruncationNote is what the capped diff ends with: the byte count the
+// note always carried, plus the clipped files and the instruction to read
+// them on the checked-out PR head branch (the maintainer's reduction of
+// issue #231 — the review run has the checkout, so named files can be read
+// even though the brief cannot carry them).
+func diffTruncationNote(max int, clipped []string) string {
+	note := fmt.Sprintf("(diff truncated at %d bytes)\n", max)
+	if len(clipped) == 0 {
+		return note
+	}
+	named := clipped
+	extra := 0
+	if len(named) > capDiffMaxNoteFiles {
+		extra = len(named) - capDiffMaxNoteFiles
+		named = named[:capDiffMaxNoteFiles]
+	}
+	note = fmt.Sprintf("(diff truncated at %d bytes; not all of every file is shown — read the full content of %s on the checked-out PR head branch",
+		max, strings.Join(named, ", "))
+	if extra > 0 {
+		note += fmt.Sprintf(" and %d more", extra)
+	}
+	return note + ")\n"
+}
+
+// capDiff caps the diff embedded in the review brief. The cap is file-aware
+// (issue #231): the diff is split into per-file sections, every `diff --git`
+// header line is always kept, and the byte budget (the note included) is
+// allocated across the files so each one contributes some content, the
+// leftovers going to the largest files first. Sections whose body is cut
+// short are named in the note. A diff too large even for its headers, or
+// with no file headers at all, falls back to a plain prefix cap. The result
+// never splits a UTF-8 rune and never exceeds max bytes.
 func capDiff(diff string, max int) string {
 	if len(diff) <= max {
 		return diff
 	}
+	secs := splitDiffSections(diff)
+	headerBytes := 0
+	for _, s := range secs {
+		headerBytes += len(s.header)
+	}
+	if len(secs) == 0 || headerBytes >= max {
+		// No per-file sections to preserve — cap the text itself.
+		return capDiffPrefix(diff, max)
+	}
+	share := make([]int, len(secs))
+	contentBudget := max - headerBytes
+	for round := 0; round < 16; round++ {
+		allocDiffShares(secs, contentBudget, share)
+		var b strings.Builder
+		var clipped []string
+		for i, s := range secs {
+			cut := share[i]
+			if cut > len(s.body) {
+				cut = len(s.body) // a file short of its share is kept whole
+			}
+			// Back off to a rune boundary, never splitting one; a cut at
+			// the end of the body has nothing to back off from.
+			for cut > 0 && cut < len(s.body) && !utf8.RuneStart(s.body[cut]) {
+				cut-- // never split a rune
+			}
+			b.WriteString(s.header)
+			if cut < len(s.body) {
+				b.WriteString(s.body[:cut])
+				if s.name != "" {
+					clipped = append(clipped, s.name)
+				}
+			} else {
+				b.WriteString(s.body)
+			}
+		}
+		out := b.String()
+		note := diffTruncationNote(max, clipped)
+		if len(out) > 0 && out[len(out)-1] != '\n' {
+			out += "\n" // a clipped body may end mid-line
+		}
+		out += note
+		if len(out) <= max {
+			return out
+		}
+		// The note names more clipped files than this round's budget left
+		// room for: shrink the content budget and re-allocate.
+		contentBudget -= len(out) - max
+		if contentBudget < 0 {
+			break
+		}
+	}
+	// Degenerate shapes (headers plus note past the cap): a bounded prefix
+	// keeps the total within max, as before issue #231.
+	return capDiffPrefix(diff, max)
+}
+
+// capDiffPrefix is the pre-#231 plain cap: a byte prefix with a note.
+func capDiffPrefix(diff string, max int) string {
 	note := fmt.Sprintf("\n(diff truncated at %d bytes)\n", max)
 	cut := max - len(note)
 	if cut < 0 {
@@ -783,7 +1418,18 @@ func runReviewReport() error {
 	// run finished in the store, promoting an incomplete stop to done. Both
 	// are read as untrusted data.
 	c := readClosing(trajectoryPath())
-	findings, sawSection := parseFindings(effectiveAnswer(result, c))
+	// The PR's changed paths discriminate a quoted finding from a reported
+	// one (issue #224): a location the diff does not touch is text the
+	// reviewer quoted, not a place to fix. The diff fetch is best-effort —
+	// this command already reports a review without one, so a failed or
+	// unreadable fetch parses every finding, as it did before the issue.
+	known := map[string]bool(nil)
+	if diff, err := newGitHub().diff(pr); err == nil {
+		known = diffPaths(diff)
+	} else {
+		fmt.Fprintf(os.Stderr, "review-report: reading the diff of %d: %v; findings are parsed without it\n", pr, err)
+	}
+	findings, sawSection := parseFindingsIn(effectiveAnswer(result, c), known)
 	if len(findings) == 0 {
 		// The answer carried no findings (issue #49) — it may be empty, or
 		// the review may have written them inline where the envelope never
@@ -791,7 +1437,7 @@ func runReviewReport() error {
 		// record, which the run job shipped beside this result and which is
 		// read as untrusted data.
 		if answer := c.Answer; answer != "" {
-			if tf, tsec := parseFindings(answer); len(tf) > 0 {
+			if tf, tsec := parseFindingsIn(answer, known); len(tf) > 0 {
 				findings, sawSection = tf, sawSection || tsec
 			}
 		}

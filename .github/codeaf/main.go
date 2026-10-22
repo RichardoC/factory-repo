@@ -2272,7 +2272,12 @@ type item struct {
 	Comments    int             `json:"comments"`
 	CreatedAt   string          `json:"created_at"`
 	PullRequest json.RawMessage `json:"pull_request"` // present on issues that are PRs
-	Head        struct {
+	// Draft is the pull request's draft flag, present only on the JSON the
+	// pulls API returns (/pulls/N); the issues-list JSON leaves it unset. The
+	// review reads it to withhold the pass label while a run that stopped
+	// early keeps its pull request a draft (issue #237).
+	Draft bool `json:"draft"`
+	Head  struct {
 		Ref string `json:"ref"`
 		// SHA is the head commit SHA, present on the JSON the pulls API
 		// returns (/pulls/N); the issues-list JSON does not carry it. The
@@ -2515,6 +2520,36 @@ func (g github) post(path string, body, into any) error {
 	if response.StatusCode < 200 || response.StatusCode > 299 {
 		reply, _ := io.ReadAll(response.Body)
 		return fmt.Errorf("POST %s: %s: %.300s", path, response.Status, reply)
+	}
+	if into != nil {
+		return json.NewDecoder(response.Body).Decode(into)
+	}
+	return nil
+}
+
+// patch sends a JSON body as a PATCH request and decodes the reply, when
+// into is not nil. The queue uses it to edit a hold comment whose reason
+// changed in place (issue #235); everything else the harness reads.
+func (g github) patch(path string, body, into any) error {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequest(http.MethodPatch, g.api+"/repos/"+g.repo+path, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Authorization", "Bearer "+g.token)
+	request.Header.Set("Accept", "application/vnd.github+json")
+	request.Header.Set("Content-Type", "application/json")
+	response, err := g.client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		reply, _ := io.ReadAll(response.Body)
+		return fmt.Errorf("PATCH %s: %s: %.300s", path, response.Status, reply)
 	}
 	if into != nil {
 		return json.NewDecoder(response.Body).Decode(into)
@@ -2911,6 +2946,18 @@ func lastN[T any](items []T, n int) []T {
 	return items
 }
 
+// thread renders the recent comments on the issue or PR for the brief.
+// Anyone who can comment contributes here, so logins and bodies are
+// untrusted text and render escaped (issue #234): a comment cannot forge
+// brief structure, HTML or the run-report marker.
+//
+// maxThreadLogin and maxThreadBody cap the comment logins, associations
+// and bodies, in runes, in #233 style.
+const (
+	maxThreadLogin = 80
+	maxThreadBody  = 4000
+)
+
 func (g github) thread(number int) (string, error) {
 	var comments []issueComment
 	if err := g.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", number), &comments); err != nil {
@@ -2931,7 +2978,14 @@ func (g github) thread(number int) (string, error) {
 		if c.User.Type == "Bot" && strings.Contains(body, reportMarker) {
 			body = "(CodeAF run report omitted)"
 		}
-		fmt.Fprintf(&b, "**@%s** (%s):\n%s\n\n", c.User.Login, c.AuthorAssociation, body)
+		// Issue #234: logins and bodies are untrusted text and render
+		// escaped, like reviewFindingsSection and the #233 fix in
+		// planbrief.go. oneLine is false so multi-line bodies stay
+		// readable, and the marker check above stays on the raw body.
+		fmt.Fprintf(&b, "**@%s** (%s):\n%s\n\n",
+			escapeMD(c.User.Login, maxThreadLogin, true),
+			escapeMD(c.AuthorAssociation, maxThreadLogin, true),
+			escapeMD(body, maxThreadBody, false))
 	}
 	if b.Len() == 0 {
 		return "(no comments)", nil
@@ -3554,7 +3608,14 @@ func runBrief() error {
 				if line != nil {
 					where = strconv.Itoa(*line)
 				}
-				fmt.Fprintf(&b, "- `%s` line %s, @%s: %s\n", c.Path, where, c.User.Login, c.Body)
+				// Issue #234: paths, logins and bodies are untrusted text
+				// and render escaped, like reviewFindingsSection; the
+				// body keeps its newlines so it stays readable.
+				fmt.Fprintf(&b, "- `%s` line %s, @%s: %s\n",
+					escapeMD(c.Path, 200, true),
+					where,
+					escapeMD(c.User.Login, maxThreadLogin, true),
+					escapeMD(c.Body, maxThreadBody, false))
 			}
 			parts = append(parts, b.String())
 		}
