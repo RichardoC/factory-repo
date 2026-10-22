@@ -89,7 +89,12 @@ const maxContinuations = 2
 // continuationsUsed counts how many continuations a pull request has already
 // had, given how many run-report comments it carries: the first report is
 // the run that opened the pull request, not a continuation, so one report
-// means zero continuations used.
+// means zero continuations used. Only the review path counts this way
+// (review.go): a review run posts no run report of its own, so its fix
+// continuations are labelled from the reports left by earlier PR-mode runs.
+// The PR-mode continuation count (continuePlan) does not subtract one: it
+// runs before the stopping run has posted its own report, so the plain
+// report count already equals the continuations used (issue #219).
 func continuationsUsed(reportComments int) int {
 	if reportComments < 1 {
 		return 0
@@ -101,15 +106,54 @@ func continuationsUsed(reportComments int) int {
 // is used up.
 func continuationCapReached(used int) bool { return used >= maxContinuations }
 
+// failedReportHeadings open the reports of a run whose patch never landed
+// (issue #219): main.go writes the outcome as "### CodeAF run — <outcome>",
+// and codeaf.yml's report step sets that outcome to "publishing failed" when
+// the publish job failed and to "run job failed" when the run job itself did.
+// queue.go's strandedByFailedRun treats both as the same stranded state
+// (issue #215), so both must be excluded here too: a run that stopped with
+// either heading did not land its work, and spending a continuation slot on
+// it would let a later continuation push the pull request one run past the
+// cap. Each entry is an exact prefix, never a search inside the body, because
+// a comment is untrusted data; the strings are fixed literals this package
+// writes itself, so a comment is excluded only by reproducing one exactly,
+// and only a comment by the workflow bot reaches this check at all.
+var failedReportHeadings = []string{
+	reportMarker + "\n### CodeAF run — publishing failed\n",
+	reportMarker + "\n### CodeAF run — run job failed\n",
+}
+
+// isFailedReportHeading reports whether a comment body begins with one of the
+// failed-run report headings above.
+func isFailedReportHeading(body string) bool {
+	for _, heading := range failedReportHeadings {
+		if strings.HasPrefix(body, heading) {
+			return true
+		}
+	}
+	return false
+}
+
 // countReports counts the comments on a pull request that carry a CodeAF
-// run report. Ordinary comments, including the continue and cap comments
-// this file posts, carry no report marker and are not counted.
+// run report (issue #219, sharpening the count issue #31 started with).
+// Ordinary comments, including the continue and cap comments this file
+// posts, carry no report marker and are not counted. Two comments that
+// carry the marker are still not reports: one by anyone but the workflow
+// bot (a forged marker on a public repository can neither inflate nor
+// suppress the count), and one whose outcome heading says the run did not
+// land — publish failed, or the run job failed — because its patch never
+// landed, so it must not spend a continuation slot that a later run's
+// report can only undercount.
 func countReports(comments []issueComment) int {
 	n := 0
 	for _, c := range comments {
-		if strings.Contains(c.Body, reportMarker) {
-			n++
+		if c.User.Login != planReportBotLogin || !strings.Contains(c.Body, reportMarker) {
+			continue
 		}
+		if isFailedReportHeading(c.Body) {
+			continue
+		}
+		n++
 	}
 	return n
 }
@@ -180,7 +224,11 @@ func continuePlan(gh github, pr int, stop string) (action string, body string, u
 	if err := gh.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", pr), &comments); err != nil {
 		return "", "", 0, err
 	}
-	used = continuationsUsed(countReports(comments))
+	// The count is the continuations already run (issue #219): continue-plan
+	// runs before this run's own report is posted, so every report comment
+	// counted here is a run that came before, and the next continuation is
+	// labelled used+1.
+	used = countReports(comments)
 	if continuationCapReached(used) {
 		return "cap", capBody(stop), used, nil
 	}
@@ -261,7 +309,9 @@ func continueConflicted(gh github, pr int) (action string, body string, used int
 	if err := gh.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", pr), &comments); err != nil {
 		return "", "", 0, err
 	}
-	used = continuationsUsed(countReports(comments))
+	// Same semantics as continuePlan (issue #219): the plain report count,
+	// not one less — this run's own report is not posted yet either.
+	used = countReports(comments)
 	state, err := gh.mergeableState(pr)
 	if err != nil {
 		return "", "", 0, err
