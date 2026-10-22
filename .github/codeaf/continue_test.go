@@ -197,9 +197,24 @@ func commentsServer(t *testing.T, comments []issueComment, status int) *httptest
 	return server
 }
 
+// pageDelay is how long the paged comment stub holds a page after the
+// first (see commentsPagesServer): long enough that a client which reads
+// the final page more than once is noticed by the request count, short
+// enough not to slow the suite.
+const pageDelay = 500 * time.Millisecond
+
 // commentsPagesServer serves issue #7's comments the way the real API
 // does: perPage per page, and a `Link: rel="next"` header while more
 // remain. The pointer it returns counts the pages served.
+//
+// Pages after the first are served slowly (pageDelay). A client that
+// follows the listing page by page reads the tail once and finishes well
+// inside the delay; a client that loops over the listing (reading it per
+// page, say to count reports) or follows the same next link twice re-reads
+// the tail and goes past the delay, so the request count it leaves behind
+// stops matching the page count. That keeps the page count in these tests
+// an assertion about the read, not about a single pass that happens to
+// append.
 func commentsPagesServer(t *testing.T, perPage int, comments []issueComment) (*httptest.Server, *atomic.Int32) {
 	t.Helper()
 	var requests atomic.Int32
@@ -214,6 +229,9 @@ func commentsPagesServer(t *testing.T, perPage int, comments []issueComment) (*h
 			if v, err := strconv.Atoi(s); err == nil {
 				page = v
 			}
+		}
+		if page > 1 {
+			time.Sleep(pageDelay) // the tail page is slow, as a second page in the real API can be
 		}
 		start := (page - 1) * perPage
 		if start >= len(comments) {
@@ -252,26 +270,76 @@ func serverURL(r *http.Request) string {
 	return scheme + "://" + r.Host
 }
 
-// TestCountReportsAcrossPages is the issue #223 stub: more than 100 report
-// comments, served across two pages, must reach countReports whole — the
-// one-page read counted only the first 100, the cap stayed unfired and fix
-// runs repeated.
+// straddleComments builds the pull request the continuation cap straddles
+// (issue #223): one ordinary comment, then the filler comments that fill
+// out the API's first page, then the run reports. With perPage=100 the
+// first page ends at index 99 — inside the filler — so the reports past the
+// cap live past index 100, where only a read that follows the next link
+// finds them: the one-page read this test guards against stops before the
+// first report and counts none.
+func straddleComments(filler, reports int) []issueComment {
+	comments := []issueComment{{ID: 999, Body: "untrusted prose that must never reach a comment we post <!-- -->"}}
+	for i := 0; i < filler; i++ {
+		comments = append(comments, issueComment{
+			ID:   int64(1000 + i),
+			Body: fmt.Sprintf("an ordinary reviewer comment, number %d", i),
+		})
+	}
+	for i := 0; i < reports; i++ {
+		comments = append(comments, issueComment{
+			ID:   int64(i + 1),
+			Body: fmt.Sprintf("%s\n### CodeAF run — done\n\n| stop / ok | done / `true` |\n", reportMarker),
+		})
+	}
+	return comments
+}
+
+// TestCountReportsAcrossPages is the issue #223 stub: the reports that
+// straddle the continuation cap are past the API's first page, and a read
+// that follows the next link must reach them whole, so the cap fires.
+//
+// The shape is what makes this test discriminate. `reportComments` puts
+// the reports first, so 100 of them fit inside the first page and the old
+// one-page read already counted 99 — cap fired, assertion green, harm
+// untested. Here the first page (indices 0..99) holds one ordinary comment
+// and 99 filler ones, and the page boundary at index 100 falls inside the
+// run: the reports sit at indices 100..102. A page-1-only read sees no
+// report at all (two or fewer, even if it swallowed the first tail report,
+// is still below the cap), so only a read that follows the listing to its
+// end reaches used = 2 and the cap.
 func TestCountReportsAcrossPages(t *testing.T) {
-	server, requests := commentsPagesServer(t, 100, reportComments(150))
+	perPage := 100
+	// 99 filler comments + 1 leading ordinary comment = one full first
+	// page whose last comment is filler; the 20 reports that follow start
+	// exactly at index 100.
+	comments := straddleComments(perPage-1, 20)
+	if len(comments) <= perPage {
+		t.Fatalf("the stub serves %d comments, a first page of %d or less: no next link, nothing paged", len(comments), perPage)
+	}
+	if got := countReports(comments[:perPage]); got >= int(maxContinuations) {
+		t.Fatalf("the first page alone carries %d reports (cap fires at %d); the shape must straddle the boundary, not straddle the cap", got, maxContinuations)
+	}
+	server, requests := commentsPagesServer(t, perPage, comments)
 	ghEnv(t, server)
 	gh := newGitHub()
+	started := time.Now()
 	action, body, used, err := continuePlan(gh, 7, stopDeadline)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if action != "cap" || !continuationCapReached(used) {
-		t.Fatalf("with 150 reports on two pages, action = %q, used = %d; want the cap fired (used >= %d)", action, used, maxContinuations)
+	if action != "cap" || used != continuationsUsed(countReports(comments)) {
+		t.Fatalf("with 20 reports past the first page, action = %q, used = %d; want the cap fired (used >= %d)", action, used, maxContinuations)
 	}
 	if want := capBody(stopDeadline); body != want {
 		t.Errorf("body = %q, want the cap comment %q", body, want)
 	}
+	// Both pages: the reports are past index 100, so a read that stops at
+	// the first page counts fewer than the cap needs.
 	if n := requests.Load(); n != 2 {
-		t.Errorf("pages read = %d, want 2: the second page holds the reports past 100", n)
+		t.Errorf("pages read = %d, want 2: the second page holds every report past the cap", n)
+	}
+	if elapsed := time.Since(started); elapsed < pageDelay {
+		t.Errorf("continuePlan answered in %s, faster than the tail page's own %s and request count unmatched", elapsed, pageDelay)
 	}
 }
 
