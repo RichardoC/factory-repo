@@ -859,7 +859,7 @@ func reviewPlan(gh github, pr int, result Result, haveResult bool, findings []Fi
 	// #32) or stopped early (issue #49): an incomplete review with findings
 	// is a review with findings, not one with none.
 	var comments []issueComment
-	if err := gh.get(fmt.Sprintf("/issues/%d/comments?per_page=100", pr), &comments); err != nil {
+	if err := gh.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", pr), &comments); err != nil {
 		return "", "", 0, err
 	}
 	used = continuationsUsed(countReports(comments))

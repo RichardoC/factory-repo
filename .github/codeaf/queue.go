@@ -1048,15 +1048,17 @@ func runNext() error {
 	return nil
 }
 
-// maxPRFiles caps how many changed paths are read per pull request: one
-// page of 100, matching the API's own page size.
+// maxPRFiles is the page size the changed-files listing is read with: the
+// API's own maximum. The listing runs through getList, so the pages after
+// the first are followed too (issue #223).
 const maxPRFiles = 100
 
 // fetchPRFiles fetches the changed-file paths of every open pull request an
 // in-flight run is working on (issue #132): a PR item carries no area of its
 // own, so the queue reads what the PR touched. A number whose item is not an
-// open PR in the issues list is skipped, and a fetch failure leaves the
-// entry absent — which makes that run's area set empty and conflict with
+// open PR in the issues list is skipped, and a failure — a fetch error,
+// or a listing that may be truncated (issue #223) — leaves the entry
+// absent, which makes that run's area set empty and conflict with
 // everything, fail closed. Review titles (`CodeAF review #N`, issue #137) do
 // not parse through runTitleFields and are skipped here: a review holds no
 // area, so it needs no files.
@@ -1085,13 +1087,16 @@ func fetchPRFiles(g github, issues []item, runs []runStatus, logf func(string, .
 			continue
 		}
 		seen[n] = true
+		// The listing is read paged, to the maxListPages cap; an error — a
+		// failed page, or a listing still offering a next page at the cap,
+		// so possibly truncated — leaves the entry absent and the run's
+		// area set empty, conflicting with everything: the guard fails
+		// closed (issue #223), where it used to slice a full page to 100
+		// paths and silently drop the tail.
 		var files []prFile
-		if err := g.get(fmt.Sprintf("/pulls/%d/files?per_page=%d", n, maxPRFiles), &files); err != nil {
+		if err := g.getList(fmt.Sprintf("/pulls/%d/files?per_page=%d", n, maxPRFiles), &files); err != nil {
 			logf("pr files for #%d: %v", n, err)
 			continue
-		}
-		if len(files) > maxPRFiles {
-			files = files[:maxPRFiles]
 		}
 		paths := make([]string, 0, len(files))
 		for _, f := range files {
@@ -1316,7 +1321,7 @@ func repickMarkerBody(n int, sha string) string {
 // repeat ticks from posting the comment twice for the same commit.
 func ensureRepickMarker(g github, n int, sha string) error {
 	var comments bodyComments
-	if err := g.get(fmt.Sprintf("/issues/%d/comments?per_page=100", n), &comments); err != nil {
+	if err := g.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", n), &comments); err != nil {
 		return err
 	}
 	if slices.Contains(repickMarkers(comments), sha) {
@@ -1356,7 +1361,7 @@ func fetchStrandedPRs(g github, issues []item, runs []runStatus, lbl string, log
 			continue
 		}
 		var comments bodyComments
-		if err := g.get(fmt.Sprintf("/issues/%d/comments?per_page=100", i.Number), &comments); err != nil {
+		if err := g.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", i.Number), &comments); err != nil {
 			logf("stranded PR #%d comments: %v", i.Number, err)
 			continue
 		}
@@ -1399,7 +1404,7 @@ func ensureHoldCommentBody(g github, n int, body string) error {
 			Type string `json:"type"`
 		} `json:"user"`
 	}
-	if err := g.get(fmt.Sprintf("/issues/%d/comments?per_page=100", n), &comments); err != nil {
+	if err := g.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", n), &comments); err != nil {
 		return err
 	}
 	want := holdReasonOf(body)
@@ -1568,7 +1573,7 @@ func fetchStrandedIssues(g github, issues []item, runs []runStatus, lbl, queuedL
 			continue
 		}
 		var comments bodyComments
-		if err := g.get(fmt.Sprintf("/issues/%d/comments?per_page=100", i.Number), &comments); err != nil {
+		if err := g.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", i.Number), &comments); err != nil {
 			logf("stranded issue #%d comments: %v", i.Number, err)
 			continue
 		}
@@ -1587,7 +1592,7 @@ func fetchStrandedIssues(g github, issues []item, runs []runStatus, lbl, queuedL
 // keeps the retry to once, whatever later ticks observe.
 func ensureIssueRetryMarker(g github, n int) error {
 	var comments bodyComments
-	if err := g.get(fmt.Sprintf("/issues/%d/comments?per_page=100", n), &comments); err != nil {
+	if err := g.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", n), &comments); err != nil {
 		return err
 	}
 	for _, c := range comments {
@@ -1666,7 +1671,7 @@ func ensureMaintainerComment(g github, n int) error {
 	var comments []struct {
 		Body string `json:"body"`
 	}
-	if err := g.get(fmt.Sprintf("/issues/%d/comments?per_page=100", n), &comments); err != nil {
+	if err := g.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", n), &comments); err != nil {
 		return err
 	}
 	for _, c := range comments {

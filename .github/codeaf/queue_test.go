@@ -11,7 +11,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -2240,5 +2242,107 @@ func TestFailedRunReportCountsRefusedNoChanges(t *testing.T) {
 	bot[0].User.Type = "Bot"
 	if got := strandedIssueState(bot); got != strandRetry {
 		t.Errorf("refused issue state = %q, want %q", got, strandRetry)
+	}
+}
+
+// prFilesIssues is the queue input the fetchPRFiles tests run on: one open
+// pull request, #7, with an in-flight run on it.
+func prFilesIssues() ([]item, []runStatus) {
+	issues := []item{{
+		Number:      7,
+		State:       "open",
+		PullRequest: json.RawMessage(`{}`),
+	}}
+	runs := []runStatus{{Status: "in_progress", DisplayTitle: "CodeAF #7"}}
+	return issues, runs
+}
+
+// prFilesServer serves pull request #7's changed files API. total is the
+// number of files the stub knows, perPage the page size it answers with;
+// past page one it offers a `Link: rel="next"` header until the last file
+// is served, or forever when total is endless.
+func prFilesServer(t *testing.T, perPage, total int, endless bool) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/RichardoC/factory-repo/pulls/7/files" {
+			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+		requests.Add(1)
+		page := 1
+		if s := r.URL.Query().Get("page"); s != "" {
+			if v, err := strconv.Atoi(s); err == nil {
+				page = v
+			}
+		}
+		start := (page - 1) * perPage
+		end := start + perPage
+		if !endless && end > total {
+			end = total
+		}
+		w.Header().Set("Content-Type", "application/json")
+		var b strings.Builder
+		b.WriteString("[")
+		for i := start; i < end; i++ {
+			if i > start {
+				b.WriteString(",")
+			}
+			fmt.Fprintf(&b, `{"filename":"app/e/changed-%d.go"}`, i)
+		}
+		b.WriteString("]")
+		if endless || end < total {
+			link := fmt.Sprintf("<%s%s?per_page=%d&page=%d>; rel=\"next\"", serverURL(r), r.URL.Path, perPage, page+1)
+			w.Header().Set("Link", link)
+		}
+		_, _ = io.WriteString(w, b.String())
+	}))
+	t.Cleanup(server.Close)
+	return server, &requests
+}
+
+// TestFetchPRFilesPaginates is the issue #223 stub: a pull request with
+// more than 100 changed files must have them all read, following the next
+// page — the old one-page read saw only the first 100, and the tail paths
+// looked untouched.
+func TestFetchPRFilesPaginates(t *testing.T) {
+	server, requests := prFilesServer(t, 100, 120, false)
+	g := github{api: server.URL, repo: "RichardoC/factory-repo", token: "t", client: server.Client()}
+	issues, runs := prFilesIssues()
+	files := fetchPRFiles(g, issues, runs, t.Logf)
+	if got := len(files[7]); got != 120 {
+		t.Fatalf("paths for #%d = %d, want 120: `e/changed-100.go` to `e/changed-119.go` must be seen", 7, got)
+	}
+	if files[7][100] != "app/e/changed-100.go" || files[7][119] != "app/e/changed-119.go" {
+		t.Errorf("paths past page one are %q..%q, want changed-100.go..changed-119.go", files[7][100], files[7][119])
+	}
+	if n := requests.Load(); n != 2 {
+		t.Errorf("pages read = %d, want 2", n)
+	}
+}
+
+// TestFetchPRFilesFailsClosed is the other issue #223 stub: a listing that
+// never stops offering a next page is possibly truncated, and the area
+// guard must fail closed — the entry stays absent, so the run's area set
+// is empty and conflicts with everything — instead of silently making do
+// with the first 100 paths.
+func TestFetchPRFilesFailsClosed(t *testing.T) {
+	// Endless pages: every reply serves a full page of 100 files and
+	// offers another page, so the listing is longer than any page cap.
+	server, requests := prFilesServer(t, 100, 0, true)
+	g := github{api: server.URL, repo: "RichardoC/factory-repo", token: "t", client: server.Client()}
+	issues, runs := prFilesIssues()
+	var logged strings.Builder
+	files := fetchPRFiles(g, issues, runs, func(format string, args ...any) {
+		fmt.Fprintf(&logged, format, args...)
+	})
+	if _, ok := files[7]; ok {
+		t.Fatalf("fetchPRFiles answered %d paths for an endless listing; want no entry, so the run conflicts with everything", len(files[7]))
+	}
+	if !strings.Contains(logged.String(), "may be truncated") {
+		t.Errorf("log = %q, want the truncation named", logged.String())
+	}
+	if n := requests.Load(); n != maxListPages {
+		t.Errorf("pages read = %d, want the %d-page cap", n, maxListPages)
 	}
 }
