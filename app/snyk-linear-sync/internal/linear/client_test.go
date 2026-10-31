@@ -1624,6 +1624,29 @@ func TestCreateLabelIDsIncludesCreateOnlyLabels(t *testing.T) {
 	}
 }
 
+// TestCreateLabelNamesKeepsCreateOnlyLabelsWhenManagementOff pins the sentence
+// README and PROJECT.md state next to the LINEAR_MANAGED_LABEL=off description:
+// turning label management off empties the managed set but not the create-only
+// set, because LINEAR_CREATE_ONLY_LABELS is configured separately. Those labels
+// therefore still resolve on create, and must still exist in Linear.
+func TestCreateLabelNamesKeepsCreateOnlyLabelsWhenManagementOff(t *testing.T) {
+	// The feature under test is createLabelNames, which takes no LabelConfig; a
+	// desired issue built with an empty managed set is exactly what a run with
+	// management off produces.
+	desired := model.DesiredIssue{
+		ManagedLabels:    nil,
+		CreateOnlyLabels: []string{"df:kikimora-snyk"},
+	}
+
+	got := createLabelNames(desired)
+	if !slices.Equal(got, []string{"df:kikimora-snyk"}) {
+		t.Fatalf("createLabelNames() = %#v, want only the create-only label", got)
+	}
+	if names := managedLabelsFromDesiredIssues([]model.DesiredIssue{desired}); !slices.Contains(names, "df:kikimora-snyk") {
+		t.Fatalf("managedLabelsFromDesiredIssues() = %#v, want the create-only label to still be resolved", names)
+	}
+}
+
 // TestUpdateIssuesFailsWhenLiveLabelsUnreadable pins the fail-closed path. An
 // issue missing from the live label read is indistinguishable from one carrying
 // no protected label, so the update must not proceed — guessing wrong deletes a
@@ -2527,5 +2550,135 @@ func TestCreateBatchAmbiguousFailureLookupFailsLeavesBatchForNextRun(t *testing.
 	}
 	if result.FailedOps != 2 {
 		t.Fatalf("FailedOps = %d, want 2 (the whole unreconciled batch)", result.FailedOps)
+	}
+}
+
+// typedSnykFindings is e2eSnykFindings with an issue type on each finding, so
+// the tool-label fallback (LINEAR_TOOL_LABEL_DEFAULT) has something to fire on.
+type typedSnykFindings struct{}
+
+func (typedSnykFindings) LoadSnapshot(context.Context) (model.SnykSnapshot, error) {
+	snapshot, _ := e2eSnykFindings{}.LoadSnapshot(context.Background())
+	for i := range snapshot.Findings {
+		snapshot.Findings[i].IssueType = "code"
+	}
+	return snapshot, nil
+}
+
+// TestRunWithLabelManagementOffToleratesMissingManagedLabel is the issue #333
+// end-to-end guard, using the real Linear client against a stubbed API whose
+// workspace has no snyk-automation (or triage-dependency) label at all. With
+// label management on, the label lookup finds nothing and the run fails; with
+// LINEAR_MANAGED_LABEL=off the whole managed set is off, so no lookup happens,
+// the create carries no labelIds, and the run succeeds.
+func TestRunWithLabelManagementOffToleratesMissingManagedLabel(t *testing.T) {
+	labelLookups := 0
+	var createInputs []map[string]any
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		var payload struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			http.Error(w, "unmarshal: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(payload.Query, "query resolveTeam"):
+			_, _ = io.WriteString(w, `{"data":{"teams":{"nodes":[{"id":"team-1","key":"team-1","name":"Team A"}]}}}`)
+		case strings.Contains(payload.Query, "query teamStates"):
+			_, _ = io.WriteString(w, `{"data":{"team":{"states":{"nodes":[{"id":"state-todo","name":"Todo","type":"unstarted"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}`)
+		case strings.Contains(payload.Query, "query existingIssues"):
+			_, _ = io.WriteString(w, `{"data":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`)
+		case strings.Contains(payload.Query, "query managedIssueLabels"):
+			labelLookups++
+			// The workspace has no such label: an empty result is what makes
+			// resolveManagedLabel fail with "was not found".
+			_, _ = io.WriteString(w, `{"data":{"issueLabels":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`)
+		case strings.Contains(payload.Query, "mutation issueCreateBatch"):
+			results := make(map[string]any)
+			for i := 0; ; i++ {
+				input, ok := payload.Variables[fmt.Sprintf("input%d", i)].(map[string]any)
+				if !ok {
+					break
+				}
+				createInputs = append(createInputs, input)
+				results[fmt.Sprintf("issueCreate%d", i)] = map[string]any{
+					"success": true,
+					"issue":   map[string]any{"id": fmt.Sprintf("i-%d", i+1), "identifier": fmt.Sprintf("SEC-%d", i+1)},
+				}
+			}
+			resp, err := json.Marshal(map[string]any{"data": results})
+			if err != nil {
+				t.Errorf("marshal create response: %v", err)
+				return
+			}
+			_, _ = w.Write(resp)
+		default:
+			http.Error(w, "unhandled operation: "+payload.Query, http.StatusBadRequest)
+		}
+	})
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// The defaults LINEAR_MANAGED_LABEL=off leaves behind: Managed empty, the
+	// derived fallbacks still non-empty.
+	labelCfg := config.LabelConfig{
+		Managed:     "",
+		ToolDefault: "snyk-automation",
+		AwaitingFix: "triage-dependency",
+	}
+	states := config.StateConfig{Todo: "Todo", Backlog: "Backlog", Done: "Done", Cancelled: "Cancelled"}
+	due := config.DueDateConfig{CriticalDays: 15, HighDays: 30, MediumDays: 45, LowDays: 90}
+
+	client := New(config.LinearConfig{
+		TeamID: "team-1",
+		APIKey: "test-key",
+		Labels: labelCfg,
+		States: states,
+		Due:    due,
+	}, 1, logger)
+	client.gql = gqlclient.New(server.URL, &http.Client{})
+
+	cfg := config.Config{
+		Linear: config.LinearConfig{TeamID: "team-1", Labels: labelCfg, States: states, Due: due},
+		Sync:   config.SyncConfig{Workers: 1},
+	}
+	// The findings carry an issue type so the tool-label fallback would fire on
+	// its own with label management on: without the off gate the create would
+	// try to resolve snyk-automation and fail against this label-less workspace.
+	service := linSync.New(cfg, logger, typedSnykFindings{}, client, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	result, err := service.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want success with label management off", err)
+	}
+	if result.FailedOps != 0 {
+		t.Fatalf("FailedOps = %d, want 0", result.FailedOps)
+	}
+	if labelLookups != 0 {
+		t.Fatalf("managed label lookups = %d, want 0 when label management is off", labelLookups)
+	}
+	if len(createInputs) != 2 {
+		t.Fatalf("creates = %d, want 2", len(createInputs))
+	}
+	for i, input := range createInputs {
+		if labels, ok := input["labelIds"]; ok {
+			t.Fatalf("create %d sent labelIds = %#v, want none when label management is off", i, labels)
+		}
+		description, _ := input["description"].(string)
+		if strings.Contains(description, "managed_labels:") {
+			t.Fatalf("create %d metadata block records managed labels:\n%s", i, description)
+		}
 	}
 }

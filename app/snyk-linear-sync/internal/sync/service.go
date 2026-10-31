@@ -2455,10 +2455,17 @@ func stripVisibleFingerprintLine(description string) string {
 }
 
 func managedLabels(labelCfg config.LabelConfig, finding model.Finding) []string {
-	labels := make([]string, 0, 4)
-	if managed := strings.TrimSpace(labelCfg.Managed); managed != "" {
-		labels = append(labels, managed)
+	// Label management off (LINEAR_MANAGED_LABEL=off) turns off the whole
+	// managed set, derived labels included. The awaiting-fix, tool and origin
+	// fallbacks have non-empty defaults, so returning early here is what stops
+	// them being asserted — and resolved, and failing the run when the label is
+	// missing in Linear — after the operator disabled label management.
+	if !labelCfg.Enabled() {
+		return nil
 	}
+
+	labels := make([]string, 0, 4)
+	labels = append(labels, strings.TrimSpace(labelCfg.Managed))
 
 	if finding.Status == model.FindingAwaitingFix && strings.TrimSpace(labelCfg.AwaitingFix) != "" {
 		labels = append(labels, labelCfg.AwaitingFix)
@@ -2490,6 +2497,12 @@ func managedLabels(labelCfg config.LabelConfig, finding model.Finding) []string 
 // change comments a "why" instead of just listing added labels.
 func buildLabelReasons(labelCfg config.LabelConfig, finding model.Finding) map[string]string {
 	reasons := make(map[string]string)
+
+	// Mirror managedLabels: with label management off no managed label is
+	// written, so no label needs a "why" in the change comment either.
+	if !labelCfg.Enabled() {
+		return reasons
+	}
 
 	if finding.Status == model.FindingAwaitingFix && strings.TrimSpace(labelCfg.AwaitingFix) != "" {
 		reasons[model.NormalizeLabelName(labelCfg.AwaitingFix)] = "awaiting upstream fix"

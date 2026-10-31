@@ -172,7 +172,11 @@ If repository, file, or commit data is missing, the sync falls back to plain tex
 `LINEAR_MANAGED_LABEL` controls the label this tool manages on synced issues.
 
 - default: `snyk-automation`
-- `off`: disables label management
+- `off`: disables label management, and with it the whole managed label set —
+  the derived awaiting-fix, tool and origin labels are not applied or looked up
+  either, whatever their configured values. `LINEAR_CREATE_ONLY_LABELS` is a
+  separate set rather than part of label management, so its labels are still
+  resolved and stamped on create
 - any other value: the exact Linear label name to manage
 
 Behavior:

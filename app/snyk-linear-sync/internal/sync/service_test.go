@@ -1895,6 +1895,167 @@ func TestManagedLabelsOmitsAwaitingFixLabelForOpenIssue(t *testing.T) {
 	}
 }
 
+// TestManagedLabelsEmptyWhenLabelManagementOff is the issue #333 guard: with
+// LINEAR_MANAGED_LABEL=off and no other label configuration, the derived labels
+// keep their non-empty defaults, so a naive managed set would still assert
+// snyk-automation and triage-dependency. Turning management off must turn off
+// the whole set — labels and the "why" reasons alike.
+func TestManagedLabelsEmptyWhenLabelManagementOff(t *testing.T) {
+	labelCfg := config.LabelConfig{
+		Managed:       "",
+		Tool:          map[string]string{"code": "snyk-code"},
+		ToolDefault:   "snyk-automation",
+		Origin:        map[string]string{"github": "snyk-github"},
+		OriginDefault: "snyk-origin",
+		AwaitingFix:   "triage-dependency",
+	}
+	finding := model.Finding{
+		Status:        model.FindingAwaitingFix,
+		IssueType:     "code",
+		ProjectOrigin: "github",
+	}
+
+	if labels := managedLabels(labelCfg, finding); len(labels) != 0 {
+		t.Fatalf("managedLabels() = %#v, want none when label management is off", labels)
+	}
+	if reasons := buildLabelReasons(labelCfg, finding); len(reasons) != 0 {
+		t.Fatalf("buildLabelReasons() = %#v, want none when label management is off", reasons)
+	}
+}
+
+// TestDesiredIssueWritesNoManagedLabelsWhenManagementOff checks the whole
+// desired issue, not just the helper: the label set and the metadata block the
+// description carries must both come out empty.
+func TestDesiredIssueWritesNoManagedLabelsWhenManagementOff(t *testing.T) {
+	cfg := githubCfg()
+	cfg.Linear.Labels = config.LabelConfig{
+		Managed:     "",
+		ToolDefault: "snyk-automation",
+		AwaitingFix: "triage-dependency",
+	}
+
+	finding := scanFinding("issue-1", commitA, 10)
+	finding.Status = model.FindingAwaitingFix
+
+	desired := desiredIssue(cfg, finding)
+
+	if len(desired.ManagedLabels) != 0 {
+		t.Fatalf("ManagedLabels = %#v, want none when label management is off", desired.ManagedLabels)
+	}
+	if len(desired.LabelReasons) != 0 {
+		t.Fatalf("LabelReasons = %#v, want none when label management is off", desired.LabelReasons)
+	}
+	if strings.Contains(desired.Description, "managed_labels:") {
+		t.Fatalf("metadata block records managed labels with management off:\n%s", desired.Description)
+	}
+}
+
+// TestRunPlansNoLabelMutationWhenManagementOff drives the run: a finding that
+// would otherwise gain snyk-automation and a default tool label must create a
+// ticket whose desired label set is empty, so no label resolution or mutation
+// is planned.
+func TestRunPlansNoLabelMutationWhenManagementOff(t *testing.T) {
+	cfg := githubCfg()
+	cfg.Linear.Labels = config.LabelConfig{
+		Managed:     "",
+		ToolDefault: "snyk-automation",
+		AwaitingFix: "triage-dependency",
+	}
+	sim := &linearSim{issues: map[string]*model.ExistingIssue{}}
+	store := &fakeCache{}
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+		Findings:   []model.Finding{scanFinding("issue-1", commitA, 10)},
+		ProjectIDs: map[string]struct{}{"project-a": {}},
+	}}
+
+	if _, err := New(cfg, discardLogger(), snyk, sim, store).Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if len(sim.created) != 1 {
+		t.Fatalf("created = %d issues, want 1", len(sim.created))
+	}
+	created := sim.created[0]
+	if len(created.ManagedLabels) != 0 {
+		t.Fatalf("created ManagedLabels = %#v, want none", created.ManagedLabels)
+	}
+	if strings.Contains(created.Description, "managed_labels:") {
+		t.Fatalf("created metadata block records managed labels:\n%s", created.Description)
+	}
+}
+
+// TestRunRemovesPreviouslyManagedLabelsWhenManagementTurnedOff is the other
+// half of issue #333: README's "the previously managed label is removed if
+// label management is turned off". A ticket created while label management was
+// on carries snyk-automation and its derived tool/awaiting-fix labels, recorded
+// in the managed_labels: metadata line. The operator then sets
+// LINEAR_MANAGED_LABEL=off; the next run's desired label set is empty, so every
+// previously managed label must be reported removed and the metadata line must
+// stop recording them — while a label the sync does not own is left alone.
+func TestRunRemovesPreviouslyManagedLabelsWhenManagementTurnedOff(t *testing.T) {
+	cfg := githubCfg()
+	// The defaults LINEAR_MANAGED_LABEL=off leaves behind: Managed empty, the
+	// derived fallbacks still non-empty.
+	cfg.Linear.Labels = config.LabelConfig{
+		Managed:     "",
+		ToolDefault: "snyk-automation",
+		AwaitingFix: "triage-dependency",
+	}
+
+	finding := scanFinding("issue-1", commitA, 10)
+	finding.Status = model.FindingAwaitingFix
+	// Written by the previous run, while label management was still on.
+	existing := storedIssue("existing-1", "SNYK-1", "Backlog", desiredIssue(githubCfg(), finding))
+	existing.Title = "stale title" // force an update, so the label diff is produced
+	existing.ManagedLabels = []string{"snyk-automation", "triage-dependency", "snyk-code"}
+	existing.Labels = []model.IssueLabel{
+		{ID: "l1", Name: "snyk-automation"},
+		{ID: "l2", Name: "triage-dependency"},
+		{ID: "l3", Name: "snyk-code"},
+		{ID: "l4", Name: "human-triage"}, // not the sync's: must survive
+	}
+
+	linear := &fakeLinear{snapshot: []model.ExistingIssue{existing}}
+	snyk := fakeSnyk{snapshot: model.SnykSnapshot{
+		Findings:   []model.Finding{finding},
+		ProjectIDs: map[string]struct{}{"project-a": {}},
+	}}
+
+	if _, err := New(cfg, discardLogger(), snyk, linear, nil).Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if len(linear.updates) != 1 {
+		t.Fatalf("updates = %d, want 1", len(linear.updates))
+	}
+	update := linear.updates[0]
+
+	if len(update.Desired.ManagedLabels) != 0 {
+		t.Fatalf("Desired.ManagedLabels = %#v, want none with label management off", update.Desired.ManagedLabels)
+	}
+	if update.Diff == nil {
+		t.Fatal("Diff = nil, want the label removal recorded")
+	}
+	if !update.Diff.LabelsNeedUpdate {
+		t.Fatal("Diff.LabelsNeedUpdate = false, want true (previously managed labels must be removed)")
+	}
+	got := slices.Sorted(slices.Values(update.Diff.LabelsRemoved))
+	want := []string{"snyk-automation", "snyk-code", "triage-dependency"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("Diff.LabelsRemoved = %v, want %v", got, want)
+	}
+	if slices.Contains(update.Diff.LabelsRemoved, "human-triage") {
+		t.Fatalf("Diff.LabelsRemoved = %v, must not name a label the sync does not own", update.Diff.LabelsRemoved)
+	}
+	if slices.Contains(update.Diff.LabelsAdded, "snyk-automation") ||
+		slices.Contains(update.Diff.LabelsAdded, "triage-dependency") {
+		t.Fatalf("Diff.LabelsAdded = %v, want no derived label re-added with management off", update.Diff.LabelsAdded)
+	}
+	if strings.Contains(update.Desired.Description, "managed_labels:") {
+		t.Fatalf("desired metadata block still records managed labels:\n%s", update.Desired.Description)
+	}
+}
+
 func TestNeedsUpdateClearsDueDateWhenDesiredIsEmpty(t *testing.T) {
 	existing := model.ExistingIssue{
 		Title:       "title",
@@ -3157,6 +3318,7 @@ func TestDesiredIssueDueDateUsesIgnoreExpiryForExpiredSnooze(t *testing.T) {
 func TestDesiredItemDisregardIfFixableMapsToBacklog(t *testing.T) {
 	cfg := minimalCfg()
 	cfg.Linear.Labels.AwaitingFix = "triage-dependency"
+	cfg.Linear.Labels.Managed = "snyk-automation"
 	finding := model.Finding{
 		Fingerprint:        "snyk:project-a:issue-1",
 		SnykIssueID:        "issue-1",
@@ -3500,6 +3662,7 @@ func TestRunAwaitingFixIssueGoesToBacklogWithNoDueDate(t *testing.T) {
 	cfg := minimalCfg()
 	cfg.Linear.States.Backlog = "Backlog"
 	cfg.Linear.Labels.AwaitingFix = "triage-dependency"
+	cfg.Linear.Labels.Managed = "snyk-automation"
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	snyk := fakeSnyk{
@@ -3564,6 +3727,7 @@ func TestRunAwaitingFixIssueMovedFromTodoToBacklog(t *testing.T) {
 	cfg := minimalCfg()
 	cfg.Linear.States.Backlog = "Backlog"
 	cfg.Linear.Labels.AwaitingFix = "triage-dependency"
+	cfg.Linear.Labels.Managed = "snyk-automation"
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	finding := model.Finding{
@@ -4032,6 +4196,7 @@ func TestRunPreservesTodoWhenFindingIsAwaitingFix(t *testing.T) {
 	cfg.Linear.States.Todo = "Triage"
 	cfg.Linear.States.Backlog = "Backlog"
 	cfg.Linear.Labels.AwaitingFix = "triage-dependency"
+	cfg.Linear.Labels.Managed = "snyk-automation"
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	finding := model.Finding{
@@ -4307,6 +4472,7 @@ func TestRunAwaitingFixToOpenRecalculatesDueDateFromFixAvailability(t *testing.T
 	cfg := minimalCfg()
 	cfg.Linear.States.Backlog = "Backlog"
 	cfg.Linear.Labels.AwaitingFix = "triage-dependency"
+	cfg.Linear.Labels.Managed = "snyk-automation"
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	finding := model.Finding{
@@ -4367,11 +4533,24 @@ func TestRunAwaitingFixToOpenRecalculatesDueDateFromFixAvailability(t *testing.T
 		t.Fatalf("updated due date = %q, want %q (SLA from fix availability, not from months-old created_at)", updated.DueDate, expectedStr)
 	}
 
-	// The triage-dependency label should be removed.
+	// The triage-dependency label must be gone from the desired set and
+	// reported as removed in the diff: a loop over the desired set alone would
+	// pass vacuously for any set that does not happen to contain it.
 	for _, label := range updated.ManagedLabels {
 		if label == "triage-dependency" {
 			t.Fatalf("updated managed labels should not contain triage-dependency after fix is available: %v", updated.ManagedLabels)
 		}
+	}
+	if len(linear.updates) != 1 || linear.updates[0].Diff == nil {
+		t.Fatalf("updates = %d, want one diffed update", len(linear.updates))
+	}
+	if !slices.Contains(linear.updates[0].Diff.LabelsRemoved, "triage-dependency") {
+		t.Fatalf("Diff.LabelsRemoved = %v, want it to contain triage-dependency", linear.updates[0].Diff.LabelsRemoved)
+	}
+	// Label management is on here, so the global label stays: this is what
+	// separates this test from the turn-off case, where it is removed too.
+	if slices.Contains(linear.updates[0].Diff.LabelsRemoved, "snyk-automation") {
+		t.Fatalf("Diff.LabelsRemoved = %v, must not contain snyk-automation while label management is on", linear.updates[0].Diff.LabelsRemoved)
 	}
 
 	// The sync parked this ticket in Backlog itself, so the manual Backlog
@@ -4404,6 +4583,7 @@ func TestRunAwaitingFixToOpenKeepsManuallyChosenInProgress(t *testing.T) {
 	cfg := minimalCfg()
 	cfg.Linear.States.Backlog = "Backlog"
 	cfg.Linear.Labels.AwaitingFix = "triage-dependency"
+	cfg.Linear.Labels.Managed = "snyk-automation"
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	finding := model.Finding{
@@ -4465,11 +4645,24 @@ func TestRunAwaitingFixToOpenKeepsManuallyChosenInProgress(t *testing.T) {
 	}
 
 	// The label removal happens regardless of which state the ticket sits in:
-	// the awaiting-fix condition is over, so the label goes.
+	// the awaiting-fix condition is over, so the label goes. It must be gone
+	// from the desired set and reported as removed in the diff: a loop over the
+	// desired set alone would pass vacuously for a set that does not contain it.
 	for _, label := range updated.ManagedLabels {
 		if label == "triage-dependency" {
 			t.Fatalf("updated managed labels should not contain triage-dependency after fix is available: %v", updated.ManagedLabels)
 		}
+	}
+	if len(linear.updates) != 1 || linear.updates[0].Diff == nil {
+		t.Fatalf("updates = %d, want one diffed update", len(linear.updates))
+	}
+	if !slices.Contains(linear.updates[0].Diff.LabelsRemoved, "triage-dependency") {
+		t.Fatalf("Diff.LabelsRemoved = %v, want it to contain triage-dependency", linear.updates[0].Diff.LabelsRemoved)
+	}
+	// Label management is on here, so the global label stays: this is what
+	// separates this test from the turn-off case, where it is removed too.
+	if slices.Contains(linear.updates[0].Diff.LabelsRemoved, "snyk-automation") {
+		t.Fatalf("Diff.LabelsRemoved = %v, must not contain snyk-automation while label management is on", linear.updates[0].Diff.LabelsRemoved)
 	}
 }
 
@@ -4645,6 +4838,7 @@ func TestRunAwaitingFixStaysInBacklogWhileStillAwaiting(t *testing.T) {
 	cfg := minimalCfg()
 	cfg.Linear.States.Backlog = "Backlog"
 	cfg.Linear.Labels.AwaitingFix = "triage-dependency"
+	cfg.Linear.Labels.Managed = "snyk-automation"
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	finding := model.Finding{
@@ -4712,6 +4906,7 @@ func TestRunAwaitingFixToOpenPostsStateChangeComment(t *testing.T) {
 	cfg := minimalCfg()
 	cfg.Linear.States.Backlog = "Backlog"
 	cfg.Linear.Labels.AwaitingFix = "triage-dependency"
+	cfg.Linear.Labels.Managed = "snyk-automation"
 	cfg.Linear.CommentsEnabled = true
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
