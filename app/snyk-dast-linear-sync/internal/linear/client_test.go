@@ -1710,7 +1710,7 @@ func TestUpdateIssuesReadsLiveLabelsWhenNoProtectedLabels(t *testing.T) {
 					sawLabelRead = true
 					// The live read sees a label another actor added after the
 					// run's opening snapshot.
-					return jsonResponse(t, `{"data":{"issues":{"nodes":[{"id":"issue-1","labels":{"nodes":[{"id":"label-baseline","name":"breach"},{"id":"label-other","name":"customer-visible"}],"pageInfo":{"hasNextPage":false}}}]}}}`), nil
+					return jsonResponse(t, `{"data":{"issues":{"nodes":[{"id":"issue-1","labels":{"nodes":[{"id":"label-baseline","name":"human-label"},{"id":"label-other","name":"customer-visible"}],"pageInfo":{"hasNextPage":false}}}]}}}`), nil
 				}
 				if strings.Contains(payload.Query, "mutation issueUpdateBatch") {
 					input, _ := payload.Variables["input0"].(map[string]any)
@@ -1734,7 +1734,7 @@ func TestUpdateIssuesReadsLiveLabelsWhenNoProtectedLabels(t *testing.T) {
 		Existing: model.ExistingIssue{
 			ID:         "issue-1",
 			Identifier: "SEC-1",
-			Labels:     []model.IssueLabel{{ID: "label-baseline", Name: "breach"}},
+			Labels:     []model.IssueLabel{{ID: "label-baseline", Name: "human-label"}},
 		},
 		Desired: model.DesiredIssue{State: model.StateTodo},
 	}}
