@@ -5,7 +5,9 @@
 // A database file is split into fixed-size sectors (SectorSize — 64 KiB, the
 // largest SQLite page size). Each sector is the BinaryData of a ConfigMap
 // named "<base32 filename>-<sector index>", labelled with the file's base32
-// name; the lock ConfigMap is named "<base32 filename>-lockfile" and holds
+// name (shortened once that passes Kubernetes' 63-character label-value
+// cap — see file.relevantFileLabel); the lock ConfigMap is named "<base32
+// filename>-lockfile" and holds
 // the lock level as a string. Reads and writes map onto Get/Update/Create
 // calls, and the file size is computed from a single LIST of the file's
 // sector ConfigMaps.
@@ -24,6 +26,7 @@ package vfs
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base32"
 	"encoding/json"
 	"errors"
@@ -66,6 +69,22 @@ const (
 	// Those calls run on lockCtx, which no caller can cancel; this timeout
 	// is what keeps a hung API server from hanging SQLite instead.
 	lockCallTimeout = 30 * time.Second
+
+	// maxLabelValue is Kubernetes' hard cap on a label VALUE: 63
+	// characters. The "relevant-file" label of every ConfigMap of a file
+	// carries that file's base32-encoded name, which needs 8 characters
+	// per 5 name bytes, so a name over 35 bytes cannot be the label
+	// verbatim and is represented by the shortened stand-in below
+	// (issue #351).
+	maxLabelValue = 63
+
+	// longNameLabelPrefix marks a "relevant-file" label standing in for a
+	// name too long to fit maxLabelValue: longNameLabelPrefix + the
+	// unpadded lower-case base32 of SHA-256(name). The prefix contains
+	// '-', which no plain base32 encoding produced by this package
+	// does, so the two label forms can never be confused with — or collide
+	// with — one another.
+	longNameLabelPrefix = "long-"
 )
 
 // The lock ConfigMap's Data holds the lock state under these keys:
@@ -161,6 +180,40 @@ func (f *file) b32ByteFromString(s string) []byte {
 	dst := make([]byte, f.encoding.EncodedLen(len(sb)))
 	f.encoding.Encode(dst, sb)
 	return dst
+}
+
+// longNameLabelEncoding spells the SHA-256 digest of an over-long name as
+// its "relevant-file" label stand-in: RFC 4648 base32, lower case, without
+// padding — 52 characters for a 32-byte digest, always within
+// maxLabelValue.
+var longNameLabelEncoding = base32.NewEncoding("abcdefghijklmnopqrstuvwxyz234567").WithPadding(base32.NoPadding)
+
+// relevantFileLabel returns the value stored under the "relevant-file"
+// LABEL on this file's lockfile and every sector ConfigMap (issue #351).
+// Kubernetes caps a label value at maxLabelValue (63 characters) and the
+// base32 name needs 8 characters per 5 name bytes, so any name over 35
+// bytes used to overflow the cap and make every ConfigMap Create fail on
+// a real API server — while the fake clientset, which validates nothing,
+// admitted it, so no test caught the limit. The label keeps the full
+// encoded name whenever it fits — every such name keeps exactly the label
+// it always had — and only an over-long name is represented by the
+// fixed-size stand-in longNameLabelPrefix + base32(SHA-256(name)), which
+// never passes the cap and cannot collide with a plain encoding (its
+// prefix contains a character no plain encoding has) nor, bar a 2^-256
+// coincidence, with another file's stand-in.
+//
+// The label is a pure function of the name, so every process — the one
+// writing a sector, the one LISTing them, the one deleting them — derives
+// the same selector. The ConfigMap NAMES keep the full encoded name
+// whatever the label does, and the lockfile's "relevant-file" Data key
+// keeps it too (ConfigMap data values have no 63-character cap).
+func (f *file) relevantFileLabel() string {
+	encoded := f.b32ByteFromString(f.RawName)
+	if len(encoded) <= maxLabelValue {
+		return string(encoded)
+	}
+	sum := sha256.Sum256([]byte(f.RawName))
+	return longNameLabelPrefix + longNameLabelEncoding.EncodeToString(sum[:])
 }
 
 // Close implements sqlite3vfs.File: it releases the file's holdings —
@@ -305,7 +358,9 @@ type file struct {
 	encoding *base32.Encoding
 
 	// SectorLabels are the labels every sector ConfigMap of this file
-	// carries: CommonSectorLabel plus the file's base32 "relevant-file".
+	// carries: CommonSectorLabel plus the file's "relevant-file" label —
+	// the base32 name while it fits the 63-character label-value cap,
+	// otherwise the "long-" stand-in (relevantFileLabel, issue #351).
 	SectorLabels map[string]string
 
 	// Local view of the shared state, kept to cut Kubernetes API round
@@ -671,12 +726,15 @@ func serializeLockState(st *lockView) (lockLevel, holdersJSON, writerJSON string
 
 // newLockConfigMap builds the lock ConfigMap with the same labels and
 // "lock"/"relevant-file" keys the single-writer setLock always wrote, plus
-// the holder keys.
+// the holder keys. The "relevant-file" LABEL carries the short form
+// (relevantFileLabel): a label value is capped at 63 characters, while the
+// "relevant-file" Data key keeps the full base32 name, a Data value having
+// no such cap.
 func (f *file) newLockConfigMap(lockLevel, holdersJSON, writerJSON string) *corev1.ConfigMap {
 	fileNameLabel := string(f.b32ByteFromString(f.RawName))
 	lockfileLabels := make(map[string]string, len(LockfileLabel)+1)
 	maps.Copy(lockfileLabels, LockfileLabel)
-	lockfileLabels["relevant-file"] = fileNameLabel
+	lockfileLabels["relevant-file"] = f.relevantFileLabel()
 
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: f.LockFileName(), Labels: lockfileLabels},
@@ -894,12 +952,16 @@ func (f *file) LockFileName() string {
 	return localLockFileName
 }
 
+// generateSectorsLabels builds the labels every sector ConfigMap of this
+// file carries: CommonSectorLabel plus this file's "relevant-file" label
+// (relevantFileLabel — the base32 name while it fits a label value,
+// otherwise the longNameLabelPrefix stand-in, issue #351). The selector
+// built from these labels is the only thing that LISTs and deletes this
+// file's sectors, so every one of them must carry exactly these.
 func (f *file) generateSectorsLabels() {
-	fileNameLabel := string(f.b32ByteFromString(f.RawName))
-
 	f.SectorLabels = make(map[string]string, len(CommonSectorLabel)+1)
 	maps.Copy(f.SectorLabels, CommonSectorLabel)
-	f.SectorLabels["relevant-file"] = fileNameLabel
+	f.SectorLabels["relevant-file"] = f.relevantFileLabel()
 }
 
 // dropCaches discards the cached file size and sector contents. Everything

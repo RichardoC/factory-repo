@@ -274,6 +274,12 @@ func TestOpenFreshFileCreatesLockfileAndEmptySector(t *testing.T) {
 	if got := lf.Data["relevant-file"]; got != string(f.b32ByteFromString("fresh.db")) {
 		t.Errorf("lockfile relevant-file = %q, want the base32 file label", got)
 	}
+	// While the encoded name fits the 63-character label-value cap
+	// (issue #351) the LABEL is the encoded name too, identical to the
+	// Data key above; only an over-long name would be shortened here.
+	if got := lf.Labels["relevant-file"]; got != string(f.b32ByteFromString("fresh.db")) {
+		t.Errorf("lockfile label relevant-file = %q, want the base32 file label", got)
+	}
 	if got := lf.Data["shared-holders"]; got != "{}" {
 		t.Errorf("fresh lockfile shared-holders = %q, want %q (an opened file holds nothing)", got, "{}")
 	}
@@ -298,6 +304,163 @@ func TestOpenFreshFileCreatesLockfileAndEmptySector(t *testing.T) {
 	}
 	if size != 0 {
 		t.Errorf("FileSize on fresh file = %d, want 0", size)
+	}
+}
+
+// --- Label limits (issue #351) ---
+
+// longNameDB is the 40-byte database name of issue #351: its base32
+// encoding is 64 characters, one past the 63-character Kubernetes
+// label-value cap, so no ConfigMap labelled with it verbatim survives a
+// real API server.
+const longNameDB = "/data/prod/warehouse-events-2026.sqlite3"
+
+// longNameDBEncoded and longNameDBLabel pin, independently of the VFS, the
+// two values its rule must produce for longNameDB: the straight base32 of
+// the name, and the 57-character stand-in "long-" + lower-case unpadded
+// base32 of SHA-256(name).
+const (
+	longNameDBEncoded = "f7sgc7dbf72he55ef750c6tfnb11k65ffvs1m3loor3s4mrqgi5c665rnru1i3jt"
+	longNameDBLabel   = "long-zikguppo7uhkbgd33ycix5uhbeirvfvsjjyxfejltjpbzxdbwr5a"
+)
+
+// TestLabelRuleShortAndLongNames pins the rule of relevantFileLabel, the
+// single place the label limit is decided (issue #351): a name whose
+// encoding fits the 63-character cap keeps the encoded name as the label;
+// a name over 35 bytes gets the "long-" stand-in; and the label depends on
+// the name alone, so two files for the same name — two processes on one
+// database — always derive the same one, while a different long name never
+// shares it.
+func TestLabelRuleShortAndLongNames(t *testing.T) {
+	v, _ := newTestVFS(t)
+
+	// 35 bytes encode to 56 characters: the last length that fits, and the
+	// label is that encoding verbatim.
+	name35 := strings.Repeat("a", 35)
+	f35 := NewFile(name35, v)
+	if got, want := f35.relevantFileLabel(), string(f35.b32ByteFromString(name35)); got != want {
+		t.Errorf("35-byte name: label = %q, want the full encoding %q", got, want)
+	}
+
+	// 36 bytes encode to 64 characters: the first that does not fit, so
+	// the label switches to the stand-in, pinned verbatim.
+	name36 := strings.Repeat("a", 36)
+	f36 := NewFile(name36, v)
+	const want36 = "long-ela5es6napu252mdf36m23ngcp6haj4tc6hf6ewjixd3m7o5vezq"
+	if got := f36.relevantFileLabel(); got != want36 {
+		t.Errorf("36-byte name: label = %q, want the pinned stand-in %q", got, want36)
+	}
+	if got := len(f36.relevantFileLabel()); got > 63 {
+		t.Errorf("36-byte name: label is %d characters, want at most 63", got)
+	}
+
+	// The 40-byte name of the issue, with both values pinned verbatim.
+	fL := NewFile(longNameDB, v)
+	if got := string(fL.b32ByteFromString(longNameDB)); got != longNameDBEncoded {
+		t.Errorf("encoding of the 40-byte name = %q, want the pinned 64-character %q", got, longNameDBEncoded)
+	}
+	if got := fL.relevantFileLabel(); got != longNameDBLabel {
+		t.Errorf("label of the 40-byte name = %q, want the pinned %q", got, longNameDBLabel)
+	}
+	if got := len(fL.relevantFileLabel()); got > 63 {
+		t.Errorf("label of the 40-byte name is %d characters, want at most 63", got)
+	}
+
+	// A second file over the same name agrees (the LIST selector of one
+	// process must find the sectors of the other), and a different long
+	// name gets a different label.
+	if got := NewFile(longNameDB, v).relevantFileLabel(); got != fL.relevantFileLabel() {
+		t.Errorf("two files over the same name disagree on the label: %q vs %q", got, fL.relevantFileLabel())
+	}
+	other := NewFile(longNameDB+"x", v) // a different, 41-byte name
+	if got := other.relevantFileLabel(); got == fL.relevantFileLabel() {
+		t.Errorf("a different long name shares the label %q", got)
+	}
+	if got := len(other.relevantFileLabel()); got > 63 {
+		t.Errorf("label of the 41-byte name is %d characters, want at most 63", got)
+	}
+}
+
+// TestLongNameWritesWorkThroughShortenedLabel exercises the 40-byte name of
+// issue #351 exactly where it failed before: opening for writing, and every
+// sector write. The lockfile's and every sector's "relevant-file" LABEL is
+// the 63-character-safe stand-in, the lockfile's "relevant-file" Data key
+// keeps the full encoded name, and growth, size, reads, LISTing and Delete
+// all work through the selector built from that label. The fake clientset
+// validates nothing, so what is pinned here is the VFS side of the fix:
+// nothing it stores carries a label value over 63 characters, and the
+// shortened label still selects exactly this file's sectors.
+func TestLongNameWritesWorkThroughShortenedLabel(t *testing.T) {
+	v, fcs := newTestVFS(t)
+	f := openTestFile(t, v, longNameDB)
+
+	// The lockfile Open created: shortened label, full name in Data.
+	lf := getLockfileConfigMap(t, fcs, f)
+	if got := lf.Labels["relevant-file"]; got != longNameDBLabel {
+		t.Errorf("lockfile relevant-file label = %q, want the shortened stand-in %q", got, longNameDBLabel)
+	}
+	if got := lf.Data["relevant-file"]; got != longNameDBEncoded {
+		t.Errorf("lockfile relevant-file data key = %q, want the full encoded name %q", got, longNameDBEncoded)
+	}
+
+	// The fresh open seeds one empty sector, labelled the same way and
+	// still NAMED with the full encoded name.
+	sectors := listSectorConfigMaps(t, fcs, f)
+	if len(sectors) != 1 {
+		t.Fatalf("fresh long-named file has %d sector configmaps, want exactly 1", len(sectors))
+	}
+	if got := sectors[0].Labels["relevant-file"]; got != longNameDBLabel {
+		t.Errorf("sector 0 label = %q, want %q", got, longNameDBLabel)
+	}
+	if got, want := sectors[0].Name, longNameDBEncoded+"-0"; got != want {
+		t.Errorf("sector 0 name = %q, want %q (the ConfigMap name keeps the full encoding)", got, want)
+	}
+
+	// Grow the file across sectors and read it back: every step here LISTs
+	// or writes through the shortened label.
+	data := make([]byte, multiSectorLen)
+	fillPattern(data)
+	mustWriteAt(t, f, data, 0)
+
+	size, err := f.FileSize()
+	if err != nil {
+		t.Fatalf("FileSize on the long-named file: %v", err)
+	}
+	if size != int64(len(data)) {
+		t.Errorf("FileSize = %d, want %d", size, len(data))
+	}
+	buf := make([]byte, len(data))
+	mustReadAt(t, f, buf, 0)
+	if !bytes.Equal(buf, data) {
+		t.Errorf("read back different bytes than were written")
+	}
+
+	sectors = listSectorConfigMaps(t, fcs, f)
+	if len(sectors) != 2 {
+		t.Fatalf("the shortened label selected %d sector configmaps, want 2 (sectors 0 and 1)", len(sectors))
+	}
+	for _, s := range sectors {
+		if got := s.Labels["relevant-file"]; got != longNameDBLabel {
+			t.Errorf("sector %s label = %q, want %q", s.Name, got, longNameDBLabel)
+		}
+	}
+
+	// A different long name in the same namespace is invisible to this
+	// file's selector: only its own empty sector 0, none of the above.
+	other := openTestFile(t, v, longNameDB+"x")
+	if got := listSectorConfigMaps(t, fcs, other); len(got) != 1 {
+		t.Errorf("a different long name selected %d sector configmaps, want just its own 1", len(got))
+	}
+
+	// Delete walks the same selector and removes everything.
+	if err := v.Delete(longNameDB, false); err != nil {
+		t.Fatalf("Delete of the long-named file: %v", err)
+	}
+	if got := listSectorConfigMaps(t, fcs, f); len(got) != 0 {
+		t.Errorf("after Delete, %d sector configmaps remain, want 0", len(got))
+	}
+	if _, err := fcs.CoreV1().ConfigMaps(testNamespace).Get(t.Context(), f.LockFileName(), metav1.GetOptions{}); !kerrors.IsNotFound(err) {
+		t.Errorf("after Delete, lockfile get returned err=%v, want NotFound", err)
 	}
 }
 

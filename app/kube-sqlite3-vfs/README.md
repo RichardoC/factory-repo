@@ -72,7 +72,26 @@ a series of configmaps named which contain up to 64kB of data each
 
 namespaces all labelled with "kube-sqlite3-vfs": "used" to ease cleanup
 
-Configmap names can be 253 characters long after encoding
+Configmap names can be 253 characters long after encoding, but until
+issue #351 the full encoded name was also copied into the `relevant-file`
+**label** on every lockfile and sector ConfigMap, and Kubernetes caps a
+label value at **63 characters**. The base32 encoding needs 8 characters
+per 5 name bytes, so that capped usable database names at 35 bytes: a
+36-byte name encodes to 64 characters, and any real API server rejected
+its lockfile and sectors outright — such a database could not be opened
+for writing (the fake clientset used by the tests validates nothing,
+which is why no test caught it).
+
+The label is now the full encoded name only while it fits — every raw
+name up to 35 bytes keeps exactly the label it always had — and longer
+names are labelled `long-` + the unpadded lower-case base32 of SHA-256
+of the name (57 characters, a pure function of the name, so the
+label-selector LIST that finds and deletes a file's sectors still
+matches). The lockfile's `relevant-file` **data key** always carries the
+full encoded name. With the label no longer the binding limit, the
+253-character ConfigMap **name** is: after the `-lockfile` (9 characters)
+and `-<sector index>` suffixes, raw names up to about 145 bytes stay
+within it.
 
 ## Command-line flags
 
@@ -194,7 +213,7 @@ The VFS is no longer "really very slow" at the Kubernetes API, though: reads and
 
 The on-cluster data layout is backward and forward compatible — databases written by the old code remain readable by the new code and vice versa. Issue #47 added two data keys to the lockfile ConfigMap and issue #68 added journal files, both described in the bullets below:
 
-* sector ConfigMaps are still named `<base32 filename>-<index>`, labelled `data: sector` and `relevant-file: <base32 filename>`, and hold the sector bytes in the `sector` binary key plus the `filename` data key;
+* sector ConfigMaps are still named `<base32 filename>-<index>`, labelled `data: sector` and `relevant-file: <base32 filename>` (shortened to the `long-` stand-in once the encoding passes the 63-character label-value cap — see "How it works"; issue #351), and hold the sector bytes in the `sector` binary key plus the `filename` data key;
 * the lockfile ConfigMap is still named `<base32 filename>-lockfile`, labelled `data: lockfile` and `relevant-file`, and holds the locking state: the lock level — the highest level any live holder has — in the `lock` data key as before, plus the issue #47 keys `shared-holders` (holder id → lease expiry) and `writer` (the one writer's id, level and lease); a lockfile written by the old code carries only `lock`, which the new code reads as "nobody holds anything" until its next CAS rewrites it in the new format;
 * a **rollback journal** (issue #68) is stored exactly like the database it belongs to: its sector ConfigMaps are named `<base32 "<db>-journal">-<index>` with the same `data: sector` and `relevant-file` labels and the same `sector` and `filename` data keys, and it has its own lockfile ConfigMap named `<base32 "<db>-journal">-lockfile`. `xOpen`, `xAccess`, `xTruncate`, `xFileSize` and `xDelete` on that name go through the VFS. Deleting the journal removes every one of its sectors: one LIST of them, then the header sector 0 first, then the remaining sectors, and its lockfile last — the order that makes every half-state of a crash mid-delete safe, described in "Crash part-way through deleting the rollback journal (issue #121)" under WARNINGS above. A database written with `_journal=MEMORY` has no such ConfigMaps and still opens unchanged — its journal mode is a per-connection decision, and "no journal sectors" is exactly what `Access` reports for a name with no sector ConfigMaps;
 * namespaces are still labelled `kube-sqlite3-vfs: used`.

@@ -25,7 +25,9 @@
 package vfs
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base32"
 	"encoding/json"
 	"errors"
@@ -175,6 +177,20 @@ func storedLockState(t *testing.T, f *file) lockView {
 // lowercase alphabet with 'x' padding, as NewFile builds it).
 func b32Name(name string) string {
 	return base32.NewEncoding("abcdefghijklmnopqrstuv0123456789").WithPadding('x').EncodeToString([]byte(name))
+}
+
+// wantRelevantFileLabel mirrors, independently of the VFS, the
+// "relevant-file" label rule of issue #351: the base32 name while it fits
+// the 63-character label-value cap, else "long-" + the unpadded lower-case
+// base32 of SHA-256(name). (The fake-clientset unit tests pin the VFS to
+// exactly these spellings with literal strings, so a drift fails there.)
+func wantRelevantFileLabel(name string) string {
+	encoded := b32Name(name)
+	if len(encoded) <= 63 {
+		return encoded
+	}
+	sum := sha256.Sum256([]byte(name))
+	return "long-" + base32.NewEncoding("abcdefghijklmnopqrstuvwxyz234567").WithPadding(base32.NoPadding).EncodeToString(sum[:])
 }
 
 // TestIntegrationRealAPIServerRejectsStaleResourceVersion pins the
@@ -515,6 +531,7 @@ func TestIntegrationOnClusterLayout(t *testing.T) {
 	name := newSQLFileName()
 	f := NewFile(name, v)
 	b32 := b32Name(name)
+	label := wantRelevantFileLabel(name)
 
 	// Names: <base32 filename>-lockfile and <base32 filename>-<index>.
 	if want := b32 + "-lockfile"; f.LockFileName() != want {
@@ -526,8 +543,11 @@ func TestIntegrationOnClusterLayout(t *testing.T) {
 	}
 	cm := getLockConfigMap(t, f)
 
-	// Lockfile labels: data=lockfile plus relevant-file=<base32 filename>.
-	wantLabels := map[string]string{"data": "lockfile", "relevant-file": b32}
+	// Lockfile labels: data=lockfile plus relevant-file=<the file's label —
+	// the base32 filename while it fits the 63-character label-value cap,
+	// here the short test name, so the label is the encoding itself
+	// (issue #351)>.
+	wantLabels := map[string]string{"data": "lockfile", "relevant-file": label}
 	if cm.Name != b32+"-lockfile" {
 		t.Errorf("stored lockfile name %q, want %q", cm.Name, b32+"-lockfile")
 	}
@@ -581,7 +601,7 @@ func TestIntegrationOnClusterLayout(t *testing.T) {
 		t.Fatalf("WriteAt %d bytes: n=%d err=%v", fileSize, n, err)
 	}
 	sectorList, err := testKc.CoreV1().ConfigMaps(testNamespace).List(t.Context(), metav1.ListOptions{
-		LabelSelector: "data=sector,relevant-file=" + b32,
+		LabelSelector: "data=sector,relevant-file=" + label,
 	})
 	if err != nil {
 		t.Fatalf("list sector ConfigMaps: %v", err)
@@ -630,7 +650,7 @@ func TestIntegrationOnClusterLayout(t *testing.T) {
 		t.Fatalf("Delete: %v", err)
 	}
 	after, err := testKc.CoreV1().ConfigMaps(testNamespace).List(t.Context(), metav1.ListOptions{
-		LabelSelector: "data=sector,relevant-file=" + b32,
+		LabelSelector: "data=sector,relevant-file=" + label,
 	})
 	if err != nil {
 		t.Fatalf("post-delete list: %v", err)
@@ -640,5 +660,108 @@ func TestIntegrationOnClusterLayout(t *testing.T) {
 	}
 	if _, err := testKc.CoreV1().ConfigMaps(testNamespace).Get(t.Context(), f.LockFileName(), metav1.GetOptions{}); !kerrors.IsNotFound(err) {
 		t.Errorf("post-delete lockfile: got %v, want NotFound", err)
+	}
+}
+
+// TestIntegrationLongNameWritesOnRealAPIServer pins the fix for issue #351
+// exactly where the bug showed: longNameDB is 40 bytes, its base32 encoding
+// 64 characters — one past the 63-character label-value cap — so on a real
+// API server the lockfile Create inside Open and every sector write used to
+// come back 422 Invalid, and such a database could not be opened for
+// writing at all. With the label shortened to the "long-" stand-in, Open,
+// a multi-sector write, the label-selector LIST, the size computation and
+// Delete all succeed against the real API server, and no stored object
+// carries a label value over 63 characters.
+func TestIntegrationLongNameWritesOnRealAPIServer(t *testing.T) {
+	v := newIntegrationVFS(t)
+	name := longNameDB
+	wantLabel := wantRelevantFileLabel(name)
+
+	sf, _, err := v.Open(name, 0)
+	if err != nil {
+		t.Fatalf("Open(%q) on the real API server: %v", name, err)
+	}
+	f, ok := sf.(*file)
+	if !ok {
+		t.Fatalf("Open(%q) returned %T, want *file", name, sf)
+	}
+
+	cms := testKc.CoreV1().ConfigMaps(testNamespace)
+	lf, err := cms.Get(t.Context(), f.LockFileName(), metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get the lockfile the real API server just accepted: %v", err)
+	}
+	if got := lf.Labels["relevant-file"]; got != wantLabel {
+		t.Errorf("lockfile relevant-file label = %q, want %q", got, wantLabel)
+	}
+	if got := lf.Data["relevant-file"]; got != b32Name(name) {
+		t.Errorf("lockfile relevant-file data key = %q, want the full encoded name %q", got, b32Name(name))
+	}
+	for _, l := range lf.Labels {
+		if len(l) > 63 {
+			t.Errorf("lockfile label %q is %d characters, want at most 63 (the API server accepts it, so it must not)", l, len(l))
+		}
+	}
+
+	// A 160 KiB write spans three sectors, every one a Create the real API
+	// server must also accept.
+	const fileSize = 160 * 1024
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("Lock(SHARED): %v", err)
+	}
+	buf := make([]byte, fileSize)
+	fillPattern(buf)
+	if n, err := f.WriteAt(buf, 0); err != nil || n != fileSize {
+		t.Fatalf("WriteAt %d bytes on the real API server: n=%d err=%v", fileSize, n, err)
+	}
+	sectorList, err := cms.List(t.Context(), metav1.ListOptions{
+		LabelSelector: "data=sector,relevant-file=" + wantLabel,
+	})
+	if err != nil {
+		t.Fatalf("label-selector LIST with the shortened label: %v", err)
+	}
+	if len(sectorList.Items) != 3 {
+		t.Fatalf("LIST on the shortened label returned %d ConfigMaps, want the 3 sectors", len(sectorList.Items))
+	}
+	for _, s := range sectorList.Items {
+		if got := s.Labels["relevant-file"]; got != wantLabel {
+			t.Errorf("sector %s label = %q, want %q", s.Name, got, wantLabel)
+		}
+		if fn := s.Data["filename"]; fn != name {
+			t.Errorf("sector %s filename = %q, want %q", s.Name, fn, name)
+		}
+	}
+	size, err := f.FileSize()
+	if err != nil {
+		t.Fatalf("FileSize: %v", err)
+	}
+	if size != fileSize {
+		t.Errorf("FileSize = %d, want %d", size, fileSize)
+	}
+	readBack := make([]byte, fileSize)
+	if n, err := f.ReadAt(readBack, 0); err != nil || n != fileSize {
+		t.Fatalf("ReadAt %d bytes: n=%d err=%v", fileSize, n, err)
+	}
+	if !bytes.Equal(readBack, buf) {
+		t.Errorf("read back different bytes than were written")
+	}
+
+	if err := f.Unlock(sqlite3vfs.LockNone); err != nil {
+		t.Fatalf("Unlock: %v", err)
+	}
+	if err := v.Delete(name, false); err != nil {
+		t.Fatalf("Delete on the real API server: %v", err)
+	}
+	after, err := cms.List(t.Context(), metav1.ListOptions{
+		LabelSelector: "data=sector,relevant-file=" + wantLabel,
+	})
+	if err != nil {
+		t.Fatalf("post-delete LIST: %v", err)
+	}
+	if len(after.Items) != 0 {
+		t.Errorf("post-delete LIST returned %d ConfigMaps, want 0", len(after.Items))
+	}
+	if _, err := cms.Get(t.Context(), f.LockFileName(), metav1.GetOptions{}); !kerrors.IsNotFound(err) {
+		t.Errorf("post-delete lockfile get: err=%v, want NotFound", err)
 	}
 }
