@@ -1180,14 +1180,28 @@ func TestNextRepicksStrandedPR(t *testing.T) {
 
 // TestRepickMarkers covers the marker parse (issue #215): only a full
 // 40-hex SHA after the marker is kept, everything else — a truncated SHA,
-// prose, a comment without the marker — is ignored as if absent.
+// prose, a comment without the marker — is ignored as if absent. Only a
+// bot's marker counts (issue #316): a person quoting or reposting a valid
+// marker is not a marker, so it can neither spend nor suppress the re-pick.
 func TestRepickMarkers(t *testing.T) {
 	sha := strings.Repeat("c", 40)
+	bot := func(body string) struct {
+		Body string `json:"body"`
+		User struct {
+			Type string `json:"type"`
+		} `json:"user"`
+	} {
+		c := bodyComments{{Body: body}}[0]
+		c.User.Type = "Bot"
+		return c
+	}
 	got := repickMarkers(bodyComments{
 		{Body: "a person's note"},
 		{Body: "<!-- codeaf-queue-repick " + sha[:39] + " -->"},
-		{Body: "<!-- codeaf-queue-repick " + sha + " -->"},
+		{Body: "<!-- codeaf-queue-repick " + sha + " --> reposted verbatim by a person"},
 		{Body: "quote: the queue posts <!-- codeaf-queue-repick zzz --> on stranded PRs"},
+		bot("<!-- codeaf-queue-repick " + sha + " -->"),
+		bot("<!-- codeaf-queue-repick " + sha[:39] + " -->"),
 	})
 	if len(got) != 1 || got[0] != sha {
 		t.Fatalf("repickMarkers = %v; want [%s]", got, sha)
