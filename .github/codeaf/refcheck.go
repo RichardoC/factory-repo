@@ -61,21 +61,46 @@ type compareCommit struct {
 
 // compare is the bounded part of the compare API response that ref-check
 // reads; unknown or missing extra fields are ignored. commits is ordered
-// oldest first, so its last entry is the tip of upstream main.
+// oldest first, so its last entry is the tip of upstream main — unless the
+// API capped the array (see truncated), in which case that last entry is
+// the newest of the listed commits, not upstream's tip.
 type compare struct {
 	Status  string          `json:"status"`
 	AheadBy int             `json:"ahead_by"`
 	Commits []compareCommit `json:"commits"`
 }
 
+// truncated reports whether the compare API capped the commits array. The
+// API lists at most 250 commits per compare (issue #324), so when upstream
+// is further ahead than that the array stops short of the tip while
+// ahead_by still carries the true count.
+func (c compare) truncated() bool {
+	return len(c.Commits) > 0 && len(c.Commits) < c.AheadBy
+}
+
+// cappedHead is the head marker a capped compare records instead of a sha:
+// it names the listing the decision was made from, "capped (250 of 300
+// commits listed)". The last listed sha is not upstream's tip then, and
+// recording it would make the next run match it again and never update the
+// issue; this marker moves as soon as ahead_by does, and it is not a sha a
+// later run can mistake for the tip.
+func cappedHead(listed, ahead int) string {
+	return fmt.Sprintf("capped (%d of %d commits listed)", listed, ahead)
+}
+
 // head returns the upstream head the decision keys off: the sha of the last
 // commit since the pin, or the pin itself when the compare lists none,
-// which is what an identical comparison looks like. A compare that carries
-// commits must carry a well-formed sha for its tip: the head goes into the
-// issue marker line, and a corrupt one could never be matched again.
+// which is what an identical comparison looks like. A capped listing has no
+// tip in it, so it returns cappedHead's marker instead of a sha. A compare
+// whose listing is complete must carry a well-formed sha for its tip: the
+// head goes into the issue marker line, and a corrupt one could never be
+// matched again.
 func (c compare) head(pin string) (string, error) {
 	if len(c.Commits) == 0 {
 		return pin, nil
+	}
+	if c.truncated() {
+		return cappedHead(len(c.Commits), c.AheadBy), nil
 	}
 	head := c.Commits[len(c.Commits)-1].SHA
 	if !validRef.MatchString(head) {
@@ -139,8 +164,11 @@ func refCommitLine(c compareCommit) string {
 }
 
 // refIssueBody is the issue body of a create and an update. The first line
-// is the marker "Upstream head: <head>", then the pin, the commits since
-// the pin capped at refMaxCommits, and what CodeAF should do about them.
+// is the marker "Upstream head: <head>", then the pin, the newest
+// refMaxCommits commits since the pin, and what CodeAF should do about
+// them. When the compare API capped its listing the body says so, because
+// the head is then a capped-listing marker and the oldest commits since the
+// pin are not in the response at all.
 func refIssueBody(pin, head string, c compare) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s%s\n", refHeadMarker, head)
@@ -150,11 +178,15 @@ func refIssueBody(pin, head string, c compare) string {
 	if shown > refMaxCommits {
 		shown = refMaxCommits
 	}
-	for _, cm := range c.Commits[:shown] {
+	// The newest commits are the ones the reader needs: slice from the end.
+	for _, cm := range c.Commits[len(c.Commits)-shown:] {
 		b.WriteString(refCommitLine(cm) + "\n")
 	}
 	if left := len(c.Commits) - shown; left > 0 {
 		fmt.Fprintf(&b, "- ... and %d more\n", left)
+	}
+	if c.truncated() {
+		fmt.Fprintf(&b, "\nThe compare API lists at most 250 commits and this compare lists %d of the %d commits since the pin, so the list above stops short of upstream's tip and this issue does not record one. The next run replaces this body when the listing moves.\n", len(c.Commits), c.AheadBy)
 	}
 	// The acceptance sections the queue's gate reads (issue #136): the
 	// body is generated, so the sections are written here rather than
@@ -185,7 +217,10 @@ A codeaf-ref-update run on this issue completes with the module checks green and
 // there is one and does nothing otherwise. The moved branch — commits past
 // the pin, or status "diverged" — creates the issue when there is none,
 // leaves alone one already at this head, and updates one still on an older
-// head. The reason is one line, for the workflow log.
+// head. The reason is one line, for the workflow log. A compare the API
+// capped (issue #324) has no tip to record: its head is a capped-listing
+// marker, which moves as soon as ahead_by does, so a later run never
+// mistakes a stale capped listing for upstream's tip.
 func RefCheck(pin string, c compare, issues []item) (decision, error) {
 	head, err := c.head(pin)
 	if err != nil {
@@ -210,6 +245,10 @@ func RefCheck(pin string, c compare, issues []item) (decision, error) {
 	reason := fmt.Sprintf("upstream main is %d commits past the pin", c.AheadBy)
 	if c.Status == "diverged" {
 		reason = fmt.Sprintf("upstream main has diverged from the pin (%d commits ahead)", c.AheadBy)
+	}
+	if c.truncated() {
+		// The head is a listing marker rather than a sha; say why.
+		reason += fmt.Sprintf(", and the compare capped its listing at %d commits", len(c.Commits))
 	}
 	body := refIssueBody(pin, head, c)
 	it := refIssue(issues)

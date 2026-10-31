@@ -123,9 +123,15 @@ func TestRefCheckDecision(t *testing.T) {
 			wantTitle: refIssueTitle, wantLabels: queued,
 		},
 		{
-			name:       "diverged counts as moved and the reason notes it",
-			pin:        refTestPin,
-			cmp:        refCompareJSON("diverged", 3, refCommitJSON(refTestHead, "New commit")),
+			name: "diverged counts as moved and the reason notes it",
+			pin:  refTestPin,
+			// ahead_by must count the listed commits: a short list is a
+			// capped compare (issue #324), covered by
+			// TestRefCheckTruncatedCommitList.
+			cmp: refCompareJSON("diverged", 3,
+				refCommitJSON(refTestOld, "Older commit"),
+				refCommitJSON(refTestPin, "At the pin"),
+				refCommitJSON(refTestHead, "New commit")),
 			issues:     "[]",
 			wantAction: "create", wantHead: refTestHead, wantTitle: refIssueTitle,
 			wantLabels: queued, wantReason: []string{"diverged", "3 commits"},
@@ -231,7 +237,7 @@ func TestRefCheckBodyCommitList(t *testing.T) {
 	var commits []string
 	for i := range 25 {
 		msg := fmt.Sprintf("Commit number %02d", i)
-		if i == 0 {
+		if i == 24 {
 			// The first line is taken alone, trimmed, and capped at
 			// refCommitMaxLen characters; the body must stay out.
 			msg = " \t" + strings.Repeat("x", 150) + "\n\nBody that must not appear."
@@ -247,11 +253,13 @@ func TestRefCheckBodyCommitList(t *testing.T) {
 		t.Fatalf("head = %q, want the sha of the last commit", d.Head)
 	}
 	body := d.Body
-	if !strings.Contains(body, "Commit number 19") {
-		t.Fatal("the 20th commit is missing from the body")
+	// The list shows the newest refMaxCommits commits, not the oldest: 05
+	// through 24 of 25 (issue #324).
+	if !strings.Contains(body, "Commit number 05") {
+		t.Fatal("the oldest commit of the newest 20 is missing from the body")
 	}
-	if strings.Contains(body, "Commit number 20") {
-		t.Fatal("more than 20 commits were listed")
+	if strings.Contains(body, "Commit number 04") {
+		t.Fatal("more than 20 commits were listed, or the oldest were shown")
 	}
 	if !strings.Contains(body, "- ... and 5 more") {
 		t.Fatal("the truncation line is missing")
@@ -269,6 +277,122 @@ func TestRefCheckBodyCommitList(t *testing.T) {
 		if got := utf8.RuneCountInString(strings.TrimPrefix(line, "- `abcdef6` ")); got > refCommitMaxLen {
 			t.Fatalf("commit summary is %d characters: %q", got, line)
 		}
+	}
+}
+
+// refListing builds n commits for a compare fixture, oldest first, with
+// predictable shas and messages; the newest is called "newest commit".
+func refListing(n int) []string {
+	commits := make([]string, 0, n)
+	for i := range n {
+		msg := fmt.Sprintf("Commit number %03d", i)
+		if i == n-1 {
+			msg = "newest commit"
+		}
+		sha := fmt.Sprintf("fedcba%02d%s", i%100, strings.Repeat("0", 32))
+		commits = append(commits, refCommitJSON(sha, msg))
+	}
+	return commits
+}
+
+// TestRefCheckTruncatedCommitList covers issue #324: the compare API caps
+// its commits array at 250 while ahead_by carries the true count, so once
+// upstream is more than 250 commits past the pin the last listed commit is
+// not upstream's tip. The recorded head must not be that sha (a later run
+// would match it again and never update the issue), the issueAtHead branch
+// must not be taken, and a complete listing must behave as before.
+func TestRefCheckTruncatedCommitList(t *testing.T) {
+	commits := refListing(260)
+	lastListed := "fedcba59" + strings.Repeat("0", 32) // sha of the 260th listed commit
+	if !strings.Contains(commits[len(commits)-1], "newest commit") ||
+		!strings.Contains(commits[len(commits)-1], lastListed) {
+		t.Fatalf("fixture: last commit is not the newest one: %s", commits[len(commits)-1])
+	}
+
+	capped := refParseCompare(t, refCompareJSON("ahead", 300, commits...))
+	if !capped.truncated() {
+		t.Fatal("a compare with ahead_by=300 and 260 listed commits is not detected as truncated")
+	}
+	d, err := RefCheck(refTestPin, capped, nil)
+	if err != nil {
+		t.Fatalf("RefCheck: %v", err)
+	}
+	if d.Action != "create" {
+		t.Fatalf("action = %q, want create for a capped compare with no open issue", d.Action)
+	}
+	if d.Head == lastListed {
+		t.Fatal("head is the last listed sha, which a later run would re-match")
+	}
+	if !validRef.MatchString(d.Head) {
+		// A capped compare records a listing marker instead of a sha.
+		if !strings.Contains(d.Head, "260") || !strings.Contains(d.Head, "300") {
+			t.Fatalf("head = %q, want a marker naming the capped listing and ahead_by", d.Head)
+		}
+	} else {
+		t.Fatalf("head = %q: a capped listing must not record a sha", d.Head)
+	}
+	if !strings.Contains(d.Reason, "300 commits past the pin") || !strings.Contains(d.Reason, "capped") {
+		t.Fatalf("reason = %q, want the ahead_by count and the cap named", d.Reason)
+	}
+	if !strings.HasPrefix(d.Body, refHeadMarker+d.Head+"\n") {
+		t.Fatalf("body does not open with the head marker: %q", d.Body)
+	}
+	if !strings.Contains(d.Body, "capped") || !strings.Contains(d.Body, "260") {
+		t.Fatalf("body does not say the listing was capped:\n%s", d.Body)
+	}
+	// The body lists the newest commits, so the newest one is visible.
+	if !strings.Contains(d.Body, "newest commit") {
+		t.Fatalf("body hides the newest listed commit:\n%s", d.Body)
+	}
+
+	// An issue whose marker is the last listed sha (what the buggy code
+	// wrote) must not be treated as reporting this head.
+	stale := []item{{Number: 7, Body: refHeadMarker + lastListed + "\nPin: " + refTestPin,
+		Labels: []label{{Name: refUpdateLabel}}}}
+	d, err = RefCheck(refTestPin, capped, stale)
+	if err != nil {
+		t.Fatalf("RefCheck: %v", err)
+	}
+	if d.Action != "update" || d.IssueNumber != 7 {
+		t.Fatalf("decision = %+v, want an update of #7: a capped listing matches no issue marker", d)
+	}
+
+	// The same compare on an issue already at the capped marker: none.
+	atCapped := []item{{Number: 7, Body: refHeadMarker + d.Head + "\nPin: " + refTestPin,
+		Labels: []label{{Name: refUpdateLabel}}}}
+	d, err = RefCheck(refTestPin, capped, atCapped)
+	if err != nil {
+		t.Fatalf("RefCheck: %v", err)
+	}
+	if d.Action != "none" {
+		t.Fatalf("action = %q, want none when the issue already records the capped marker", d.Action)
+	}
+	// Upstream moving further ahead moves the marker, so the issue is
+	// updated rather than stuck.
+	further := refParseCompare(t, refCompareJSON("ahead", 301, commits...))
+	d, err = RefCheck(refTestPin, further, atCapped)
+	if err != nil {
+		t.Fatalf("RefCheck: %v", err)
+	}
+	if d.Action != "update" {
+		t.Fatalf("action = %q, want an update once ahead_by moves", d.Action)
+	}
+
+	// A complete listing (ahead_by == len(commits)) keeps today's
+	// behaviour: the head is the last listed sha.
+	complete := refParseCompare(t, refCompareJSON("ahead", 260, commits...))
+	if complete.truncated() {
+		t.Fatal("a complete listing was mistaken for a truncated one")
+	}
+	d, err = RefCheck(refTestPin, complete, nil)
+	if err != nil {
+		t.Fatalf("RefCheck: %v", err)
+	}
+	if d.Head != lastListed || !validRef.MatchString(d.Head) {
+		t.Fatalf("head = %q, want the last listed sha %q", d.Head, lastListed)
+	}
+	if strings.Contains(d.Body, "capped") {
+		t.Fatalf("a complete listing's body claims it was capped:\n%s", d.Body)
 	}
 }
 

@@ -166,6 +166,14 @@ func TestPRSweep(t *testing.T) {
 			}},
 	}
 	report, free := prSweep(prs)
+	// Five PRs were examined (12, 14, 17, 19 and 25 are open `codeaf/*`);
+	// only three carry findings, but the header counts the whole queue.
+	if !strings.Contains(report, "## PR sweep: 5 open `codeaf/*` PR(s) checked") {
+		t.Errorf("header does not count the 5 examined PRs:\\n%s", report)
+	}
+	if strings.Contains(report, "## PR sweep: 3 open") {
+		t.Errorf("header counts findings, not the checked queue:\\n%s", report)
+	}
 	for _, want := range []string{
 		"#12 `codeaf/fix-quota` — merge conflict",
 		"#14 `codeaf/hedge` — failing checks: 1 failing check(s)",
@@ -185,6 +193,38 @@ func TestPRSweep(t *testing.T) {
 	}
 }
 
+// TestPRSweepNullAuthor pins issue #326: a PR whose only review is
+// CHANGES_REQUESTED with a null author — what `gh pr list --json` sends for
+// a deleted account — is a standing finding and is reported under
+// "@nobody (reviewer unknown)", while a PR with no review stays unreported.
+func TestPRSweepNullAuthor(t *testing.T) {
+	at := func(s string) time.Time {
+		ts, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			t.Fatalf("fixture stamp: %v", err)
+		}
+		return ts
+	}
+	prs := []prStatus{
+		{Number: 31, HeadRefName: "codeaf/deleted-reviewer", State: "OPEN", Mergeable: "MERGEABLE",
+			Reviews: []prReview{{State: "CHANGES_REQUESTED", SubmittedAt: at("2026-10-17T09:00:00Z")}}},
+		{Number: 33, HeadRefName: "codeaf/no-review", State: "OPEN", Mergeable: "MERGEABLE"},
+	}
+	report, free := prSweep(prs)
+	if !strings.Contains(report, "## PR sweep: 2 open `codeaf/*` PR(s) checked") {
+		t.Errorf("header does not count the 2 examined PRs:\n%s", report)
+	}
+	if !strings.Contains(report, "#31 `codeaf/deleted-reviewer` — unaddressed finding: @nobody (reviewer unknown)") {
+		t.Errorf("null-author finding not reported under @nobody:\n%s", report)
+	}
+	if strings.Contains(report, "#33") {
+		t.Errorf("review-less PR reported, must stay unreported:\n%s", report)
+	}
+	if len(free) != 0 {
+		t.Errorf("conflictedFree = %v, want empty", free)
+	}
+}
+
 // TestPRSweepClean pins the empty case: a clean queue says so, and
 // conflictedFree stays empty.
 func TestPRSweepClean(t *testing.T) {
@@ -192,8 +232,11 @@ func TestPRSweepClean(t *testing.T) {
 		{Number: 9, HeadRefName: "codeaf/clean", State: "OPEN", Mergeable: "MERGEABLE",
 			StatusCheckRollup: []prCheck{{State: "SUCCESS"}}},
 	})
-	if !strings.Contains(report, "No red, conflicted or unaddressed-review PRs") {
-		t.Errorf("clean sweep reported findings:\n%s", report)
+	if !strings.Contains(report, "## PR sweep: 1 open `codeaf/*` PR(s) checked") {
+		t.Errorf("clean header does not count the 1 examined PR:\n%s", report)
+	}
+	if !strings.Contains(report, "No red, conflicted or unaddressed-review PR(s) among the 1 checked.") {
+		t.Errorf("clean line does not carry the checked count:\n%s", report)
 	}
 	if len(free) != 0 {
 		t.Errorf("conflictedFree = %v, want empty", free)
@@ -222,6 +265,9 @@ func TestFlakyTests(t *testing.T) {
 	out.WriteString("=== RUN   TestSub/case1\n")
 	out.WriteString("--- FAIL: TestSub/case1 (0.00s)\n")
 	out.WriteString("    sub_test.go:9: case1 flaked\n")
+	// A bare marker with no test name: log noise (issue #325). It must be
+	// skipped, not counted, and must not panic.
+	out.WriteString("--- FAIL: \n")
 	out.WriteString("FAIL\n")
 	out.WriteString("FAIL\tcodeaf-harness\t1.2s\n")
 
@@ -247,6 +293,34 @@ func TestFlakyTests(t *testing.T) {
 	}
 	if strings.Contains(report, "### TestStable") {
 		t.Errorf("stable test reported as flaky:\n%s", report)
+	}
+}
+
+// TestFlakyTestsBareMarker pins the never-panic contract of the file header
+// (issue #325): a "--- FAIL: " line that carries no test name — anything a
+// test or a subprocess prints goes into the combined output — is skipped,
+// not counted and not panicked on.
+func TestFlakyTestsBareMarker(t *testing.T) {
+	for _, out := range []string{
+		"--- FAIL: \n",
+		"--- FAIL: \t\n", // trailing whitespace is not a name either
+		"--- FAIL: \r\n",
+	} {
+		report, failed := flakyTests([]byte(out))
+		if len(failed) != 0 {
+			t.Errorf("no-name FAIL marker counted a test: failed = %v", failed)
+		}
+		if !strings.Contains(report, "No intermittent test failures") {
+			t.Errorf("report for %q = %q, want the no-failure report", out, report)
+		}
+	}
+	// A real failure is still counted when noise surrounds it.
+	report, failed := flakyTests([]byte("--- FAIL: \n--- FAIL: TestReal (0.00s)\n"))
+	if len(failed) != 1 || failed[0] != "TestReal" {
+		t.Fatalf("failed = %v, want [TestReal]", failed)
+	}
+	if !strings.Contains(report, "### TestReal") {
+		t.Errorf("named failure missing from report:\n%s", report)
 	}
 }
 

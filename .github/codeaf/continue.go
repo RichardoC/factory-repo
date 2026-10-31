@@ -392,12 +392,14 @@ func runContinuePlan() error {
 // ---------------------------------------------------------------- the brief
 
 // closeKeywords are the phrases GitHub links a closing issue on, longest
-// first so "closed" is tried before "close".
-var closeKeywords = []string{"resolves", "closed", "closes", "resolve", "fixed", "fixes", "close"}
+// first so "closed" is tried before "close", and "fixes"/"fixed" before
+// "fix".
+var closeKeywords = []string{"resolved", "resolves", "closed", "closes", "resolve", "fixed", "fixes", "close", "fix"}
 
 // linkedIssue returns the issue number the pull request body says it closes:
-// the first "#N" preceded by a close keyword (Closes/Close/Closed/Fixes/
-// Fixed/Resolve/Resolves, case-insensitive), 0 when there is none. The
+// the first "#N" preceded by a close keyword (Closes/Close/Closed/Fix/
+// Fixes/Fixed/Resolve/Resolves/Resolved, case-insensitive), 0 when there is
+// none. The
 // continuation brief uses it to say what the issue still requires. N is read
 // as digits with a sane bound; an oversized or malformed reference yields 0.
 func linkedIssue(body string) int {

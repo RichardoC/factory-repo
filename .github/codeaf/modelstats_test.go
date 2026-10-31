@@ -147,11 +147,128 @@ func TestModelStatsStatusIsNotAMarkerUnlessKindSaysSo(t *testing.T) {
 	if !strings.Contains(got, "| 0 | 1 | 1 | 0 |") {
 		t.Errorf("want cut=0, one 429 (the marker), one error (that same 429) and no stall, got:\n%s", got)
 	}
-	if strings.Contains(got, "above the 1.00% threshold") == false {
-		// 429 rate is 1 of (2 calls + 1 marker) = 33.33%: the alert must
-		// still fire, and the denominator must include the marker as a call
-		// the proxy never completed.
-		t.Errorf("the 429 alert did not fire on a 33.33%% rate:\n%s", got)
+	// 429 rate is 1 of (2 calls + 1 marker) = 33.33%: the alert must
+	// still fire, and the denominator must include the marker as a call
+	// the proxy never completed. The whole line is pinned so the wording
+	// stays identical to the marker-only branch the alert loop grew for
+	// issue #320.
+	want := "`alpha`: 429 rate 33.33% above the 1.00% threshold (1 of 3); " +
+		"consider lowering max_concurrent, not raising it"
+	if !strings.Contains(got, want) {
+		t.Errorf("the 429 alert did not fire on a 33.33%% rate, want %q:\n%s", want, got)
+	}
+}
+
+// TestModelStatsThrottledToDeathFires429Alert: issue #320. A model whose
+// every call was refused with 429 never has a call row -- a refusal is
+// recorded only as a kind "status" marker -- so Calls is 0 and Four29 is
+// the marker count. The 429-rate alert is the one that carries the
+// operational advice ("consider lowering max_concurrent, not raising it"),
+// and it must fire on the markers alone, with the marker count alone as
+// the denominator, in place of the bare "no calls" line.
+func TestModelStatsThrottledToDeathFires429Alert(t *testing.T) {
+	cfg := modelStatsTestConfigWith(t, "delta")
+	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	win := modelStatsWindowFrom(cfg, now)
+
+	// Two refused calls, recorded as markers only: no call row ever exists.
+	lines := []string{
+		`{"ts":"2026-10-21T11:00:00Z","model":"delta","kind":"status","status":429}`,
+		`{"ts":"2026-10-21T11:01:00Z","model":"delta","kind":"status","status":429}`,
+	}
+	zr := modelStatsTestZip(t, "codeaf-ledger.jsonl", strings.Join(lines, "\n")+"\n")
+
+	in := parseModelStatsZips([]*zip.Reader{zr}, cfg)
+	if in.Stats.Rows != 0 {
+		t.Fatalf("a marker produced a call row: rows=%d, want 0", in.Stats.Rows)
+	}
+	got := modelStatsReport(in, cfg, win, now)
+
+	// The table still shows the throttling: zero calls, and the two
+	// 429s are also the two errors (Errs sums the 4xx/5xx/other/429
+	// classes: cut=0 | 429=2 | error=2 | stall=0).
+	if !strings.Contains(got, "| `delta` | 0 | 0 |") {
+		t.Errorf("the marker-only model is missing from the model table:\n%s", got)
+	}
+	if !strings.Contains(got, "| 0 | 2 | 2 | 0 |") {
+		t.Errorf("want cut=0, two 429s and those same two errors in the table, got:\n%s", got)
+	}
+	// The alert names the model and divides by the marker count alone
+	// (2 of 2 = 100%), in the same wording as the call-bearing case.
+	want := "`delta`: 429 rate 100.00% above the 1.00% threshold (2 of 2); " +
+		"consider lowering max_concurrent, not raising it"
+	if !strings.Contains(got, want) {
+		t.Errorf("the 429 alert did not fire on markers alone, want %q:\n%s", want, got)
+	}
+	if strings.Contains(got, "configured model with no calls in the window") {
+		t.Errorf("a throttled model got the bare no-calls line instead of the 429 advice:\n%s", got)
+	}
+	// Exactly that one alert: no other per-model alert fires on markers.
+	if !strings.Contains(got, "### Alerts (1)") {
+		t.Errorf("want exactly the 429 alert for the marker-only model:\n%s", got)
+	}
+}
+
+// TestModelStatsMarkersAreWindowFiltered: a status marker from outside the
+// window must not count in the error classes or the 429-rate denominator.
+// filterWindow used to copy every marker verbatim while rejecting
+// out-of-window call rows, so a directory holding artifacts older than the
+// 72 h window reported a 429 rate for hours the report does not cover --
+// stale 429s inflated both the numerator-bound class table and the
+// denominator counting markers as calls, which can push the rate down past
+// the threshold and quieten the very alert the denominator exists for
+// (issue #319). The decoder also has to keep the marker timestamp it used
+// to drop, a line the proxy always records.
+func TestModelStatsMarkersAreWindowFiltered(t *testing.T) {
+	cfg := modelStatsTestConfig(t)
+	now := time.Now().UTC()
+	oneHourAgo := now.Add(-1 * time.Hour).Format(time.RFC3339)
+	lines := []string{
+		// Two in-window calls.
+		fmt.Sprintf(`{"ts":%q,"model":"alpha","completion_tokens":1000,"usage_seen":true,"ttft_ms":1000,"dur_ms":9000}`, oneHourAgo),
+		fmt.Sprintf(`{"ts":%q,"model":"alpha","completion_tokens":1000,"usage_seen":true,"ttft_ms":1000,"dur_ms":9000}`, oneHourAgo),
+		// An in-window 429 marker: it must count everywhere.
+		fmt.Sprintf(`{"ts":%q,"model":"alpha","kind":"status","status":429}`, oneHourAgo),
+		// A 429 marker older than the 72 h window: it must count nowhere.
+		fmt.Sprintf(`{"ts":%q,"model":"alpha","kind":"status","status":429}`, now.Add(-100*time.Hour).Format(time.RFC3339)),
+	}
+	zr := modelStatsTestZip(t, "codeaf-ledger.jsonl", strings.Join(lines, "\n")+"\n")
+
+	in := parseModelStatsZips([]*zip.Reader{zr}, cfg)
+	if in.Stats.Rejected != 0 || len(in.Stats.Markers) != 2 {
+		t.Fatalf("decode: rows rejected=%d markers=%d, want 0/2 (both markers parse; the window is applied later)",
+			in.Stats.Rejected, len(in.Stats.Markers))
+	}
+	win := modelStatsWindowFrom(cfg, now)
+	filtered := filterWindow(in, win)
+	if n := countMarkers(filtered, "alpha"); n != 1 {
+		t.Fatalf("filterWindow kept %d marker(s) in the window, want the one in-window 429", n)
+	}
+	// The class table: the in-window 429 is the only 429 and the only
+	// error; the stale one charges no class.
+	for _, a := range modelAggregate(filtered, cfg, win) {
+		if a.ID == "alpha" && (a.Calls != 2 || a.Four29 != 1 || a.Errs != 1) {
+			t.Errorf("alpha aggregate: calls=%d four29=%d errs=%d, want 2/1/1 (the out-of-window 429 counted too)",
+				a.Calls, a.Four29, a.Errs)
+		}
+	}
+	got := modelStatsReport(in, cfg, win, now)
+	// Columns after e2e tok/s are cut | 429 | error | stall (see
+	// TestModelStatsStatusIsNotAMarkerUnlessKindSaysSo).
+	if !strings.Contains(got, "| `alpha` | 2 | 1 |") {
+		t.Errorf("the in-window calls are missing from the model table:\n%s", got)
+	}
+	if !strings.Contains(got, "| 0 | 1 | 1 | 0 |") {
+		t.Errorf("the error classes count the stale marker, or miss the in-window one:\n%s", got)
+	}
+	// The 429 rate and its denominator count the in-window marker as one of
+	// three calls (2 rows + 1 marker); with the bug the stale marker made it
+	// 2 of 4.
+	if !strings.Contains(got, "429 rate 33.33% above the 1.00% threshold (1 of 3)") {
+		t.Errorf("the 429 alert does not state the in-window marker alone as its own count and denominator:\n%s", got)
+	}
+	if strings.Contains(got, "2 of 4") {
+		t.Errorf("the stale marker leaked into the 429 count or the denominator:\n%s", got)
 	}
 }
 
@@ -400,6 +517,39 @@ func TestModelStatsZipBounds(t *testing.T) {
 	in = parseModelStatsWithBounds([]*zip.Reader{run}, allowed, b)
 	if len(in.Rows) != b.MaxRunRows {
 		t.Fatalf("row cap: got %d rows, want %d", len(in.Rows), b.MaxRunRows)
+	}
+}
+
+// TestParseModelStatsZipCountCap: the zip-count cap refuses only the
+// artifacts past it, not the whole window. The first MaxZips zips are read
+// and the excess is counted as skipped with one bounded reason -- the same
+// per-item refusal every other bound in the reader uses.
+func TestParseModelStatsZipCountCap(t *testing.T) {
+	allowed := map[string]bool{"alpha": true}
+	b := defaultModelStatsBounds()
+	b.MaxZips = 3
+
+	line := `{"ts":"2026-10-21T11:00:00Z","model":"alpha","ttft_ms":1,"dur_ms":2}` + "\n"
+	var zips []*zip.Reader
+	for i := 0; i < b.MaxZips+1; i++ {
+		zips = append(zips, modelStatsTestZip(t, modelStatsLedgerName, line))
+	}
+
+	// Over the cap: every zip up to it is read, the excess is one skip line.
+	in := parseModelStatsWithBoundsSkipped(zips, nil, allowed, b)
+	if in.Stats.Zips != b.MaxZips {
+		t.Errorf("zips = %d, want %d (the cap must refuse only the excess)", in.Stats.Zips, b.MaxZips)
+	}
+	if in.Stats.ZipSkipped != 1 || len(in.Stats.SkippedReason) != 1 ||
+		!strings.Contains(in.Stats.SkippedReason[0], "over the 3-zip cap") {
+		t.Errorf("excess: skipped=%d reasons=%v, want one bounded reason", in.Stats.ZipSkipped, in.Stats.SkippedReason)
+	}
+
+	// At the cap: a window at or under it reads every zip and skips nothing.
+	at := parseModelStatsWithBoundsSkipped(zips[:b.MaxZips], nil, allowed, b)
+	if at.Stats.Zips != b.MaxZips || at.Stats.ZipSkipped != 0 || len(at.Stats.SkippedReason) != 0 {
+		t.Errorf("at cap: zips=%d skipped=%d reasons=%v, want every zip read",
+			at.Stats.Zips, at.Stats.ZipSkipped, at.Stats.SkippedReason)
 	}
 }
 

@@ -336,18 +336,32 @@ func TestReadManifestRejectsOutOfRangeSpend(t *testing.T) {
 	for name, entry := range map[string]string{
 		"future day":        `"2099-01-01": 0.5`,
 		"a day 30 days old": fmt.Sprintf("%q: 0.5", day(-30)),
-		// Two oversized days: one just past the write-path ceiling (the
-		// weekly credit plus every parallel run in flight when the cap was
-		// crossed), one well under the old three-weekly ceiling that
-		// admitted it — neither is a day the queue funds, so both are
-		// refused.
-		"a day just over the write-path ceiling":    fmt.Sprintf("%q: %v", day(0), dayCap+0.01),
-		"an oversized day the old ceiling admitted": fmt.Sprintf("%q: %v", day(0), 2*cfg.Limits.WeeklyCreditUSD),
 	} {
 		dir := t.TempDir()
 		writeTestFile(t, filepath.Join(dir, manifestFile), []byte(fmt.Sprintf(`{"version":1,"generation":2,"merged":[],"updated":"2026-10-16T11:00:00Z","spend":{"2026-10-16":0.5,%s}}`, entry)))
 		if _, _, err := readManifest(dir, cfg, now); err == nil {
 			t.Errorf("%s (%s) accepted", name, entry)
+		}
+	}
+
+	// An oversized day is capped at the ceiling, not refused: the merge
+	// adds spend without that bound and a config edit can lower it, so a
+	// refusal would fail every run on a bundle the harness wrote. The cap
+	// never loosens the hold, since the ceiling is at least the weekly
+	// credit.
+	for name, usd := range map[string]float64{
+		"just over the ceiling":       dayCap + 0.01,
+		"twice the weekly credit":     2*cfg.Limits.WeeklyCreditUSD + dayCap,
+		"just under validUSD's bound": 999_999,
+	} {
+		dir := t.TempDir()
+		writeTestFile(t, filepath.Join(dir, manifestFile), []byte(fmt.Sprintf(`{"version":1,"generation":2,"merged":[],"updated":"2026-10-16T11:00:00Z","spend":{"2026-10-15":0.5,%q:%v}}`, day(0), usd)))
+		m := readManifestT(t, dir, cfg, now)
+		if m.Spend[day(0)] != dayCap || m.Spend["2026-10-15"] != 0.5 {
+			t.Errorf("%s: spend = %v, want %s capped at %v and the other day unchanged", name, m.Spend, day(0), dayCap)
+		}
+		if week := weekSpend(m, now); week < cfg.Limits.WeeklyCreditUSD {
+			t.Errorf("%s: week spend %v after the cap is under the weekly credit %v: the cap loosened the hold", name, week, cfg.Limits.WeeklyCreditUSD)
 		}
 	}
 
@@ -517,5 +531,130 @@ func TestStateLoadOutputsWeekSpend(t *testing.T) {
 	output, _ := os.ReadFile(os.Getenv("GITHUB_OUTPUT"))
 	if string(output) != "generation=4\nday_usd=1.5\nweek_usd=7.5\n" {
 		t.Errorf("load output = %q, want day_usd 1.5 and week_usd 7.5", output)
+	}
+}
+
+// TestStateMergeSeedsMergedKeysFromALegacyBundle covers a bundle written before
+// issue #312: only manifest.json has dedup keys, and the first merge after the
+// change must carry them into merged-keys.jsonl instead of forgetting them.
+func TestStateMergeSeedsMergedKeysFromALegacyBundle(t *testing.T) {
+	cfg, err := loadConfig("models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	bundle := t.TempDir()
+	writeTestFile(t, filepath.Join(bundle, manifestFile),
+		[]byte(`{"version":1,"generation":3,"merged":["10-1","11-1"],"updated":"2026-10-16T11:00:00Z","spend":{"2026-10-16":1.25}}`))
+	t.Setenv("GITHUB_OUTPUT", filepath.Join(t.TempDir(), "output"))
+
+	// Run 10 is re-presented: the legacy window still knows it.
+	run := t.TempDir()
+	writeRecordRun(t, run, "10", RunRecord{RunID: "10", Attempt: "1", Mode: "issue", Stop: stopDone, Date: "2026-10-16"}, true)
+
+	// Nothing to merge: the bundle is handed back with the seeded key set.
+	out := filepath.Join(t.TempDir(), "out")
+	if err := stateMerge(bundle, out, []string{run}, cfg, now); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := readMergedKeys(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(keys, ",") != "10-1,11-1" {
+		t.Errorf("%s = %v, want the legacy window seeded in order", mergedFile, keys)
+	}
+	m := readManifestT(t, out, cfg, now)
+	if m.Generation != 3 || m.Spend["2026-10-16"] != 1.25 {
+		t.Errorf("no-op merge changed the bundle: %+v", m)
+	}
+	if output, _ := os.ReadFile(os.Getenv("GITHUB_OUTPUT")); !strings.Contains(string(output), "changed=false") {
+		t.Errorf("output = %q, want changed=false", output)
+	}
+}
+
+// TestStateLoadRefusesBadMergedKeys pins where a bad merged-keys.jsonl fails:
+// at the load, before anything is installed — not for the first time at the
+// merge, where it would fail every later run with nothing to reload
+// (issue #312 review, AGENTS.md: carried data is validated on every load).
+func TestStateLoadRefusesBadMergedKeys(t *testing.T) {
+	cfg, err := loadConfig("models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	bundle := t.TempDir()
+	writeTestFile(t, filepath.Join(bundle, manifestFile),
+		[]byte(`{"version":1,"generation":3,"merged":[],"updated":"2026-10-16T11:00:00Z","spend":{}}`))
+	writeTestFile(t, filepath.Join(bundle, mergedFile), []byte("1-1\nnot-a-key\n"))
+	home := t.TempDir()
+	t.Setenv("GITHUB_OUTPUT", filepath.Join(t.TempDir(), "output"))
+	if err := stateLoad(bundle, home, cfg, now); err == nil {
+		t.Fatalf("stateLoad accepted a bundle whose %s is malformed; the load must refuse it first", mergedFile)
+	}
+	if _, err := os.Stat(filepath.Join(home, recordsFile)); !os.IsNotExist(err) {
+		t.Error("stateLoad installed files from a bundle it refused")
+	}
+
+	// The same bundle with a well-formed key set loads.
+	writeTestFile(t, filepath.Join(bundle, mergedFile), []byte("1-1\n2-2\n"))
+	if err := stateLoad(bundle, home, cfg, now); err != nil {
+		t.Errorf("stateLoad refused a valid %s: %v", mergedFile, err)
+	}
+}
+
+// TestMergedUnion covers the `state merged` download filter: the set the
+// merge decides on is the union of merged-keys.jsonl and the manifest window,
+// so a legacy bundle still lists its window and no key is printed twice
+// (issue #312 review; reverting this to the manifest window alone means the
+// state workflow re-downloads already-merged artifacts).
+func TestMergedUnion(t *testing.T) {
+	cfg, err := loadConfig("models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, manifestFile),
+		[]byte(`{"version":1,"generation":3,"merged":["1-1","2-1"],"updated":"2026-10-16T11:00:00Z","spend":{}}`))
+	// A legacy bundle (no key file): the window is the whole set.
+	union, err := mergedUnion(dir, cfg, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(union, ",") != "1-1,2-1" {
+		t.Errorf("legacy union = %v, want the window 1-1,2-1", union)
+	}
+	// The key file is the dedup set; window keys it has not recorded join
+	// it, and nothing is listed twice.
+	writeTestFile(t, filepath.Join(dir, mergedFile), []byte("2-1\n5-1\n"))
+	union, err = mergedUnion(dir, cfg, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(union, ",") != "1-1,2-1,5-1" {
+		t.Errorf("union = %v, want 1-1,2-1,5-1 (window plus file, each key once)", union)
+	}
+	// A window that has forgotten old runs must not shrink the set: the
+	// file still holds their keys.
+	writeTestFile(t, filepath.Join(dir, manifestFile),
+		[]byte(`{"version":1,"generation":3,"merged":["9-1"],"updated":"2026-10-16T11:00:00Z","spend":{}}`))
+	union, err = mergedUnion(dir, cfg, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(union, ",") != "9-1,2-1,5-1" {
+		t.Errorf("union = %v, want 9-1,2-1,5-1 (no re-download of 2-1 because the window forgot it)", union)
+	}
+	// A key file with a bad line is refused here too, not at the merge.
+	writeTestFile(t, filepath.Join(dir, mergedFile), []byte("2-1\nbad key\n"))
+	if _, err := mergedUnion(dir, cfg, now); err == nil {
+		t.Error("mergedUnion accepted a malformed key file")
+	}
+	// A manifest that fails validation fails here too.
+	writeTestFile(t, filepath.Join(dir, manifestFile),
+		[]byte(`{"version":1,"generation":3,"merged":["9-1"],"updated":"2026-10-16T11:00:00Z","spend":{"2026-10-16":-5}}`))
+	if _, err := mergedUnion(dir, cfg, now); err == nil {
+		t.Error("mergedUnion accepted an unvalidated manifest")
 	}
 }

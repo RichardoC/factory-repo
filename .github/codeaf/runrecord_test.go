@@ -272,6 +272,127 @@ func TestStateMergeAppendsRecordsAndCaps(t *testing.T) {
 	}
 }
 
+// TestStateMergeIsIdempotentPastTheCap re-presents a run the manifest window
+// has already forgotten (issue #312): the merge must recognise it by its key,
+// leave the day's spend alone and not advance the generation for it.
+func TestStateMergeIsIdempotentPastTheCap(t *testing.T) {
+	cfg, err := loadConfig("models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One UTC day of maxMergedRuns+1 runs is far past the read-time day
+	// ceiling (issue #311), which would cap the figure and hide a double
+	// count; a weekly credit above it keeps the spend checks exact here.
+	cfg.Limits.WeeklyCreditUSD = 10 * maxMergedRuns
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	empty := filepath.Join(t.TempDir(), "no-bundle")
+	out := filepath.Join(t.TempDir(), "out")
+	t.Setenv("GITHUB_OUTPUT", filepath.Join(t.TempDir(), "output"))
+	writeRun := func(runID string) string {
+		dir := t.TempDir()
+		meta := RunMeta{Version: stateVersion, RunID: runID, Attempt: "1", BaseGeneration: 0, Date: "2026-10-16", RunUSD: 1}
+		data, err := json.MarshalIndent(meta, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeTestFile(t, filepath.Join(dir, metaFile), data)
+		return dir
+	}
+
+	var dirs []string
+	for i := 1; i <= maxMergedRuns+1; i++ {
+		dirs = append(dirs, writeRun(strconv.Itoa(i)))
+	}
+	first := dirs[0]
+	if err := stateMerge(empty, out, dirs, cfg, now); err != nil {
+		t.Fatal(err)
+	}
+	m := readManifestT(t, out, cfg, now)
+	if len(m.Merged) != maxMergedRuns {
+		t.Fatalf("%d runs merged, want the %d cap", len(m.Merged), maxMergedRuns)
+	}
+	if got := m.Spend["2026-10-16"]; got != float64(maxMergedRuns+1) {
+		t.Fatalf("spend after the first merge = %v, want %d", got, maxMergedRuns+1)
+	}
+	// The window has forgotten run 1, which is exactly the trap.
+	for _, key := range m.Merged {
+		if key == "1-1" {
+			t.Fatal("run 1-1 is still in the manifest window; the test proves nothing")
+		}
+	}
+
+	// Re-present the forgotten run alongside a genuinely new one.
+	fresh := writeRun("9999")
+	out2 := filepath.Join(t.TempDir(), "out2")
+	if err := stateMerge(out, out2, []string{first, fresh}, cfg, now); err != nil {
+		t.Fatal(err)
+	}
+	again := readManifestT(t, out2, cfg, now)
+	if got, want := again.Spend["2026-10-16"], m.Spend["2026-10-16"]+1; got != want {
+		t.Errorf("spend after re-merging run 1-1 = %v, want %v (its dollars counted once)", got, want)
+	}
+	if got, want := again.Generation, m.Generation+1; got != want {
+		t.Errorf("generation after re-merging run 1-1 = %d, want %d (only run 9999 advanced it)", got, want)
+	}
+	if again.Updated.IsZero() {
+		t.Error("the repeat merge did not write the bundle")
+	}
+
+	// The dedup set outlives the manifest window.
+	keys, err := readMergedKeys(out2)
+	if err != nil {
+		t.Fatalf("merged keys: %v", err)
+	}
+	found := false
+	for _, key := range keys {
+		if key == "1-1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("run 1-1 is not in %s; the dedup set forgot it again", mergedFile)
+	}
+
+	// The repeat alone, one last time: a re-presented run changes nothing
+	// at all — neither the day's spend nor the generation (issue #312 Done
+	// when: "m.Spend for that day is unchanged and m.Generation did not
+	// advance for the repeat").
+	out3 := filepath.Join(t.TempDir(), "out3")
+	if err := stateMerge(out2, out3, []string{first}, cfg, now); err != nil {
+		t.Fatal(err)
+	}
+	lone := readManifestT(t, out3, cfg, now)
+	if got, want := lone.Spend["2026-10-16"], again.Spend["2026-10-16"]; got != want {
+		t.Errorf("spend after a lone re-merge of run 1-1 = %v, want %v unchanged", got, want)
+	}
+	if got, want := lone.Generation, again.Generation; got != want {
+		t.Errorf("generation after a lone re-merge of run 1-1 = %d, want %d unchanged", got, want)
+	}
+}
+
+func TestReadMergedKeysRefusesBsdKeys(t *testing.T) {
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, mergedFile), []byte("1-1\n20; rm -rf /\n"))
+	if _, err := readMergedKeys(dir); err == nil {
+		t.Error("a malformed merged key was accepted")
+	}
+	// A missing file is an empty set: bundles from before issue #312 keep merging.
+	if keys, err := readMergedKeys(t.TempDir()); err != nil || len(keys) != 0 {
+		t.Errorf("missing %s: (%v, %v)", mergedFile, keys, err)
+	}
+	// A set well under the byte bound is kept whole. A set over it is
+	// TestTrimMergedKeysBoundsTheSet, which actually crosses
+	// maxMergedKeyBytes; a 1000-key set is only a few kilobytes and would
+	// leave that loop unexecuted (issue #312 review).
+	many := make([]string, 0, 1000)
+	for i := 0; i < 1000; i++ {
+		many = append(many, strconv.Itoa(i)+"-1")
+	}
+	if trimmed := trimMergedKeys(many); len(trimmed) != len(many) {
+		t.Errorf("a %d-key set was trimmed to %d keys; only sets past the %d-byte bound are", len(many), len(trimmed), maxMergedKeyBytes)
+	}
+}
+
 func TestStateLoadDropsBadRecordLines(t *testing.T) {
 	cfg, err := loadConfig("models.json")
 	if err != nil {
@@ -450,5 +571,214 @@ func TestStateMergeTakesOnlyTheRunsOwnRecord(t *testing.T) {
 	records, _ := CleanRecords(data)
 	if len(records) != 1 || records[0].RunID != "1" {
 		t.Errorf("records = %+v, want only run 1's own", records)
+	}
+}
+
+// TestTrimMergedKeysBoundsTheSet drives the trim loop with a set that really
+// crosses maxMergedKeyBytes — the handful-of-kilobytes sets every other test
+// builds never execute it — and checks it drops the oldest keys and keeps the
+// newest: the direction the bundle handed on depends on (issue #312 review).
+func TestTrimMergedKeysBoundsTheSet(t *testing.T) {
+	keys := []string{}
+	total := 0
+	for i := 1; total <= maxMergedKeyBytes; i++ {
+		if i > 1_000_000 {
+			t.Fatalf("the key set never reached the %d-byte bound", maxMergedKeyBytes)
+		}
+		key := strconv.Itoa(i) + "-1"
+		keys = append(keys, key)
+		total += len(key) + 1
+	}
+
+	trimmed := trimMergedKeys(keys)
+	if len(trimmed) == len(keys) {
+		t.Fatalf("a %d-byte set stayed %d keys; a set past the %d-byte bound must shrink", total, len(keys), maxMergedKeyBytes)
+	}
+	kept := 0
+	for _, key := range trimmed {
+		kept += len(key) + 1
+	}
+	if kept > maxMergedKeyBytes {
+		t.Errorf("trimmed set is %d bytes, still over the %d bound", kept, maxMergedKeyBytes)
+	}
+	// Newest last, and the survivors are the input's tail unchanged — a
+	// trim that kept the oldest head instead would fail both.
+	if trimmed[len(trimmed)-1] != keys[len(keys)-1] || trimmed[0] != keys[len(keys)-len(trimmed)] {
+		t.Errorf("trim kept %q..%q, want the input tail %q..%q", trimmed[0], trimmed[len(trimmed)-1],
+			keys[len(keys)-len(trimmed)], keys[len(keys)-1])
+	}
+
+	// The bound holds at the write seam: whatever path writes a bundle, the
+	// file it hands on must read back on the next pass.
+	dir := t.TempDir()
+	if err := writeMergedKeys(dir, keys); err != nil {
+		t.Fatalf("writeMergedKeys: %v", err)
+	}
+	round, err := readMergedKeys(dir)
+	if err != nil {
+		t.Fatalf("%v: an over-bound set was written unreadable (the write seam must trim)", err)
+	}
+	if len(round) != len(trimmed) || round[len(round)-1] != keys[len(keys)-1] {
+		t.Errorf("round trip kept %d keys, newest %q; want %d keys, newest %q",
+			len(round), round[len(round)-1], len(trimmed), keys[len(keys)-1])
+	}
+}
+
+// TestStateMergeHandsBackABoundedKeyFile covers the nothing-to-merge path with
+// a bundle whose dedup set already fills the byte bound: seeding its legacy
+// manifest window pushes the set past the bound, and what the merge hands
+// back must still be readable on the next pass (issue #312 review; this was
+// written untrimmed, a file readMergedKeys then refused).
+func TestStateMergeHandsBackABoundedKeyFile(t *testing.T) {
+	cfg, err := loadConfig("models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	legacy := t.TempDir()
+	// A legacy bundle whose key file still fits (readMergedKeys refuses
+	// anything bigger), filled right up to the bound. Run ids climb, so
+	// the newest key is last.
+	var b strings.Builder
+	total, lastKey := 0, ""
+	for i := 1; ; i++ {
+		key := strconv.Itoa(i) + "-1"
+		if total+len(key)+1 > maxMergedKeyBytes {
+			break
+		}
+		b.WriteString(key)
+		b.WriteByte('\n')
+		total += len(key) + 1
+		lastKey = key
+	}
+	writeTestFile(t, filepath.Join(legacy, mergedFile), []byte(b.String()))
+	// The window knows two runs the file has not recorded; one is
+	// re-presented, so nothing merges and the bundle is handed back.
+	writeTestFile(t, filepath.Join(legacy, manifestFile),
+		[]byte(`{"version":1,"generation":3,"merged":["9000001-1","9000002-1"],"updated":"2026-10-16T11:00:00Z","spend":{"2026-10-16":1.25}}`))
+	run := t.TempDir()
+	writeRecordRun(t, run, "9000001", RunRecord{RunID: "9000001", Attempt: "1", Mode: "issue", Stop: stopDone, Date: "2026-10-16"}, true)
+	t.Setenv("GITHUB_OUTPUT", filepath.Join(t.TempDir(), "output"))
+
+	out := filepath.Join(t.TempDir(), "out")
+	if err := stateMerge(legacy, out, []string{run}, cfg, now); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := readMergedKeys(out)
+	if err != nil {
+		t.Fatalf("the handed-back bundle was refused by its own %s: %v", mergedFile, err)
+	}
+	if got, bound := keysBytes(keys), maxMergedKeyBytes; got > bound {
+		t.Errorf("handed-back key set is %d bytes, over the %d bound", got, bound)
+	}
+	// The seeded window keys sit at the front of the set, so under the
+	// bound they are the first the trim drops; they stay in m.Merged, which
+	// reseeds them on the next merge. What must never be dropped is the
+	// newest: the last file key.
+	if len(keys) == 0 || keys[len(keys)-1] != lastKey {
+		t.Errorf("last key = %q, want the newest file key %q", lastOf(keys), lastKey)
+	}
+	windowed := false
+	for _, key := range readManifestT(t, out, cfg, now).Merged {
+		if key == "9000001-1" {
+			windowed = true
+		}
+	}
+	if !windowed {
+		t.Error("the window key that was trimmed out of the key file is gone from m.Merged too")
+	}
+	m := readManifestT(t, out, cfg, now)
+	if m.Generation != 3 || m.Spend["2026-10-16"] != 1.25 {
+		t.Errorf("no-op merge changed the bundle: %+v", m)
+	}
+}
+
+// keysBytes totals a key set the way trimMergedKeys measures it: one key,
+// one newline.
+func keysBytes(keys []string) (total int) {
+	for _, key := range keys {
+		total += len(key) + 1
+	}
+	return total
+}
+
+func lastOf(keys []string) string {
+	if len(keys) == 0 {
+		return ""
+	}
+	return keys[len(keys)-1]
+}
+
+// TestMergeRecordsCap covers the cap on the bundle's run-record history
+// (maxRecordLines, issue #140) at its seam: re-merging a bundle with records it
+// already has adds none of them twice — the dedup-by-key the double-spend fix
+// of issue #312 rests on — and the newest maxRecordLines are what stay.
+// The name matches the issue #312 end-to-end check, which runs
+// `go test -run "TestStateMerge|TestMergeRecordsCap"`.
+func TestMergeRecordsCap(t *testing.T) {
+	rec := func(id string) RunRecord {
+		return RunRecord{RunID: id, Attempt: "1", Mode: "issue", Stop: stopDone, Date: "2026-10-16"}
+	}
+	base := make([]RunRecord, 0, maxRecordLines)
+	for i := 1; i <= maxRecordLines; i++ {
+		base = append(base, rec(strconv.Itoa(i)))
+	}
+	// Run 1 again plus two new runs: appended once, then capped at the
+	// newest maxRecordLines.
+	out := MergeRecords(base, []RunRecord{rec("1"), rec("2001"), rec("2002")})
+	if len(out) != maxRecordLines {
+		t.Fatalf("%d records, want the %d cap (2002 kept + capped, not 2003)", len(out), maxRecordLines)
+	}
+	if out[len(out)-1].RunID != "2002" || out[len(out)-2].RunID != "2001" {
+		t.Errorf("newest records = ...%s, %s; want the new runs last", out[len(out)-2].RunID, out[len(out)-1].RunID)
+	}
+	if out[0].RunID != "3" {
+		t.Errorf("oldest kept = %s, want 3 (run 1 deduped, 2 dropped by the cap)", out[0].RunID)
+	}
+	// Re-merging a bundle with itself must change nothing.
+	same := MergeRecords(base, base)
+	if len(same) != maxRecordLines || same[len(same)-1].RunID != "2000" {
+		t.Errorf("re-merge: %d records, newest %s; want %d, 2000", len(same), lastOfRunRecords(same), maxRecordLines)
+	}
+}
+
+func lastOfRunRecords(rs []RunRecord) string {
+	if len(rs) == 0 {
+		return ""
+	}
+	return rs[len(rs)-1].RunID
+}
+
+func TestRecordShape(t *testing.T) {
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	rec := func(mode, stop, date string) RunRecord {
+		return RunRecord{RunID: "1", Attempt: "1", Mode: mode, Stop: stop, Date: date}
+	}
+
+	// Records with issue, pr and review runs that ended done or
+	// incomplete: only the issue records may feed the done/incomplete
+	// figures, and only inside the seven-day window (2026-10-10 .. today).
+	records := []RunRecord{
+		rec("issue", stopDone, "2026-10-16"),
+		rec("issue", stopDone, "2026-10-10"),
+		rec("issue", stopIncomplete, "2026-10-14"),
+		rec("issue", stopBudget, "2026-10-15"), // not done/incomplete
+		rec("issue", stopDone, "2026-10-09"),   // before the window
+		rec("issue", stopDone, "2026-10-17"),   // after today
+		rec("pr", stopDone, "2026-10-15"),
+		rec("pr", stopIncomplete, "2026-10-16"),
+		rec("pr", stopDone, "2026-10-09"), // outside the window either way
+		rec("review", stopDone, "2026-10-13"),
+		rec("review", stopIncomplete, "2026-10-16"),
+		rec("plan", stopIncomplete, "2026-10-12"),
+		rec("experiment", stopDone, "2026-10-16"),
+	}
+	want := "issue 2 done/1 incomplete, review 2, plan 1"
+	if got := recordShape(records, now); got != want {
+		t.Errorf("recordShape = %q, want %q", got, want)
+	}
+
+	if got, want := recordShape(nil, now), "issue 0 done/0 incomplete, review 0, plan 0"; got != want {
+		t.Errorf("recordShape(nil) = %q, want %q", got, want)
 	}
 }

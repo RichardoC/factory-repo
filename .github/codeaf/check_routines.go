@@ -220,6 +220,7 @@ var prFailingStates = map[string]bool{
 // free slot is a workflow decision, not this routine's.
 func prSweep(prs []prStatus) (report string, conflictedFree []int) {
 	var red, conflicted, unaddressed []prStatus
+	examined := 0
 	for _, pr := range prs {
 		if !strings.HasPrefix(pr.HeadRefName, "codeaf/") {
 			continue // only the factory's own branches count
@@ -227,6 +228,7 @@ func prSweep(prs []prStatus) (report string, conflictedFree []int) {
 		if pr.State != "" && pr.State != "OPEN" {
 			continue // merged and closed PRs need no sweep
 		}
+		examined++ // healthy PRs are still part of the checked queue
 		fails := 0
 		for _, c := range pr.StatusCheckRollup {
 			if prFailingStates[c.State] || prFailingStates[c.Conclusion] {
@@ -250,7 +252,7 @@ func prSweep(prs []prStatus) (report string, conflictedFree []int) {
 	sort.Ints(conflictedFree)
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "## PR sweep: %d open `codeaf/*` PR(s) checked\n\n", len(red)+len(conflicted)+len(unaddressed))
+	fmt.Fprintf(&b, "## PR sweep: %d open `codeaf/*` PR(s) checked\n\n", examined)
 	line := func(label string, pr prStatus, detail string) {
 		fmt.Fprintf(&b, "- #%d `%s` — %s", pr.Number, escapeMD(pr.HeadRefName, 80, true), label)
 		if detail != "" {
@@ -259,7 +261,7 @@ func prSweep(prs []prStatus) (report string, conflictedFree []int) {
 		b.WriteString("\n")
 	}
 	if len(red) == 0 && len(conflicted) == 0 && len(unaddressed) == 0 {
-		b.WriteString("No red, conflicted or unaddressed-review PRs.\n")
+		fmt.Fprintf(&b, "No red, conflicted or unaddressed-review PR(s) among the %d checked.\n", examined)
 		return b.String(), conflictedFree
 	}
 	if len(red) > 0 {
@@ -283,8 +285,10 @@ func prSweep(prs []prStatus) (report string, conflictedFree []int) {
 	if len(unaddressed) > 0 {
 		b.WriteString("\n### Unaddressed review findings\n\n")
 		for _, pr := range unaddressed {
-			who := unaddressedReviewer(pr.Reviews)
-			if who == "" || who == "@nobody" {
+			who, _ := unaddressedReviewer(pr.Reviews)
+			if who == "" {
+				// A standing finding whose author is null (a deleted
+				// account): name nobody rather than drop the finding.
 				line("unaddressed finding", pr, "@nobody (reviewer unknown)")
 			} else {
 				line("unaddressed finding", pr, "@"+escapeMD(strings.TrimPrefix(who, "@"), 80, true))
@@ -298,13 +302,18 @@ func prSweep(prs []prStatus) (report string, conflictedFree []int) {
 // review with no later approving or dismissed review: reviews are read in
 // submittedAt order when any stamp is set, otherwise in list order.
 func hasUnaddressedReview(reviews []prReview) bool {
-	return unaddressedReviewer(reviews) != ""
+	_, standing := unaddressedReviewer(reviews)
+	return standing
 }
 
 // unaddressedReviewer names the reviewer whose CHANGES_REQUESTED finding is
 // still standing — the raw login, escaped only where it is rendered — or ""
-// when none is. The later-review rule is hasUnaddressedReview's.
-func unaddressedReviewer(reviews []prReview) string {
+// when the reviewer is unknown. The bool says whether a finding stands at
+// all: a CHANGES_REQUESTED review whose author is null — what `gh pr list
+// --json` sends for a deleted account — is a standing finding with an unknown
+// reviewer, not the absence of one. The later-review rule is
+// hasUnaddressedReview's.
+func unaddressedReviewer(reviews []prReview) (who string, standing bool) {
 	ordered := make([]prReview, len(reviews))
 	copy(ordered, reviews)
 	stamped := false
@@ -317,11 +326,11 @@ func unaddressedReviewer(reviews []prReview) string {
 	if stamped {
 		sort.Slice(ordered, func(i, j int) bool { return ordered[i].SubmittedAt.Before(ordered[j].SubmittedAt) })
 	}
-	who := ""
 	for i, r := range ordered {
 		switch r.State {
 		case "CHANGES_REQUESTED":
 			who = ""
+			standing = true
 			if r.Author != nil && r.Author.Login != "" {
 				who = r.Author.Login
 			}
@@ -330,10 +339,11 @@ func unaddressedReviewer(reviews []prReview) string {
 			// anything before it is history.
 			if i > 0 {
 				who = ""
+				standing = false
 			}
 		}
 	}
-	return who
+	return who, standing
 }
 
 // checkPRSweep is the live wrapper: it reads the PR list from PRS_PATH
@@ -383,7 +393,14 @@ func flakyTests(output []byte) (report string, failed []string) {
 	for _, line := range lines {
 		switch {
 		case strings.HasPrefix(line, "--- FAIL: "):
-			name := strings.Fields(line[len("--- FAIL: "):])[0]
+			fields := strings.Fields(line[len("--- FAIL: "):])
+			if len(fields) == 0 {
+				// A bare "--- FAIL: " marker carries no test name: log
+				// noise, not a failure. Skip it rather than panic or
+				// invent a name (untrusted log text, fail-closed).
+				continue
+			}
+			name := fields[0]
 			f, ok := found[name]
 			if !ok {
 				f = &flaky{}

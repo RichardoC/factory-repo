@@ -1180,14 +1180,28 @@ func TestNextRepicksStrandedPR(t *testing.T) {
 
 // TestRepickMarkers covers the marker parse (issue #215): only a full
 // 40-hex SHA after the marker is kept, everything else — a truncated SHA,
-// prose, a comment without the marker — is ignored as if absent.
+// prose, a comment without the marker — is ignored as if absent. Only a
+// bot's marker counts (issue #316): a person quoting or reposting a valid
+// marker is not a marker, so it can neither spend nor suppress the re-pick.
 func TestRepickMarkers(t *testing.T) {
 	sha := strings.Repeat("c", 40)
+	bot := func(body string) struct {
+		Body string `json:"body"`
+		User struct {
+			Type string `json:"type"`
+		} `json:"user"`
+	} {
+		c := bodyComments{{Body: body}}[0]
+		c.User.Type = "Bot"
+		return c
+	}
 	got := repickMarkers(bodyComments{
 		{Body: "a person's note"},
 		{Body: "<!-- codeaf-queue-repick " + sha[:39] + " -->"},
-		{Body: "<!-- codeaf-queue-repick " + sha + " -->"},
+		{Body: "<!-- codeaf-queue-repick " + sha + " --> reposted verbatim by a person"},
 		{Body: "quote: the queue posts <!-- codeaf-queue-repick zzz --> on stranded PRs"},
+		bot("<!-- codeaf-queue-repick " + sha + " -->"),
+		bot("<!-- codeaf-queue-repick " + sha[:39] + " -->"),
 	})
 	if len(got) != 1 || got[0] != sha {
 		t.Fatalf("repickMarkers = %v; want [%s]", got, sha)
@@ -2414,5 +2428,110 @@ func TestFetchPRFilesFailsClosed(t *testing.T) {
 	}
 	if n := requests.Load(); n != maxListPages {
 		t.Errorf("pages read = %d, want the %d-page cap", n, maxListPages)
+	}
+}
+
+// TestRunNextMaintainerCommentIgnoresHumanMarker pins the fix for issue
+// #315: only a bot's marker suppresses the maintainer hand-off comment, as
+// in ensureIssueRetryMarker. A person quoting the hand-off text or pasting
+// the marker on a public issue must not stop the real comment being posted,
+// while the existing all-bot behaviour — a served bot marker posts nothing
+// — is unchanged.
+func TestRunNextMaintainerCommentIgnoresHumanMarker(t *testing.T) {
+	report := func(outcome string) string {
+		return reportMarker + "\n### CodeAF run — " + outcome + "\n\n| | |\n"
+	}
+	issueJSON := `[{"number":130,"state":"open","created_at":"2024-01-01T00:00:00Z","body":"## Done when\n\n- tests pass\n\n## End-to-end check\n\nharness next prints nothing for #130\n","labels":[{"name":"codeaf"},{"name":"area:app/x"}]}]`
+
+	// tick runs one queue tick against the comments served by commentsJSON,
+	// and returns the marker posts made and the comments now on the issue.
+	commentsJSON := ""
+	posts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/issues" && r.URL.Query().Get("state") == "open":
+			fmt.Fprint(w, issueJSON)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/issues/130/comments":
+			fmt.Fprint(w, commentsJSON)
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/RichardoC/factory-repo/issues/130/comments":
+			posts++
+			var body struct {
+				Body string `json:"body"`
+			}
+			data, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(data, &body)
+			commentsJSON = strings.TrimSuffix(commentsJSON, "]")
+			if commentsJSON == "" || commentsJSON == "[" {
+				commentsJSON = "[" + fmt.Sprintf(`{"body":%q,"user":{"type":"Bot"}}`, body.Body)
+			} else {
+				commentsJSON += "," + fmt.Sprintf(`{"body":%q,"user":{"type":"Bot"}}`, body.Body)
+			}
+			commentsJSON += "]"
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/issues/130":
+			fmt.Fprint(w, `{"number":130,"state":"open","labels":[{"name":"codeaf-maintainer"}]}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/RichardoC/factory-repo/issues/130/labels":
+			fmt.Fprint(w, `[]`)
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/RichardoC/factory-repo/labels":
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/RichardoC/factory-repo/contents/app":
+			fmt.Fprint(w, `[]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	t.Setenv("GITHUB_API_URL", server.URL)
+	t.Setenv("GITHUB_REPOSITORY", "RichardoC/factory-repo")
+	t.Setenv("GH_TOKEN", "tok")
+	t.Setenv("PROXY_MODELS", "models.json")
+	t.Setenv("CODEAF_WEEK_SPENT_USD", "1")
+	if _, err := loadConfig("models.json"); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	issuesPath := filepath.Join(dir, "issues.json")
+	runsPath := filepath.Join(dir, "runs.json")
+	if err := os.WriteFile(issuesPath, []byte(issueJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(runsPath, []byte(`[{"status":"completed"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A maintainer case (a failed run after the retry marker) whose history
+	// carries the hand-off marker on a human's comment: the comment still
+	// posts. The type here is what a person's comment really carries
+	// (GitHub types a user comment "User", not an absent field).
+	quote := issueMaintainerBody(130)
+	commentsJSON = fmt.Sprintf(`[
+		{"body":%q,"user":{"type":"Bot"}},
+		{"body":%q,"user":{"type":"Bot"}},
+		{"body":%q,"user":{"type":"User"}}
+	]`, issueRetryBody(130), report("run job failed"), quote)
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "" {
+		t.Fatalf("runNext printed %q, %v; want nothing picked", out, err)
+	}
+	if posts != 1 || !strings.Contains(commentsJSON, queueIssueMaintainerMarker) {
+		t.Fatalf("posts = %d; want the hand-off comment posted despite the human marker", posts)
+	}
+
+	// The same fixture with the marker on a bot's comment posts nothing:
+	// the bot's marker still suppresses the comment on a later tick.
+	commentsJSON = fmt.Sprintf(`[
+		{"body":%q,"user":{"type":"Bot"}},
+		{"body":%q,"user":{"type":"Bot"}},
+		{"body":%q,"user":{"type":"Bot"}}
+	]`, issueRetryBody(130), report("run job failed"), quote)
+	posts = 0
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "" {
+		t.Fatalf("runNext printed %q, %v; want nothing picked", out, err)
+	}
+	if posts != 0 {
+		t.Fatalf("posts = %d; want the bot's marker to keep suppressing the comment", posts)
 	}
 }

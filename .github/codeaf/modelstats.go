@@ -117,9 +117,12 @@ type ledgerRow struct {
 	completion bool
 }
 
-// ledgerMarker is a status line kept for the error-class rates. It never
-// carries a timestamp the report needs, only the status class.
+// ledgerMarker is a status line kept for the error-class rates. It carries
+// the timestamp the window filter needs (issue #319) alongside the class:
+// a marker from an hour the report does not cover must drop out of the
+// error classes and the 429-rate denominator, not just the call rows.
 type ledgerMarker struct {
+	Time   time.Time
 	Model  string
 	Run    int
 	Status int
@@ -278,16 +281,22 @@ func parseModelStatsWithBoundsSkipped(zips []*zip.Reader, skipped []skippedArtif
 		in.Stats.SkippedReason = append(in.Stats.SkippedReason, reason)
 	}
 	for i, zr := range zips {
+		if i >= b.MaxZips {
+			// Over the cap: refuse only the artifacts past it and read on,
+			// like every other bound in this reader -- never the whole
+			// window. Each excess artifact counts as skipped; the reason is
+			// one bounded line, written once at the first excess artifact.
+			in.Stats.ZipSkipped++
+			if i == b.MaxZips {
+				in.Stats.SkippedReason = append(in.Stats.SkippedReason,
+					skipReason("%d zips present, over the %d-zip cap", len(zips), b.MaxZips))
+			}
+			continue
+		}
 		if zr == nil {
 			in.Stats.ZipSkipped++
 			in.Stats.SkippedReason = append(in.Stats.SkippedReason, skipReason("run %d: no artifact", i+1))
 			continue
-		}
-		if len(zips) > b.MaxZips {
-			in.Stats.ZipSkipped++
-			in.Stats.SkippedReason = append(in.Stats.SkippedReason,
-				skipReason("%d zips present, over the %d-zip cap", len(zips), b.MaxZips))
-			break
 		}
 		if len(zr.File) == 0 {
 			in.Stats.ZipSkipped++
@@ -462,25 +471,30 @@ func (in *modelStatsInput) decodeLedgerLine(line []byte, run int, allowed map[st
 	// carry an explicit status -- the ledger this report reads -- from being
 	// filed as a marker and dropped from every count.
 	if raw.Kind == "status" {
-		// A status marker (kind "status", issue #140) carries no timing: it
-		// feeds the 4xx/5xx classes and nothing else. It must carry a status
-		// number to say which class it belongs to.
+		// A status marker (kind "status", issue #140) carries no call timing:
+		// it feeds the 4xx/5xx classes and nothing else about the call. It
+		// must carry a status number to say which class it belongs to, and
+		// its timestamp is kept so the window can clip it (issue #319).
 		if !hasStatus {
 			in.addReject(rejectBadStatus)
 			return
 		}
+		// The marker keeps the timestamp a status line always carries (the
+		// proxy records one on every line), so filterWindow can window-clip
+		// markers exactly as it clips rows: an unparseable time is refused
+		// here as it is for a call row, under the same reject class.
+		ts, tsOK := decodeLedgerTS(raw.TS)
+		if !tsOK {
+			in.addReject(rejectBadTime)
+			return
+		}
 		if len(in.Stats.Markers) < b.MaxMarkers {
-			in.Stats.Markers = append(in.Stats.Markers, ledgerMarker{Model: model, Run: run, Status: status})
+			in.Stats.Markers = append(in.Stats.Markers, ledgerMarker{Time: ts, Model: model, Run: run, Status: status})
 		}
 		return
 	}
-	var ts time.Time
-	if err := json.Unmarshal(raw.TS, &ts); err != nil || ts.IsZero() {
-		in.addReject(rejectBadTime)
-		return
-	}
-	ts = ts.UTC()
-	if ts.Year() < 2000 || ts.Year() > 2100 {
+	ts, tsOK := decodeLedgerTS(raw.TS)
+	if !tsOK {
 		in.addReject(rejectBadTime)
 		return
 	}
@@ -571,6 +585,21 @@ func decodeTokens(raw json.RawMessage, max int64) (int, bool, bool) {
 		return 0, false, false
 	}
 	return int(n), true, true
+}
+
+// decodeLedgerTS decodes the ts field a call row and a status marker both
+// carry, to the range raw row decoding already enforced. Both line kinds
+// share it so their bounds cannot drift apart.
+func decodeLedgerTS(raw json.RawMessage) (time.Time, bool) {
+	var ts time.Time
+	if err := json.Unmarshal(raw, &ts); err != nil || ts.IsZero() {
+		return time.Time{}, false
+	}
+	ts = ts.UTC()
+	if ts.Year() < 2000 || ts.Year() > 2100 {
+		return time.Time{}, false
+	}
+	return ts, true
 }
 
 // decodeStatus reads the upstream status. Absent, null or 0 means the line
@@ -917,7 +946,9 @@ func inWindow(ts time.Time, win modelStatsWindow) bool {
 
 // filterWindow drops rows outside the window and counts them as rejected:
 // a row for an hour the report does not cover is out of range, and the count
-// is what the reject percentage states.
+// is what the reject percentage states. Status markers outside the window
+// are dropped too, silently: they never joined the accepted or rejected row
+// counts, so they leave nothing behind to decrement.
 func filterWindow(in modelStatsInput, win modelStatsWindow) modelStatsInput {
 	out := modelStatsInput{Stats: in.Stats, RunCount: in.RunCount}
 	if out.Stats.RejectedClass == nil {
@@ -937,9 +968,17 @@ func filterWindow(in modelStatsInput, win modelStatsWindow) modelStatsInput {
 		}
 		out.addReject(rejectBadTime)
 	}
+	// Status markers are window-clipped like the rows (issue #319): a
+	// 429 from an hour the report does not cover must not count in the error
+	// classes or in the 429-rate denominator -- a stale marker inflated both
+	// and could quieten the very alert the denominator exists for. A dropped
+	// marker joins no reject count: rows and rejected count call rows, and a
+	// marker was never a row in either figure.
 	kept := in.Stats.Markers[:0:0]
 	for _, m := range in.Stats.Markers {
-		kept = append(kept, m)
+		if inWindow(m.Time, win) {
+			kept = append(kept, m)
+		}
 	}
 	out.Stats.Markers = kept
 	return out
@@ -1151,6 +1190,21 @@ func modelStatsAlerts(in modelStatsInput, aggs []*modelAgg, cfg Config, win mode
 	baselineHours := *cfg.Alerts.TTFTp50RatioBaselineHours
 	for _, a := range aggs {
 		if a.Calls == 0 {
+			// Issue #320: a model throttled to death has no call row at all --
+			// every attempt the proxy made came back 429 and was recorded as a
+			// status marker only. The 429-rate alert is the one that carries
+			// the operational advice, so it is evaluated here on the markers
+			// alone (the denominator is the marker count; percentOf already
+			// divides by Calls+markers, and Calls is 0), in the same wording
+			// as below, instead of the bare "no calls" line.
+			if a.Four29 > 0 {
+				if rate := percentOf(float64(a.Four29), float64(countMarkers(in, a.ID))); rate > cfg.Alerts.Rate429Pct {
+					out = append(out, fmt.Sprintf("%s: 429 rate %.2f%% above the %.2f%% threshold (%d of %d); "+
+						"consider lowering max_concurrent, not raising it",
+						modelIDCell(a.ID), rate, cfg.Alerts.Rate429Pct, a.Four29, countMarkers(in, a.ID)))
+					continue
+				}
+			}
 			out = append(out, fmt.Sprintf("%s: configured model with no calls in the window", modelIDCell(a.ID)))
 			continue
 		}
