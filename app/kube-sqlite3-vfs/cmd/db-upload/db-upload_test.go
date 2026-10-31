@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/RichardoC/kube-sqlite3-vfs/pkg/vfs"
+	"github.com/psanford/sqlite3vfs"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -158,5 +159,129 @@ func TestRunWithClientFailsWhenSectorWriteFails(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "write sector") {
 		t.Errorf("error = %v, want it to report the failed sector write", err)
+	}
+}
+
+// Uploading a smaller database over a larger remote used to leave the old
+// database's trailing sectors in place (issue #332): WriteSector only
+// creates and overwrites, so nothing shortened the remote. After the fix
+// the re-upload truncates, and the cluster ends up holding exactly the
+// smaller file's sectors and size — nothing of the old, larger database.
+func TestRunWithClientUploadsSmallerFileOverLargerRemote(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	big := make([]byte, 3*vfs.SectorSize+123)
+	if _, err := rand.Read(big); err != nil {
+		t.Fatalf("read random bytes: %v", err)
+	}
+	if err := os.WriteFile("file2.db", big, 0o644); err != nil {
+		t.Fatalf("write local file: %v", err)
+	}
+
+	fcs := fake.NewSimpleClientset()
+	if err := runWithClient(fcs, Options{Retries: 1}, testLogger()); err != nil {
+		t.Fatalf("first (large) upload: %v", err)
+	}
+
+	small := make([]byte, vfs.SectorSize+5)
+	if _, err := rand.Read(small); err != nil {
+		t.Fatalf("read random bytes: %v", err)
+	}
+	if err := os.WriteFile("file2.db", small, 0o644); err != nil {
+		t.Fatalf("write local file: %v", err)
+	}
+
+	if err := runWithClient(fcs, Options{Retries: 1}, testLogger()); err != nil {
+		t.Fatalf("second (small) upload over the larger remote: %v", err)
+	}
+
+	sectors := listConfigMaps(t, fcs, "data=sector")
+	wantSectors := (int64(len(small)) + vfs.SectorSize - 1) / vfs.SectorSize
+	if int64(len(sectors)) != wantSectors {
+		t.Fatalf("sector ConfigMaps after the smaller upload = %d, want %d (the old database's trailing sectors must be gone)", len(sectors), wantSectors)
+	}
+	sort.Slice(sectors, func(i, j int) bool {
+		a, _ := sectorIndexFromName(sectors[i].Name)
+		b, _ := sectorIndexFromName(sectors[j].Name)
+		return a < b
+	})
+	for i, cm := range sectors {
+		start := int64(i) * vfs.SectorSize
+		end := min(start+vfs.SectorSize, int64(len(small)))
+		if got := cm.BinaryData["sector"]; !bytes.Equal(got, small[start:end]) {
+			t.Errorf("sector %d holds %d bytes, want %d bytes of the smaller file", i, len(got), end-start)
+		}
+	}
+
+	// The size the cluster reports must be the smaller file's, too.
+	vfsN := vfs.NewVFS(context.Background(), fcs, "test", testLogger(), 1)
+	if _, _, err := vfsN.Open("file2.db", sqlite3vfs.OpenFlag(0)); err != nil {
+		t.Fatalf("open uploaded file: %v", err)
+	}
+	size, err := vfs.NewFile("file2.db", vfsN).FileSize()
+	if err != nil {
+		t.Fatalf("remote FileSize: %v", err)
+	}
+	if size != int64(len(small)) {
+		t.Errorf("remote FileSize = %d, want %d", size, len(small))
+	}
+}
+
+// The upload's final size check must fail the run when the remote does not
+// match the local file, rather than exiting zero over a stale remote. The
+// upload issues exactly three sector LISTs — one in Open, one for
+// Truncate's FileSize and one for the final verification — so the reactor
+// below lets the first two through and injects a phantom trailing sector
+// into the third: the cluster then reports a size larger than the local
+// file, and the command must report the mismatch.
+func TestRunWithClientFailsWhenRemoteSizeDoesNotMatchLocal(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	want := make([]byte, vfs.SectorSize+7)
+	if _, err := rand.Read(want); err != nil {
+		t.Fatalf("read random bytes: %v", err)
+	}
+	if err := os.WriteFile("file2.db", want, 0o644); err != nil {
+		t.Fatalf("write local file: %v", err)
+	}
+
+	fcs := fake.NewSimpleClientset()
+	lists := 0
+	fcs.PrependReactor("list", "configmaps", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		lists++
+		if lists != 3 {
+			return false, nil, nil
+		}
+		listAction, ok := action.(clienttesting.ListAction)
+		if !ok {
+			return false, nil, nil
+		}
+		obj, err := fcs.Tracker().List(
+			corev1.SchemeGroupVersion.WithResource("configmaps"),
+			corev1.SchemeGroupVersion.WithKind("ConfigMap"),
+			action.GetNamespace(), metav1.ListOptions{LabelSelector: listAction.GetListRestrictions().Labels.String()})
+		if err != nil {
+			return true, nil, err
+		}
+		cmList := obj.(*corev1.ConfigMapList)
+		// A phantom sector 9 past the uploaded file's end: stale bytes the
+		// truncation is supposed to have removed.
+		phantom := *cmList.Items[0].DeepCopy()
+		name := phantom.Name
+		cut := strings.LastIndex(name, "-")
+		phantom.Name = name[:cut+1] + "9"
+		phantom.BinaryData = map[string][]byte{"sector": bytes.Repeat([]byte{0xAA}, vfs.SectorSize)}
+		cmList.Items = append(cmList.Items, phantom)
+		return true, cmList, nil
+	})
+
+	err := runWithClient(fcs, Options{Retries: 1}, testLogger())
+	if err == nil {
+		t.Fatal("runWithClient succeeded despite the remote size not matching the local file")
+	}
+	if !strings.Contains(err.Error(), "size mismatch") {
+		t.Errorf("error = %v, want it to report the size mismatch", err)
 	}
 }

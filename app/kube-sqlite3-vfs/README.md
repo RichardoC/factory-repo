@@ -289,13 +289,63 @@ What the table says, in before/after terms for the issue #68-era numbers:
   once the journal is warm (its journal sectors survive commit), which is
   why it edges `TRUNCATE` at ten transactions.
 * The ten-transaction rows are where the per-transaction costs show up, and
-  they confirm the ranking holds across consecutive transactions: no mode's
-  cost per transaction grows with the count.
+  they confirm the ranking holds across consecutive transactions. The
+  per-transaction cost itself is not constant, though: from
+  `transactions=01` to `transactions=10` it rises ~16–18 calls/tx for the
+  crash-safe modes (DELETE 65.00 → 83.20, TRUNCATE 61.00 → 79.20, PERSIST
+  62.00 → 78.30 api-calls/tx) and ~1 for MEMORY (25.00 → 26.10). The
+  measured source of that growth is in the next section.
 * `DELETE` stays the default anyway (see the journal-mode paragraph in the
   WARNINGS section): it is the only mode that leaves no journal state on the
   cluster after a clean commit — `TRUNCATE` leaves the journal's lockfile
   ConfigMap, `PERSIST` leaves its journal sectors. `MEMORY` remains
   refusable-only: 25.00 calls buys no crash safety at all.
+
+### Where the ten-transaction growth comes from (issue #338)
+
+The `transactions=01` row is the cheapest transaction of the sequence, not a
+steady-state rate. Each 1000-row transaction adds ~200 KiB — about three
+64 KiB sectors — to the database, and as the b-tree deepens the same insert
+workload overwrites more sectors. A crash-safe mode pays for every
+overwritten sector twice: once to write the database sector, and once to
+record that sector's original content in the rollback journal (which DELETE
+deletes again at commit, TRUNCATE truncates away and PERSIST rewrites in
+place). `MEMORY` keeps no journal on the cluster, so it pays only the
+database-sector share — which is why the crash-safe modes' averages climb
+~16–18 api-calls/tx above their `transactions=01` row over ten transactions
+while `MEMORY` climbs ~1.
+
+`BenchmarkSQLiteInsert1000RowsFirstVsLater` measures the sequence one
+transaction at a time — the journal-mode matrix above conflates the first
+transaction with the nine later ones, so it cannot show this shape:
+
+```
+go test ./pkg/vfs -run ZZZ -bench BenchmarkSQLiteInsert1000RowsFirstVsLater -benchtime 1x
+```
+
+api-calls per transaction (the metric is exact; identical across repeated
+runs):
+
+| journal  | tx01 | tx02 | tx03 | tx04 | tx05 | tx06 | tx07 | tx08 | tx09 | tx10 | 10-tx avg |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `DELETE`   | 65 | 73 | 73 | 79 | 73 | 93 | 97 | 73 | 103 | 103 | 83.20 |
+| `TRUNCATE` | 61 | 69 | 69 | 75 | 69 | 89 | 93 | 69 | 99  | 99  | 79.20 |
+| `PERSIST`  | 62 | 69 | 69 | 75 | 69 | 87 | 91 | 69 | 96  | 96  | 78.30 |
+| `MEMORY`   | 25 | 24 | 24 | 30 | 24 | 26 | 30 | 24 | 27  | 27  | 26.10 |
+
+The cost is flat while consecutive transactions overwrite the same number of
+sectors (DELETE's runs of 73s) and steps up when a transaction's writes reach
+further into the file — the jumps land as extra sector creates, gets,
+updates and journal-sector deletes, not as a smooth per-transaction tax, and
+the shape is stepwise rather than monotonic (DELETE tx04 costs more than
+tx05) because it tracks which sectors a transaction's writes happen to
+reach, not the transaction count. The 10-transaction averages of these
+sequences reproduce the matrix above exactly (83.20 / 79.20 / 78.30 /
+26.10), and each tx01 row reproduces the matching `transactions=01` row
+(65.00 / 61.00 / 62.00 / 25.00). What this table does not do is attribute
+the jumps call by call; the totals are exact, the mechanism above accounts
+for their direction and size, and the individual calls inside a jump were
+not traced further.
 
 ## Go 1.27 and dependencies (issue #9)
 

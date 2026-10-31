@@ -16,6 +16,7 @@ package vfs
 // and its transaction spans several 64 KiB sectors.
 
 import (
+	"database/sql"
 	"fmt"
 	"math/rand/v2"
 	"strings"
@@ -182,6 +183,13 @@ func BenchmarkSQLiteInsert1000Rows(b *testing.B) {
 // transactions, and MEMORY never touches the cluster for the journal at
 // all. The measured numbers and the exact command are in the module README.
 //
+// Note what the transactions=01/transactions=10 pair cannot show: the pair
+// conflates the first transaction of a database's life with the nine later
+// ones, so the rise it reports (65.00 -> 83.20 api-calls/tx for DELETE,
+// 25.00 -> 26.10 for MEMORY) is a sequence average, not a per-transaction
+// tax. BenchmarkSQLiteInsert1000RowsFirstVsLater below isolates the delta
+// transaction by transaction; its comment explains the measured growth.
+//
 // Everything is deliberately identical across sub-benchmarks — the same 64
 // KiB page_size before the first CREATE TABLE, the same CREATE TABLE before
 // ClearActions, the same 1000-row prepared-insert transactions under
@@ -200,89 +208,181 @@ func BenchmarkSQLiteInsert1000RowsJournalModes(b *testing.B) {
 	}
 }
 
-// runInsertBenchmark is the shared body of the insert benchmarks: it opens
-// a sqlite database over the fake-clientset VFS with _journal=journalMode,
-// and per iteration commits `transactions` consecutive 1000-row insert
-// transactions, counting the Kubernetes API calls they cost. One iteration
-// is one unit of work for api-calls/op: with transactions=1 that is one
-// committed transaction, with transactions=10 it is the whole
-// 10-transaction sequence.
-func runInsertBenchmark(b *testing.B, journalMode string, transactions int) {
+// insertBenchmarkEnv is the per-iteration environment shared by the insert
+// benchmarks: a sqlite database over a fresh fake-clientset VFS, opened with
+// _journal=journalMode, at the 64 KiB page size main.go and the cmd tools
+// use, with the 1000-row books table already created. Everything the
+// journal-mode matrix compares is set up identically here, so the
+// sub-benchmarks' api-calls differ only by the journal costs.
+type insertBenchmarkEnv struct {
+	v        *vfs
+	fcs      *fake.Clientset
+	db       *sql.DB
+	fileName string
+}
+
+// openInsertBenchmarkEnv builds the shared environment and asserts the two
+// preconditions the insert benchmarks' numbers rest on: that SQLite honoured
+// the requested journal mode (a silently ignored mode would report the same
+// number under a different name) and that the workload actually leaves the
+// first 64 KiB sector.
+func openInsertBenchmarkEnv(b *testing.B, journalMode string) *insertBenchmarkEnv {
+	v, fcs := newTestVFS(b)
+	vfsName := registerUniqueVFS(b, v)
+	fileName := newSQLFileName()
+	db := openSQLDBWithJournal(b, vfsName, fileName, journalMode)
+	// 64 KiB pages, as main.go and the cmd tools use. page_size is only
+	// honoured while the database is still empty, so it must come
+	// before the first CREATE TABLE.
+	if _, err := db.Exec("PRAGMA page_size=65536"); err != nil {
+		b.Fatalf("PRAGMA page_size=65536: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE books (
+		id text NOT NULL PRIMARY KEY,
+		title text
+	)`); err != nil {
+		b.Fatalf("CREATE TABLE: %v", err)
+	}
+	// SQLite reports the pragma value lower-case ("delete"), so the
+	// comparison is case-insensitive.
+	var reportedMode string
+	if err := db.QueryRow("PRAGMA journal_mode").Scan(&reportedMode); err != nil {
+		b.Fatalf("PRAGMA journal_mode: %v", err)
+	}
+	if !strings.EqualFold(reportedMode, journalMode) {
+		b.Fatalf("PRAGMA journal_mode = %s, want %s", reportedMode, journalMode)
+	}
+	return &insertBenchmarkEnv{v: v, fcs: fcs, db: db, fileName: fileName}
+}
+
+// runInsertTransaction commits one 1000-row insert transaction through
+// database/sql, the module's own insert-heavy workload. The primary key
+// includes the transaction index so consecutive transactions' rows cannot
+// collide.
+func runInsertTransaction(b *testing.B, env *insertBenchmarkEnv, txIndex int) {
 	const rows = 1000
+	tx, err := env.db.Begin()
+	if err != nil {
+		b.Fatalf("Begin: %v", err)
+	}
+	stmt, err := tx.Prepare("INSERT INTO books (id, title) VALUES (?, ?)")
+	if err != nil {
+		b.Fatalf("Prepare: %v", err)
+	}
+	for r := 0; r < rows; r++ {
+		if _, err := stmt.Exec(fmt.Sprintf("r-%02d-%06d", txIndex, r), fmt.Sprintf("title %02d %06d %0178d", txIndex, r, r)); err != nil {
+			b.Fatalf("insert %d: %v", r, err)
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		b.Fatalf("stmt.Close: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		b.Fatalf("Commit: %v", err)
+	}
+}
+
+// finish asserts the workload's shape (the transaction spanned several
+// 64 KiB sectors — see BenchmarkSQLiteInsert1000Rows) and closes the
+// database.
+func (env *insertBenchmarkEnv) finish(b *testing.B) {
+	size, err := NewFile(env.fileName, env.v).FileSize()
+	if err != nil {
+		b.Fatalf("FileSize: %v", err)
+	}
+	if size <= SectorSize {
+		b.Fatalf("database stayed at %d bytes: the transaction never left the first 64 KiB sector, so this benchmark would not span several sectors", size)
+	}
+	if err := env.db.Close(); err != nil {
+		b.Fatalf("db.Close: %v", err)
+	}
+}
+
+// runInsertBenchmark is the shared body of the journal-mode insert
+// benchmarks. One iteration is one unit of work for api-calls/op: with
+// transactions=1 that is one committed transaction, with transactions=10 it
+// is the whole 10-transaction sequence.
+func runInsertBenchmark(b *testing.B, journalMode string, transactions int) {
 	var calls int64
 	for range b.N {
 		b.StopTimer()
-		v, fcs := newTestVFS(b)
-		vfsName := registerUniqueVFS(b, v)
-		fileName := newSQLFileName()
-		db := openSQLDBWithJournal(b, vfsName, fileName, journalMode)
-		// 64 KiB pages, as main.go and the cmd tools use. page_size is only
-		// honoured while the database is still empty, so it must come
-		// before the first CREATE TABLE.
-		if _, err := db.Exec("PRAGMA page_size=65536"); err != nil {
-			b.Fatalf("PRAGMA page_size=65536: %v", err)
-		}
-		if _, err := db.Exec(`CREATE TABLE books (
-			id text NOT NULL PRIMARY KEY,
-			title text
-		)`); err != nil {
-			b.Fatalf("CREATE TABLE: %v", err)
-		}
-		// The journal mode must be what the caller asked for before the
-		// timed work starts: a mode SQLite silently ignored would make the
-		// whole matrix report the same number under different names.
-		var reportedMode string
-		if err := db.QueryRow("PRAGMA journal_mode").Scan(&reportedMode); err != nil {
-			b.Fatalf("PRAGMA journal_mode: %v", err)
-		}
-		// SQLite reports the pragma value lower-case ("delete"), so the
-		// comparison is case-insensitive.
-		if !strings.EqualFold(reportedMode, journalMode) {
-			b.Fatalf("PRAGMA journal_mode = %s, want %s", reportedMode, journalMode)
-		}
-		fcs.ClearActions()
+		env := openInsertBenchmarkEnv(b, journalMode)
+		env.fcs.ClearActions()
 		b.StartTimer()
-
 		for t := 0; t < transactions; t++ {
-			tx, err := db.Begin()
-			if err != nil {
-				b.Fatalf("Begin: %v", err)
-			}
-			stmt, err := tx.Prepare("INSERT INTO books (id, title) VALUES (?, ?)")
-			if err != nil {
-				b.Fatalf("Prepare: %v", err)
-			}
-			// The primary key includes the transaction index: the rows of
-			// transaction 2 must not collide with transaction 1's.
-			for r := 0; r < rows; r++ {
-				if _, err := stmt.Exec(fmt.Sprintf("r-%02d-%06d", t, r), fmt.Sprintf("title %02d %06d %0178d", t, r, r)); err != nil {
-					b.Fatalf("insert %d: %v", r, err)
-				}
-			}
-			if err := stmt.Close(); err != nil {
-				b.Fatalf("stmt.Close: %v", err)
-			}
-			if err := tx.Commit(); err != nil {
-				b.Fatalf("Commit: %v", err)
-			}
+			runInsertTransaction(b, env, t)
 		}
-		calls += int64(len(fcs.Actions()))
+		calls += int64(len(env.fcs.Actions()))
 		b.StopTimer()
-
-		size, err := NewFile(fileName, v).FileSize()
-		if err != nil {
-			b.Fatalf("FileSize: %v", err)
-		}
-		if size <= SectorSize {
-			b.Fatalf("database stayed at %d bytes: the transaction never left the first 64 KiB sector, so this benchmark would not span several sectors", size)
-		}
-		if err := db.Close(); err != nil {
-			b.Fatalf("db.Close: %v", err)
-		}
+		env.finish(b)
 	}
 	b.ReportMetric(float64(calls)/float64(b.N), "api-calls/op")
 	if transactions > 1 {
 		b.ReportMetric(float64(calls)/(float64(b.N)*float64(transactions)), "api-calls/tx")
+	}
+}
+
+// BenchmarkSQLiteInsert1000RowsFirstVsLater isolates the first-vs-later
+// transaction delta that the journal-mode matrix above conflates: its
+// transactions=01 row measures only the first transaction of a database's
+// life, while its transactions=10 row averages that first transaction with
+// nine later ones, so a reader cannot tell from the matrix alone whether the
+// per-transaction rise it shows (65.00 -> 83.20 api-calls/tx for DELETE,
+// 25.00 -> 26.10 for MEMORY) is a constant per-transaction tax paid after
+// the first commit or something that keeps growing.
+//
+// It runs the same committed 1000-row insert workload as the matrix, for ten
+// consecutive transactions per journal mode, and reports each transaction's
+// own cost separately as api-calls/tx01 .. api-calls/tx10. Measured (the
+// metric is exact; the numbers are tabulated in the module README):
+//
+//	DELETE  65 73 73 79 73 93  97 73 103 103  (avg 83.2)
+//	MEMORY  25 24 24 30 24 26  30 24  27  27  (avg 26.1)
+//
+// The pattern is stepwise, not a smooth per-transaction tax: the first
+// transaction is the cheapest (the database is at its smallest and the
+// inserts touch the fewest sectors), the cost is flat while consecutive
+// transactions overwrite the same number of sectors (DELETE's 73s), and it
+// steps up when a transaction's writes reach further into the file — each
+// transaction adds ~200 KiB, about three 64 KiB sectors, and as the b-tree
+// deepens the same insert workload overwrites more of them. A crash-safe
+// journal pays for every overwritten sector twice — once to write the
+// database sector, once to record the sector's original content in the
+// journal (and, in DELETE mode, to delete the journal sector again at
+// commit) — which is why the crash-safe modes' ten-transaction average
+// climbs ~16-18 api-calls/tx above their one-transaction row while MEMORY,
+// which keeps no journal on the cluster, climbs ~1 (the database sectors
+// alone).
+func BenchmarkSQLiteInsert1000RowsFirstVsLater(b *testing.B) {
+	for _, mode := range []string{"DELETE", "TRUNCATE", "PERSIST", "MEMORY"} {
+		b.Run("journal="+mode, func(b *testing.B) {
+			runFirstVsLaterBenchmark(b, mode)
+		})
+	}
+}
+
+// runFirstVsLaterBenchmark is BenchmarkSQLiteInsert1000RowsFirstVsLater's
+// body: per iteration it commits ten consecutive 1000-row transactions on a
+// fresh database and reports each transaction's Kubernetes API calls
+// separately.
+func runFirstVsLaterBenchmark(b *testing.B, journalMode string) {
+	const transactions = 10
+	var perTx [transactions]int64
+	for range b.N {
+		b.StopTimer()
+		env := openInsertBenchmarkEnv(b, journalMode)
+		env.fcs.ClearActions()
+		b.StartTimer()
+		for t := 0; t < transactions; t++ {
+			before := len(env.fcs.Actions())
+			runInsertTransaction(b, env, t)
+			perTx[t] += int64(len(env.fcs.Actions()) - before)
+		}
+		b.StopTimer()
+		env.finish(b)
+	}
+	for t := range perTx {
+		b.ReportMetric(float64(perTx[t])/float64(b.N), fmt.Sprintf("api-calls/tx%02d", t+1))
 	}
 }
 

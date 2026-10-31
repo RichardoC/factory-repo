@@ -1284,9 +1284,23 @@ func strandedByFailedRun(comments bodyComments) bool {
 // proxy refused from its first call reports (the 2026-10-19 quota stall
 // stranded a dozen issues and PRs this way). A run that ended ok with no
 // changes had nothing to do, and is not a failure.
+//
+// A run whose result.json is missing or unparseable reports no stop / ok row
+// at all -- only the fixed no-result line the report writer falls back to,
+// whatever heading the report carries (issue #310). Such a run fell over
+// before it could say anything, so it counts as failed; without this it was
+// never counted and its issue or PR sat with nothing to retry it.
 func failedRunReport(body string) bool {
 	if strings.HasPrefix(body, reportMarker+"\n### CodeAF run — publishing failed\n") ||
 		strings.HasPrefix(body, reportMarker+"\n### CodeAF run — run job failed\n") {
+		return true
+	}
+	// Only a report with no stop / ok row to parse counts on the fixed
+	// line: a literal this package writes itself (main.go), so a report
+	// from any other writer matches it only by reproducing it, and only
+	// bot comments reach here anyway (strandedByFailedRun).
+	if _, ok := reportTableRow(body, "stop / ok"); !ok &&
+		strings.Contains(body, "\n"+noResultRow+"\n") {
 		return true
 	}
 	if !strings.HasPrefix(body, reportMarker+"\n### CodeAF run — no changes\n") {
@@ -1295,6 +1309,10 @@ func failedRunReport(body string) bool {
 	cell, ok := reportTableRow(body, "stop / ok")
 	return ok && strings.HasSuffix(cell, "/ `false`")
 }
+
+// noResultRow is the fixed table row the run report falls back to when the
+// run produced no JSON result at all (result.json missing or unparseable).
+const noResultRow = "| result | CodeAF produced no JSON result; see the workflow logs |"
 
 // repickMarkers collects the head SHAs the re-pick marker comments name, in
 // comment order, lowercased. A malformed marker is ignored as if absent
