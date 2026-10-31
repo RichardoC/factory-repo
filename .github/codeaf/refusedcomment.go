@@ -77,8 +77,12 @@ func publishReason(path string) string {
 // refusedComment builds the comment body. The reason arrives already read;
 // it is escaped here so an @ in it cannot start a mention and its markup
 // cannot structure the comment. The diff is never escaped — it renders
-// verbatim inside the fence — but it is neutralised (backtick runs become
-// three single-quotes, so nothing in it can end the fence early) and capped.
+// verbatim inside the fence — but it is neutralised: stripControls drops
+// NUL, ESC, CR and the other control bytes (the diff is raw git-diff
+// --binary output, and control bytes must not reach the comment body a
+// maintainer posts) while keeping newline and tab, then any backtick run
+// becomes three single-quotes, so nothing in it can end the fence early. It
+// is capped last.
 func refusedComment(diff, reason string) string {
 	var b strings.Builder
 	b.WriteString("The workflow part of this patch was **not published**: it changes files under `.github/`, which needs a maintainer's approval. Everything else in the patch was applied and is on this PR.\n")
@@ -87,7 +91,7 @@ func refusedComment(diff, reason string) string {
 		b.WriteString(strings.ReplaceAll(r, "\n", "\n> "))
 		b.WriteString("\n")
 	}
-	d := backtickRun.ReplaceAllString(diff, "'''")
+	d := backtickRun.ReplaceAllString(stripControls(diff), "'''")
 	cut := false
 	if len(d) > maxDiffBytes {
 		d = truncateBytes(d, maxDiffBytes)
