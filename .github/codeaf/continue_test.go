@@ -1012,6 +1012,9 @@ func TestLinkedIssue(t *testing.T) {
 		{"Closes: #0", 0},
 		{"Closes #", 0},
 		{"preposethat closes #5", 5}, // mid-sentence: GitHub links this too
+		{"fix #12", 12},              // GitHub's missing keyword
+		{"resolved #12", 12},         // GitHub's missing keyword
+		{"prefix #12", 0},            // "fix" inside a word must not match
 	}
 	for _, c := range cases {
 		if got := linkedIssue(c.body); got != c.want {
