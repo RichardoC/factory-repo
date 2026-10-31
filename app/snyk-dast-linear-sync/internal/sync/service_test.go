@@ -3193,3 +3193,33 @@ func createCallSizes(batches [][]model.DesiredIssue) []int {
 	}
 	return sizes
 }
+
+// TestNormalizeDescriptionForCompareTreatsLinearRewritesAsEqual verifies that
+// a description written with underscore emphasis and double blank lines
+// compares equal to the asterisk-emphasis, collapsed form Linear stores, so
+// re-matched findings do not churn their description on every run, while a
+// genuinely changed description still compares unequal.
+func TestNormalizeDescriptionForCompareTreatsLinearRewritesAsEqual(t *testing.T) {
+	written := "Status: `open`\n\n### Fix\n\n_Check the handler._"
+	stored := "Status: `open`\n\n### Fix\n\n*Check the handler.*"
+	if got, want := normalizeDescriptionForCompare(written), normalizeDescriptionForCompare(stored); got != want {
+		t.Fatalf("normalizeDescriptionForCompare: written and Linear-stored emphasis forms should compare equal\nwritten: %q\nstored:  %q", got, want)
+	}
+
+	writtenBold := "Status: `open`\n\n### Fix\n\n__Check the handler.__"
+	storedBold := "Status: `open`\n\n### Fix\n\n**Check the handler.**"
+	if got, want := normalizeDescriptionForCompare(writtenBold), normalizeDescriptionForCompare(storedBold); got != want {
+		t.Fatalf("normalizeDescriptionForCompare: written and Linear-stored bold forms should compare equal\nwritten: %q\nstored:  %q", got, want)
+	}
+
+	writtenBlanks := "Status: `open`\n\n\n### Fix\n\n\n\n_Check the handler._"
+	storedBlanks := "Status: `open`\n\n### Fix\n\n*Check the handler.*"
+	if got, want := normalizeDescriptionForCompare(writtenBlanks), normalizeDescriptionForCompare(storedBlanks); got != want {
+		t.Fatalf("normalizeDescriptionForCompare: written and Linear-stored blank-line forms should compare equal\nwritten: %q\nstored:  %q", got, want)
+	}
+
+	changed := "Status: `resolved`\n\n### Fix\n\n**Check the handler again.**"
+	if normalizeDescriptionForCompare(written) == normalizeDescriptionForCompare(changed) {
+		t.Fatalf("normalizeDescriptionForCompare: a genuinely changed description must compare unequal")
+	}
+}

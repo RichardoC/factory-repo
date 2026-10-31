@@ -62,6 +62,12 @@ const (
 )
 
 var linearAutoLinkPattern = regexp.MustCompile(`\[([^\]]+)\]\((?:<)?([^)\n>]+)(?:>)?\)`)
+
+// blankLineRunPattern matches one or more blank lines. Linear's markdown
+// serializer inserts a blank line after headings (and between some blocks),
+// so blank-line structure is not stable across a write/read round trip.
+var blankLineRunPattern = regexp.MustCompile(`\n(?:[ \t]*\n)+`)
+
 var markdownEscapePattern = regexp.MustCompile(`\\([\\` + "`" + `*_{}\[\]()#+\-.!~])`)
 
 type RunResult struct {
@@ -1421,8 +1427,14 @@ func FingerprintTargetID(fingerprint string) (string, bool) {
 
 func normalizeDescriptionForCompare(description string) string {
 	description = strings.TrimSpace(strings.ReplaceAll(description, "\r\n", "\n"))
+	description = blankLineRunPattern.ReplaceAllString(description, "\n")
 	description = linearAutoLinkPattern.ReplaceAllString(description, "[$1]($2)")
 	description = markdownEscapePattern.ReplaceAllString(description, "$1")
+	// Linear re-serializes underscore emphasis as asterisks (__x__ -> **x**,
+	// _x_ -> *x*). Mapping '*' to '_' on both sides makes the written and stored forms
+	// compare equal; it can only ever suppress a spurious difference, never
+	// hide a real one, because it is applied to both sides.
+	description = strings.ReplaceAll(description, "*", "_")
 	description = strings.ReplaceAll(description, "DO NOT EDIT OR REMOVE THIS BLOCK. Used by snyk-dast-linear-sync for deduplication.", "__SNYK_DAST_LINEAR_METADATA_WARNING__")
 	description = strings.ReplaceAll(description, "DO NOT EDIT, REMOVE, OR REFORMAT THIS BLOCK. It is required by snyk-dast-linear-sync for deduplication and safe updates.", "__SNYK_DAST_LINEAR_METADATA_WARNING__")
 	return description
