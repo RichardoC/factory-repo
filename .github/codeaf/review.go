@@ -100,6 +100,16 @@ var (
 // maxReviewFindings; text and path are never truncated at parse time — the
 // comment renderer escapes and caps them.
 //
+// The cap keeps the findings that can change the review's decision (issue
+// #385). Truncating in arrival order let a verbose or hostile answer list
+// fifty [low] findings and then the one [high] that mattered, so the cap
+// dropped the blocking finding and reviewPlan added the pass label to a
+// review that did not pass. A finding is now kept ahead of the ones it
+// outranks — high, then medium, then an unrecognized severity (which withholds
+// the label too), then low, which only decides whether the comment carries a
+// table — and a tie keeps the earlier finding, so an answer under the cap
+// parses in arrival order exactly as before.
+//
 // The pass is fenced-code aware (issue #224): a finding read from inside a
 // ``` or ~~~ fence is dropped when it is quoted text and kept when it is a
 // report. parseFindingsIn carries that rule, and this wrapper asks for it
@@ -188,8 +198,8 @@ func parseFindingsIn(answer string, known map[string]bool) (findings []Finding, 
 				// has kept the finding first, so a duplicate copy there is
 				// dropped — and the same exemption covers the inline pass
 				// itself, for the written forms this bullet parser misses.
-				if !quotedEcho(f) && !duplicateFinding(findings, f) {
-					findings = append(findings, f)
+				if !quotedEcho(f) {
+					findings = addFinding(findings, f)
 				}
 			}
 		}
@@ -206,12 +216,9 @@ func parseFindingsIn(answer string, known map[string]bool) (findings []Finding, 
 			if inSection {
 				dropped = quotedEcho(f)
 			}
-			if !dropped && !duplicateFinding(findings, f) {
-				findings = append(findings, f)
+			if !dropped {
+				findings = addFinding(findings, f)
 			}
-		}
-		if len(findings) >= maxReviewFindings {
-			return findings[:maxReviewFindings], sawSection // cap reached: ignore the rest
 		}
 	}
 	return findings, sawSection
@@ -669,6 +676,70 @@ func textOnlyFinding(token, rest string) (Finding, bool) {
 		return Finding{}, false
 	}
 	return Finding{Severity: token, Text: text, Recognized: true}, true
+}
+
+// The ranks capReviewFindings orders findings by when the cap truncates,
+// most decision-relevant first: a high or medium finding starts a fix run, an
+// unrecognized severity withholds the pass label, and a low finding only
+// decides whether the comment carries a table. Adding a rank means revisiting
+// reviewPlan's branches; ranks that rank the same keep arrival order.
+const (
+	findingRankHigh    = iota // starts a fix run
+	findingRankMedium         // starts a fix run
+	findingRankUnknown        // withholds the pass label
+	findingRankLow            // advisory only
+)
+
+// findingRank is the decision weight of a finding (issue #385). An
+// unrecognized severity outranks low because it withholds the label; a low
+// finding outranks nothing, because a review of only low findings can pass.
+func findingRank(f Finding) int {
+	if !f.Recognized {
+		return findingRankUnknown
+	}
+	switch asciiLower(f.Severity) {
+	case "high":
+		return findingRankHigh
+	case "medium":
+		return findingRankMedium
+	}
+	return findingRankLow
+}
+
+// addFinding records one parsed finding unless the same finding is already
+// held, and keeps the slice at or below maxReviewFindings (issue #385).
+//
+// While the findings fit, they are held in arrival order, exactly as the
+// reviewer wrote them. Once adding one would pass the cap, the finding that
+// gives way is the lowest-ranked one already held — ranking by findingRank,
+// and among equals the one that arrived last — which is the decision this
+// change exists for: the cap used to truncate in arrival order, so a verbose
+// review, or a hostile prompt-injected one, could list fifty [low] findings
+// and its only [high] at the end, the cap dropped the high, blockingFindings
+// came back empty and reviewPlan added reviewPassedLabel to a review that did
+// not pass. Making room by rank means what the cap drops is never a finding
+// that would change the decision while a kept one would, however far into the
+// answer the reviewer wrote it. An answer under the cap is untouched and still
+// parses in arrival order.
+func addFinding(findings []Finding, f Finding) []Finding {
+	if duplicateFinding(findings, f) {
+		return findings
+	}
+	if len(findings) < maxReviewFindings {
+		return append(findings, f)
+	}
+	// At the cap: f displaces the weakest held finding, unless f is that one.
+	worst, rank := 0, findingRank(findings[0])
+	for i, g := range findings {
+		if r := findingRank(g); r >= rank {
+			worst, rank = i, r // ties go to the later finding
+		}
+	}
+	if findingRank(f) >= rank {
+		return findings // f is no more decision-relevant than what is held
+	}
+	findings[worst] = f
+	return findings
 }
 
 // duplicateFinding reports whether the same finding is already held: the

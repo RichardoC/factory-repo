@@ -2611,3 +2611,104 @@ func TestCapDiffMixedWholeAndClippedFile(t *testing.T) {
 		t.Errorf("header-over-cap fallback is not a bounded prefix cap: len %d", len(got))
 	}
 }
+
+// TestReviewPlanCapKeepsBlockingFinding is issue #385: the cap kept findings
+// in arrival order, so an answer with more than maxReviewFindings findings
+// lost whatever it wrote last. A verbose — or hostile, prompt-injected —
+// review could list fifty [low] findings and then its only [high]; the cap
+// dropped the high, blockingFindings came back empty and reviewPlan added
+// codeaf-review-passed to a review that did not pass. The cap now keeps the
+// findings that can change the decision, so the pass label cannot outrun a
+// blocking finding written past it.
+func TestReviewPlanCapKeepsBlockingFinding(t *testing.T) {
+	// answerWith builds a findings section of n low bullets whose last bullet
+	// carries severity: the only finding past the cap that matters.
+	answerWith := func(severity string, n int) string {
+		var b strings.Builder
+		b.WriteString("## Findings\n\n")
+		for i := 1; i < n; i++ {
+			fmt.Fprintf(&b, "- [low] app/cap.go:%d - nit %d\n", i, i)
+		}
+		fmt.Fprintf(&b, "- [%s] app/cap.go:%d - the finding that matters\n", severity, n)
+		return b.String()
+	}
+	const n = maxReviewFindings + 10 // 60 findings: the cap cuts ten of them
+
+	for _, tc := range []struct {
+		name     string
+		severity string
+		want     int    // blocking findings the parse must keep
+		action   string // what reviewPlan must decide
+	}{
+		{"high last", "high", 1, "fix"},
+		{"medium last", "medium", 1, "fix"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			findings, sawSection := parseFindings(answerWith(tc.severity, n))
+			if !sawSection {
+				t.Fatal("sawSection = false, want true")
+			}
+			if len(findings) != maxReviewFindings {
+				t.Fatalf("parse = %d findings, want the cap %d", len(findings), maxReviewFindings)
+			}
+			if got := len(blockingFindings(findings)); got != tc.want {
+				t.Fatalf("blocking findings past the cap = %d, want %d: %+v", got, tc.want, findings)
+			}
+			kept := false
+			for _, f := range findings {
+				if f.Line == n && strings.Contains(f.Text, "the finding that matters") {
+					kept = true
+				}
+			}
+			if !kept {
+				t.Errorf("the %s finding written past the cap was dropped: %+v", tc.severity, findings)
+			}
+			// The decision, not just the count: the label must not be added.
+			server := commentsServer(t, reportComments(0), http.StatusOK)
+			ghEnv(t, server)
+			action, body, _, err := reviewPlan(newGitHub(), 7,
+				Result{Stop: stopDone, Model: "deepseek-ai/deepseek-v4.1-flash"}, true, findings, sawSection)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if action != tc.action {
+				t.Fatalf("action = %q, want %q (the %s finding past the cap was dropped)", action, tc.action, tc.severity)
+			}
+			if strings.Contains(body, reviewPassedLabel) || !strings.HasPrefix(body, command+" fix:") {
+				t.Errorf("a review whose only %s finding sits past the cap = %q, want the fix run and no pass label", tc.severity, body)
+			}
+			assertReviewBodyClean(t, body)
+		})
+	}
+
+	// An unrecognized severity past the cap withholds the label too, exactly
+	// as one under the cap already did.
+	findings, sawSection := parseFindings(answerWith("critical", n))
+	if len(blockingFindings(findings)) != 0 || !hasUnrecognizedSeverity(findings) {
+		t.Fatalf("an unknown severity past the cap = %+v, want it kept and the scale unknown", findings)
+	}
+	server := commentsServer(t, reportComments(0), http.StatusOK)
+	ghEnv(t, server)
+	action, body, _, err := reviewPlan(newGitHub(), 7,
+		Result{Stop: stopDone, Model: "deepseek-ai/deepseek-v4.1-flash"}, true, findings, sawSection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action == "label" || strings.Contains(body, reviewPassedLabel) {
+		t.Errorf("an unknown severity past the cap = action %q body %q, want the label withheld", action, body)
+	}
+
+	// The ranking changes nothing under the cap: an answer whose findings all
+	// fit keeps arrival order, so a review reads as the reviewer wrote it.
+	inOrder, _ := parseFindings("## Findings\n\n- [low] app/a.go:1 - first\n- [high] app/a.go:2 - second\n- [low] app/a.go:3 - third\n")
+	if len(inOrder) != 3 || inOrder[0].Line != 1 || inOrder[1].Line != 2 || inOrder[2].Line != 3 {
+		t.Errorf("an answer under the cap = %+v, want the findings in arrival order", inOrder)
+	}
+	// Ties keep arrival order at the cap as well: the retained low findings
+	// are the ones written first, so the same answer parses the same way.
+	ties, _ := parseFindings(answerWith("low", n))
+	if len(ties) != maxReviewFindings || ties[maxReviewFindings-1].Line != maxReviewFindings {
+		t.Errorf("an all-low answer at the cap = %d findings, last line %d, want the first %d in arrival order",
+			len(ties), ties[len(ties)-1].Line, maxReviewFindings)
+	}
+}
