@@ -372,3 +372,42 @@ func TestStateLoadOutputsWeekSpend(t *testing.T) {
 		t.Errorf("load output = %q, want day_usd 1.5 and week_usd 7.5", output)
 	}
 }
+
+// TestStateMergeSeedsMergedKeysFromALegacyBundle covers a bundle written before
+// issue #312: only manifest.json has dedup keys, and the first merge after the
+// change must carry them into merged-keys.jsonl instead of forgetting them.
+func TestStateMergeSeedsMergedKeysFromALegacyBundle(t *testing.T) {
+	cfg, err := loadConfig("models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	bundle := t.TempDir()
+	writeTestFile(t, filepath.Join(bundle, manifestFile),
+		[]byte(`{"version":1,"generation":3,"merged":["10-1","11-1"],"spend":{"2026-10-16":1.25}}`))
+	t.Setenv("GITHUB_OUTPUT", filepath.Join(t.TempDir(), "output"))
+
+	// Run 10 is re-presented: the legacy window still knows it.
+	run := t.TempDir()
+	writeRecordRun(t, run, "10", RunRecord{RunID: "10", Attempt: "1", Mode: "issue", Stop: stopDone, Date: "2026-10-16"}, true)
+
+	// Nothing to merge: the bundle is handed back with the seeded key set.
+	out := filepath.Join(t.TempDir(), "out")
+	if err := stateMerge(bundle, out, []string{run}, cfg, now); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := readMergedKeys(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(keys, ",") != "10-1,11-1" {
+		t.Errorf("%s = %v, want the legacy window seeded in order", mergedFile, keys)
+	}
+	m := readManifestT(t, out)
+	if m.Generation != 3 || m.Spend["2026-10-16"] != 1.25 {
+		t.Errorf("no-op merge changed the bundle: %+v", m)
+	}
+	if output, _ := os.ReadFile(os.Getenv("GITHUB_OUTPUT")); !strings.Contains(string(output), "changed=false") {
+		t.Errorf("output = %q, want changed=false", output)
+	}
+}

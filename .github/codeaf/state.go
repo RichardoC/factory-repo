@@ -42,6 +42,7 @@ const (
 
 	manifestFile = "manifest.json"
 	metaFile     = "meta.json"
+	mergedFile   = "merged-keys.jsonl"
 	ledgerFile   = "router-ledger.json"
 	eventsFile   = "router-events.jsonl"
 	dbFile       = "graph.db"
@@ -52,17 +53,27 @@ const (
 	maxEventLineBytes = 64 << 10
 	maxEventLines     = 20_000
 	maxMetaBytes      = 64 << 10
+	// maxMergedRuns bounds the window of run keys kept in manifest.json,
+	// which has to stay small. It is not the dedup horizon: the merge
+	// consults mergedFile, which keeps the full key set up to
+	// maxMergedKeyBytes, so an artifact the workflow re-presents long
+	// after its run (a delayed run, a retried artifact) is still
+	// recognised as merged (issue #312).
 	maxMergedRuns     = 500
+	maxMergedKeyBytes = 4 << 20
 	spendDays         = 7
 )
 
 // Manifest is a shared bundle's manifest.json.
 type Manifest struct {
-	Version    int                `json:"version"`
-	Generation int                `json:"generation"`
-	Merged     []string           `json:"merged"` // "<run id>-<attempt>", newest last
-	Spend      map[string]float64 `json:"spend"`  // UTC date -> credit USD
-	Updated    time.Time          `json:"updated"`
+	Version    int `json:"version"`
+	Generation int `json:"generation"`
+	// Merged is the newest maxMergedRuns run keys ("<run id>-<attempt>",
+	// newest last), kept in the manifest for readers. mergedFile holds the
+	// longer dedup set stateMerge decides on.
+	Merged  []string           `json:"merged"` // "<run id>-<attempt>", newest last
+	Spend   map[string]float64 `json:"spend"`  // UTC date -> credit USD
+	Updated time.Time          `json:"updated"`
 }
 
 // RunMeta is a packed run's meta.json.
@@ -330,6 +341,58 @@ func readManifest(dir string) (Manifest, bool, error) {
 	return m, true, nil
 }
 
+// readMergedKeys reads a bundle's merged-run dedup keys: one
+// "<run id>-<attempt>" per line, oldest first, at most maxMergedKeyBytes. A
+// missing file is an empty set, which is how bundles written before issue #312
+// read. Unlike the manifest's Merged window, this is the set the merge decides
+// on, so a bad line is an error rather than a silent dedup miss.
+func readMergedKeys(dir string) ([]string, error) {
+	data, err := readRegular(filepath.Join(dir, mergedFile), maxMergedKeyBytes)
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return []string{}, nil
+	}
+	var keys []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" {
+			continue
+		}
+		key := line
+		runID, attempt, ok := strings.Cut(key, "-")
+		if !ok || !digits(runID) || !digits(attempt) {
+			return nil, fmt.Errorf("%s: invalid run key %q", mergedFile, key)
+		}
+		keys = append(keys, key)
+	}
+	return keys, nil
+}
+
+// trimMergedKeys drops keys from the front of the longest-lived dedup set
+// until it fits in maxMergedKeyBytes. Keys are newest last, so the ones dropped
+// are the oldest.
+func trimMergedKeys(keys []string) []string {
+	total := 0
+	for _, key := range keys {
+		total += len(key) + 1
+	}
+	for len(keys) > 0 && total > maxMergedKeyBytes {
+		total -= len(keys[0]) + 1
+		keys = keys[1:]
+	}
+	return keys
+}
+
+func writeMergedKeys(dir string, keys []string) error {
+	var b strings.Builder
+	for _, key := range keys {
+		b.WriteString(key)
+		b.WriteByte('\n')
+	}
+	return writeFile(filepath.Join(dir, mergedFile), []byte(b.String()))
+}
+
 func validUSD(x float64) bool { return !math.IsNaN(x) && !math.IsInf(x, 0) && x >= 0 && x < 1e6 }
 
 // ---------------------------------------------------------------- merge rules
@@ -525,7 +588,25 @@ func runState() error {
 		if err != nil {
 			return err
 		}
+		// Print the dedup set the merge decides on, not just the manifest's
+		// newest window: the state workflow filters its downloads by these
+		// keys, so a short list means re-downloading artifacts that will be
+		// skipped (issue #312).
+		keys, err := readMergedKeys(args[0])
+		if err != nil {
+			return err
+		}
+		seen := map[string]bool{}
+		for _, key := range keys {
+			seen[key] = true
+		}
 		for _, key := range m.Merged {
+			if !seen[key] {
+				fmt.Println(key)
+				seen[key] = true
+			}
+		}
+		for _, key := range keys {
 			fmt.Println(key)
 		}
 		return nil
@@ -661,10 +742,27 @@ func stateMerge(bundle, out string, runDirs []string, cfg Config, now time.Time)
 			return err
 		}
 	}
+	// Dedup against the full key set, not just the manifest's window: a
+	// window that has forgotten an old run would merge it again, count its
+	// spend twice and bump the generation for it (issue #312).
+	mergedKeys, err := readMergedKeys(bundle)
+	if err != nil {
+		return err
+	}
 	done := map[string]bool{}
-	for _, key := range m.Merged {
+	for _, key := range mergedKeys {
 		done[key] = true
 	}
+	// A bundle written before the dedup set existed has only its manifest
+	// window; seed the set from it so no key is forgotten on the way over.
+	prefix := []string{}
+	for _, key := range m.Merged {
+		if !done[key] {
+			done[key] = true
+			prefix = append(prefix, key)
+		}
+	}
+	mergedKeys = append(prefix, mergedKeys...)
 	var runs []packedRun
 	for _, dir := range runDirs {
 		meta, err := readRunMeta(dir)
@@ -673,6 +771,7 @@ func stateMerge(bundle, out string, runDirs []string, cfg Config, now time.Time)
 			continue
 		}
 		if done[meta.key()] {
+			log.Printf("run %s: already merged; skipped", meta.key())
 			continue
 		}
 		done[meta.key()] = true
@@ -687,6 +786,24 @@ func stateMerge(bundle, out string, runDirs []string, cfg Config, now time.Time)
 		return runs[i].meta.Attempt < runs[j].meta.Attempt
 	})
 	if len(runs) == 0 {
+		// Still hand the bundle back, unchanged apart from a seeded dedup
+		// set: the state workflow moves whatever is here into the shared
+		// path, and a bundle from before issue #312 gains its key file.
+		if found {
+			if err := os.RemoveAll(out); err != nil {
+				return err
+			}
+			if err := shared.write(out); err != nil {
+				return err
+			}
+			if err := writeMergedKeys(out, mergedKeys); err != nil {
+				return err
+			}
+			data, _ := json.MarshalIndent(m, "", "  ")
+			if err := writeFile(filepath.Join(out, manifestFile), append(data, '\n')); err != nil {
+				return err
+			}
+		}
 		log.Printf("nothing to merge; shared state stays at generation %d", m.Generation)
 		return setOutput("changed", "false", "generation", strconv.Itoa(m.Generation))
 	}
@@ -715,10 +832,12 @@ func stateMerge(bundle, out string, runDirs []string, cfg Config, now time.Time)
 		log.Printf("run %s: %s; spend $%.4f on %s", r.meta.key(), how, usd, day)
 		m.Generation++
 		m.Merged = append(m.Merged, r.meta.key())
+		mergedKeys = append(mergedKeys, r.meta.key())
 	}
 	if len(m.Merged) > maxMergedRuns {
 		m.Merged = m.Merged[len(m.Merged)-maxMergedRuns:]
 	}
+	mergedKeys = trimMergedKeys(mergedKeys)
 	pruneSpend(m.Spend, now)
 	m.Updated = now.UTC()
 	if err := os.RemoveAll(out); err != nil {
@@ -727,10 +846,13 @@ func stateMerge(bundle, out string, runDirs []string, cfg Config, now time.Time)
 	if err := shared.write(out); err != nil {
 		return err
 	}
+	if err := writeMergedKeys(out, mergedKeys); err != nil {
+		return err
+	}
 	data, _ := json.MarshalIndent(m, "", "  ")
 	if err := writeFile(filepath.Join(out, manifestFile), append(data, '\n')); err != nil {
 		return err
 	}
-	log.Printf("shared state is now generation %d (%d runs merged)", m.Generation, len(runs))
+	log.Printf("shared state is now generation %d (%d runs merged, %d run keys known)", m.Generation, len(runs), len(mergedKeys))
 	return setOutput("changed", "true", "generation", strconv.Itoa(m.Generation))
 }

@@ -272,6 +272,105 @@ func TestStateMergeAppendsRecordsAndCaps(t *testing.T) {
 	}
 }
 
+// TestStateMergeIsIdempotentPastTheCap re-presents a run the manifest window
+// has already forgotten (issue #312): the merge must recognise it by its key,
+// leave the day's spend alone and not advance the generation for it.
+func TestStateMergeIsIdempotentPastTheCap(t *testing.T) {
+	cfg, err := loadConfig("models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	empty := filepath.Join(t.TempDir(), "no-bundle")
+	out := filepath.Join(t.TempDir(), "out")
+	t.Setenv("GITHUB_OUTPUT", filepath.Join(t.TempDir(), "output"))
+	writeRun := func(runID string) string {
+		dir := t.TempDir()
+		meta := RunMeta{Version: stateVersion, RunID: runID, Attempt: "1", BaseGeneration: 0, Date: "2026-10-16", RunUSD: 1}
+		data, err := json.MarshalIndent(meta, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeTestFile(t, filepath.Join(dir, metaFile), data)
+		return dir
+	}
+
+	var dirs []string
+	for i := 1; i <= maxMergedRuns+1; i++ {
+		dirs = append(dirs, writeRun(strconv.Itoa(i)))
+	}
+	first := dirs[0]
+	if err := stateMerge(empty, out, dirs, cfg, now); err != nil {
+		t.Fatal(err)
+	}
+	m := readManifestT(t, out)
+	if len(m.Merged) != maxMergedRuns {
+		t.Fatalf("%d runs merged, want the %d cap", len(m.Merged), maxMergedRuns)
+	}
+	if got := m.Spend["2026-10-16"]; got != float64(maxMergedRuns+1) {
+		t.Fatalf("spend after the first merge = %v, want %d", got, maxMergedRuns+1)
+	}
+	// The window has forgotten run 1, which is exactly the trap.
+	for _, key := range m.Merged {
+		if key == "1-1" {
+			t.Fatal("run 1-1 is still in the manifest window; the test proves nothing")
+		}
+	}
+
+	// Re-present the forgotten run alongside a genuinely new one.
+	fresh := writeRun("9999")
+	out2 := filepath.Join(t.TempDir(), "out2")
+	if err := stateMerge(out, out2, []string{first, fresh}, cfg, now); err != nil {
+		t.Fatal(err)
+	}
+	again := readManifestT(t, out2)
+	if got, want := again.Spend["2026-10-16"], m.Spend["2026-10-16"]+1; got != want {
+		t.Errorf("spend after re-merging run 1-1 = %v, want %v (its dollars counted once)", got, want)
+	}
+	if got, want := again.Generation, m.Generation+1; got != want {
+		t.Errorf("generation after re-merging run 1-1 = %d, want %d (only run 9999 advanced it)", got, want)
+	}
+	if again.Updated.IsZero() {
+		t.Error("the repeat merge did not write the bundle")
+	}
+
+	// The dedup set outlives the manifest window.
+	keys, err := readMergedKeys(out2)
+	if err != nil {
+		t.Fatalf("merged keys: %v", err)
+	}
+	found := false
+	for _, key := range keys {
+		if key == "1-1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("run 1-1 is not in %s; the dedup set forgot it again", mergedFile)
+	}
+}
+
+func TestReadMergedKeysRefusesBsdKeys(t *testing.T) {
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, mergedFile), []byte("1-1\n20; rm -rf /\n"))
+	if _, err := readMergedKeys(dir); err == nil {
+		t.Error("a malformed merged key was accepted")
+	}
+	// A missing file is an empty set: bundles from before issue #312 keep merging.
+	if keys, err := readMergedKeys(t.TempDir()); err != nil || len(keys) != 0 {
+		t.Errorf("missing %s: (%v, %v)", mergedFile, keys, err)
+	}
+	// The set is trimmed by length, oldest first.
+	many := make([]string, 0, 1000)
+	for i := 0; i < 1000; i++ {
+		many = append(many, strconv.Itoa(i)+"-1")
+	}
+	trimmed := trimMergedKeys(many)
+	if len(trimmed) == 0 || trimmed[len(trimmed)-1] != "999-1" {
+		t.Errorf("trimMergedKeys kept %d keys, newest last = %q", len(trimmed), trimmed[len(trimmed)-1])
+	}
+}
+
 func TestStateLoadDropsBadRecordLines(t *testing.T) {
 	cfg, err := loadConfig("models.json")
 	if err != nil {
