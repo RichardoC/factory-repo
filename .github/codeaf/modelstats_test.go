@@ -896,3 +896,67 @@ func TestModelStatsUnknownKindRefused(t *testing.T) {
 		}
 	}
 }
+
+// TestModelStatsWaitedThenRefusedCountsSlotFigures: issue #342. A call that
+// queued for a slot and was then refused — by upstream, or by the credit cap
+// just after the wait — never reached the slot figures: the call-row gate
+// also demanded a first token a refusal never has, and a status marker
+// carried no slot_wait_s at all. The fixture is exactly the shape the issue
+// names: a call row with slot_wait_s and no ttft_ms, plus a status-marker
+// line carrying slot_wait_s, in one run.
+func TestModelStatsWaitedThenRefusedCountsSlotFigures(t *testing.T) {
+	cfg := modelStatsTestConfig(t)
+	// Threshold 1, so two waits in one run fire the per-run alert; every
+	// other threshold keeps its default.
+	one := 1
+	cfg.Alerts.SlotWaitsPerRun = &one
+	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	win := modelStatsWindowFrom(cfg, now)
+	// The shape issue #342 names, in one run: a call row with slot_wait_s
+	// and no ttft_ms -- a call that queued 120 s and died before a first
+	// token -- plus a status-marker line carrying the wait its call queued
+	// through before the proxy refused it with 402.
+	lines := []string{
+		`{"ts":"2026-10-21T11:00:00Z","model":"alpha","slot_wait_s":120}`,
+		`{"ts":"2026-10-21T11:00:00Z","model":"alpha","kind":"status","status":402,"slot_wait_s":7}`,
+	}
+	zr := modelStatsTestZip(t, "codeaf-ledger.jsonl", strings.Join(lines, "\n")+"\n")
+
+	in := parseModelStatsZips([]*zip.Reader{zr}, cfg)
+	if in.Stats.Rows != 1 || in.Stats.Rejected != 0 || len(in.Stats.Markers) != 1 {
+		t.Fatalf("rows=%d rejected=%d markers=%d, want 1/0/1", in.Stats.Rows, in.Stats.Rejected, len(in.Stats.Markers))
+	}
+	var alpha *modelAgg
+	for _, a := range modelAggregate(filterWindow(in, win), cfg, win) {
+		if a.ID == "alpha" {
+			alpha = a
+		}
+	}
+	if alpha == nil {
+		t.Fatal("no alpha aggregate")
+	}
+	// Both waits count, and neither call completed, so both are abandoned.
+	// Runs are numbered from 1 (parseModelStatsZips counts the zips).
+	if alpha.SlotCalls != 2 || len(alpha.SlotWaits) != 2 || alpha.Abandoned != 2 || alpha.slotWaitsPerRun[1] != 2 {
+		t.Fatalf("slot figures: calls=%d waits=%d abandoned=%d perRun=%d, want 2/2/2/2",
+			alpha.SlotCalls, len(alpha.SlotWaits), alpha.Abandoned, alpha.slotWaitsPerRun[1])
+	}
+	// The 7 s refused wait sorts below the 120 s row, so the p90 is 120.0
+	// (nearest rank: sorted[ceil(0.9*2)-1] over [7, 120]).
+	if summarize(alpha.SlotWaits).P90 != 120.0 {
+		t.Fatalf("slot p90 = %v, want 120", summarize(alpha.SlotWaits).P90)
+	}
+	got := modelStatsReport(in, cfg, win, now)
+	// The per-model row: n and runs from the one call row, then a slot
+	// figure of 2 counting the refused call. The tail columns are
+	// | slot waits | slot p90 | abandoned |.
+	if !strings.Contains(got, "| `alpha` | 1 | 1 |") || !strings.Contains(got, "| 2 | 120.0 | 2 |") {
+		t.Errorf("the waited-and-refused calls are missing from the slot figures:\n%s", got)
+	}
+	if want := "`alpha`: 2 slot waits in run 1, over the 1-per-run threshold"; !strings.Contains(got, want) {
+		t.Errorf("the per-run slot-wait alert did not count the refused wait:\n%s", got)
+	}
+	if want := "`alpha`: 2 abandoned slot wait(s) \u2014 a call queued for a slot and produced no completion"; !strings.Contains(got, want) {
+		t.Errorf("the abandoned alert did not count the waited refusals:\n%s", got)
+	}
+}

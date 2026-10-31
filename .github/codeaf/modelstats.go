@@ -120,12 +120,19 @@ type ledgerRow struct {
 // ledgerMarker is a status line kept for the error-class rates. It carries
 // the timestamp the window filter needs (issue #319) alongside the class:
 // a marker from an hour the report does not cover must drop out of the
-// error classes and the 429-rate denominator, not just the call rows.
+// error classes and the 429-rate denominator, not just the call rows. A
+// marker can also carry the slot wait the refused call queued through
+// (issue #342), because congestion that ends in a refusal is exactly the
+// congestion the slot figures and the abandoned alert exist to report.
 type ledgerMarker struct {
 	Time   time.Time
 	Model  string
 	Run    int
 	Status int
+	// SlotWaitS is that wait, in seconds: 0 on a status line the proxy
+	// refused without queueing -- a model it never allowed, a body it never
+	// parsed, a call upstream answered outright.
+	SlotWaitS float64
 }
 
 // windowStats is everything the report needs that is not per-model.
@@ -488,8 +495,18 @@ func (in *modelStatsInput) decodeLedgerLine(line []byte, run int, allowed map[st
 			in.addReject(rejectBadTime)
 			return
 		}
+		// A status line may carry the slot wait the call queued through
+		// before the refusal (issue #342): an upstream refusal records one
+		// too, and so does the proxy credit-cap refusal after a wait.
+		// Decoded and validated like a call row wait, so a forged wait is
+		// refused rather than folded into the slot figures.
+		slot, slotOK := decodeSlotWait(raw.SlotWaitS, b.MaxSlotWaitS)
+		if !slotOK {
+			in.addReject(rejectBadNumber)
+			return
+		}
 		if len(in.Stats.Markers) < b.MaxMarkers {
-			in.Stats.Markers = append(in.Stats.Markers, ledgerMarker{Time: ts, Model: model, Run: run, Status: status})
+			in.Stats.Markers = append(in.Stats.Markers, ledgerMarker{Time: ts, Model: model, Run: run, Status: status, SlotWaitS: slot})
 		}
 		return
 	}
@@ -823,9 +840,11 @@ func modelAggregate(in modelStatsInput, cfg Config, win modelStatsWindow) []*mod
 		a.Calls++
 		a.Runs[r.Run] = true
 		a.TTFT = append(a.TTFT, float64(r.TTFTMs))
-		if r.SlotWaitS > 0 && r.TTFTMs > 0 {
-			// A wait only exists on a call that reached the slot: the
-			// refusal path records no measurements at all.
+		if r.SlotWaitS > 0 {
+			// A wait exists the moment the call queued, whether or not it
+			// ever reached upstream: the wait, not the first token, is the
+			// measurement (issue #342). A row that waited and produced no
+			// completion is the abandoned wait the alert names.
 			a.SlotCalls++
 			a.SlotWaits = append(a.SlotWaits, r.SlotWaitS)
 			a.slotWaitsPerRun[r.Run]++
@@ -881,6 +900,17 @@ func modelAggregate(in modelStatsInput, cfg Config, win modelStatsWindow) []*mod
 			continue
 		}
 		markerCalls[m.Model]++
+		// A status line that queued before its refusal (issue #342) was
+		// abandoned mid-congestion, which is exactly what the abandoned
+		// alert and the per-run slot-wait count describe, so its wait feeds
+		// the same slot figures a waited call row feeds. A marker never
+		// completed, so a waited one always counts abandoned.
+		if m.SlotWaitS > 0 {
+			a.SlotCalls++
+			a.SlotWaits = append(a.SlotWaits, m.SlotWaitS)
+			a.slotWaitsPerRun[m.Run]++
+			a.Abandoned++
+		}
 		switch class := statusClass(m.Status); class {
 		case "429":
 			a.Four29++

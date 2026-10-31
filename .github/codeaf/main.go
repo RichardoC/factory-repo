@@ -1194,9 +1194,11 @@ func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slot
 		TTFTMs: timing.TTFT.Milliseconds(), DurMs: timing.Dur.Milliseconds(),
 		MaxGapMs: timing.MaxGap.Milliseconds(), Cut: timing.Cut}
 	if status != 0 {
-		// A non-200 upstream answer is recorded as a status line (issue #140):
-		// it carries no usage and no cost, and the kind keeps it out of every
-		// call and timing figure the report computes.
+		// A non-200 answer is recorded as a status line (issue #140): an
+		// upstream refusal, or the credit-cap refusal after a slot wait
+		// (issue #342). It carries no usage and no cost, and the kind keeps
+		// it out of every call and timing figure the report computes, while
+		// the slot_wait_s it still carries reaches the slot figures.
 		line.Kind = "status"
 		line.Status = status
 	}
@@ -1590,6 +1592,14 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 	}()
 	// Checked after the wait, since other calls may have spent the cap.
 	if reason := p.overCap(); reason != "" {
+		// The refusal is recorded like an upstream refusal (issue #342): the
+		// call held its place in the queue exactly as any other did, so the
+		// wait it spent there is a real measure of congestion and belongs in
+		// the ledger. The call itself never started, so it carries no usage,
+		// no cost and no timing of its own: kind "status", like a refusal
+		// from upstream.
+		started := time.Now()
+		p.record(m, nil, wantsStream(body), started, slotWait, 0, charCounts{}, 0, http.StatusPaymentRequired, timingOf(started))
 		p.fail(w, out, http.StatusPaymentRequired, reason)
 		return
 	}
