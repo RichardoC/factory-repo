@@ -435,9 +435,9 @@ func TestModelStatsRejectsHostileRows(t *testing.T) {
 	}
 }
 
-// TestModelStatsZipBounds: a zip bomb and too many entries are refused
+// TestParseModelStatsZipBounds: a zip bomb and too many entries are refused
 // without extracting.
-func TestModelStatsZipBounds(t *testing.T) {
+func TestParseModelStatsZipBounds(t *testing.T) {
 	allowed := map[string]bool{"alpha": true}
 	b := defaultModelStatsBounds()
 
@@ -517,6 +517,34 @@ func TestModelStatsZipBounds(t *testing.T) {
 	in = parseModelStatsWithBounds([]*zip.Reader{run}, allowed, b)
 	if len(in.Rows) != b.MaxRunRows {
 		t.Fatalf("row cap: got %d rows, want %d", len(in.Rows), b.MaxRunRows)
+	}
+
+	// Several ledger entries in one zip (issue #388): matched by base name,
+	// the same ledger under several directories is read once per entry, so
+	// the per-run cap has to bound the run across entries -- not the entry.
+	// The excess is stated in SkippedReason like every other cap.
+	entries := []string{}
+	for i := 0; i < 4; i++ {
+		entries = append(entries,
+			fmt.Sprintf("copy-%d/%s", i, modelStatsLedgerName),
+			strings.Join(rows, "\n")+"\n")
+	}
+	multi := modelStatsTestZip(t, entries...)
+	in = parseModelStatsWithBounds([]*zip.Reader{multi}, allowed, b)
+	if len(in.Rows) != b.MaxRunRows {
+		t.Fatalf("multi-entry row cap: got %d rows, want %d", len(in.Rows), b.MaxRunRows)
+	}
+	capped := false
+	for _, r := range in.Stats.SkippedReason {
+		if strings.Contains(r, "per-run cap") {
+			capped = true
+		}
+	}
+	if !capped {
+		t.Fatalf("multi-entry row cap: no reason states the excess, got %v", in.Stats.SkippedReason)
+	}
+	if in.Stats.Rows != b.MaxRunRows {
+		t.Fatalf("multi-entry row cap: counted %d rows, want %d", in.Stats.Rows, b.MaxRunRows)
 	}
 }
 
