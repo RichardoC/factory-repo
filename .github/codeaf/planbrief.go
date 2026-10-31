@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -28,12 +29,17 @@ const (
 	maxPlanAppRulesBytes = 8192  // each app's AGENTS.md in the per-app rules
 	maxPlanIssueBody     = 200   // runes of body shown per open issue
 	maxPlanOpenIssues    = 60    // open issues listed at most
+	maxPlanClosedIssues  = 20    // closed issues shown at most (pull requests do not count)
 	maxPlanClosedBody    = 3000  // runes of a closed issue's body (the Out-of-scope notes live there)
 	maxPlanRunReports    = 3     // recent run reports embedded at most
 	maxPlanReportPages   = 5     // comment pages the report scan follows at most
 	maxPlanReportBody    = 3000  // runes of one embedded run report
 	planReportBotLogin   = "github-actions[bot]"
 	planStandingFileName = "plan-instructions.md"
+	// planClosedIssuesPath is the closed-issues window's first page. The
+	// issues endpoint lists closed pull requests too, so this read pages on
+	// (issue #322) instead of trusting the first 20 items to be issues.
+	planClosedIssuesPath = "/issues?state=closed&sort=updated&per_page=20"
 )
 
 // planHarnessPreChangeSentence is the evidence rule plan-instructions.md
@@ -188,14 +194,16 @@ func planOpenIssues(gh github) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// The three "recent" reads below (closed issues, closed pull requests, run
-// reports) are windows, not whole lists. Closed issues and pull requests
-// take one page of the newest items through the one-shot get: through
-// getList they would walk the repository's whole history and, past
-// maxListPages, lose the section to the page-cap error. The run-report scan
-// instead pages on its own smaller bound (maxPlanReportPages), because its
-// endpoint carries every comment kind and one page can hold no report at
-// all (issue #321).
+// The "recent" reads below are windows, not whole lists: the newest items
+// are what they want, never the repository's whole history. The closed
+// pull requests take one page with the one-shot get. The closed issues page
+// too (issue #322): the issues endpoint lists pull requests as well, so a
+// page of 20 closed pull requests would spend the whole window and leave the
+// section empty, and a genuinely recent closed issue would never be read.
+// closedIssuesWindow therefore follows next links, counting only the items
+// it renders against the window's budget. The run-report scan pages on its
+// own smaller bound (maxPlanReportPages), because its endpoint carries every
+// comment kind and one page can hold no report at all (issue #321).
 //
 // planClosedIssues embeds the recently closed issues' bodies nearly whole:
 // their "Out of scope" and follow-up notes are the planner's second source
@@ -207,8 +215,8 @@ func planOpenIssues(gh github) string {
 func planClosedIssues(gh github) string {
 	var b strings.Builder
 	b.WriteString("## Recently closed issues\n\n")
-	var issues []item
-	if err := gh.get("/issues?state=closed&sort=updated&per_page=20", &issues); err != nil {
+	issues, truncated, err := gh.closedIssuesWindow(planClosedIssuesPath, maxPlanClosedIssues)
+	if err != nil {
 		fmt.Fprintf(&b, "(recently closed issues unavailable: %s)\n", escapeMD(err.Error(), 200, true))
 		return strings.TrimRight(b.String(), "\n")
 	}
@@ -218,18 +226,68 @@ func planClosedIssues(gh github) string {
 			continue // pull requests are listed separately, titles only
 		}
 		fmt.Fprintf(&b, "### #%d — %s\n\n", it.Number, escapeMD(it.Title, 200, true))
+		shown++ // the issue is rendered, with or without a body
 		if strings.TrimSpace(it.Body) == "" {
 			b.WriteString("(no body)\n\n")
 			continue
 		}
 		b.WriteString(escapeMD(it.Body, maxPlanClosedBody, false))
 		b.WriteString("\n\n")
-		shown++
 	}
-	if shown == 0 {
+	switch {
+	case shown > 0:
+		// The window is filled, or the listing ended: either way what the
+		// section holds is what the repository's head holds.
+	case truncated:
+		// The read stopped at the page cap without filling the window, so
+		// nothing here is a fact about the repository: say what was read.
+		fmt.Fprintf(&b, "(no recently closed issues in the newest %d pages; older ones may still exist)\n", maxListPages)
+	default:
 		b.WriteString("(no recently closed issues)\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// closedIssuesWindow reads the head of the closed-issues listing until it
+// holds budget items that are issues — pull requests share this endpoint and
+// are dropped below, so they must not spend the window's slots (issue #322)
+// — or the listing ends. It follows the `Link: rel="next"` header through
+// listNext, exactly as getList does, and stops at maxListPages; a window
+// truncated there is not an error (the newest items are still the newest),
+// so truncated reports it to the caller instead. Any other failure keeps
+// its meaning and degrades the section to a note.
+func (g github) closedIssuesWindow(path string, budget int) (issues []item, truncated bool, err error) {
+	for pages := 0; path != ""; pages++ {
+		if pages == maxListPages {
+			return issues, true, nil
+		}
+		response, err := g.doGet(path)
+		if err != nil {
+			return nil, false, err
+		}
+		data, err := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if err != nil {
+			return nil, false, err
+		}
+		var page []item
+		if err := json.Unmarshal(data, &page); err != nil {
+			return nil, false, err
+		}
+		for _, it := range page {
+			if len(it.PullRequest) > 0 {
+				continue // pull requests are listed separately, titles only
+			}
+			issues = append(issues, it)
+			if len(issues) == budget {
+				return issues, false, nil
+			}
+		}
+		if path, err = g.listNext(response.Header.Get("Link")); err != nil {
+			return nil, false, err
+		}
+	}
+	return issues, false, nil
 }
 
 // planClosedPulls lists the recently closed pull requests, titles only:
