@@ -398,7 +398,7 @@ func TestProposalBodyWorkflowsNote(t *testing.T) {
 
 // approvalNote is the exact sentence ProposalBody appends when a gated path is
 // named and the planner did not already state the approval requirement.
-const approvalNote = "Note: changes to .github/workflows/ need a maintainer's approval before merging."
+const approvalNote = "Note: changes under .github/ outside .github/codeaf/ (workflows, CODEOWNERS) need a maintainer's approval before merging."
 
 func TestProposalBodyEscapesAndTemplate(t *testing.T) {
 	p := Proposal{

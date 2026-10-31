@@ -394,7 +394,7 @@ func ProposalBody(p Proposal) string {
 	}
 	text := strings.ToLower(p.Problem + "\n" + p.What)
 	if namesApprovalPath(text) && !strings.Contains(text, "approval") {
-		b.WriteString("\nNote: changes to .github/workflows/ need a maintainer's approval before merging.\n")
+		b.WriteString("\nNote: changes under .github/ outside .github/codeaf/ (workflows, CODEOWNERS) need a maintainer's approval before merging.\n")
 	}
 	return b.String()
 }
