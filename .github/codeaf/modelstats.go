@@ -262,7 +262,7 @@ func parseModelStatsZipsSkipped(zips []*zip.Reader, skipped []skippedArtifact, c
 }
 
 // parseModelStatsWithBounds is parseModelStatsZipsSkipped with the bounds
-// made explicit, so TestModelStatsZipBounds can drive the real reader.
+// made explicit, so TestParseModelStatsZipBounds can drive the real reader.
 func parseModelStatsWithBounds(zips []*zip.Reader, allowed map[string]bool, b modelStatsBounds) modelStatsInput {
 	return parseModelStatsWithBoundsSkipped(zips, nil, allowed, b)
 }
@@ -350,11 +350,12 @@ func parseModelStatsWithBoundsSkipped(zips []*zip.Reader, skipped []skippedArtif
 			// the two cannot drift apart: parseLedger stops at MaxEntryUnc+1
 			// bytes and refuses the entry when it gets there, so nothing a
 			// zip's header promised can make the reader inflate past the cap.
-			rowsThisRun += in.parseLedger(rc, run, allowed, b, b.MaxEntryUnc+1)
+			// The run's remaining row budget travels with the read (issue
+			// #388): one artifact may hold the ledger under more than one
+			// directory, and a budget counted per entry would let every copy
+			// count afresh, so the cap bounds the run across entries.
+			rowsThisRun += in.parseLedger(rc, run, allowed, b, b.MaxEntryUnc+1, b.MaxRunRows-rowsThisRun)
 			rc.Close()
-			if rowsThisRun > b.MaxRunRows {
-				rowsThisRun = b.MaxRunRows
-			}
 		}
 		// A run that contributed no rows at all is still a run the window
 		// saw: "runs" in the report is runs with a ledger, and a run whose
@@ -367,8 +368,12 @@ func parseModelStatsWithBoundsSkipped(zips []*zip.Reader, skipped []skippedArtif
 // parseLedger decodes one ledger entry, line by line, into the window. A
 // line that fails any check is refused and counted under its class; the
 // decoder never aborts the run on one hostile line. maxBytes bounds the
-// inflated input (the decompression-bomb guard).
-func (in *modelStatsInput) parseLedger(r io.Reader, run int, allowed map[string]bool, b modelStatsBounds, maxBytes int64) int {
+// inflated input (the decompression-bomb guard). rowsLeft is what the run
+// may still contribute after the entries read so far: once it is spent the
+// entry stops and the excess is stated in SkippedReason, so a zip holding
+// the ledger under several names cannot multiply one run's rows (issue
+// #388).
+func (in *modelStatsInput) parseLedger(r io.Reader, run int, allowed map[string]bool, b modelStatsBounds, maxBytes int64, rowsLeft int) int {
 	data, err := io.ReadAll(io.LimitReader(r, maxBytes))
 	if err != nil {
 		in.Stats.SkippedReason = append(in.Stats.SkippedReason,
@@ -402,9 +407,20 @@ func (in *modelStatsInput) parseLedger(r io.Reader, run int, allowed map[string]
 			in.addReject(rejectOversize)
 			continue
 		}
-		if in.Stats.Rows >= b.MaxRows || rows >= b.MaxRunRows {
-			// The caps are hit: the rest of this run is not read, and the
-			// fact is stated rather than silently dropped.
+		if in.Stats.Rows >= b.MaxRows {
+			// The window cap has nothing left to give: the rest of this entry
+			// is not read. The window's own figures in the report say so, so
+			// unlike the per-run cap no reason line is needed here.
+			return rows
+		}
+		if rowsLeft <= 0 || rows >= rowsLeft {
+			// The run's row budget is spent, by this entry or an earlier one:
+			// a zip may hold the ledger under several names, and a budget
+			// counted per entry would let every copy count afresh (issue #388).
+			// The rest of the entry is not read, and the excess is stated
+			// like every other cap rather than silently dropped.
+			in.Stats.SkippedReason = append(in.Stats.SkippedReason,
+				skipReason("run %d: %d-row per-run cap reached, rest of entry skipped", run, b.MaxRunRows))
 			return rows
 		}
 		rows++
