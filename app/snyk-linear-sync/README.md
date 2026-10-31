@@ -225,8 +225,11 @@ The subject portion then uses this preference:
 `off` turns off the whole managed label set, not just the global label: the
 derived awaiting-fix, tool and origin labels are not applied either (their
 defaults and any explicit mapping are ignored), no label is recorded in the
-metadata block, and no label is looked up in Linear — so a workspace without
-`snyk-automation` or `triage-dependency` does not fail the run.
+metadata block, and no managed label is looked up in Linear — so a workspace
+without `snyk-automation` or `triage-dependency` does not fail the run.
+`LINEAR_CREATE_ONLY_LABELS` is a separate set, not part of label management:
+its labels are still resolved and stamped on create, so they must still exist
+in Linear.
 
 When label management is enabled, the sync:
 

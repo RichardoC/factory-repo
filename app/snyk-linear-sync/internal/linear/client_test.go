@@ -1624,6 +1624,29 @@ func TestCreateLabelIDsIncludesCreateOnlyLabels(t *testing.T) {
 	}
 }
 
+// TestCreateLabelNamesKeepsCreateOnlyLabelsWhenManagementOff pins the sentence
+// README and PROJECT.md state next to the LINEAR_MANAGED_LABEL=off description:
+// turning label management off empties the managed set but not the create-only
+// set, because LINEAR_CREATE_ONLY_LABELS is configured separately. Those labels
+// therefore still resolve on create, and must still exist in Linear.
+func TestCreateLabelNamesKeepsCreateOnlyLabelsWhenManagementOff(t *testing.T) {
+	// The feature under test is createLabelNames, which takes no LabelConfig; a
+	// desired issue built with an empty managed set is exactly what a run with
+	// management off produces.
+	desired := model.DesiredIssue{
+		ManagedLabels:    nil,
+		CreateOnlyLabels: []string{"df:kikimora-snyk"},
+	}
+
+	got := createLabelNames(desired)
+	if !slices.Equal(got, []string{"df:kikimora-snyk"}) {
+		t.Fatalf("createLabelNames() = %#v, want only the create-only label", got)
+	}
+	if names := managedLabelsFromDesiredIssues([]model.DesiredIssue{desired}); !slices.Contains(names, "df:kikimora-snyk") {
+		t.Fatalf("managedLabelsFromDesiredIssues() = %#v, want the create-only label to still be resolved", names)
+	}
+}
+
 // TestUpdateIssuesFailsWhenLiveLabelsUnreadable pins the fail-closed path. An
 // issue missing from the live label read is indistinguishable from one carrying
 // no protected label, so the update must not proceed — guessing wrong deletes a
