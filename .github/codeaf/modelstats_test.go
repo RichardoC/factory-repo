@@ -520,6 +520,39 @@ func TestModelStatsZipBounds(t *testing.T) {
 	}
 }
 
+// TestParseModelStatsZipCountCap: the zip-count cap refuses only the
+// artifacts past it, not the whole window. The first MaxZips zips are read
+// and the excess is counted as skipped with one bounded reason -- the same
+// per-item refusal every other bound in the reader uses.
+func TestParseModelStatsZipCountCap(t *testing.T) {
+	allowed := map[string]bool{"alpha": true}
+	b := defaultModelStatsBounds()
+	b.MaxZips = 3
+
+	line := `{"ts":"2026-10-21T11:00:00Z","model":"alpha","ttft_ms":1,"dur_ms":2}` + "\n"
+	var zips []*zip.Reader
+	for i := 0; i < b.MaxZips+1; i++ {
+		zips = append(zips, modelStatsTestZip(t, modelStatsLedgerName, line))
+	}
+
+	// Over the cap: every zip up to it is read, the excess is one skip line.
+	in := parseModelStatsWithBoundsSkipped(zips, nil, allowed, b)
+	if in.Stats.Zips != b.MaxZips {
+		t.Errorf("zips = %d, want %d (the cap must refuse only the excess)", in.Stats.Zips, b.MaxZips)
+	}
+	if in.Stats.ZipSkipped != 1 || len(in.Stats.SkippedReason) != 1 ||
+		!strings.Contains(in.Stats.SkippedReason[0], "over the 3-zip cap") {
+		t.Errorf("excess: skipped=%d reasons=%v, want one bounded reason", in.Stats.ZipSkipped, in.Stats.SkippedReason)
+	}
+
+	// At the cap: a window at or under it reads every zip and skips nothing.
+	at := parseModelStatsWithBoundsSkipped(zips[:b.MaxZips], nil, allowed, b)
+	if at.Stats.Zips != b.MaxZips || at.Stats.ZipSkipped != 0 || len(at.Stats.SkippedReason) != 0 {
+		t.Errorf("at cap: zips=%d skipped=%d reasons=%v, want every zip read",
+			at.Stats.Zips, at.Stats.ZipSkipped, at.Stats.SkippedReason)
+	}
+}
+
 // zipReaderUncompressedSize is the size the reader sees on a test zip's
 // single entry header, which the caps in these tests are set against.
 func zipReaderUncompressedSize(zr *zip.Reader) uint64 {

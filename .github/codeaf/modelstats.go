@@ -281,16 +281,22 @@ func parseModelStatsWithBoundsSkipped(zips []*zip.Reader, skipped []skippedArtif
 		in.Stats.SkippedReason = append(in.Stats.SkippedReason, reason)
 	}
 	for i, zr := range zips {
+		if i >= b.MaxZips {
+			// Over the cap: refuse only the artifacts past it and read on,
+			// like every other bound in this reader -- never the whole
+			// window. Each excess artifact counts as skipped; the reason is
+			// one bounded line, written once at the first excess artifact.
+			in.Stats.ZipSkipped++
+			if i == b.MaxZips {
+				in.Stats.SkippedReason = append(in.Stats.SkippedReason,
+					skipReason("%d zips present, over the %d-zip cap", len(zips), b.MaxZips))
+			}
+			continue
+		}
 		if zr == nil {
 			in.Stats.ZipSkipped++
 			in.Stats.SkippedReason = append(in.Stats.SkippedReason, skipReason("run %d: no artifact", i+1))
 			continue
-		}
-		if len(zips) > b.MaxZips {
-			in.Stats.ZipSkipped++
-			in.Stats.SkippedReason = append(in.Stats.SkippedReason,
-				skipReason("%d zips present, over the %d-zip cap", len(zips), b.MaxZips))
-			break
 		}
 		if len(zr.File) == 0 {
 			in.Stats.ZipSkipped++
