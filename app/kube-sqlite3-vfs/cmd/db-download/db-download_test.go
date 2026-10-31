@@ -227,3 +227,107 @@ func TestRunWithClientFailsOnByteMismatch(t *testing.T) {
 		t.Errorf("error = %v, want it to report the byte mismatch", err)
 	}
 }
+
+// TestJournalModeValidation covers the reader's --journal-mode validation,
+// which delegates to the same shared journalmode package as the writer's
+// (issue #318): the modes a reader may run under (DELETE, TRUNCATE,
+// PERSIST, case-insensitively, and the flag's empty default, DELETE), and
+// the modes it must refuse — MEMORY and OFF for the crash-safety reason
+// from issue #68, WAL for the -shm file this VFS cannot store, and anything
+// else as unknown.
+func TestJournalModeValidation(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    string
+		wantErr string
+	}{
+		{in: "", want: "DELETE"},                         // the flag's default
+		{in: "DELETE", want: "DELETE"},                   // accepted, canonical case
+		{in: "TRUNCATE", want: "TRUNCATE"},               // accepted
+		{in: "truncate", want: "TRUNCATE"},               // accepted, lower case
+		{in: "PERSIST", want: "PERSIST"},                 // accepted
+		{in: " truncate ", want: "TRUNCATE"},             // accepted, surrounding space trimmed
+		{in: "MEMORY", wantErr: "cannot be rolled back"}, // refused: crash-safety (issue #68)
+		{in: "OFF", wantErr: "cannot be rolled back"},    // refused: crash-safety (issue #68)
+		{in: "WAL", wantErr: "shared-memory -shm"},       // refused: no -shm through this VFS
+		{in: "bogus", wantErr: "unknown --journal-mode"}, // refused: not a mode
+	}
+	for _, tc := range cases {
+		got, err := journalModeName(tc.in)
+		if tc.wantErr != "" {
+			if err == nil {
+				t.Errorf("journalModeName(%q) = %q, want error mentioning %q", tc.in, got, tc.wantErr)
+				continue
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("journalModeName(%q) error = %q, want it to mention %q", tc.in, err, tc.wantErr)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("journalModeName(%q): %v", tc.in, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("journalModeName(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestReaderDSNCarriesJournalMode shows that the requested mode reaches the
+// SQLite DSN the reader opens (issue #318): the DSN carries
+// _journal=<mode> alongside the read-only parameters, the flag's empty
+// default behaves as DELETE, and a refused mode produces no DSN at all.
+func TestReaderDSNCarriesJournalMode(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{in: "", want: "file2.db?_query_only=true&_journal=DELETE"}, // the flag's default
+		{in: "DELETE", want: "file2.db?_query_only=true&_journal=DELETE"},
+		{in: "TRUNCATE", want: "file2.db?_query_only=true&_journal=TRUNCATE"},
+		{in: "PERSIST", want: "file2.db?_query_only=true&_journal=PERSIST"},
+	} {
+		dsn, err := readerDSN(tc.in)
+		if err != nil {
+			t.Fatalf("readerDSN(%q): %v", tc.in, err)
+		}
+		if dsn != tc.want+"&mode=ro&sqlite_os_trace=&vfs=kube-sqlite3-vfs" {
+			t.Errorf("readerDSN(%q) = %q, want it to carry %q", tc.in, dsn, tc.want)
+		}
+	}
+	for _, mode := range []string{"MEMORY", "OFF", "WAL", "bogus"} {
+		if dsn, err := readerDSN(mode); err == nil {
+			t.Errorf("readerDSN(%q) = %q, want an error: a refused mode must not produce a DSN", mode, dsn)
+		}
+	}
+}
+
+// TestRunWithClientHonoursJournalModeFlag drives the reader with
+// --journal-mode=TRUNCATE end to end over the fake clientset: the mode in
+// the DSN is one SQLite accepts over this VFS (a refused or mangled DSN
+// parameter fails the open), so the transfer and its read-back COUNT query
+// succeed through a TRUNCATE-mode connection.
+func TestRunWithClientHonoursJournalModeFlag(t *testing.T) {
+	path, _ := buildSQLiteFile(t, 500)
+	fcs := fake.NewSimpleClientset()
+
+	if err := runWithClient(fcs, Options{FileName: path, Retries: 1, JournalMode: "TRUNCATE"}, testLogger()); err != nil {
+		t.Fatalf("runWithClient with --journal-mode=TRUNCATE: %v", err)
+	}
+}
+
+// TestRunWithClientRefusesMemoryJournalMode shows the refusal at the run's
+// front door: a reader asked for _journal=MEMORY fails before any cluster
+// work, with the crash-safety reason from issue #68 in the error.
+func TestRunWithClientRefusesMemoryJournalMode(t *testing.T) {
+	fcs := fake.NewSimpleClientset()
+
+	err := runWithClient(fcs, Options{FileName: filepath.Join(t.TempDir(), "no-such.db"), Retries: 1, JournalMode: "MEMORY"}, testLogger())
+	if err == nil {
+		t.Fatal("runWithClient succeeded with --journal-mode=MEMORY, want a crash-safety refusal")
+	}
+	if !strings.Contains(err.Error(), "cannot be rolled back") {
+		t.Errorf("error = %q, want it to give the crash-safety reason (issue #68)", err)
+	}
+	if cms := listConfigMaps(t, fcs, "data=sector"); len(cms) != 0 {
+		t.Errorf("a refused run wrote %d sector ConfigMaps, want 0: the refusal must come before any cluster work", len(cms))
+	}
+}
