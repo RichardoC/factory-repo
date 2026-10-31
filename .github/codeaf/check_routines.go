@@ -285,8 +285,10 @@ func prSweep(prs []prStatus) (report string, conflictedFree []int) {
 	if len(unaddressed) > 0 {
 		b.WriteString("\n### Unaddressed review findings\n\n")
 		for _, pr := range unaddressed {
-			who := unaddressedReviewer(pr.Reviews)
-			if who == "" || who == "@nobody" {
+			who, _ := unaddressedReviewer(pr.Reviews)
+			if who == "" {
+				// A standing finding whose author is null (a deleted
+				// account): name nobody rather than drop the finding.
 				line("unaddressed finding", pr, "@nobody (reviewer unknown)")
 			} else {
 				line("unaddressed finding", pr, "@"+escapeMD(strings.TrimPrefix(who, "@"), 80, true))
@@ -300,13 +302,18 @@ func prSweep(prs []prStatus) (report string, conflictedFree []int) {
 // review with no later approving or dismissed review: reviews are read in
 // submittedAt order when any stamp is set, otherwise in list order.
 func hasUnaddressedReview(reviews []prReview) bool {
-	return unaddressedReviewer(reviews) != ""
+	_, standing := unaddressedReviewer(reviews)
+	return standing
 }
 
 // unaddressedReviewer names the reviewer whose CHANGES_REQUESTED finding is
 // still standing — the raw login, escaped only where it is rendered — or ""
-// when none is. The later-review rule is hasUnaddressedReview's.
-func unaddressedReviewer(reviews []prReview) string {
+// when the reviewer is unknown. The bool says whether a finding stands at
+// all: a CHANGES_REQUESTED review whose author is null — what `gh pr list
+// --json` sends for a deleted account — is a standing finding with an unknown
+// reviewer, not the absence of one. The later-review rule is
+// hasUnaddressedReview's.
+func unaddressedReviewer(reviews []prReview) (who string, standing bool) {
 	ordered := make([]prReview, len(reviews))
 	copy(ordered, reviews)
 	stamped := false
@@ -319,11 +326,11 @@ func unaddressedReviewer(reviews []prReview) string {
 	if stamped {
 		sort.Slice(ordered, func(i, j int) bool { return ordered[i].SubmittedAt.Before(ordered[j].SubmittedAt) })
 	}
-	who := ""
 	for i, r := range ordered {
 		switch r.State {
 		case "CHANGES_REQUESTED":
 			who = ""
+			standing = true
 			if r.Author != nil && r.Author.Login != "" {
 				who = r.Author.Login
 			}
@@ -332,10 +339,11 @@ func unaddressedReviewer(reviews []prReview) string {
 			// anything before it is history.
 			if i > 0 {
 				who = ""
+				standing = false
 			}
 		}
 	}
-	return who
+	return who, standing
 }
 
 // checkPRSweep is the live wrapper: it reads the PR list from PRS_PATH
