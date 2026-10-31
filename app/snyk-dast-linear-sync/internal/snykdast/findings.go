@@ -152,6 +152,15 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykDASTSnapshot, erro
 
 		status, ignoreExpiresAt := mapStatus(finding.State, finding.ExpirationDate)
 		findingIDStr := finding.ID.String()
+		if raw, unparseable := unparseableAcceptanceExpiry(finding.State, finding.ExpirationDate); unparseable {
+			// The acceptance carries an expiry but it cannot be parsed, so
+			// mapStatus treats the acceptance as permanent (ignored ->
+			// Cancelled). That silently cancels a reopened-ticket candidate,
+			// so say so: name the finding and the value that failed to parse.
+			c.logger.Warn("accepted finding has an unparseable expiration_date; treating the acceptance as permanent",
+				slog.String("finding_id", findingIDStr),
+				slog.String("expiration_date", raw))
+		}
 
 		normalized = append(normalized, model.Finding{
 			Fingerprint:       model.Fingerprint(targetID, findingIDStr),
@@ -422,8 +431,12 @@ func (c *Client) listFindings(ctx context.Context) ([]findingNode, error) {
 //   - invalid -> ignored (false positive / not a real vulnerability)
 //   - accepted with a future expiration_date -> snoozed (time-limited risk
 //     acceptance); the SLA clock restarts from the acceptance expiry
-//   - accepted without (or past) expiration_date -> ignored (permanent risk
-//     acceptance)
+//   - accepted with a past expiration_date -> open (the acceptance has
+//     lapsed and the finding needs attention again)
+//   - accepted without an expiration_date, or with one that cannot be
+//     parsed -> ignored (permanent risk acceptance). An unparseable expiry
+//     is additionally reported with a warning by LoadSnapshot so the
+//     permanent cancellation is visible.
 //
 // correlationNode is one entry from the Snyk Code (SAST) correlation
 // endpoint. The `markdown` field is a pre-rendered human-readable block
@@ -581,6 +594,24 @@ func mapStatus(state string, expirationDate *string) (model.FindingStatus, time.
 	default: // notfixed, retesting, or unknown
 		return model.FindingOpen, time.Time{}
 	}
+}
+
+// unparseableAcceptanceExpiry reports whether a finding is an accepted one
+// whose expiration_date is present but cannot be parsed (see
+// parseExpirationDate). mapStatus treats such an acceptance as permanent
+// (ignored, which the sync maps to Cancelled); the caller uses this helper to
+// log a warning naming the finding and the value, so the permanent
+// cancellation is visible instead of silent.
+func unparseableAcceptanceExpiry(state string, expirationDate *string) (raw string, unparseable bool) {
+	// An empty or blank value is no expiry at all, which mapStatus already
+	// documents as a permanent acceptance: nothing failed to parse.
+	if expirationDate == nil || strings.TrimSpace(*expirationDate) == "" || !strings.EqualFold(strings.TrimSpace(state), "accepted") {
+		return "", false
+	}
+	if _, _, ok := parseExpirationDate(*expirationDate); ok {
+		return "", false
+	}
+	return *expirationDate, true
 }
 
 // parseExpirationDate parses a Snyk DAST acceptance expiry. The API documents a
