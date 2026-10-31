@@ -89,6 +89,12 @@ All four commands (`main`, `db-upload`, `db-download`, `file-create`) share:
 store in the cluster, defaulting to `file2.db`. (`db-upload` and
 `db-download` are demo tools with fixed remote name `file2.db`.)
 
+`db-download` also takes `--journal-mode MODE` (issue #318): the mode of the
+read-only connection it opens to read the row count back, validated by the
+same shared rules as the writer's flag, so an operator running the writer
+with, say, `TRUNCATE` can give the reader the same mode and keep the two
+aligned.
+
 `main` (the writer) additionally takes `--journal-mode MODE` (issue #120),
 the SQLite rollback journal mode it opens its database with — `DELETE` (the
 default), `TRUNCATE` or `PERSIST`, matched case-insensitively. The default is
@@ -105,7 +111,7 @@ panics on an ordinary error.
 
 ## WARNINGS
 
-**Crash safety now comes from an on-cluster rollback journal (issue #68).** An in-memory journal (`_journal=MEMORY`) leaves no on-cluster record of an uncommitted transaction, so a crash mid-transaction could not be rolled back and very likely corrupted the database; that was the old warning, and it is gone. The databases this project opens — `main.go` (read-write) and `cmd/db-download` (read-only, `mode=ro`) — now use `_journal=DELETE`, and the journal is stored through the same VFS as the database: when SQLite opens `<db>-journal` it reaches this VFS's `xOpen`, answers `xAccess` from cluster truth (the name exists exactly when it has at least one sector ConfigMap), and removes the whole journal with `xDelete`. (`cmd/db-upload` and `cmd/file-create` open no database at all — they drive `vfs.NewFile` and sector I/O directly — so the journal mode is not theirs to set.) So a crash mid-transaction is now recoverable:
+**Crash safety now comes from an on-cluster rollback journal (issue #68).** An in-memory journal (`_journal=MEMORY`) leaves no on-cluster record of an uncommitted transaction, so a crash mid-transaction could not be rolled back and very likely corrupted the database; that was the old warning, and it is gone. The databases this project opens — `main.go` (read-write) and `cmd/db-download` (read-only, `mode=ro`) — take `_journal` from `--journal-mode`, defaulting to `DELETE` so a clean default deployment leaves no journal state behind, and the journal is stored through the same VFS as the database: when SQLite opens `<db>-journal` it reaches this VFS's `xOpen`, answers `xAccess` from cluster truth (the name exists exactly when it has at least one sector ConfigMap), and removes the whole journal with `xDelete`. (`cmd/db-upload` and `cmd/file-create` open no database at all — they drive `vfs.NewFile` and sector I/O directly — so the journal mode is not theirs to set.) So a crash mid-transaction is now recoverable:
 
 * **Committed data survives a crash.** Rows committed before the crash are intact; `PRAGMA integrity_check` reports `ok` after the next opener recovers.
 * **A crash mid-transaction leaves a hot journal the next opener rolls back.** The uncommitted transaction's journal sectors and modified database sectors are both on the cluster, the journal's magic byte at offset 0 is non-zero, so `hasHotJournal` treats it as hot and SQLite plays it back, restoring the pre-transaction image and unlinking the journal. This is proven by `TestCrashAfterCompleteJournalRollsBackOnReopen` (crash after the journal is complete) and `TestCrashBeforeCompleteJournalKeepsDataIntact` (crash before any journal sector exists — nothing to roll back, and nothing is lost) in `pkg/vfs/vfs_journal_test.go`, both through a fresh VFS instance over the same fake clientset after the dead holder's lease lapses. `TestCrashMidTransactionWithoutStoredJournalLosesData` is the control that fails without the change: with `_journal=MEMORY`, or with a VFS whose `Access` pretends a `-journal` name never exists, the same crash loses or corrupts data.
