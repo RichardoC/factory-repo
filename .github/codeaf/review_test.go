@@ -419,16 +419,86 @@ func TestParseFindingsFencedRealFindingKept(t *testing.T) {
 	if got := blockingFindings(findings); len(got) != 1 {
 		t.Errorf("blocking = %+v, want the fenced real finding", got)
 	}
-	// The location a quote names but the diff never touches is dropped.
+	// A bullet written in the section, inside a closed fence, is always
+	// read (issue #334): the quoted-path filter never applies to the
+	// section, so even a bullet on a path the diff does not touch blocks —
+	// the section is the contract the instructions promise.
 	quoted := "## Findings\n\n```\n" +
 		"- [high] app/elsewhere/other.go:7 - a finding about another change\n" +
 		"```\n"
-	if findings, _ := parseFindingsIn(quoted, known); len(findings) != 0 {
-		t.Errorf("a fenced path outside the diff = %+v, want none", findings)
+	findings, _ = parseFindingsIn(quoted, known)
+	if len(blockingFindings(findings)) != 1 {
+		t.Errorf("a fenced section finding outside the diff = %+v, want it kept and blocking", findings)
 	}
-	// With no diff known the same text is kept: the parser never guesses.
-	if findings, _ := parseFindingsIn(quoted, nil); len(findings) != 1 {
+	// With no diff known the same text is kept as well: the parser never
+	// guesses, and no diff read may ever lose a finding.
+	if findings, _ = parseFindingsIn(quoted, nil); len(blockingFindings(findings)) != 1 {
 		t.Errorf("no diff known = %+v, want the finding kept", findings)
+	}
+}
+
+// TestParseFindingsFencedSectionAlwaysRead (issue #334): the instructions
+// promise "a finding written in the `## Findings` section is always read",
+// but the quoted-path filter used to reach section bullets too, so a real
+// blocking finding written in the section, inside a closed fence, on a path
+// the diff did not touch was dropped and the review ended with the pass
+// label. The section pass keeps it: only the contract-echo phantom — a file
+// this repository does not have — is still a quote in the section.
+func TestParseFindingsFencedSectionAlwaysRead(t *testing.T) {
+	known := map[string]bool{"app/x/main.go": true}
+	// The answer the issue reproduced: pre-fix it parsed to 0 findings and
+	// returned the pass label, while the same bullet unfenced parsed to 1.
+	reviewed := "## Findings\n\n```\n" +
+		"- [high] app/other/y.go:7 - real blocking bug in a file the diff does not touch\n" +
+		"```\n"
+	findings, sawSection := parseFindingsIn(reviewed, known)
+	if !sawSection {
+		t.Fatal("the findings section inside the closed fence was missed")
+	}
+	if got := len(blockingFindings(findings)); got != 1 {
+		t.Fatalf("blocking = %d, want 1 — the fenced section finding was dropped: %+v", got, findings)
+	}
+	if f := findings[0]; f.Path != "app/other/y.go" || !f.fenced || !f.quoted {
+		t.Errorf("the kept finding = %+v, want the fenced bullet on app/other/y.go", f)
+	}
+	// The same bullet unfenced in the section parses to the same one
+	// finding — the fence changes nothing in the section.
+	unfenced := "## Findings\n\n" +
+		"- [high] app/other/y.go:7 - real blocking bug in a file the diff does not touch\n"
+	if findings, _ := parseFindingsIn(unfenced, known); len(blockingFindings(findings)) != 1 {
+		t.Errorf("the unfenced section finding = %+v, want it kept too", findings)
+	}
+	// The contract echo inside the section is still a quote (issue #224
+	// stands in the section, #334 or not): only the path filter is exempt.
+	echo := "## Findings\n\n```\n" +
+		"- [high] app/zip/queue.go:42 - " + contractExampleText + "\n```\n"
+	if findings, _ := parseFindingsIn(echo, known); len(blockingFindings(findings)) != 0 {
+		t.Errorf("the contract echo in a fenced section = %+v, want it dropped", findings)
+	}
+	// Outside the section the same closed fence still drops a bullet on an
+	// untouched path: the fix is the section's exemption, not a wider one.
+	plain := "I quoted the hunk:\n```\n- [high] app/other/y.go:7 - a bug in a file the diff does not touch\n```\n"
+	if findings, _ := parseFindingsIn(plain, known); len(findings) != 0 {
+		t.Errorf("a fenced prose bullet outside the section and the diff = %+v, want it dropped", findings)
+	}
+	// Plan-level: reviewPlan reads blockingFindings to choose between the
+	// pass label and a fix run, and the reproduced answer now parses to a
+	// blocking finding — so the review that carried it starts a fix run, and
+	// `codeaf-review-passed` is never added (that was the false pass the
+	// issue reported).
+	parsed, _ := parseFindingsIn(reviewed, known)
+	server := commentsServer(t, reportComments(0), http.StatusOK)
+	ghEnv(t, server)
+	action, body, used, err := reviewPlan(newGitHub(), 7,
+		Result{Stop: stopDone, Model: "deepseek-ai/deepseek-v4.1-flash"}, true, parsed, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "fix" || used != 0 || !strings.HasPrefix(body, command+" fix:") {
+		t.Errorf("a review of the reproduced answer = action %q used %d, want the fix run: %q", action, used, body)
+	}
+	if strings.Contains(body, reviewPassedLabel) {
+		t.Errorf("the reproduced answer still earns the pass label: %q", body)
 	}
 }
 
@@ -1347,14 +1417,14 @@ func TestRunReviewBrief(t *testing.T) {
 		}
 	}
 	// A section header written inside a properly closed fence still opens the
-	// section — the reviewer wrote it, and the section is the contract — but
-	// it does not free the bullets under it from the fence rules: a finding
-	// inside the closed fence is judged as quoted text, so this one, whose
-	// path the diff does not touch, is dropped while an identical bullet
-	// outside the fence is read.
+	// section — the reviewer wrote it, and the section is the contract — and
+	// (issue #334) it frees the bullets under it from the quoted-path
+	// filter: a finding written in the section is always read, so this one,
+	// whose path the diff does not touch, is kept and blocks instead of
+	// ending the review with a false `codeaf-review-passed`.
 	headerInFence := "```\n## Findings\n\n- [high] app/other/main.go:7 - a real bug in an untouched file\n```\n"
-	if findings, sawSection := parseFindingsIn(headerInFence, diffKnown); len(findings) != 0 || !sawSection {
-		t.Errorf("a header inside a closed fence = %+v sawSection=%t, want the section seen and its fenced finding dropped", findings, sawSection)
+	if findings, sawSection := parseFindingsIn(headerInFence, diffKnown); len(blockingFindings(findings)) != 1 || !sawSection {
+		t.Errorf("a header inside a closed fence = %+v sawSection=%t, want the section seen and its fenced finding kept", findings, sawSection)
 	}
 	// The same header inside a fence that never closes is not a quote, so the
 	// finding under it is read and blocks.
