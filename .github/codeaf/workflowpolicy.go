@@ -82,11 +82,39 @@ func loadWorkflowDir(dir string) (map[string]map[string]any, error) {
 	return out, nil
 }
 
-// mentionsSecrets reports whether any string inside v references secrets.
+// expression matches one `${{ ... }}` expression.
+var expression = regexp.MustCompile(`(?s)\$\{\{(.*?)\}\}`)
+
+// Bare-context matches a context name used without a `.` or `[`, delimited
+// by non-identifier characters: `toJSON(secrets)`, `toJSON(github)`, or a
+// bare `${{ secrets }}`.
+var (
+	bareSecrets = regexp.MustCompile(`(?:^|[^A-Za-z0-9_])secrets(?:$|[^A-Za-z0-9_.\[])`)
+	bareGithub  = regexp.MustCompile(`(?:^|[^A-Za-z0-9_])github(?:$|[^A-Za-z0-9_.\[])`)
+)
+
+// bareCredentialContext reports whether an expression in s uses a context
+// whole — `${{ toJSON(secrets) }}`, `${{ toJSON(github) }}` or a bare
+// `${{ secrets }}` — which renders the entire context, token and all,
+// though it contains neither `secrets.` nor `github.token`. Inside the
+// expression the name must be delimited by non-identifier characters and
+// not followed by `.` or `[`: those are the dotted references the other
+// checks already catch, and `github.com` in a URL is not a context use.
+func bareCredentialContext(s string, bare *regexp.Regexp) bool {
+	for _, m := range expression.FindAllStringSubmatch(s, -1) {
+		if bare.MatchString(m[1]) {
+			return true
+		}
+	}
+	return false
+}
+
+// mentionsSecrets reports whether any string inside v references secrets,
+// including the context used whole (`toJSON(secrets)`, a bare `secrets`).
 func mentionsSecrets(v any) bool {
 	found := false
 	walkStrings(v, func(s string) {
-		if strings.Contains(s, "secrets.") || strings.Contains(s, "secrets[") {
+		if strings.Contains(s, "secrets.") || strings.Contains(s, "secrets[") || bareCredentialContext(s, bareSecrets) {
 			found = true
 		}
 	})
@@ -94,11 +122,14 @@ func mentionsSecrets(v any) bool {
 }
 
 // mentionsCredentials reports whether any string inside v references a
-// secret or the workflow token (`github.token`, `secrets.GITHUB_TOKEN`).
+// secret or the workflow token (`github.token`, `secrets.GITHUB_TOKEN`, or
+// the github context used whole, `toJSON(github)`).
 func mentionsCredentials(v any) bool {
 	found := false
 	walkStrings(v, func(s string) {
-		if strings.Contains(s, "secrets.") || strings.Contains(s, "secrets[") || strings.Contains(s, "github.token") {
+		if strings.Contains(s, "secrets.") || strings.Contains(s, "secrets[") ||
+			strings.Contains(s, "github.token") ||
+			bareCredentialContext(s, bareSecrets) || bareCredentialContext(s, bareGithub) {
 			found = true
 		}
 	})
@@ -112,8 +143,10 @@ func mentionsCredentials(v any) bool {
 // secret can still feed one that does (it builds the binary the key is
 // piped to, picks the checkout ref, sets $GITHUB_ENV), so such a job must
 // stay exactly as it is on the default branch.
-func privilegedJob(job map[string]any, topPermissions any) bool {
-	if mentionsCredentials(job) || job["environment"] != nil || job["uses"] != nil {
+// topEnv is the workflow's top-level env: it reaches every job, so an env
+// naming a credential makes the whole workflow privileged.
+func privilegedJob(job map[string]any, topPermissions, topEnv any) bool {
+	if mentionsCredentials(job) || mentionsCredentials(topEnv) || job["environment"] != nil || job["uses"] != nil {
 		return true
 	}
 	if perms, ok := job["permissions"]; ok {
@@ -275,7 +308,7 @@ func WorkflowPolicy(before, after map[string]map[string]any) []string {
 		if !reflect.DeepEqual(a["permissions"], b["permissions"]) {
 			add("%s: top-level permissions changed", name)
 		}
-		if (mentionsSecrets(a["env"]) || mentionsSecrets(b["env"])) && !reflect.DeepEqual(a["env"], b["env"]) {
+		if (mentionsCredentials(a["env"]) || mentionsCredentials(b["env"])) && !reflect.DeepEqual(a["env"], b["env"]) {
 			add("%s: a top-level env that references secrets changed", name)
 		}
 
@@ -285,7 +318,12 @@ func WorkflowPolicy(before, after map[string]map[string]any) []string {
 		// (triggers and permissions are reported above).
 		hasPrivileged := false
 		for _, j := range bJobs {
-			if privilegedJob(asMap(j), b["permissions"]) {
+			if privilegedJob(asMap(j), b["permissions"], b["env"]) {
+				hasPrivileged = true
+			}
+		}
+		for _, j := range aJobs {
+			if privilegedJob(asMap(j), a["permissions"], a["env"]) {
 				hasPrivileged = true
 			}
 		}
@@ -341,7 +379,7 @@ func WorkflowPolicy(before, after map[string]map[string]any) []string {
 				}
 			} else {
 				bjm := asMap(bj)
-				if (privilegedJob(bjm, b["permissions"]) || privilegedJob(aj, a["permissions"])) && !reflect.DeepEqual(aj, bjm) {
+				if (privilegedJob(bjm, b["permissions"], b["env"]) || privilegedJob(aj, a["permissions"], a["env"])) && !reflect.DeepEqual(aj, bjm) {
 					add("%s: job %q holds a secret, the token, an environment or a write permission, and changed; only a maintainer may change it", name, id)
 				}
 				for _, key := range []string{"permissions", "environment", "uses", "secrets"} {
@@ -366,7 +404,7 @@ func WorkflowPolicy(before, after map[string]map[string]any) []string {
 				if n, ok := sm["name"].(string); ok {
 					label = fmt.Sprintf("%s: job %q step %q", name, id, n)
 				}
-				if mentionsSecrets(sm) {
+				if mentionsCredentials(sm) {
 					same := false
 					for _, bs := range beforeSteps {
 						if reflect.DeepEqual(step, bs) {
@@ -375,7 +413,7 @@ func WorkflowPolicy(before, after map[string]map[string]any) []string {
 						}
 					}
 					if !same {
-						add("%s references secrets and is new or changed", label)
+						add("%s references secrets or the token and is new or changed", label)
 					}
 				}
 				if u, ok := sm["uses"].(string); ok {

