@@ -27,9 +27,9 @@
   },
   "limits": {
     "plan": "big",
-    "plan_note": "Big plan $90/mo. synthetic.new reports the weekly credit itself (GET /v2/quotas weeklyTokenLimit.maxCredits: $22.17 at subscription rates, regenerating about $0.44 every 3h22m), and the owner's other workloads draw on the same quota. All figures and caps here are at the API list (overage) prices, the owner's decision on 2026-10-20: CostOf prices calls at api_*; the input/output/cache_read subscription rates are reference only. weekly_credit_usd 100 is maxCredits x 4.5, the measured overage/subscription ratio for the factory's model mix (2026-10-17..19; DeepSeek alone is ~7.9x); it only paces the queue. The hard stop is synthetic.new's own percentRemaining: with overage_usd 0 the proxy refuses below min_credit_percent (25, leaving a quarter of the week for the owner's other workloads), re-reading /v2/quotas every 5 minutes. run_credit_usd 5 is about 2.5x the most expensive run seen at overage prices ($1.97). overage_usd 0 = stop rather than pay past the quota.",
+    "plan_note": "Big plan $90/mo. synthetic.new reports the weekly credit itself (GET /v2/quotas weeklyTokenLimit.maxCredits: $22.17 at subscription rates, regenerating about $0.44 every 3h22m), and the owner's other workloads draw on the same quota. All figures and caps here are at the API list (overage) prices, the owner's decision on 2026-10-20: CostOf prices calls at api_*; the input/output/cache_read subscription rates are reference only. weekly_credit_usd 100 is maxCredits x 4.5, the measured overage/subscription ratio for the factory's model mix (2026-10-17..19; DeepSeek alone is ~7.9x); it only paces the queue. The hard stop is synthetic.new's own percentRemaining: with overage_usd 0 the proxy refuses below min_credit_percent (50 since 2026-10-31, leaving half of the week for the owner's other workloads), re-reading /v2/quotas every 5 minutes. run_credit_usd 5 is about 2.5x the most expensive run seen at overage prices ($1.97). overage_usd 0 = stop rather than pay past the quota.",
     "weekly_credit_usd": 100,
-    "min_credit_percent": 25,
+    "min_credit_percent": 50,
     "run_credit_usd": 5,
     "overage_usd": 0,
     "searches_per_run": 50
@@ -57,22 +57,6 @@
       "upstream": "hf:deepseek-ai/DeepSeek-V4.1-Flash",
       "max_concurrent": 8,
       "name": "DeepSeek-V4.1-Flash (synthetic.new)",
-      "role": "mid",
-      "input": 0.06,
-      "output": 0.30,
-      "cache_read": 0.003,
-      "api_input": 0.60,
-      "api_cached": 0.03,
-      "api_output": 1.20,
-      "context_length": 524288,
-      "input_modalities": ["text", "image"],
-      "efforts": ["none", "low", "high", "xhigh", "max"]
-    },
-    {
-      "id": "deepseek-ai/deepseek-v4.1-flash-1017",
-      "upstream": "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
-      "max_concurrent": 8,
-      "name": "DeepSeek-V4.1-Flash 10/17 checkpoint (synthetic.new)",
       "role": "experiment",
       "input": 0.06,
       "output": 0.30,
@@ -83,7 +67,24 @@
       "context_length": 524288,
       "input_modalities": ["text", "image"],
       "efforts": ["none", "low", "high", "xhigh", "max"],
-      "efforts_note": "role experiment: never picked by a lane until an experiment shows it beats deepseek-v4.1-flash. Added 2026-10-20 from synthetic.new's /openai/v1/models: same API prices, context and efforts as deepseek-v4.1-flash; its subscription rates are assumed equal (not published)."
+      "efforts_note": "role experiment since 2026-10-31 (owner's decision): the 10/17 checkpoint below replaced it as the default DeepSeek model. Kept so experiment profiles can still name it."
+    },
+    {
+      "id": "deepseek-ai/deepseek-v4.1-flash-1017",
+      "upstream": "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017",
+      "max_concurrent": 8,
+      "name": "DeepSeek-V4.1-Flash 10/17 checkpoint (synthetic.new)",
+      "role": "mid",
+      "input": 0.06,
+      "output": 0.30,
+      "cache_read": 0.003,
+      "api_input": 0.60,
+      "api_cached": 0.03,
+      "api_output": 1.20,
+      "context_length": 524288,
+      "input_modalities": ["text", "image"],
+      "efforts": ["none", "low", "high", "xhigh", "max"],
+      "efforts_note": "role mid, the default DeepSeek model since 2026-10-31 (owner's decision, after the 1017 vs v4.1-flash experiment: all 16 runs passed, at about a third of the calls and cost per run; first-token latency about 6x slower). Added 2026-10-20 from synthetic.new's /openai/v1/models: same API prices, context and efforts as deepseek-v4.1-flash; its subscription rates are assumed equal (not published)."
     },
     {
       "id": "zai-org/glm-5.3",

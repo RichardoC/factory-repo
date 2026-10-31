@@ -180,7 +180,7 @@ factory's model mix that is about 4.5× the subscription credit (DeepSeek ~7.9×
 so `weekly_credit_usd` is 100 (maxCredits × 4.5, used only to pace the queue)
 and `run_credit_usd` (5) caps one run, about 2.5× the most expensive run seen.
 The hard stop is synthetic.new's own `percentRemaining`: the proxy refuses below
-`min_credit_percent` (25), which leaves a quarter of the week for the other
+`min_credit_percent` (50), which leaves half of the week for the other
 workloads.
 
 What the harness does with it:
