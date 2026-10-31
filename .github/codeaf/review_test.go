@@ -338,6 +338,109 @@ func TestParseFindings(t *testing.T) {
 	}
 }
 
+// TestParseFindingsSeverityWordInsideFindingText: a bracketed severity word
+// inside a finding's own text must stay that finding's text (issue #335).
+// The inline pass advanced only past the token it had just read, so it
+// rescanned the text the finding had already consumed; a `[medium] severity`
+// the reviewer quoted parsed again as the no-location form, minting a phantom
+// blocking finding with no path. blockingFindings counted 2, and a `/codeaf
+// fix` run started against a finding nobody wrote, spending a continuation
+// slot and its credit.
+func TestParseFindingsSeverityWordInsideFindingText(t *testing.T) {
+	// The exact answer from the issue: one located finding that quotes the
+	// word `medium` in its text. It is one finding, and it blocks once.
+	answer := "## Findings\n\n- [high] app/x/main.go:42 - the mutex is released twice, so a [medium] severity is misreported by this check\n"
+	findings, sawSection := parseFindings(answer)
+	if !sawSection {
+		t.Error("the findings section was not seen")
+	}
+	if len(findings) != 1 {
+		t.Fatalf("quoted severity word = %d findings, want 1: %+v", len(findings), findings)
+	}
+	f := findings[0]
+	if f.Severity != "high" || f.Path != "app/x/main.go" || f.Line != 42 ||
+		f.Text != "the mutex is released twice, so a [medium] severity is misreported by this check" {
+		t.Errorf("finding was rewritten: %+v", f)
+	}
+	if blocking := blockingFindings(findings); len(blocking) != 1 {
+		t.Errorf("blocking = %d findings, want 1: %+v", len(blocking), blocking)
+	}
+
+	// The same line read inline, outside the section: still one finding.
+	findings, _ = parseFindings("Findings: [high] app/x/main.go:42 - a [medium] severity, and a [low] one too\n")
+	if len(findings) != 1 || findings[0].Path != "app/x/main.go" ||
+		findings[0].Text != "a [medium] severity, and a [low] one too" {
+		t.Fatalf("inline quoted severity word = %+v, want the one high finding", findings)
+	}
+	if blocking := blockingFindings(findings); len(blocking) != 1 {
+		t.Errorf("inline blocking = %d findings, want 1: %+v", len(blocking), blocking)
+	}
+
+	// A genuine chain still splits at its `;` boundary, with or without a
+	// connective word after the semicolon (issue #111), and a located
+	// finding later on the same line still parses (the lenient same-line
+	// form the contract accepts).
+	chains := []struct {
+		line  string
+		paths []string
+		texts []string
+	}{
+		{
+			"[high] a.go:1 - first; [medium] b.go:2 - second",
+			[]string{"a.go", "b.go"},
+			[]string{"first", "second"},
+		},
+		{
+			"[high] a.go:1 - first; and [medium] b.go:2 - second",
+			[]string{"a.go", "b.go"},
+			[]string{"first", "second"},
+		},
+		{
+			// No `;` at all: the located bullet on the same line still
+			// parses, and the word before it stays the first finding's
+			// text (the lenient same-line form, unchanged).
+			"[high] a.go:1 - first and [low] b.go:2 - second",
+			[]string{"a.go", "b.go"},
+			[]string{"first and [low] b.go:2 - second", "second"},
+		},
+		{
+			"[high] a.go:1 - the check reports a [medium] severity; [low] b.go:2 - second",
+			[]string{"a.go", "b.go"},
+			[]string{"the check reports a [medium] severity", "second"},
+		},
+	}
+	for _, w := range chains {
+		got, _ := parseFindings(w.line)
+		if len(got) != len(w.paths) {
+			t.Errorf("%q = %d findings, want %d: %+v", w.line, len(got), len(w.paths), got)
+			continue
+		}
+		for i := range w.paths {
+			if got[i].Path != w.paths[i] || got[i].Text != w.texts[i] {
+				t.Errorf("%q findings[%d] = %+v, want path %q text %q", w.line, i, got[i], w.paths[i], w.texts[i])
+			}
+		}
+	}
+
+	// A hostile paragraph that quotes severities in every finding's text:
+	// each finding keeps its own text and no phantom is minted.
+	hostile := "FINDINGS (2, 2 blocking): [high] a.go:1 - treats [high] and [medium] and [low] as prose; " +
+		"[medium] b.go:2 - also quotes [low] and [high] words"
+	findings, _ = parseFindings(hostile)
+	if len(findings) != 2 || findings[0].Path != "a.go" || findings[1].Path != "b.go" {
+		t.Fatalf("hostile quoted-severity paragraph = %+v, want a.go then b.go", findings)
+	}
+	if findings[0].Text != "treats [high] and [medium] and [low] as prose" {
+		t.Errorf("hostile paragraph text was rewritten: %q", findings[0].Text)
+	}
+	if findings[1].Text != "also quotes [low] and [high] words" {
+		t.Errorf("hostile paragraph text was rewritten: %q", findings[1].Text)
+	}
+	if blocking := blockingFindings(findings); len(blocking) != 2 {
+		t.Errorf("hostile paragraph blocking = %d, want 2: %+v", len(blocking), blocking)
+	}
+}
+
 // TestParseFindingsFencedContractEcho: the harness's own output contract
 // echoes back in a fence (issue #224) — the exact phantom that minted a
 // blocking finding on app/zip/queue.go and started a fix run against a file
@@ -1759,6 +1862,76 @@ func TestRunReviewReport(t *testing.T) {
 		}
 		if !strings.Contains(string(data), "high app/x/main.go:42; medium\n\n") {
 			t.Errorf("inline findings missing from the command line: %q", data)
+		}
+		assertReviewBodyClean(t, string(data))
+	})
+
+	t.Run("a severity word inside a finding's text mints no phantom fix", func(t *testing.T) {
+		// Issue #335, end to end: the review's one finding quotes `[medium]`
+		// in its own text. Before the fix the inline pass rescanned that
+		// text, read a path-less medium finding out of it and started a fix
+		// run against a finding nobody wrote.
+		diffBody := "diff --git a/app/x/main.go b/app/x/main.go\n" +
+			"--- a/app/x/main.go\n+++ b/app/x/main.go\n" +
+			"@@ -1,2 +1,3 @@\n context\n-removed\n+added\n"
+		server := reviewServer(t, map[string]string{
+			"/repos/RichardoC/factory-repo/pulls/7":           `{"number":7,"title":"Review target","body":"The change.\n\nCloses #3","state":"open","head":{"ref":"codeaf/issue-3-42"},"base":{"ref":"main"},"draft":false}`,
+			"/repos/RichardoC/factory-repo/issues/7/comments": "[]",
+		}, diffBody, nil)
+		t.Cleanup(server.Close)
+		ghEnv(t, server)
+		setArgs("7")
+		// A low finding that quotes a blocking word: one finding, no block,
+		// so the pass label lands and no fix command is written.
+		writeReviewResult(t, stopDone, "## Findings\n\n"+
+			"- [low] app/x/main.go:42 - the mutex is released twice, so a [medium] severity is misreported by this check\n")
+		reviewLedger(t)
+		t.Setenv("REVIEW_COMMENT_PATH", comment)
+		out, err := captureStdout(t, runReviewReport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != "action=label\nused=0\nblocking=0\n" {
+			t.Errorf("a quoted severity word still blocks: stdout = %q", out)
+		}
+		data, err := os.ReadFile(comment)
+		if err != nil {
+			t.Fatalf("comment not written: %v", err)
+		}
+		if strings.HasPrefix(string(data), command+" fix:") || strings.Contains(string(data), "blocking finding") {
+			t.Errorf("a quoted severity word started a fix run: %q", data)
+		}
+
+		// The issue's own answer with a high finding: exactly one blocking
+		// finding, and the fix command names it once, with no path-less
+		// phantom beside it.
+		server2 := reviewServer(t, map[string]string{
+			"/repos/RichardoC/factory-repo/pulls/7":           `{"number":7,"title":"Review target","body":"The change.\n\nCloses #3","state":"open","head":{"ref":"codeaf/issue-3-42"},"base":{"ref":"main"},"draft":false}`,
+			"/repos/RichardoC/factory-repo/issues/7/comments": "[]",
+		}, diffBody, nil)
+		t.Cleanup(server2.Close)
+		ghEnv(t, server2)
+		writeReviewResult(t, stopDone, "## Findings\n\n"+
+			"- [high] app/x/main.go:42 - the mutex is released twice, so a [medium] severity is misreported by this check\n")
+		reviewLedger(t)
+		comment2 := filepath.Join(t.TempDir(), "review-comment.md")
+		t.Setenv("REVIEW_COMMENT_PATH", comment2)
+		out, err = captureStdout(t, runReviewReport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != "action=fix\nused=0\nblocking=1\n" {
+			t.Errorf("stdout = %q, want exactly one blocking finding", out)
+		}
+		data, err = os.ReadFile(comment2)
+		if err != nil {
+			t.Fatalf("comment not written: %v", err)
+		}
+		if !strings.HasPrefix(string(data), "/codeaf fix: 1 blocking finding - high app/x/main.go:42\n") {
+			t.Errorf("the fix command carries a phantom finding: %q", data)
+		}
+		if strings.Contains(string(data), "medium (unsafe path)") {
+			t.Errorf("the phantom path-less medium finding reached the command line: %q", data)
 		}
 		assertReviewBodyClean(t, string(data))
 	})

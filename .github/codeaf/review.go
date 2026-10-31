@@ -66,10 +66,18 @@ var (
 	// markdownHeader is any markdown header line; it closes the section.
 	markdownHeader = regexp.MustCompile(`^#{1,6}(\s|$)`)
 	// chainedFinding opens the next finding after a `;` on the same line
-	// (issue #111): optional whitespace, then a recognized severity in
-	// brackets followed by the whitespace before its location or text. An
-	// unrecognized word after a `;` is prose, not a boundary.
-	chainedFinding = regexp.MustCompile(`(?i)^\s{0,16}\[(?:high|medium|low)\][ \t]`)
+	// (issue #111): optional whitespace, an optional short connective word
+	// and its whitespace, then a recognized severity in brackets followed by
+	// the whitespace before its location or text. An unrecognized word after
+	// a `;` is prose, not a boundary.
+	//
+	// The connective is what a reviewer writes between two findings on one
+	// line -- "; and [medium] ..." -- and it is why the boundary is read
+	// before the text is taken (issue #335): the second finding's token sits
+	// past the `;` that ends the first finding's text, so the exact boundary
+	// the issue-#111 logic recognizes still splits the chain. Only these few
+	// words are accepted, so ordinary prose after a `;` stays in the text.
+	chainedFinding = regexp.MustCompile(`(?i)^\s{0,16}(?:(?:and|then|also|plus|next)[ \t]+)?\[(?:high|medium|low)\][ \t]`)
 )
 
 // parseFindings reads the findings out of a reviewer's answer (issues #32
@@ -543,16 +551,36 @@ var locationShaped = regexp.MustCompile(`^\s*\S+:\d+`)
 // one line, separated by `;` (issue #111): the run that prompted it wrote
 // "FINDINGS (3, 2 blocking): [medium] a.go:1 - x; [medium] b.go:2 - y; [low]
 // c.go:3 - z" as one paragraph, and each finding must keep its own text.
-// Every bracketed token on the line gets its chance.
+// Every bracketed token on the line gets its chance, but a token inside the
+// text a finding has already taken is that finding's text (issue #335): a
+// severity word a finding quotes never opens a second, path-less finding,
+// which `blockingFindings` would count and send a fix run after. A located
+// bullet inside that text still parses — the same-line form the lenient
+// contract accepts — and a `;` before the next finding is a boundary as it
+// always was.
 func parseInlineFindings(line string) []Finding {
 	var out []Finding
+	// consumed is the index just past the text the last parsed finding took
+	// for itself — its location and text, up to the next chain boundary
+	// (issue #335). A token that starts before it sits inside that finding's
+	// own text, and the scan is past that text already: a `[medium] severity`
+	// the finding quotes would otherwise be read again and mint a second,
+	// path-less finding that counts as blocking and starts a fix run nobody
+	// wrote. Such a token can still open a finding when it is a complete
+	// located bullet, the same-line form
+	// `[high] a.go:1 - first and [low] b.go:2 - second` that the lenient
+	// contract accepts; what it can never do is fall back to the no-location
+	// form, which is the phantom's shape.
+	consumed := 0
 	for i := 0; i < len(line); {
 		m := inlineSeverityToken.FindStringIndex(line[i:])
 		if m == nil {
 			break // no severity token anywhere in the rest of the line
 		}
+		start := i + m[0]
 		token := line[i+m[0]+1 : i+m[1]-1]
 		i += m[1] // every path consumes the token, whether it reads or not
+		inText := start < consumed
 		rest := line[i:]
 		// A `;` that opens the next recognized severity ends this
 		// finding (issue #111): the text before it is this finding's,
@@ -562,25 +590,39 @@ func parseInlineFindings(line string) []Finding {
 		if k := chainBoundary(rest); k >= 0 {
 			segment, next = rest[:k], k+1
 		}
+		// end is where this finding's text ends: the chain boundary, or
+		// the end of the line when the finding takes the rest of it.
+		end := len(line)
+		if next >= 0 {
+			end = i + next - 1
+		}
 		if f, ok := parseFinding("[" + token + "]" + segment); ok {
 			out = append(out, f)
 			i += next
+			consumed = end
 			continue
 		}
 		if next >= 0 {
 			// The chain still splits when the finding carries no
 			// location: its text ends at the `;` too.
-			if f, ok := textOnlyFinding(token, segment); ok {
+			if f, ok := textOnlyFinding(token, segment); ok && !inText {
 				out = append(out, f)
 			}
 			i += next
+			if !inText {
+				consumed = end
+			}
 			continue
+		}
+		if inText {
+			continue // a word inside a parsed finding's text is its text
 		}
 		if locationShaped.MatchString(rest) {
 			continue // a broken location is dropped, never read as text
 		}
 		if f, ok := textOnlyFinding(token, rest); ok {
 			out = append(out, f)
+			consumed = end
 		}
 	}
 	return out
