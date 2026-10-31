@@ -32,6 +32,9 @@ func TestLoadDefaultsAndValidation(t *testing.T) {
 	if cfg.Linear.Labels.Managed != defaultManagedLabel {
 		t.Fatalf("Managed label = %q, want %q", cfg.Linear.Labels.Managed, defaultManagedLabel)
 	}
+	if !cfg.Linear.Labels.Enabled() {
+		t.Fatal("Label management Enabled() = false, want true with the default managed label")
+	}
 	if !cfg.Linear.UnsubscribeActor {
 		t.Fatal("UnsubscribeActor = false, want true")
 	}
@@ -104,6 +107,9 @@ func TestLoadEnvFile(t *testing.T) {
 	}
 	if cfg.Linear.Labels.Managed != "" {
 		t.Fatalf("Managed label = %q, want empty", cfg.Linear.Labels.Managed)
+	}
+	if cfg.Linear.Labels.Enabled() {
+		t.Fatal("Label management Enabled() = true, want false with LINEAR_MANAGED_LABEL=off")
 	}
 	if !cfg.Linear.UnsubscribeActor {
 		t.Fatal("UnsubscribeActor = false, want true")

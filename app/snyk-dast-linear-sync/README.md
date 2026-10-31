@@ -243,6 +243,10 @@ When label management is enabled, the sync:
 - removes the previously managed label if the configured label changes
 - removes the previously managed label if label management is turned off
 
+Turning label management off (`off`) also turns off the derived check-type and
+target-type labels, even when their mappings or defaults are still configured:
+none of them are asserted, and the ones previously managed are removed.
+
 If the configured label does not exist in Linear, the run fails with a clear message telling the operator to create the label or disable label management.
 
 Linear label groups are mutually exclusive — an issue may carry at most one child of a group. If a ticket carries two children of the same group (for example, labels applied before the group was made exclusive), updates keep exactly one: the managed label when the sync asserts one for that group, otherwise the first existing one. Without this, Linear rejects every update for such a ticket ("labelIds not exclusive child labels") until the ticket is edited by hand.
