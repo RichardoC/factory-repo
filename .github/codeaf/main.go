@@ -3397,21 +3397,71 @@ func hashRefs(s string) []int {
 	return out
 }
 
-// depListEnd returns the length of the list that starts at s: everything up
-// to the first sentence boundary, so prose after the list ("Depends on #12.
-// Related: #99") is not read as part of it.
-func depListEnd(s string) int {
-	if i := strings.IndexAny(s, ".;!?"); i >= 0 {
-		return i
+// isVersion reports whether w is a version or dotted number ("v1.2", "1.2.3"):
+// the periods in one are not the end of a sentence.
+func isVersion(w string) bool {
+	w = strings.TrimPrefix(w, "v")
+	dot := false
+	for i := 0; i < len(w); i++ {
+		switch c := w[i]; {
+		case c >= '0' && c <= '9':
+		case c == '.':
+			dot = true
+		default:
+			return false
+		}
 	}
-	return len(s)
+	return dot
+}
+
+// depRef returns the first #N reference in s when it is the next item of a
+// dependency list, and how many bytes of s that item occupies. Only list
+// punctuation (whitespace, ',', '&', '+', ':', '-'), the word "and", an
+// abbreviation ("i.e.", "e.g.") or a version ("v1.2") may come first: any
+// other word, and any sentence terminator ('.', ';', '!', '?'), ends the list.
+// So "Depends on #12. Related: #99" keeps 12, while "Depends on #12, i.e. #13"
+// keeps both, without having to guess which period ends a sentence.
+func depRef(s string) (n, size int, ok bool) {
+	for i := 0; ; {
+		if i >= len(s) {
+			return 0, 0, false
+		}
+		switch c := s[i]; {
+		case strings.IndexByte(" \t,;&+-:", c) >= 0:
+			i++
+		case c == '#':
+			j := i + 1
+			for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+				j++
+			}
+			if j == i+1 || (j < len(s) && isRefByte(s[j])) {
+				return 0, 0, false
+			}
+			n, err := strconv.Atoi(s[i+1 : j])
+			if err != nil || n <= 0 {
+				return 0, 0, false
+			}
+			return n, j, true
+		default:
+			j := i
+			for j < len(s) && strings.IndexByte(" \t,;&+-:#", s[j]) < 0 {
+				j++
+			}
+			switch w := asciiLower(s[i:j]); {
+			case w == "and", w == "i.e.", w == "e.g.", w == "vs.", w == "cf.", w == "etc.", isVersion(w):
+				i = j
+			default:
+				return 0, 0, false
+			}
+		}
+	}
 }
 
 // depsFromBody collects the issue references that follow a "depends on"
 // phrase on the same line ("Depends on #12, #13"), deduplicated and sorted,
-// at most maxDeps of them. The scan stops at the end of the sentence that
-// carries the phrase, so a later reference on the same line ("Depends on #12.
-// Related: #99") is not a dependency.
+// at most maxDeps of them. The scan takes the list that follows the phrase and
+// stops at its end, so prose after it ("Depends on #12. Related: #99") is not
+// read as part of the list.
 func depsFromBody(body string) []int {
 	seen := map[int]bool{}
 	var out []int
@@ -3423,7 +3473,12 @@ func depsFromBody(body string) []int {
 				break
 			}
 			i += j + len("depends on")
-			for _, n := range hashRefs(line[i : i+depListEnd(line[i:])]) {
+			for {
+				n, size, ok := depRef(line[i:])
+				if !ok {
+					break
+				}
+				i += size
 				if !seen[n] {
 					seen[n] = true
 					out = append(out, n)

@@ -1934,7 +1934,7 @@ func TestBriefTriggerExcludedFromFindings(t *testing.T) {
 	}
 }
 
-func TestDepsFromBodyStopsAtTheSentenceBoundary(t *testing.T) {
+func TestDepsFromBodyStopsAtTheListEnd(t *testing.T) {
 	cases := []struct {
 		body string
 		want []int
@@ -1945,6 +1945,15 @@ func TestDepsFromBodyStopsAtTheSentenceBoundary(t *testing.T) {
 		{"Depends on #12; see also #99\n", []int{12}},
 		{"Depends on #12! Related: #99?\n", []int{12}},
 		{"Depends on #12. Related: #99\nalso depends on #13\n", []int{12, 13}},
+		// An abbreviation's period is not the end of the list.
+		{"Depends on #12, i.e. #13\n", []int{12, 13}},
+		{"Depends on #12 e.g. #13 and #14\n", []int{12, 13, 14}},
+		// A version's periods are not the end of the list.
+		{"Depends on v1.2 #12, #13\n", []int{12, 13}},
+		{"Depends on #12 and 1.2.3 #13\n", []int{12, 13}},
+		// A word that is not a list joiner ends the list.
+		{"Depends on #12, see #99\n", []int{12}},
+		{"Depends on #12. Then #99\n", []int{12}},
 	}
 	for _, c := range cases {
 		if got := depsFromBody(c.body); !reflect.DeepEqual(got, c.want) {
