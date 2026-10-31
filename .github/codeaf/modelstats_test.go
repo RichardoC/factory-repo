@@ -147,11 +147,65 @@ func TestModelStatsStatusIsNotAMarkerUnlessKindSaysSo(t *testing.T) {
 	if !strings.Contains(got, "| 0 | 1 | 1 | 0 |") {
 		t.Errorf("want cut=0, one 429 (the marker), one error (that same 429) and no stall, got:\n%s", got)
 	}
-	if strings.Contains(got, "above the 1.00% threshold") == false {
-		// 429 rate is 1 of (2 calls + 1 marker) = 33.33%: the alert must
-		// still fire, and the denominator must include the marker as a call
-		// the proxy never completed.
-		t.Errorf("the 429 alert did not fire on a 33.33%% rate:\n%s", got)
+	// 429 rate is 1 of (2 calls + 1 marker) = 33.33%: the alert must
+	// still fire, and the denominator must include the marker as a call
+	// the proxy never completed. The whole line is pinned so the wording
+	// stays identical to the marker-only branch the alert loop grew for
+	// issue #320.
+	want := "`alpha`: 429 rate 33.33% above the 1.00% threshold (1 of 3); " +
+		"consider lowering max_concurrent, not raising it"
+	if !strings.Contains(got, want) {
+		t.Errorf("the 429 alert did not fire on a 33.33%% rate, want %q:\n%s", want, got)
+	}
+}
+
+// TestModelStatsThrottledToDeathFires429Alert: issue #320. A model whose
+// every call was refused with 429 never has a call row -- a refusal is
+// recorded only as a kind "status" marker -- so Calls is 0 and Four29 is
+// the marker count. The 429-rate alert is the one that carries the
+// operational advice ("consider lowering max_concurrent, not raising it"),
+// and it must fire on the markers alone, with the marker count alone as
+// the denominator, in place of the bare "no calls" line.
+func TestModelStatsThrottledToDeathFires429Alert(t *testing.T) {
+	cfg := modelStatsTestConfigWith(t, "delta")
+	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	win := modelStatsWindowFrom(cfg, now)
+
+	// Two refused calls, recorded as markers only: no call row ever exists.
+	lines := []string{
+		`{"ts":"2026-10-21T11:00:00Z","model":"delta","kind":"status","status":429}`,
+		`{"ts":"2026-10-21T11:01:00Z","model":"delta","kind":"status","status":429}`,
+	}
+	zr := modelStatsTestZip(t, "codeaf-ledger.jsonl", strings.Join(lines, "\n")+"\n")
+
+	in := parseModelStatsZips([]*zip.Reader{zr}, cfg)
+	if in.Stats.Rows != 0 {
+		t.Fatalf("a marker produced a call row: rows=%d, want 0", in.Stats.Rows)
+	}
+	got := modelStatsReport(in, cfg, win, now)
+
+	// The table still shows the throttling: zero calls, and the two
+	// 429s are also the two errors (Errs sums the 4xx/5xx/other/429
+	// classes: cut=0 | 429=2 | error=2 | stall=0).
+	if !strings.Contains(got, "| `delta` | 0 | 0 |") {
+		t.Errorf("the marker-only model is missing from the model table:\n%s", got)
+	}
+	if !strings.Contains(got, "| 0 | 2 | 2 | 0 |") {
+		t.Errorf("want cut=0, two 429s and those same two errors in the table, got:\n%s", got)
+	}
+	// The alert names the model and divides by the marker count alone
+	// (2 of 2 = 100%), in the same wording as the call-bearing case.
+	want := "`delta`: 429 rate 100.00% above the 1.00% threshold (2 of 2); " +
+		"consider lowering max_concurrent, not raising it"
+	if !strings.Contains(got, want) {
+		t.Errorf("the 429 alert did not fire on markers alone, want %q:\n%s", want, got)
+	}
+	if strings.Contains(got, "configured model with no calls in the window") {
+		t.Errorf("a throttled model got the bare no-calls line instead of the 429 advice:\n%s", got)
+	}
+	// Exactly that one alert: no other per-model alert fires on markers.
+	if !strings.Contains(got, "### Alerts (1)") {
+		t.Errorf("want exactly the 429 alert for the marker-only model:\n%s", got)
 	}
 }
 
