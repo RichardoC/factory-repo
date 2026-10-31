@@ -315,7 +315,20 @@ func newManifest() Manifest {
 // readManifest reads a bundle's manifest. No bundle at all (the first run) is
 // generation 0; a bundle that is present but unreadable is an error, since the
 // bundle is written only by the codeaf-state workflow.
-func readManifest(dir string) (Manifest, bool, error) {
+func readManifest(dir string, cfg Config, now time.Time) (Manifest, bool, error) {
+	weekCap := cfg.Limits.WeeklyCreditUSD
+	// The most one UTC day is read as: the queue holds new starts once the
+	// week's spend reaches the weekly credit, so a day's own spend past
+	// weekCap comes from runs already in flight when the cap was crossed —
+	// at most queue.max_parallel_runs of them, each of which RunSpend
+	// believes at most 2*RunCreditUSD+1. A larger day is capped to dayCap
+	// on read rather than refused: the merge adds spend without this bound,
+	// and a config edit (a lower weekly credit or fewer parallel runs) can
+	// lower dayCap under a day already written, so refusing would fail
+	// every run on a bundle the harness wrote itself. Capping never loosens
+	// the hold, because dayCap >= weekCap: a capped day alone still reaches
+	// the weekly credit, so the queue holds new starts all the same.
+	dayCap := weekCap + float64(cfg.Queue.MaxParallelRuns)*maxRunSpend(cfg.Limits.RunCreditUSD)
 	data, err := readRegular(filepath.Join(dir, manifestFile), maxMetaBytes)
 	if err != nil {
 		return Manifest{}, false, err
@@ -330,9 +343,27 @@ func readManifest(dir string) (Manifest, bool, error) {
 	if m.Version != stateVersion || m.Generation < 0 {
 		return Manifest{}, false, fmt.Errorf("%s: unsupported version %d / generation %d", manifestFile, m.Version, m.Generation)
 	}
+	// The spend is re-checked here on every load because the queue holds
+	// new starts on it (CODEAF_WEEK_SPENT_USD). The bounds mirror the write
+	// path at the moment the manifest was written (stateMerge): pruneSpend
+	// keeps a day back to that merge's own now-7d (boundary included), and
+	// SpendDate puts one at most a day ahead of it. So the days are checked
+	// against the manifest's Updated timestamp, not against this load's
+	// now: a bundle written on day D holds day D-7 by design and must still
+	// read on day D+1, however much later it is loaded. Only the timestamp
+	// itself is checked against now, so a made-up future Updated cannot
+	// widen the window. Per day, the value is capped at dayCap (above).
+	if m.Updated.IsZero() || m.Updated.After(now.Add(24*time.Hour)) {
+		return Manifest{}, false, fmt.Errorf("%s: updated %s is not a past write time", manifestFile, m.Updated.Format(time.RFC3339))
+	}
+	oldest := m.Updated.UTC().Add(-spendDays * 24 * time.Hour).Format(time.DateOnly)
+	latest := m.Updated.UTC().Add(24 * time.Hour).Format(time.DateOnly)
 	for day, usd := range m.Spend {
-		if _, err := time.Parse(time.DateOnly, day); err != nil || !validUSD(usd) {
+		if _, err := time.Parse(time.DateOnly, day); err != nil || day < oldest || day > latest || !validUSD(usd) {
 			return Manifest{}, false, fmt.Errorf("%s: invalid spend %q: %v", manifestFile, day, usd)
+		}
+		if weekCap > 0 && usd > dayCap {
+			m.Spend[day] = dayCap // see dayCap above: capped, never refused
 		}
 	}
 	if m.Merged == nil {
@@ -375,8 +406,8 @@ func readMergedKeys(dir string) ([]string, error) {
 // window). The state workflow filters its artifact downloads by these keys,
 // so a key in the union means the run is already merged and its artifact
 // need not be fetched again.
-func mergedUnion(bundle string) ([]string, error) {
-	m, _, err := readManifest(bundle)
+func mergedUnion(bundle string, cfg Config, now time.Time) ([]string, error) {
+	m, _, err := readManifest(bundle, cfg, now)
 	if err != nil {
 		return nil, err
 	}
@@ -543,11 +574,17 @@ func SpendDate(recorded string, now time.Time) string {
 	return recorded
 }
 
+// maxRunSpend is the most one packed run's spend can be believed as: a run
+// whose recorded figure cannot be right counts as the whole per-run credit
+// cap (RunSpend), and one that is right can overshoot it by up to 1 USD of
+// proxy-marked overage at list prices.
+func maxRunSpend(runCap float64) float64 { return 2*runCap + 1 }
+
 // RunSpend is what a packed run cost, as far as the merge believes it. The
 // number was written by the run job, so one that can't be right counts as the
 // whole per-run credit cap: a wrong guess must never loosen that cap.
 func RunSpend(recorded float64, runCap float64) float64 {
-	if math.IsNaN(recorded) || math.IsInf(recorded, 0) || recorded < 0 || recorded > 2*runCap+1 {
+	if math.IsNaN(recorded) || math.IsInf(recorded, 0) || recorded < 0 || recorded > maxRunSpend(runCap) {
 		return runCap
 	}
 	return recorded
@@ -625,7 +662,7 @@ func runState() error {
 		// newest window: the state workflow filters its downloads by these
 		// keys, so a short list means re-downloading artifacts that will be
 		// skipped (issue #312).
-		keys, err := mergedUnion(args[0])
+		keys, err := mergedUnion(args[0], cfg, time.Now())
 		if err != nil {
 			return err
 		}
@@ -645,7 +682,7 @@ func runState() error {
 // stateLoad installs the shared bundle into CodeAF's home and outputs its
 // generation and today's and this week's credit spend for the run job.
 func stateLoad(bundle, home string, cfg Config, now time.Time) error {
-	m, found, err := readManifest(bundle)
+	m, found, err := readManifest(bundle, cfg, now)
 	if err != nil {
 		return err
 	}
@@ -765,7 +802,7 @@ func readRunMeta(dir string) (RunMeta, error) {
 // result to out. Runs already merged are skipped; the rest are applied in run
 // order. It outputs changed=false when there was nothing to merge.
 func stateMerge(bundle, out string, runDirs []string, cfg Config, now time.Time) error {
-	m, found, err := readManifest(bundle)
+	m, found, err := readManifest(bundle, cfg, now)
 	if err != nil {
 		return err
 	}

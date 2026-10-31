@@ -236,7 +236,7 @@ func TestStateMergeAppendsRecordsAndCaps(t *testing.T) {
 	if err := stateMerge(empty, out, dirs, cfg, now); err != nil {
 		t.Fatal(err)
 	}
-	m := readManifestT(t, out)
+	m := readManifestT(t, out, cfg, now)
 	if len(m.Merged) != maxMergedRuns {
 		t.Fatalf("%d runs merged, want the %d cap", len(m.Merged), maxMergedRuns)
 	}
@@ -280,6 +280,10 @@ func TestStateMergeIsIdempotentPastTheCap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// One UTC day of maxMergedRuns+1 runs is far past the read-time day
+	// ceiling (issue #311), which would cap the figure and hide a double
+	// count; a weekly credit above it keeps the spend checks exact here.
+	cfg.Limits.WeeklyCreditUSD = 10 * maxMergedRuns
 	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
 	empty := filepath.Join(t.TempDir(), "no-bundle")
 	out := filepath.Join(t.TempDir(), "out")
@@ -303,7 +307,7 @@ func TestStateMergeIsIdempotentPastTheCap(t *testing.T) {
 	if err := stateMerge(empty, out, dirs, cfg, now); err != nil {
 		t.Fatal(err)
 	}
-	m := readManifestT(t, out)
+	m := readManifestT(t, out, cfg, now)
 	if len(m.Merged) != maxMergedRuns {
 		t.Fatalf("%d runs merged, want the %d cap", len(m.Merged), maxMergedRuns)
 	}
@@ -323,7 +327,7 @@ func TestStateMergeIsIdempotentPastTheCap(t *testing.T) {
 	if err := stateMerge(out, out2, []string{first, fresh}, cfg, now); err != nil {
 		t.Fatal(err)
 	}
-	again := readManifestT(t, out2)
+	again := readManifestT(t, out2, cfg, now)
 	if got, want := again.Spend["2026-10-16"], m.Spend["2026-10-16"]+1; got != want {
 		t.Errorf("spend after re-merging run 1-1 = %v, want %v (its dollars counted once)", got, want)
 	}
@@ -357,7 +361,7 @@ func TestStateMergeIsIdempotentPastTheCap(t *testing.T) {
 	if err := stateMerge(out2, out3, []string{first}, cfg, now); err != nil {
 		t.Fatal(err)
 	}
-	lone := readManifestT(t, out3)
+	lone := readManifestT(t, out3, cfg, now)
 	if got, want := lone.Spend["2026-10-16"], again.Spend["2026-10-16"]; got != want {
 		t.Errorf("spend after a lone re-merge of run 1-1 = %v, want %v unchanged", got, want)
 	}
@@ -402,7 +406,7 @@ func TestStateLoadDropsBadRecordLines(t *testing.T) {
 	}
 	records := strings.Join([]string{valid("1"), `{"mode":"$(id)"}`, "not json at all", valid("2")}, "\n") + "\n"
 	writeTestFile(t, filepath.Join(bundle, recordsFile), []byte(records))
-	manifest := `{"version":1,"generation":3,"merged":[],"spend":{}}`
+	manifest := `{"version":1,"generation":3,"merged":[],"updated":"2026-10-16T11:00:00Z","spend":{}}`
 	writeTestFile(t, filepath.Join(bundle, manifestFile), []byte(manifest))
 
 	var logs strings.Builder
@@ -651,7 +655,7 @@ func TestStateMergeHandsBackABoundedKeyFile(t *testing.T) {
 	// The window knows two runs the file has not recorded; one is
 	// re-presented, so nothing merges and the bundle is handed back.
 	writeTestFile(t, filepath.Join(legacy, manifestFile),
-		[]byte(`{"version":1,"generation":3,"merged":["9000001-1","9000002-1"],"spend":{"2026-10-16":1.25}}`))
+		[]byte(`{"version":1,"generation":3,"merged":["9000001-1","9000002-1"],"updated":"2026-10-16T11:00:00Z","spend":{"2026-10-16":1.25}}`))
 	run := t.TempDir()
 	writeRecordRun(t, run, "9000001", RunRecord{RunID: "9000001", Attempt: "1", Mode: "issue", Stop: stopDone, Date: "2026-10-16"}, true)
 	t.Setenv("GITHUB_OUTPUT", filepath.Join(t.TempDir(), "output"))
@@ -675,7 +679,7 @@ func TestStateMergeHandsBackABoundedKeyFile(t *testing.T) {
 		t.Errorf("last key = %q, want the newest file key %q", lastOf(keys), lastKey)
 	}
 	windowed := false
-	for _, key := range readManifestT(t, out).Merged {
+	for _, key := range readManifestT(t, out, cfg, now).Merged {
 		if key == "9000001-1" {
 			windowed = true
 		}
@@ -683,7 +687,7 @@ func TestStateMergeHandsBackABoundedKeyFile(t *testing.T) {
 	if !windowed {
 		t.Error("the window key that was trimmed out of the key file is gone from m.Merged too")
 	}
-	m := readManifestT(t, out)
+	m := readManifestT(t, out, cfg, now)
 	if m.Generation != 3 || m.Spend["2026-10-16"] != 1.25 {
 		t.Errorf("no-op merge changed the bundle: %+v", m)
 	}

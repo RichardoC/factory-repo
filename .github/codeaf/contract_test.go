@@ -597,9 +597,13 @@ func TestContract(t *testing.T) {
 		// the router ledger, here with three generations and $1.25 of
 		// spend today.
 		bundle := t.TempDir()
+		// A bundle the workflow merged moments ago: the spend days are
+		// checked against the manifest's own updated timestamp, so the
+		// fixture must be a recent write, not a date from last month.
+		written := time.Now().UTC().Format(time.RFC3339)
 		today := time.Now().UTC().Format(time.DateOnly)
 		writeContractFile(t, bundle, "manifest.json", fmt.Sprintf(
-			`{"version":1,"generation":3,"merged":["75-1"],"spend":{%q:1.25},"updated":"2026-10-17T00:00:00Z"}`, today))
+			`{"version":1,"generation":3,"merged":["75-1"],"spend":{%q:1.25},"updated":%q}`, today, written))
 		writeContractFile(t, bundle, "router-ledger.json",
 			`{"entries":[{"model":"zai-org/glm-5.3-flash","class":"good","rating":4.5,"count":7,"updated":"2026-10-17T00:00:00Z"}]}`)
 
