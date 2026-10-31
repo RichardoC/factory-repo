@@ -17,10 +17,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/RichardoC/kube-sqlite3-vfs/pkg/vfs"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/psanford/sqlite3vfs"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -329,5 +331,181 @@ func TestRunWithClientRefusesMemoryJournalMode(t *testing.T) {
 	}
 	if cms := listConfigMaps(t, fcs, "data=sector"); len(cms) != 0 {
 		t.Errorf("a refused run wrote %d sector ConfigMaps, want 0: the refusal must come before any cluster work", len(cms))
+	}
+}
+
+// --- issue #352: a crashed writer's hot rollback journal must not survive
+// --- a download, or the next read-write opener replays the OLD page
+// --- contents over the freshly written image.
+
+var testVFSNameCounter atomic.Uint64
+
+// pinnedWriters keeps the abandoned "crashed" writer connections of
+// seedHotJournal reachable for the whole test binary: see the comment there.
+var pinnedWriters []any
+
+// registerTestVFS registers v under a process-unique name:
+// sqlite3vfs.RegisterVFS is process-global, so every test needs its own
+// (the command itself registers "kube-sqlite3-vfs").
+func registerTestVFS(t *testing.T, v sqlite3vfs.VFS) string {
+	t.Helper()
+	name := fmt.Sprintf("db-download-test-vfs-%d", testVFSNameCounter.Add(1))
+	if err := sqlite3vfs.RegisterVFS(name, v); err != nil {
+		t.Fatalf("RegisterVFS(%q): %v", name, err)
+	}
+	return name
+}
+
+// seedHotJournal simulates a writer that crashed mid-transaction over the
+// remote database: it opens the remote database through a real SQLite
+// connection in DELETE journal mode (so the rollback journal is stored on
+// the cluster through the VFS, with its real magic and record checksums),
+// starts a transaction big enough to spill the page cache — which is what
+// makes SQLite write the hot journal header — and abandons the connection
+// without committing, closing or rolling back. What stays behind is
+// precisely a crashed writer's state: a hot journal over the old image. The
+// abandoned writer's lock ConfigMaps are removed the way expired leases
+// would be, so the next opener is not blocked by them. Returns the label
+// selector matching the journal's sector ConfigMaps.
+func seedHotJournal(t *testing.T, fcs *fake.Clientset) string {
+	t.Helper()
+	vfsN := vfs.NewVFS(context.Background(), fcs, "test", testLogger(), 1)
+	vfsName := registerTestVFS(t, vfsN)
+	db, err := sql.Open("sqlite3", fmt.Sprintf("file:file2.db?_journal=DELETE&vfs=%s", vfsName))
+	if err != nil {
+		t.Fatalf("open the remote database as the doomed writer: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	// A tiny page cache: SQLite writes the hot journal header at the first
+	// cache spill, so a couple of dirty pages is all the crash needs — a
+	// bigger transaction would also spill database pages and grow the old
+	// image, which this issue is not about.
+	if _, err := db.Exec("PRAGMA cache_size = 2"); err != nil {
+		t.Fatalf("shrink the doomed writer cache: %v", err)
+	}
+	// Deliberately never committed, closed or rolled back: the test wants
+	// the connection abandoned mid-transaction, like a crashed writer. The
+	// references below keep it REACHABLE for the whole test: a collected
+	// connection would be finalized, and its deferred close rolls the open
+	// transaction back through the writer's still-cached journal handle —
+	// a recovery no crashed writer can perform, which would silently undo
+	// the crash this test simulates.
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin the doomed transaction: %v", err)
+	}
+	pinnedWriters = append(pinnedWriters, db, tx)
+	for i := 0; i < 50; i++ {
+		if _, err := tx.Exec("INSERT INTO books (id, title) VALUES (?, ?)", fmt.Sprintf("uncommitted-%d", i), strings.Repeat("j", 700)); err != nil {
+			t.Fatalf("insert row %d: %v", i, err)
+		}
+	}
+
+	// The journal must be HOT: non-zero magic (the journal header) at
+	// offset 0, and at least one sector ConfigMap on the cluster.
+	jf := vfs.NewFile("file2.db-journal", vfsN)
+	selector := "data=sector,relevant-file=" + jf.SectorLabels["relevant-file"]
+	if cms := listConfigMaps(t, fcs, selector); len(cms) == 0 {
+		t.Fatal("setup: the abandoned transaction left no journal sector ConfigMaps")
+	}
+	var head [8]byte
+	n, err := jf.ReadAt(head[:], 0)
+	if err != nil || n != 8 {
+		t.Fatalf("setup: read journal header: n=%d err=%v", n, err)
+	}
+	if bytes.Equal(head[:], make([]byte, 8)) {
+		t.Fatalf("setup: journal header at offset 0 is all zeros: the seeded journal is cold, not hot")
+	}
+
+	// The crash: the writer is gone, so its lock holdings must not block
+	// the next opener — drop the DATABASE's lock ConfigMap the way an
+	// expired lease entry is pruned. The JOURNAL's lockfile stays, exactly
+	// as a crashed writer leaves it: it is part of the journal's on-cluster
+	// state (a read-only opener must still be able to open the journal to
+	// read its magic), and the journal delete below removes it.
+	dbLock := vfs.NewFile("file2.db", vfsN).LockFileName()
+	if err := fcs.CoreV1().ConfigMaps("test").Delete(context.Background(), dbLock, metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("setup: drop abandoned writer lockfile %s: %v", dbLock, err)
+	}
+	return selector
+}
+
+// The regression: a writer that crashed mid-transaction left a HOT journal
+// ("<db>-journal", non-zero magic at offset 0) over the remote database.
+// The download must delete it BEFORE writing the fresh image — the journal
+// describes the old page contents, so a journal that survives the download
+// is replayed by the next read-write opener and resurrects the old database
+// (issue #352). After the download the reopened database must be exactly
+// the uploaded file, with no journal ConfigMap left on the cluster.
+func TestRunWithClientDeletesHotJournalBeforeDownload(t *testing.T) {
+	// The cluster holds an old database image.
+	_, oldData := buildSQLiteFile(t, 500)
+	fcs := fake.NewSimpleClientset()
+	vfsN := vfs.NewVFS(context.Background(), fcs, "test", testLogger(), 1)
+	if _, err := vfs.NewFile("file2.db", vfsN).WriteAt(oldData, 0); err != nil {
+		t.Fatalf("seed the old image: %v", err)
+	}
+
+	// A writer crashed mid-transaction over it: a hot journal sits beside
+	// the old image, describing the OLD pages.
+	selector := seedHotJournal(t, fcs)
+
+	// The fresh image the run under test writes to the cluster.
+	newPath, _ := buildSQLiteFile(t, 2000)
+	if err := runWithClient(fcs, Options{FileName: newPath, Retries: 1}, testLogger()); err != nil {
+		t.Fatalf("runWithClient over a hot journal: %v", err)
+	}
+
+	// The journal must be gone: checked BEFORE the reopen below, because a
+	// read-write opener would itself replay and then delete a journal the
+	// download failed to remove.
+	if cms := listConfigMaps(t, fcs, selector); len(cms) != 0 {
+		t.Fatalf("journal sector ConfigMaps after the download = %d, want 0 (a surviving journal would be replayed over the fresh image)", len(cms))
+	}
+
+	// Reopen the downloaded database read-only, as the command's own reader
+	// does, and check it IS the uploaded file: the new image's row count,
+	// and a clean integrity check.
+	readerVFS := vfs.NewVFS(context.Background(), fcs, "test", testLogger(), 1)
+	vfsName := registerTestVFS(t, readerVFS)
+	db, err := sql.Open("sqlite3", fmt.Sprintf("file:file2.db?_query_only=true&_journal=DELETE&mode=ro&vfs=%s", vfsName))
+	if err != nil {
+		t.Fatalf("sql.Open over the downloaded database: %v", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM books").Scan(&count); err != nil {
+		t.Fatalf("row count over the reopened database: %v", err)
+	}
+	if count != 2000 {
+		t.Errorf("reopened database holds %d rows, want 2000 (the uploaded file's count)", count)
+	}
+	var integrity string
+	if err := db.QueryRow("PRAGMA integrity_check").Scan(&integrity); err != nil {
+		t.Fatalf("PRAGMA integrity_check: %v", err)
+	}
+	if integrity != "ok" {
+		t.Errorf("PRAGMA integrity_check = %q, want \"ok\"", integrity)
+	}
+}
+
+// With no journal on the cluster the download must behave exactly as
+// before: the stored bytes match the local file and no journal appears.
+func TestRunWithClientDownloadsWithoutJournal(t *testing.T) {
+	path, data := buildSQLiteFile(t, 500)
+	fcs := fake.NewSimpleClientset()
+
+	if err := runWithClient(fcs, Options{FileName: path, Retries: 1}, testLogger()); err != nil {
+		t.Fatalf("runWithClient: %v", err)
+	}
+
+	assertSectorsMatch(t, fcs, data)
+
+	vfsN := vfs.NewVFS(context.Background(), fcs, "test", testLogger(), 1)
+	jf := vfs.NewFile("file2.db-journal", vfsN)
+	if cms := listConfigMaps(t, fcs, "data=sector,relevant-file="+jf.SectorLabels["relevant-file"]); len(cms) != 0 {
+		t.Errorf("journal sector ConfigMaps = %d, want 0: a download with no journal must not create one", len(cms))
 	}
 }
