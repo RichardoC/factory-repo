@@ -155,6 +155,69 @@ func TestModelStatsStatusIsNotAMarkerUnlessKindSaysSo(t *testing.T) {
 	}
 }
 
+// TestModelStatsMarkersAreWindowFiltered: a status marker from outside the
+// window must not count in the error classes or the 429-rate denominator.
+// filterWindow used to copy every marker verbatim while rejecting
+// out-of-window call rows, so a directory holding artifacts older than the
+// 72 h window reported a 429 rate for hours the report does not cover --
+// stale 429s inflated both the numerator-bound class table and the
+// denominator counting markers as calls, which can push the rate down past
+// the threshold and quieten the very alert the denominator exists for
+// (issue #319). The decoder also has to keep the marker timestamp it used
+// to drop, a line the proxy always records.
+func TestModelStatsMarkersAreWindowFiltered(t *testing.T) {
+	cfg := modelStatsTestConfig(t)
+	now := time.Now().UTC()
+	oneHourAgo := now.Add(-1 * time.Hour).Format(time.RFC3339)
+	lines := []string{
+		// Two in-window calls.
+		fmt.Sprintf(`{"ts":%q,"model":"alpha","completion_tokens":1000,"usage_seen":true,"ttft_ms":1000,"dur_ms":9000}`, oneHourAgo),
+		fmt.Sprintf(`{"ts":%q,"model":"alpha","completion_tokens":1000,"usage_seen":true,"ttft_ms":1000,"dur_ms":9000}`, oneHourAgo),
+		// An in-window 429 marker: it must count everywhere.
+		fmt.Sprintf(`{"ts":%q,"model":"alpha","kind":"status","status":429}`, oneHourAgo),
+		// A 429 marker older than the 72 h window: it must count nowhere.
+		fmt.Sprintf(`{"ts":%q,"model":"alpha","kind":"status","status":429}`, now.Add(-100*time.Hour).Format(time.RFC3339)),
+	}
+	zr := modelStatsTestZip(t, "codeaf-ledger.jsonl", strings.Join(lines, "\n")+"\n")
+
+	in := parseModelStatsZips([]*zip.Reader{zr}, cfg)
+	if in.Stats.Rejected != 0 || len(in.Stats.Markers) != 2 {
+		t.Fatalf("decode: rows rejected=%d markers=%d, want 0/2 (both markers parse; the window is applied later)",
+			in.Stats.Rejected, len(in.Stats.Markers))
+	}
+	win := modelStatsWindowFrom(cfg, now)
+	filtered := filterWindow(in, win)
+	if n := countMarkers(filtered, "alpha"); n != 1 {
+		t.Fatalf("filterWindow kept %d marker(s) in the window, want the one in-window 429", n)
+	}
+	// The class table: the in-window 429 is the only 429 and the only
+	// error; the stale one charges no class.
+	for _, a := range modelAggregate(filtered, cfg, win) {
+		if a.ID == "alpha" && (a.Calls != 2 || a.Four29 != 1 || a.Errs != 1) {
+			t.Errorf("alpha aggregate: calls=%d four29=%d errs=%d, want 2/1/1 (the out-of-window 429 counted too)",
+				a.Calls, a.Four29, a.Errs)
+		}
+	}
+	got := modelStatsReport(in, cfg, win, now)
+	// Columns after e2e tok/s are cut | 429 | error | stall (see
+	// TestModelStatsStatusIsNotAMarkerUnlessKindSaysSo).
+	if !strings.Contains(got, "| `alpha` | 2 | 1 |") {
+		t.Errorf("the in-window calls are missing from the model table:\n%s", got)
+	}
+	if !strings.Contains(got, "| 0 | 1 | 1 | 0 |") {
+		t.Errorf("the error classes count the stale marker, or miss the in-window one:\n%s", got)
+	}
+	// The 429 rate and its denominator count the in-window marker as one of
+	// three calls (2 rows + 1 marker); with the bug the stale marker made it
+	// 2 of 4.
+	if !strings.Contains(got, "429 rate 33.33% above the 1.00% threshold (1 of 3)") {
+		t.Errorf("the 429 alert does not state the in-window marker alone as its own count and denominator:\n%s", got)
+	}
+	if strings.Contains(got, "2 of 4") {
+		t.Errorf("the stale marker leaked into the 429 count or the denominator:\n%s", got)
+	}
+}
+
 // modelStatsTestConfig is a small config built in the test, never read from
 // models.json (AGENTS.md: a test builds its own config).
 func modelStatsTestConfig(t *testing.T) Config {
