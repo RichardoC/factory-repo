@@ -293,6 +293,9 @@ func commentsPagesServer(t *testing.T, perPage int, comments []issueComment) (*h
 	t.Helper()
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveRepoID(w, r) {
+			return
+		}
 		if r.URL.Path != "/repos/RichardoC/factory-repo/issues/7/comments" {
 			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
 			return
@@ -326,12 +329,47 @@ func commentsPagesServer(t *testing.T, perPage int, comments []issueComment) (*h
 		}
 		b.WriteString("]")
 		if end < len(comments) {
-			w.Header().Set("Link", fmt.Sprintf("<%s%s?per_page=%d&page=%d>; rel=\"next\"", serverURL(r), r.URL.Path, perPage, page+1))
+			w.Header().Set("Link", idNextLink(r, fmt.Sprintf("/issues/7/comments?per_page=%d&page=%d", perPage, page+1)))
 		}
 		_, _ = io.WriteString(w, b.String())
 	}))
 	t.Cleanup(server.Close)
 	return server, &requests
+}
+
+// stubRepoID is the numeric id GitHub answers for RichardoC/factory-repo —
+// the id segment GitHub's real next links carry (issue #390).
+const stubRepoID = 1420977662
+
+// stubRepoPath is the /repos/<owner>/<repo> prefix the fixtures' list reads
+// live under.
+const stubRepoPath = "/repos/RichardoC/factory-repo"
+
+// serveRepoID answers GET /repos/RichardoC/factory-repo with this
+// repository's numeric id — the lookup listNext makes the first time a next
+// link uses GitHub's real /repositories/<id>/ form (issue #390). It reports
+// whether it served the request, so a stub handler can fall through to its
+// own routes otherwise.
+func serveRepoID(w http.ResponseWriter, r *http.Request) bool {
+	if r.URL.Path != stubRepoPath {
+		return false
+	}
+	_, _ = io.WriteString(w, fmt.Sprintf(`{"id":%d}`, stubRepoID))
+	return true
+}
+
+// idNextLink renders a next link in GitHub's real numeric form (issue
+// #390): <base>/repositories/<id>/tail. tail is the request path below the
+// repository with its query, e.g. the comments listing with its page param.
+func idNextLink(r *http.Request, tail string) string {
+	return fmt.Sprintf("<%s/repositories/%d%s>; rel=\"next\"", serverURL(r), stubRepoID, tail)
+}
+
+// idTail strips the /repos/<owner>/<repo> prefix from the request's own URI,
+// leaving the path below the repository with its query — the tail
+// idNextLink wraps.
+func idTail(r *http.Request) string {
+	return strings.TrimPrefix(r.URL.RequestURI(), stubRepoPath)
 }
 
 // serverURL rebuilds the request's own base URL, so the served next link
@@ -496,6 +534,9 @@ func TestBriefDegradesOnListPageCap(t *testing.T) {
 	// usual, so the failure under test is the page cap and nothing else.
 	comments := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveRepoID(w, r) {
+			return
+		}
 		routes := prRoutes()
 		body, ok := routes[r.URL.Path]
 		if !ok {
@@ -504,7 +545,7 @@ func TestBriefDegradesOnListPageCap(t *testing.T) {
 		}
 		if r.URL.Path == "/repos/RichardoC/factory-repo/issues/7/comments" {
 			comments++
-			w.Header().Set("Link", fmt.Sprintf("<%s%s?per_page=100&page=%d>; rel=\"next\"", serverURL(r), r.URL.Path, comments+1))
+			w.Header().Set("Link", idNextLink(r, fmt.Sprintf("/issues/7/comments?per_page=100&page=%d", comments+1)))
 			body = `[{"id":1,"body":"a comment","user":{"login":"alice","type":"User"},"author_association":"MEMBER"}]`
 		}
 		_, _ = io.WriteString(w, body)
@@ -591,6 +632,9 @@ func nextPageForeverServer(t *testing.T) (*httptest.Server, *atomic.Int32) {
 	t.Helper()
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveRepoID(w, r) {
+			return
+		}
 		requests.Add(1)
 		page := r.URL.Query().Get("page")
 		if page == "" {
@@ -600,7 +644,7 @@ func nextPageForeverServer(t *testing.T) (*httptest.Server, *atomic.Int32) {
 		if err != nil {
 			n = 1
 		}
-		w.Header().Set("Link", fmt.Sprintf("<%s%s?per_page=100&page=%d>; rel=\"next\"", serverURL(r), r.URL.Path, n+1))
+		w.Header().Set("Link", idNextLink(r, fmt.Sprintf("%s?per_page=100&page=%d", strings.TrimPrefix(r.URL.Path, stubRepoPath), n+1)))
 		_, _ = io.WriteString(w, `[{"id":1,"body":"a comment","user":{"login":"alice","type":"User"},"author_association":"MEMBER"}]`)
 	}))
 	t.Cleanup(server.Close)

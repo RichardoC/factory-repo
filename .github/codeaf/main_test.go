@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -4455,7 +4456,7 @@ func TestListNextFollowsGitHubLinkForms(t *testing.T) {
 		},
 		{
 			name:   "a link on another host",
-			header: `<!https://evil.example.com/repositories/1420977662/issues/7/comments?page=2>; rel="next"`,
+			header: `<https://evil.example.com/repositories/1420977662/issues/7/comments?page=2>; rel="next"`,
 			errex:  regexp.MustCompile(`leaves the API host`),
 		},
 	} {
