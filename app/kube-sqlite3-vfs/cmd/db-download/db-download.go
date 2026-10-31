@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/RichardoC/kube-sqlite3-vfs/pkg/journalmode"
 	"github.com/RichardoC/kube-sqlite3-vfs/pkg/vfs"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/psanford/sqlite3vfs"
@@ -28,10 +29,11 @@ import (
 
 // Options are the command's flags.
 type Options struct {
-	KubeConfig string `long:"kubeconfig" description:"(optional) absolute path to the kubeconfig file"`
-	FileName   string `long:"filename" description:"local sqlite3 database file to store in the cluster" default:"file2.db"`
-	Verbose    bool   `long:"verbosity" short:"v" description:"Log at debug level rather than info"`
-	Retries    int    `long:"retries" description:"Number of retries for API calls" default:"1"`
+	KubeConfig  string `long:"kubeconfig" description:"(optional) absolute path to the kubeconfig file"`
+	FileName    string `long:"filename" description:"local sqlite3 database file to store in the cluster" default:"file2.db"`
+	JournalMode string `long:"journal-mode" description:"SQLite rollback journal mode this connection reads the database as: DELETE (default), TRUNCATE or PERSIST. Validated by the same rules as the writer's flag (MEMORY, OFF and WAL are refused); set it to the writer's --journal-mode so reader and writer agree"`
+	Verbose     bool   `long:"verbosity" short:"v" description:"Log at debug level rather than info"`
+	Retries     int    `long:"retries" description:"Number of retries for API calls" default:"1"`
 }
 
 // newLogger returns the process logger: debug-level text logging with -v,
@@ -56,8 +58,18 @@ func main() {
 
 	logger.Info("Got config", "opts", opts)
 
-	// The only two os.Exit calls in the process are the flag-parse failure
-	// above and this one, both before or after run has returned: the old
+	// Refuse an unusable --journal-mode before any cluster work, exactly
+	// as the writer's main does — the validation in runWithClient would
+	// otherwise only fire after the kubeconfig has been read and a
+	// clientset built.
+	if _, err := journalModeName(opts.JournalMode); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	// The only three os.Exit calls in the process are the flag-parse failure
+	// above, the journal-mode refusal above, and this one, all before or
+	// after run has returned: the old
 	// fatal() exited from the middle of the work, skipping the deferred
 	// f.Close and db.Close. A failure now unwinds through run's defers and
 	// leaves the exit code to main.
@@ -98,12 +110,41 @@ func newClientset(kubeconfigFlag string) (kubernetes.Interface, error) {
 	return kubernetes.NewForConfig(config)
 }
 
+// journalModeName validates --journal-mode for this command, delegating to
+// the shared journalmode package so the reader and the writer (main.go)
+// accept and refuse exactly the same values (issue #318).
+func journalModeName(mode string) (string, error) {
+	return journalmode.Name(mode)
+}
+
+// readerDSN builds the DSN this command opens the remote database with,
+// with journalMode validated by journalModeName — the same shared
+// validation the writer (main.go) applies, so reader and writer agree
+// (issue #318). The chosen mode is carried to SQLite as the _journal DSN
+// parameter, exactly the way the flag reaches the database.
+func readerDSN(journalMode string) (string, error) {
+	mode, err := journalModeName(journalMode)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("file2.db?_query_only=true&_journal=%s&mode=ro&sqlite_os_trace=&vfs=kube-sqlite3-vfs", mode), nil
+}
+
 // runWithClient holds the command's body. It takes a kubernetes.Interface
 // so the tests can drive it — the error paths included — with the fake
 // clientset, and it returns the first failure to its caller: a read,
 // write, size or byte mismatch used to be logged and the process still
 // exited zero on a half-failed transfer.
 func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Logger) error {
+	// Validate --journal-mode and build the DSN before any cluster work, so
+	// an unusable mode fails before the kubeconfig is read, a clientset is
+	// built or a sector is written — the same front-door refusal main.go
+	// gives its writer.
+	dsn, err := readerDSN(opts.JournalMode)
+	if err != nil {
+		return err
+	}
+
 	vfsN := vfs.NewVFS(context.Background(), clientset, "test", logger, opts.Retries)
 
 	fn := "file2.db"
@@ -190,7 +231,10 @@ func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Lo
 		return fmt.Errorf("register VFS: %w", err)
 	}
 
-	// The journal mode is DELETE, not MEMORY (issue #68): MEMORY leaves no
+	// The journal mode comes from --journal-mode (issue #318), validated by
+	// the same shared rules as the writer's flag, so an operator running
+	// the writer with, say, TRUNCATE can align the reader with it; the
+	// default is DELETE, and not MEMORY (issue #68): MEMORY leaves no
 	// on-cluster record of an uncommitted transaction, so a crash cannot be
 	// rolled back. DELETE measures 65.00 api-calls/op for a committed
 	// 1000-row transaction against MEMORY's 25.00; TRUNCATE and PERSIST
@@ -217,14 +261,15 @@ func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Lo
 	//     PRAGMA integrity_check=ok, and the -journal file was still there
 	//     afterwards.
 	//
-	// So the setting is deliberately DELETE on a connection that cannot
-	// write journals: forcing DELETE blindly would be a request this mode
-	// cannot honour, while MEMORY would be wrong the other way — it says
-	// "do not consult the journal", which is exactly what makes a crashed
-	// writer's half-written database look committed. Nothing here writes
-	// the journal; the writer side (main.go) does, and it uses DELETE so
-	// the recovery above has something to read through.
-	db, err := sql.Open("sqlite3", "file2.db?_query_only=true&_journal=DELETE&mode=ro&sqlite_os_trace=&vfs=kube-sqlite3-vfs")
+	// So the mode named here is deliberately one of DELETE, TRUNCATE or
+	// PERSIST on a connection that cannot write journals: each keeps a
+	// journal SQLite can read through, while MEMORY would be wrong the
+	// other way — it says "do not consult the journal", which is exactly
+	// what makes a crashed writer's half-written database look committed.
+	// Nothing here writes the journal; the writer side (main.go) does,
+	// under whichever --journal-mode its operator chose (default DELETE),
+	// so the recovery above has something to read through.
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
