@@ -468,6 +468,36 @@ func TestParseFindingsFencedSectionAlwaysRead(t *testing.T) {
 	if findings, _ := parseFindingsIn(unfenced, known); len(blockingFindings(findings)) != 1 {
 		t.Errorf("the unfenced section finding = %+v, want it kept too", findings)
 	}
+	// The section's promise covers findings in every written form, not
+	// just bullets the section pass reads itself. A line inside the
+	// section that parseFinding misses but the inline pass reads — prose
+	// before the severity token, or a chained second finding — used to be
+	// dropped by the quoted-path filter in the inline pass (the review
+	// finding on review.go:189), so a blocking inline-form finding inside
+	// a fenced section still ended in the pass label.
+	inlineProse := "## Findings\n\n```\n" +
+		"Summary: [medium] app/other/y.go:2 - the quoted-path filter must not reach the section\n" +
+		"```\n"
+	if findings, _ := parseFindingsIn(inlineProse, known); len(blockingFindings(findings)) != 1 {
+		t.Errorf("an inline-form finding in a fenced section = %+v, want it kept and blocking", findings)
+	}
+	chained := "## Findings\n\n```\n" +
+		"- [low] app/x/main.go:3 - a minor note ; [high] app/other/y.go:9 - the chained blocking finding\n" +
+		"```\n"
+	if findings, _ := parseFindingsIn(chained, known); len(blockingFindings(findings)) != 1 {
+		t.Errorf("a chained finding in a fenced section = %+v, want the high kept and blocking", findings)
+	}
+	// Plan-level: the inline form blocks too, so the review that carried it
+	// starts a fix run instead of stamping the pass label.
+	parsedInline, _ := parseFindingsIn(inlineProse, known)
+	serverInline := commentsServer(t, reportComments(0), http.StatusOK)
+	ghEnv(t, serverInline)
+	if action, body, _, err := reviewPlan(newGitHub(), 7,
+		Result{Stop: stopDone, Model: "deepseek-ai/deepseek-v4.1-flash"}, true, parsedInline, true); err != nil {
+		t.Fatal(err)
+	} else if action != "fix" || strings.Contains(body, reviewPassedLabel) {
+		t.Errorf("an inline-form finding in a fenced section = action %q, want the fix run with no pass label: %q", action, body)
+	}
 	// The contract echo inside the section is still a quote (issue #224
 	// stands in the section, #334 or not): only the path filter is exempt.
 	echo := "## Findings\n\n```\n" +

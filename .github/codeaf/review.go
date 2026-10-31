@@ -176,9 +176,10 @@ func parseFindingsIn(answer string, known map[string]bool) (findings []Finding, 
 				// cannot end the review with the pass label. Only the
 				// contract-echo phantom — the one bullet that names a file
 				// this repository does not have — is still a quote here.
-				// The inline pass below reads the same line too and may
-				// drop its copy as a quote; this pass has kept the finding
-				// first, which is why the section wins.
+				// The inline pass below reads the same line too; this pass
+				// has kept the finding first, so a duplicate copy there is
+				// dropped — and the same exemption covers the inline pass
+				// itself, for the written forms this bullet parser misses.
 				if !quotedEcho(f) && !duplicateFinding(findings, f) {
 					findings = append(findings, f)
 				}
@@ -186,7 +187,18 @@ func parseFindingsIn(answer string, known map[string]bool) (findings []Finding, 
 		}
 		for _, f := range parseInlineFindings(line) {
 			f.fenced, f.quoted = inFence, quoted
-			if !dropQuotedFinding(f, known) && !duplicateFinding(findings, f) {
+			// The section's promise (issue #334) covers findings in
+			// every written form: inside the section this pass is exempt
+			// from the quoted-path filter too — only the contract-echo
+			// phantom is still a quote there — so an inline-form finding
+			// (prose before the severity token, a chained finding) inside
+			// a fenced section cannot end the review with the pass label.
+			// Outside the section the full filter stands.
+			dropped := dropQuotedFinding(f, known)
+			if inSection {
+				dropped = quotedEcho(f)
+			}
+			if !dropped && !duplicateFinding(findings, f) {
 				findings = append(findings, f)
 			}
 		}
