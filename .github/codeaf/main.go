@@ -4309,10 +4309,12 @@ func diffstat(patch []byte) (diffs []fileDiff, more int) {
 		case !inHunk && strings.HasPrefix(line, "rename to "):
 			cur.Path = patchPath(line[len("rename to "):], "")
 		case inHunk && !cur.Binary:
-			switch line[0] {
-			case '+':
+			// An empty line — bufio.Scanner strips the newline — has no
+			// leading byte to index, so test by prefix, not by line[0].
+			switch {
+			case strings.HasPrefix(line, "+"):
 				cur.Add++
-			case '-':
+			case strings.HasPrefix(line, "-"):
 				cur.Del++
 			}
 		}
