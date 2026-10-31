@@ -149,6 +149,47 @@ func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Lo
 
 	fn := "file2.db"
 
+	// A writer that crashed mid-transaction leaves its rollback journal
+	// ("<db>-journal") on the cluster, and the journal describes the OLD
+	// page contents: replaying it over the freshly written image would
+	// silently resurrect the old database (issue #352). These tools are
+	// documented as not for live databases, so a journal found here cannot
+	// belong to a live writer; delete it through the VFS xDelete — which
+	// removes the journal header sector first, in the crash-safe order, and
+	// is therefore idempotent on a half-deleted journal — BEFORE the image
+	// is written, never after. This also has to precede the read-only open
+	// at the end of this command: a read-only opener would not delete the
+	// journal, only read through it.
+	journalName := fn + "-journal"
+	exists, err := vfsN.Access(journalName, sqlite3vfs.AccessExists)
+	if err != nil {
+		return fmt.Errorf("look for a stale journal %q: %w", journalName, err)
+	}
+	if exists {
+		// SQLite calls a journal hot when the first bytes at offset 0 (the
+		// journal magic) are non-zero; a missing or zeroed header reads as
+		// a cold journal. Either way the name must go before the transfer.
+		hot := false
+		var head [8]byte
+		n, readErr := vfs.NewFile(journalName, vfsN).ReadAt(head[:], 0)
+		if n > 0 && (readErr == nil || errors.Is(readErr, io.EOF)) {
+			for _, b := range head[:n] {
+				if b != 0 {
+					hot = true
+					break
+				}
+			}
+		}
+		if err := vfsN.Delete(journalName, false); err != nil {
+			return fmt.Errorf("delete stale journal %q: %w", journalName, err)
+		}
+		if hot {
+			logger.Warn("Deleted a HOT rollback journal left by a crashed writer: the download replaces the database outright, so the journal was removed rather than replayed", "journal", journalName)
+		} else {
+			logger.Info("Deleted a stale (cold) rollback journal", "journal", journalName)
+		}
+	}
+
 	if _, _, err := vfsN.Open(fn, sqlite3vfs.OpenFlag(0)); err != nil {
 		return fmt.Errorf("open %q in the cluster: %w", fn, err)
 	}
