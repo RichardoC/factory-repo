@@ -26,8 +26,7 @@ const (
 	// maxLiveLabelPage is how many labels the live label read requests per issue.
 	// It is Linear's per-connection maximum, chosen so the page cannot truncate
 	// in practice; if it does anyway, fetchLabelsByIssueID fails that issue
-	// closed rather than returning a label set a protected label may be missing
-	// from.
+	// closed rather than returning a label set a label may be missing from.
 	maxLiveLabelPage = 250
 )
 
@@ -41,7 +40,10 @@ type Client struct {
 	statesByName    map[string]string
 	statesByType    map[string]string
 	managedLabelIDs map[string]string
-	blockedUntil    time.Time
+	// managedLabelGroupIDs maps a normalized managed-label name to the ID of
+	// its exclusive label group ("" when the label is ungrouped).
+	managedLabelGroupIDs map[string]string
+	blockedUntil         time.Time
 }
 
 // linearIssueNode is the shared GraphQL shape for an issue returned by
@@ -62,8 +64,11 @@ type linearIssueNode struct {
 	} `json:"state"`
 	Labels struct {
 		Nodes []struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
+			ID     string `json:"id"`
+			Name   string `json:"name"`
+			Parent *struct {
+				ID string `json:"id"`
+			} `json:"parent"`
 		} `json:"nodes"`
 	} `json:"labels"`
 }
@@ -79,12 +84,13 @@ func New(cfg config.LinearConfig, maxConcurrency int, logger *slog.Logger) *Clie
 	}
 
 	return &Client{
-		cfg:             cfg,
-		gql:             gqlclient.New("https://api.linear.app/graphql", httpClient),
-		log:             logger,
-		statesByName:    map[string]string{},
-		statesByType:    map[string]string{},
-		managedLabelIDs: map[string]string{},
+		cfg:                  cfg,
+		gql:                  gqlclient.New("https://api.linear.app/graphql", httpClient),
+		log:                  logger,
+		statesByName:         map[string]string{},
+		statesByType:         map[string]string{},
+		managedLabelIDs:      map[string]string{},
+		managedLabelGroupIDs: map[string]string{},
 	}
 }
 
@@ -136,6 +142,9 @@ query issueByIdentifier($filter: IssueFilter!) {
         nodes {
           id
           name
+          parent {
+            id
+          }
         }
       }
     }
@@ -188,9 +197,14 @@ func linearIssueToModel(issue linearIssueNode) model.ExistingIssue {
 	description := deref(issue.Description)
 	labels := make([]model.IssueLabel, 0, len(issue.Labels.Nodes))
 	for _, label := range issue.Labels.Nodes {
+		groupID := ""
+		if label.Parent != nil {
+			groupID = label.Parent.ID
+		}
 		labels = append(labels, model.IssueLabel{
-			ID:   label.ID,
-			Name: label.Name,
+			ID:      label.ID,
+			Name:    label.Name,
+			GroupID: groupID,
 		})
 	}
 	var archivedAt *time.Time
@@ -455,31 +469,31 @@ func (c *Client) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) 
 		return err
 	}
 
-	// Re-read the live label set for this batch when any label is protected.
-	// An update replaces the ticket's whole label set, so this read is what
-	// keeps a protected label another actor added since the run's opening
-	// snapshot from being deleted by that replacement.
-	var liveLabels map[string][]model.IssueLabel
-	if len(c.cfg.Labels.Protected) > 0 {
-		issueIDs := make([]string, 0, len(updates))
-		for _, update := range updates {
-			issueIDs = append(issueIDs, update.Existing.ID)
-		}
-		fetched, err := c.fetchLabelsByIssueID(ctx, issueIDs)
-		if err != nil {
-			return err
-		}
-		liveLabels = fetched
+	// Re-read the live label set for this batch, always. An update replaces the
+	// ticket's whole label set, so echoing back the run's opening snapshot
+	// deletes any label another actor added since then. The sync owns only its
+	// managed labels; every other label — protected, human-applied, or from a
+	// different automation — is carried forward from this live read, which is
+	// the ticket's current truth rather than the minutes-old snapshot.
+	issueIDs := make([]string, 0, len(updates))
+	for _, update := range updates {
+		issueIDs = append(issueIDs, update.Existing.ID)
+	}
+	liveLabels, err := c.fetchLabelsByIssueID(ctx, issueIDs)
+	if err != nil {
+		return err
+	}
 
-		// An issue missing from the read is indistinguishable from one that
-		// genuinely carries no protected label, and guessing wrong deletes
-		// another actor's control label. Fail the batch instead: the caller
-		// already falls back to updating each issue individually, so the rest of
-		// the batch still lands and only the unreadable issue is reported failed.
-		for _, update := range updates {
-			if _, ok := liveLabels[update.Existing.ID]; !ok {
-				return fmt.Errorf("refusing to update Linear issue %s: its current labels could not be read, so protected labels cannot be preserved", update.Existing.Identifier)
-			}
+	// An issue missing from the read leaves its current labels unknown, and
+	// guessing wrong deletes a label the sync does not own (a control label or
+	// a human's). An issue absent from the read — missing from the response, or
+	// omitted by fetchLabelsByIssueID because its label page was truncated — is
+	// exactly that. Fail the batch instead: the caller already falls back to
+	// updating each issue individually, so the rest of the batch still lands
+	// and only the unreadable issue is reported failed.
+	for _, update := range updates {
+		if _, ok := liveLabels[update.Existing.ID]; !ok {
+			return fmt.Errorf("refusing to update Linear issue %s: its current labels could not be read, so labels the sync does not own cannot be preserved", update.Existing.Identifier)
 		}
 	}
 
@@ -783,6 +797,9 @@ query existingIssues($filter: IssueFilter!, $after: String) {
         nodes {
           id
           name
+          parent {
+            id
+          }
         }
       }
     }
@@ -1080,9 +1097,16 @@ func (c *Client) resolveManagedLabel(ctx context.Context, managedLabel string) e
 	}
 	c.mu.RUnlock()
 
+	// labelRef pairs a resolved label ID with the ID of its exclusive group
+	// ("" when ungrouped), so the group can be recorded for the exclusivity
+	// handling in desiredLabelIDs.
+	type labelRef struct {
+		id    string
+		group string
+	}
 	var after *string
-	var teamMatches []string
-	var globalMatches []string
+	var teamMatches []labelRef
+	var globalMatches []labelRef
 	for {
 		op := gqlclient.NewOperation(`
 query managedIssueLabels($name: String!, $after: String) {
@@ -1090,6 +1114,9 @@ query managedIssueLabels($name: String!, $after: String) {
     nodes {
       id
       name
+      parent {
+        id
+      }
       team {
         id
       }
@@ -1106,8 +1133,11 @@ query managedIssueLabels($name: String!, $after: String) {
 		var resp struct {
 			IssueLabels struct {
 				Nodes []struct {
-					ID   string `json:"id"`
-					Name string `json:"name"`
+					ID     string `json:"id"`
+					Name   string `json:"name"`
+					Parent *struct {
+						ID string `json:"id"`
+					} `json:"parent"`
 					Team *struct {
 						ID string `json:"id"`
 					} `json:"team"`
@@ -1126,11 +1156,15 @@ query managedIssueLabels($name: String!, $after: String) {
 			if !strings.EqualFold(label.Name, managedLabel) {
 				continue
 			}
+			ref := labelRef{id: label.ID}
+			if label.Parent != nil {
+				ref.group = label.Parent.ID
+			}
 			switch {
 			case label.Team != nil && label.Team.ID == c.teamID():
-				teamMatches = append(teamMatches, label.ID)
+				teamMatches = append(teamMatches, ref)
 			case label.Team == nil:
-				globalMatches = append(globalMatches, label.ID)
+				globalMatches = append(globalMatches, ref)
 			}
 		}
 
@@ -1140,7 +1174,7 @@ query managedIssueLabels($name: String!, $after: String) {
 		after = resp.IssueLabels.PageInfo.EndCursor
 	}
 
-	var resolved string
+	var resolved labelRef
 	switch {
 	case len(teamMatches) == 1:
 		resolved = teamMatches[0]
@@ -1155,7 +1189,8 @@ query managedIssueLabels($name: String!, $after: String) {
 	}
 
 	c.mu.Lock()
-	c.managedLabelIDs[model.NormalizeLabelName(managedLabel)] = resolved
+	c.managedLabelIDs[model.NormalizeLabelName(managedLabel)] = resolved.id
+	c.managedLabelGroupIDs[model.NormalizeLabelName(managedLabel)] = resolved.group
 	c.mu.Unlock()
 	return nil
 }
@@ -1182,53 +1217,84 @@ func (c *Client) createLabelIDs(desired model.DesiredIssue) []string {
 // Linear's issueUpdate replaces the ticket's labels wholesale rather than
 // applying a delta.
 //
-// live carries the ticket's label set as read immediately before the write (nil
-// when no labels are protected). Protected labels are taken from live and from
-// nowhere else: the `existing` snapshot was taken at the top of the run, so a
-// protected label another actor added since then is absent from it, and echoing
-// that stale set back to Linear would delete the label. Everything else still
-// comes from the snapshot, which is the pre-existing behaviour.
+// The sync owns only its own managed labels. Every other label on the ticket —
+// protected, human-applied, or from another automation — is carried forward
+// untouched. `live` is the ticket's label set read immediately before the
+// write, and is the authority for what the ticket carries right now: the
+// `existing` snapshot was taken at the top of the run, so any label added since
+// then is absent from it and echoing that stale set back to Linear would delete
+// the label. When `live` is nil (direct callers that do not read live labels)
+// the snapshot's labels are used as the fallback.
+//
+// Linear label groups are mutually exclusive: an issue may carry at most one
+// child of a group, and issueUpdate rejects a labelIds set that names two
+// ("labelIds not exclusive child labels"). Carrying every non-managed label
+// forward can put a second child of a group into the set — a human-applied or
+// stale sibling alongside the child the sync asserts, or two siblings that
+// predate the group being made exclusive. The set is therefore collapsed to at
+// most one child per group. A managed label the sync asserts wins the group
+// (it evicts whatever sibling was carried forward); between two carried-forward
+// siblings the first read wins.
 func (c *Client) desiredLabelIDs(existing model.ExistingIssue, desired model.DesiredIssue, live []model.IssueLabel) ([]string, error) {
 	desiredManaged := normalizeManagedLabelNames(desired.ManagedLabels)
 	protected := c.protectedLabelNames()
-	out := make([]string, 0, len(existing.Labels)+len(desiredManaged))
-	seen := make(map[string]struct{}, len(existing.Labels)+len(desiredManaged))
+
+	// The live read is the current truth; fall back to the snapshot only when a
+	// caller did not supply one (nil, not merely empty — an issue whose labels
+	// were all removed reads back as a non-nil empty slice, and must not fall
+	// back to the stale snapshot).
+	current := live
+	if current == nil {
+		current = existing.Labels
+	}
+
+	out := make([]string, 0, len(current)+len(desiredManaged))
+	seen := make(map[string]struct{}, len(current)+len(desiredManaged))
+	// groupToIdx maps an exclusive group's ID to the index in `out` of the one
+	// child currently kept for it, so a later member of the same group can be
+	// dropped (or, for a managed label, replace the kept sibling in place).
+	groupToIdx := make(map[string]int, len(existing.Labels)+len(desiredManaged))
 	previousManaged := make(map[string]struct{}, len(existing.ManagedLabels))
 	for _, label := range normalizeManagedLabelNames(existing.ManagedLabels) {
 		previousManaged[label] = struct{}{}
 	}
 
-	// Protected labels come from the live read below, so skip them here: the
-	// snapshot's view of them is stale in both directions (it can miss one that
-	// was just added, and carry one that was just removed).
-	for _, label := range existing.Labels {
-		normalized := model.NormalizeLabelName(label.Name)
-		if _, isProtected := protected[normalized]; isProtected {
-			continue
+	// addLabel adds one label ID to the result unless it would be the second
+	// child of an exclusive group. group is the label's group ID ("" when
+	// ungrouped). A managed label evicts an already-kept sibling of its group; a
+	// non-managed one yields to whatever is already kept.
+	addLabel := func(id, group string, managed bool) {
+		if id == "" {
+			return
 		}
+		if _, exists := seen[id]; exists {
+			return
+		}
+		if group != "" {
+			if idx, clash := groupToIdx[group]; clash {
+				if managed {
+					delete(seen, out[idx])
+					out[idx] = id
+					seen[id] = struct{}{}
+				}
+				return
+			}
+			groupToIdx[group] = len(out)
+		}
+		out = append(out, id)
+		seen[id] = struct{}{}
+	}
+
+	// Carry forward every current label the sync does not own. A previously
+	// managed label is dropped here and only re-added below if still desired,
+	// which is how the sync reconciles its own set; everything else — protected
+	// control labels, human labels, other automations' labels — is preserved.
+	for _, label := range current {
+		normalized := model.NormalizeLabelName(label.Name)
 		if _, managed := previousManaged[normalized]; managed {
 			continue
 		}
-		if _, exists := seen[label.ID]; exists {
-			continue
-		}
-		out = append(out, label.ID)
-		seen[label.ID] = struct{}{}
-	}
-
-	// Carry over every protected label the ticket actually has right now. This
-	// preserves a label another actor added mid-run and equally respects one it
-	// just removed (an absent label is simply never re-added).
-	for _, label := range live {
-		normalized := model.NormalizeLabelName(label.Name)
-		if _, isProtected := protected[normalized]; !isProtected {
-			continue
-		}
-		if _, exists := seen[label.ID]; exists {
-			continue
-		}
-		out = append(out, label.ID)
-		seen[label.ID] = struct{}{}
+		addLabel(label.ID, label.GroupID, false)
 	}
 
 	if len(desiredManaged) == 0 {
@@ -1240,7 +1306,8 @@ func (c *Client) desiredLabelIDs(existing model.ExistingIssue, desired model.Des
 	for _, managedLabel := range desiredManaged {
 		// A protected label must never be asserted from the managed set — that
 		// would let a misconfiguration stamp another actor's control label onto
-		// a ticket that does not have one.
+		// a ticket that does not have one. It is already carried forward above if
+		// the ticket genuinely has it.
 		if _, isProtected := protected[managedLabel]; isProtected {
 			continue
 		}
@@ -1248,11 +1315,7 @@ func (c *Client) desiredLabelIDs(existing model.ExistingIssue, desired model.Des
 		if managedLabelID == "" {
 			return nil, fmt.Errorf("managed Linear label %q was not resolved", managedLabel)
 		}
-		if _, exists := seen[managedLabelID]; exists {
-			continue
-		}
-		out = append(out, managedLabelID)
-		seen[managedLabelID] = struct{}{}
+		addLabel(managedLabelID, c.managedLabelGroupIDs[managedLabel], true)
 	}
 	return out, nil
 }
@@ -1273,17 +1336,17 @@ func (c *Client) protectedLabelNames() map[string]struct{} {
 }
 
 // fetchLabelsByIssueID reads the current label set of specific issues, keyed by
-// issue ID. It is the authority for protected labels immediately before an
-// update, so it deliberately re-queries Linear rather than reusing the run's
-// snapshot.
+// issue ID. It is the authority for every label the sync does not own
+// immediately before an update, so it deliberately re-queries Linear rather
+// than reusing the run's snapshot.
 //
 // includeArchived is set because an archived ticket can still be the target of
 // an update. The issue side needs no pagination: the update batch size (10)
 // bounds it, and `first` is set from the batch.
 //
 // The label side is a connection and therefore can truncate, so its pageInfo is
-// checked. A truncated label page is not usable as the authority for protected
-// labels — a protected label past the page boundary would be absent from the
+// checked. A truncated label page is not usable as an authority for labels the
+// sync does not own — a label past the page boundary would be absent from the
 // live read, and the update would then delete it, which is the exact failure
 // this read exists to prevent. Such an issue is therefore omitted from the
 // result, which UpdateIssues treats as unreadable and refuses. Refusing beats
@@ -1308,6 +1371,9 @@ query issueLabelsByID($filter: IssueFilter!, $first: Int!) {
         nodes {
           id
           name
+          parent {
+            id
+          }
         }
         pageInfo {
           hasNextPage
@@ -1327,8 +1393,11 @@ query issueLabelsByID($filter: IssueFilter!, $first: Int!) {
 				ID     string `json:"id"`
 				Labels struct {
 					Nodes []struct {
-						ID   string `json:"id"`
-						Name string `json:"name"`
+						ID     string `json:"id"`
+						Name   string `json:"name"`
+						Parent *struct {
+							ID string `json:"id"`
+						} `json:"parent"`
 					} `json:"nodes"`
 					PageInfo struct {
 						HasNextPage bool `json:"hasNextPage"`
@@ -1344,7 +1413,7 @@ query issueLabelsByID($filter: IssueFilter!, $first: Int!) {
 	out := make(map[string][]model.IssueLabel, len(resp.Issues.Nodes))
 	for _, node := range resp.Issues.Nodes {
 		if node.Labels.PageInfo.HasNextPage {
-			c.log.Warn("Linear issue carries more labels than one page of the live label read; refusing to update it rather than risk deleting a protected label",
+			c.log.Warn("Linear issue carries more labels than one page of the live label read; refusing to update it rather than risk deleting a label the sync does not own",
 				slog.String("issue_id", node.ID),
 				slog.Int("page_size", maxLiveLabelPage),
 			)
@@ -1352,7 +1421,11 @@ query issueLabelsByID($filter: IssueFilter!, $first: Int!) {
 		}
 		labels := make([]model.IssueLabel, 0, len(node.Labels.Nodes))
 		for _, label := range node.Labels.Nodes {
-			labels = append(labels, model.IssueLabel{ID: label.ID, Name: label.Name})
+			groupID := ""
+			if label.Parent != nil {
+				groupID = label.Parent.ID
+			}
+			labels = append(labels, model.IssueLabel{ID: label.ID, Name: label.Name, GroupID: groupID})
 		}
 		out[node.ID] = labels
 	}

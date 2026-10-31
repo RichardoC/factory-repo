@@ -132,6 +132,9 @@ func TestUpdateIssuesClearsManagedLabelsWhenNoneDesired(t *testing.T) {
 				if err := json.Unmarshal(body, &payload); err != nil {
 					t.Fatalf("json.Unmarshal() error = %v", err)
 				}
+				if strings.Contains(payload.Query, "issueLabelsByID") {
+					return jsonResponse(t, `{"data":{"issues":{"nodes":[{"id":"issue-1","labels":{"nodes":[{"id":"label-1","name":"snyk-dast-automation"}],"pageInfo":{"hasNextPage":false}}}]}}}`), nil
+				}
 				if strings.Contains(payload.Query, "mutation issueUpdateBatch") {
 					for key, val := range payload.Variables {
 						if strings.HasPrefix(key, "input") {
@@ -293,6 +296,9 @@ func TestUpdateIssuesDoesNotSendSubscriberIdsInPayload(t *testing.T) {
 				if err := json.Unmarshal(body, &payload); err != nil {
 					t.Fatalf("json.Unmarshal() error = %v", err)
 				}
+				if strings.Contains(payload.Query, "issueLabelsByID") {
+					return jsonResponse(t, `{"data":{"issues":{"nodes":[{"id":"issue-1","labels":{"nodes":[{"id":"label-1","name":"snyk-dast-automation"}],"pageInfo":{"hasNextPage":false}}}]}}}`), nil
+				}
 				if strings.Contains(payload.Query, "mutation issueUpdateBatch") {
 					for key, val := range payload.Variables {
 						if !strings.HasPrefix(key, "input") {
@@ -401,6 +407,9 @@ func TestUpdateIssuesOmitsStateIdWhenPreserveStateTrue(t *testing.T) {
 					Variables: payload.Variables,
 				})
 
+				if strings.Contains(payload.Query, "issueLabelsByID") {
+					return jsonResponse(t, `{"data":{"issues":{"nodes":[{"id":"issue-1","labels":{"nodes":[{"id":"label-1","name":"snyk-dast-automation"}],"pageInfo":{"hasNextPage":false}}}]}}}`), nil
+				}
 				if strings.Contains(payload.Query, "mutation issueUpdateBatch") {
 					return jsonResponse(t, `{"data":{"issueUpdate0":{"success":true}}}`), nil
 				}
@@ -440,11 +449,16 @@ func TestUpdateIssuesOmitsStateIdWhenPreserveStateTrue(t *testing.T) {
 		t.Fatalf("UpdateIssues() error = %v", err)
 	}
 
-	if len(requests) != 1 {
-		t.Fatalf("request count = %d, want 1", len(requests))
+	// The live label read runs before the mutation, so the update itself is the
+	// second request.
+	if len(requests) != 2 {
+		t.Fatalf("request count = %d, want 2 (live label read + update mutation)", len(requests))
+	}
+	if !strings.Contains(requests[1].Query, "mutation issueUpdateBatch") {
+		t.Fatalf("requests[1] query = %s, want the update mutation", requests[1].Query)
 	}
 
-	input0 := requests[0].Variables["input0"].(map[string]any)
+	input0 := requests[1].Variables["input0"].(map[string]any)
 	if _, has := input0["stateId"]; has {
 		t.Fatalf("issueUpdate mutation must omit stateId when PreserveState=true, got: %#v", input0)
 	}
@@ -1613,9 +1627,9 @@ func TestDesiredLabelIDsNeverAssertsProtectedLabelFromManagedSet(t *testing.T) {
 
 // TestUpdateIssuesRefusesUpdateWhenLiveLabelsUnreadable pins the fail-closed
 // choice. An issue absent from the live read is indistinguishable from one with
-// no protected label, so the update must not proceed — guessing wrong deletes
-// another actor's control label. The caller retries issues individually, so only
-// the unreadable one is reported failed.
+// no label the sync does not own, so the update must not proceed — guessing
+// wrong deletes another actor's label. The caller retries issues individually,
+// so only the unreadable one is reported failed.
 func TestUpdateIssuesRefusesUpdateWhenLiveLabelsUnreadable(t *testing.T) {
 	var sawUpdateMutation bool
 
@@ -1663,27 +1677,50 @@ func TestUpdateIssuesRefusesUpdateWhenLiveLabelsUnreadable(t *testing.T) {
 	}
 }
 
-// TestUpdateIssuesSkipsLiveLabelReadWhenNoProtectedLabels keeps the extra query
-// off the hot path for anyone running without protected labels configured.
-func TestUpdateIssuesSkipsLiveLabelReadWhenNoProtectedLabels(t *testing.T) {
+// TestUpdateIssuesReadsLiveLabelsWhenNoProtectedLabels pins the always-read:
+// with no protected labels configured the update still fetches the batch's
+// current label set, because an update replaces the ticket's labels wholesale
+// and echoing the run's opening snapshot instead would delete any label another
+// actor added mid-run. The live read is what carries such a label forward.
+func TestUpdateIssuesReadsLiveLabelsWhenNoProtectedLabels(t *testing.T) {
 	var sawLabelRead bool
+	var capturedInput map[string]any
 
 	client := &Client{
 		cfg: config.LinearConfig{
 			TeamID: "team-1",
 			States: config.StateConfig{Todo: "Todo"},
+			// No Protected labels configured, and no managed labels desired.
 		},
 		resolvedTeam: "team-1",
 		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
 			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Query     string         `json:"query"`
+					Variables map[string]any `json:"variables"`
+				}
 				body, err := io.ReadAll(req.Body)
 				if err != nil {
 					t.Fatalf("ReadAll() error = %v", err)
 				}
-				if strings.Contains(string(body), "issueLabelsByID") {
-					sawLabelRead = true
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
 				}
-				return jsonResponse(t, `{"data":{"issueUpdate0":{"success":true}}}`), nil
+				if strings.Contains(payload.Query, "issueLabelsByID") {
+					sawLabelRead = true
+					// The live read sees a label another actor added after the
+					// run's opening snapshot.
+					return jsonResponse(t, `{"data":{"issues":{"nodes":[{"id":"issue-1","labels":{"nodes":[{"id":"label-baseline","name":"human-label"},{"id":"label-other","name":"customer-visible"}],"pageInfo":{"hasNextPage":false}}}]}}}`), nil
+				}
+				if strings.Contains(payload.Query, "mutation issueUpdateBatch") {
+					input, _ := payload.Variables["input0"].(map[string]any)
+					if capturedInput == nil {
+						capturedInput = input
+					}
+					return jsonResponse(t, `{"data":{"issueUpdate0":{"success":true}}}`), nil
+				}
+				t.Fatalf("unexpected GraphQL query: %s", payload.Query)
+				return nil, nil
 			}),
 		}),
 		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -1692,17 +1729,42 @@ func TestUpdateIssuesSkipsLiveLabelReadWhenNoProtectedLabels(t *testing.T) {
 		managedLabelIDs: map[string]string{},
 	}
 
+	// The snapshot predates the actor's edit: it carries only the baseline label.
 	updates := []model.IssueUpdate{{
-		Existing: model.ExistingIssue{ID: "issue-1", Identifier: "SEC-1"},
-		Desired:  model.DesiredIssue{State: model.StateTodo},
+		Existing: model.ExistingIssue{
+			ID:         "issue-1",
+			Identifier: "SEC-1",
+			Labels:     []model.IssueLabel{{ID: "label-baseline", Name: "human-label"}},
+		},
+		Desired: model.DesiredIssue{State: model.StateTodo},
 	}}
 
 	if err := client.UpdateIssues(context.Background(), updates); err != nil {
 		t.Fatalf("UpdateIssues() error = %v", err)
 	}
-	if sawLabelRead {
-		t.Fatal("UpdateIssues() read live labels with no protected labels configured")
+	if !sawLabelRead {
+		t.Fatal("UpdateIssues() skipped the live label read with no protected labels configured")
 	}
+	if capturedInput == nil {
+		t.Fatal("no update input captured")
+	}
+	labelIDs, _ := capturedInput["labelIds"].([]any)
+	if !containsAnyLabel(labelIDs, "label-other") {
+		t.Fatalf("labelIds = %#v, want the mid-run label label-other preserved", labelIDs)
+	}
+	if !containsAnyLabel(labelIDs, "label-baseline") {
+		t.Fatalf("labelIds = %#v, want the baseline label preserved", labelIDs)
+	}
+}
+
+// containsAnyLabel reports whether the JSON-decoded labelIds array contains id.
+func containsAnyLabel(ids []any, want string) bool {
+	for _, id := range ids {
+		if s, ok := id.(string); ok && s == want {
+			return true
+		}
+	}
+	return false
 }
 
 // TestFetchLabelsByIssueIDFiltersByIssueID pins the live read's shape: it must
@@ -1824,7 +1886,7 @@ func TestUpdateIssuesRefusesUpdateWhenLabelPageTruncated(t *testing.T) {
 		t.Fatalf("UpdateIssues() error = %v, want it to name the issue", err)
 	}
 	if sawUpdateMutation {
-		t.Fatal("UpdateIssues() sent an update mutation from a truncated label page; a protected label past the page boundary would be deleted")
+		t.Fatal("UpdateIssues() sent an update mutation from a truncated label page; a label the sync does not own past the page boundary would be deleted")
 	}
 }
 
@@ -2014,5 +2076,111 @@ func TestCreateIssuesSendsOneMutationWhenRateLimitBudgetExhausted(t *testing.T) 
 	if gotCreate >= 2 || gotUnsubscribe >= 2 {
 		t.Fatalf("server saw %d issueCreateBatch and %d issueUnsubscribe requests, want never 2+ per operation",
 			gotCreate, gotUnsubscribe)
+	}
+}
+
+// TestDesiredLabelIDsManagedLabelEvictsExclusiveGroupSibling guards against
+// "labelIds not exclusive child labels": when the sync asserts a managed label
+// that belongs to a Linear exclusive group, and the ticket already carries a
+// different child of that same group, the carried-forward sibling must be
+// dropped so the update names only one child of the group. The managed label
+// wins.
+func TestDesiredLabelIDsManagedLabelEvictsExclusiveGroupSibling(t *testing.T) {
+	client := &Client{
+		managedLabelIDs: map[string]string{
+			"status-confirmed": "label-confirmed",
+		},
+		managedLabelGroupIDs: map[string]string{
+			"status-confirmed": "group-status",
+		},
+	}
+
+	// The ticket already carries status-new, another child of the exclusive
+	// "status" group, applied by a human or a prior run. It is not in the
+	// sync's managed set for this finding, so it would otherwise be carried
+	// forward alongside the asserted status-confirmed and Linear would reject
+	// the update.
+	existing := model.ExistingIssue{
+		Labels: []model.IssueLabel{
+			{ID: "label-unrelated", Name: "customer-visible"},
+			{ID: "label-new", Name: "status-new", GroupID: "group-status"},
+		},
+	}
+	desired := model.DesiredIssue{
+		ManagedLabels: []string{"status-confirmed"},
+	}
+
+	labelIDs, err := client.desiredLabelIDs(existing, desired, nil)
+	if err != nil {
+		t.Fatalf("desiredLabelIDs() error = %v", err)
+	}
+	if containsString(labelIDs, "label-new") {
+		t.Fatalf("labelIDs = %#v, want carried-forward group sibling 'label-new' evicted", labelIDs)
+	}
+	if !containsString(labelIDs, "label-confirmed") {
+		t.Fatalf("labelIDs = %#v, want asserted managed group child 'label-confirmed' present", labelIDs)
+	}
+	if !containsString(labelIDs, "label-unrelated") {
+		t.Fatalf("labelIDs = %#v, want ungrouped label preserved", labelIDs)
+	}
+	if len(labelIDs) != 2 {
+		t.Fatalf("labelIDs len = %d, want 2 (at most one child per exclusive group)", len(labelIDs))
+	}
+}
+
+// TestDesiredLabelIDsDropsSecondCarriedForwardExclusiveSibling covers two
+// children of the same exclusive group present on the ticket with neither in
+// the sync's managed set — for example two labels applied before the group was
+// made exclusive. Echoing both back fails the update, so the set keeps the
+// first read and drops the rest.
+func TestDesiredLabelIDsDropsSecondCarriedForwardExclusiveSibling(t *testing.T) {
+	client := &Client{}
+
+	existing := model.ExistingIssue{
+		Labels: []model.IssueLabel{
+			{ID: "label-sev-high", Name: "sev:high", GroupID: "group-sev"},
+			{ID: "label-sev-crit", Name: "sev:critical", GroupID: "group-sev"},
+			{ID: "label-plain", Name: "backend"},
+		},
+	}
+
+	labelIDs, err := client.desiredLabelIDs(existing, model.DesiredIssue{}, nil)
+	if err != nil {
+		t.Fatalf("desiredLabelIDs() error = %v", err)
+	}
+	if !containsString(labelIDs, "label-sev-high") {
+		t.Fatalf("labelIDs = %#v, want first exclusive-group child kept", labelIDs)
+	}
+	if containsString(labelIDs, "label-sev-crit") {
+		t.Fatalf("labelIDs = %#v, want second exclusive-group child dropped", labelIDs)
+	}
+	if !containsString(labelIDs, "label-plain") {
+		t.Fatalf("labelIDs = %#v, want ungrouped label preserved", labelIDs)
+	}
+	if len(labelIDs) != 2 {
+		t.Fatalf("labelIDs len = %d, want 2", len(labelIDs))
+	}
+}
+
+// TestDesiredLabelIDsKeepsChildrenOfDistinctGroups is a regression guard: the
+// exclusive-group collapse must only fold labels that share a group. Children
+// of different groups, and ungrouped labels, are all preserved.
+func TestDesiredLabelIDsKeepsChildrenOfDistinctGroups(t *testing.T) {
+	client := &Client{}
+
+	existing := model.ExistingIssue{
+		Labels: []model.IssueLabel{
+			{ID: "label-tool", Name: "tool-a", GroupID: "group-tool"},
+			{ID: "label-origin", Name: "origin-b", GroupID: "group-origin"},
+			{ID: "label-plain", Name: "security"},
+		},
+	}
+
+	labelIDs, err := client.desiredLabelIDs(existing, model.DesiredIssue{}, nil)
+	if err != nil {
+		t.Fatalf("desiredLabelIDs() error = %v", err)
+	}
+	if len(labelIDs) != 3 {
+		t.Fatalf("labelIDs = %#v, want all three distinct-group/ungrouped labels kept", labelIDs)
 	}
 }

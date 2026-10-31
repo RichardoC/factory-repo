@@ -238,11 +238,14 @@ The synced title includes the most useful DAST context:
 When label management is enabled, the sync:
 
 - adds the configured label to newly created managed issues
-- preserves unrelated existing labels
+- preserves unrelated existing labels, reading each ticket's current labels live
+  immediately before an update so a label another actor added mid-run survives
 - removes the previously managed label if the configured label changes
 - removes the previously managed label if label management is turned off
 
 If the configured label does not exist in Linear, the run fails with a clear message telling the operator to create the label or disable label management.
+
+Linear label groups are mutually exclusive — an issue may carry at most one child of a group. If a ticket carries two children of the same group (for example, labels applied before the group was made exclusive), updates keep exactly one: the managed label when the sync asserts one for that group, otherwise the first existing one. Without this, Linear rejects every update for such a ticket ("labelIds not exclusive child labels") until the ticket is edited by hand.
 
 `LINEAR_CHECK_TYPE_LABELS` optionally maps Snyk DAST check types to additional managed Linear labels. Snyk DAST has two check types — **passive** (response analysis, e.g. missing security headers) and **active** (exploit payloads, e.g. SQL injection, XSS) — which is the DAST equivalent of Snyk's multi-product tool labels (`snyk-code`, `snyk-open-source`, etc.). Passive and active findings have different triage workflows, so labeling them separately helps route issues to the right team.
 
@@ -276,28 +279,33 @@ undoes that actor's decision.
 - default: empty (no labels protected)
 - set to `off` to disable protection entirely, overriding any value in an env file
 
-Protection is needed because Linear's `issueUpdate` replaces a ticket's whole
-label set rather than applying a delta: every update echoes back the label set
-this sync last saw, which deletes anything another actor added since the run's
-opening snapshot. So when any label is protected:
+Linear's `issueUpdate` replaces a ticket's whole label set rather than applying
+a delta, so every update restates the labels the ticket should end up with. This
+sync owns only its managed labels; every other label — protected, human-applied,
+or from a different automation — belongs to someone else and is carried forward
+untouched.
 
-- each update batch re-reads the current labels of the issues it is about to
-  write, and carries protected labels over from that live read rather than from
-  the snapshot. A protected label added since the snapshot is preserved; one
-  removed since the snapshot is not resurrected.
+To make that safe against edits made mid-run, each update batch re-reads the
+current labels of the issues it is about to write, immediately before the write.
+That live read — not the run's opening snapshot, which can be minutes old — is
+the authority for which labels the ticket carries:
+
+- a label another actor added since the snapshot is preserved; one removed since
+  the snapshot is not resurrected.
 - if that live read returns nothing for an issue, or returns a truncated page of
   its labels, the update is refused rather than proceeding — writing a label set
-  that might drop a protected label is worse than skipping one issue for one run.
-  The caller retries issues individually, so the rest of the batch still lands,
-  and the refusal is counted in `failed_ops`, which fails the run.
+  that might drop a label the sync does not own is worse than skipping one issue
+  for one run. The caller retries issues individually, so the rest of the batch
+  still lands, and the refusal is counted in `failed_ops`, which fails the run.
 - protected labels are never asserted from the managed set either, so a
   misconfiguration cannot stamp another actor's control label onto a ticket that
   does not carry one.
 - new issues need no special handling: a create has no pre-existing label set to
   replace.
 
-The live read costs one extra query per update batch, so it is skipped entirely
-when no labels are protected.
+The live read costs one extra query per update batch and always runs, whether or
+not any labels are protected: a human's or another automation's label needs it
+exactly as much as a protected control label does.
 
 `LINEAR_UNSUBSCRIBE_ACTOR` controls whether the Linear API actor should be kept off the subscriber list for managed issue creates and updates:
 
