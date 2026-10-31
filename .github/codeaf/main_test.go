@@ -253,8 +253,16 @@ func TestProxyEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(lines) != 2 || math.Abs(ledgerTotal(lines)-0.00203) > 1e-12 || !lines[1].Stream || !lines[1].UsageSeen {
+	// Three lines since issue #342: the two completed calls, then the
+	// cap refusal, which is recorded like an upstream refusal — kind
+	// "status", status 402, no usage and no cost, so the total is
+	// unchanged. This one never queued, so it carries no slot_wait_s;
+	// the queued refusal is TestCapRefusalAfterASlotWaitIsRecorded.
+	if len(lines) != 3 || math.Abs(ledgerTotal(lines)-0.00203) > 1e-12 || !lines[1].Stream || !lines[1].UsageSeen {
 		t.Fatalf("ledger = %+v", lines)
+	}
+	if lines[2].Kind != "status" || lines[2].Status != http.StatusPaymentRequired || lines[2].UsageSeen || lines[2].CostUSD != 0 || lines[2].SlotWaitS != 0 {
+		t.Fatalf("cap refusal = %+v, want a status line for the 402 with no usage, no cost and no wait", lines[2])
 	}
 	models, err := http.Get(server.URL + "/v1/models")
 	if err != nil {
@@ -4382,5 +4390,144 @@ func TestNextLink(t *testing.T) {
 		if got := nextLink(c.header); got != c.want {
 			t.Errorf("nextLink(%q) = %q, want %q", c.header, got, c.want)
 		}
+	}
+}
+
+// TestCapRefusalAfterASlotWaitIsRecorded: issue #342. The credit-cap check
+// runs after the call got its slot — other calls may have crossed the cap
+// while it queued — and the refusal used to leave no ledger line at all, so
+// a call that queued minutes for a slot and was then refused vanished from
+// every figure model-stats computes. The refusal is now recorded like an
+// upstream refusal: kind "status", no usage, no cost, and the wait it
+// queued through (slot_wait_s).
+func TestCapRefusalAfterASlotWaitIsRecorded(t *testing.T) {
+	hold := make(chan struct{})
+	var mu sync.Mutex
+	inFlight := map[string]int{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct{ Model string }
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		inFlight[body.Model]++
+		held := inFlight[body.Model] == 1
+		mu.Unlock()
+		if body.Model == "hf:zai-org/GLM-5.3" && held {
+			<-hold
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"hi"}}],"model":"x","usage":{"prompt_tokens":1000,"completion_tokens":200}}`)
+	}))
+	defer upstream.Close()
+	models := testModels(t)
+	for i := range models {
+		models[i].MaxConcurrent = 1
+	}
+	// One slot per model and a $0.0005 per-run cap: the call that holds the
+	// glm-5.3 slot spends past the cap on its own, so a call queued behind it
+	// is refused by the cap the moment its wait ends.
+	p := &proxy{upstream: upstream.URL, apiKey: "k", ledger: filepath.Join(t.TempDir(), "l.jsonl"),
+		runCap: 0.0005, weekCap: 20, models: models, client: upstream.Client(), slots: newSlots(models, 1)}
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	// The first call holds the only glm-5.3 slot upstream.
+	done := make(chan int, 1)
+	go func() {
+		response, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
+			strings.NewReader(`{"model":"zai-org/glm-5.3","messages":[]}`))
+		if err != nil {
+			done <- 0
+			return
+		}
+		defer response.Body.Close()
+		_, _ = io.Copy(io.Discard, response.Body)
+		done <- response.StatusCode
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		mu.Lock()
+		n := inFlight["hf:zai-org/GLM-5.3"]
+		mu.Unlock()
+		if n == 1 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	mu.Lock()
+	held := inFlight["hf:zai-org/GLM-5.3"] >= 1
+	mu.Unlock()
+	if !held {
+		t.Fatal("the holding call never reached upstream")
+	}
+
+	// A streaming call queues behind the holder; the comment it gets the
+	// moment it queues (issue #90) is the signal its wait has started.
+	type result struct {
+		status int
+		body   string
+	}
+	queued := make(chan struct{})
+	refused := make(chan result, 1)
+	go func() {
+		response, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
+			strings.NewReader(`{"model":"zai-org/glm-5.3","stream":true,"messages":[]}`))
+		if err != nil {
+			refused <- result{}
+			return
+		}
+		defer response.Body.Close()
+		reader := bufio.NewReader(response.Body)
+		var body strings.Builder
+		waiting := false
+		for {
+			line, err := reader.ReadString('\n')
+			body.WriteString(line)
+			if !waiting && strings.Contains(line, slotWaitComment) {
+				waiting = true
+				close(queued)
+			}
+			if err != nil {
+				break
+			}
+		}
+		refused <- result{status: response.StatusCode, body: body.String()}
+	}()
+	select {
+	case <-queued:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the second call never queued for a slot")
+	}
+	// Release the holder: it completes and records spend past the cap, then
+	// frees the slot — the queued call gets a slot after a real wait and is
+	// then refused by the cap.
+	close(hold)
+	if status := <-done; status != 200 {
+		t.Fatalf("the holding call: %d, want 200", status)
+	}
+	var got result
+	select {
+	case got = <-refused:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the queued call never finished")
+	}
+	// The wait committed the response as a stream, so the refusal arrives as
+	// an SSE error event carrying the 402 (issue #90), not a bare status.
+	if !strings.Contains(got.body, `"code":402`) || !strings.Contains(got.body, "credit cap") {
+		t.Fatalf("refused call: %d %s, want a 402 credit-cap error event", got.status, got.body)
+	}
+	lines, err := readLedger(p.ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var refusal *LedgerLine
+	for i := range lines {
+		if lines[i].Kind == "status" && lines[i].Status == http.StatusPaymentRequired {
+			refusal = &lines[i]
+		}
+	}
+	if refusal == nil {
+		t.Fatalf("no 402 status line in the ledger, want the refused call recorded: %+v", lines)
+	}
+	if refusal.Model != "zai-org/glm-5.3" || refusal.SlotWaitS <= 0 || refusal.UsageSeen || refusal.CostUSD != 0 {
+		t.Fatalf("refusal = %+v, want the queued model, a positive slot_wait_s, no usage and no cost", *refusal)
 	}
 }
