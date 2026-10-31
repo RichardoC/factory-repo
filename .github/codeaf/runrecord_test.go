@@ -348,6 +348,22 @@ func TestStateMergeIsIdempotentPastTheCap(t *testing.T) {
 	if !found {
 		t.Errorf("run 1-1 is not in %s; the dedup set forgot it again", mergedFile)
 	}
+
+	// The repeat alone, one last time: a re-presented run changes nothing
+	// at all — neither the day's spend nor the generation (issue #312 Done
+	// when: "m.Spend for that day is unchanged and m.Generation did not
+	// advance for the repeat").
+	out3 := filepath.Join(t.TempDir(), "out3")
+	if err := stateMerge(out2, out3, []string{first}, cfg, now); err != nil {
+		t.Fatal(err)
+	}
+	lone := readManifestT(t, out3)
+	if got, want := lone.Spend["2026-10-16"], again.Spend["2026-10-16"]; got != want {
+		t.Errorf("spend after a lone re-merge of run 1-1 = %v, want %v unchanged", got, want)
+	}
+	if got, want := lone.Generation, again.Generation; got != want {
+		t.Errorf("generation after a lone re-merge of run 1-1 = %d, want %d unchanged", got, want)
+	}
 }
 
 func TestReadMergedKeysRefusesBsdKeys(t *testing.T) {
@@ -360,14 +376,16 @@ func TestReadMergedKeysRefusesBsdKeys(t *testing.T) {
 	if keys, err := readMergedKeys(t.TempDir()); err != nil || len(keys) != 0 {
 		t.Errorf("missing %s: (%v, %v)", mergedFile, keys, err)
 	}
-	// The set is trimmed by length, oldest first.
+	// A set well under the byte bound is kept whole. A set over it is
+	// TestTrimMergedKeysBoundsTheSet, which actually crosses
+	// maxMergedKeyBytes; a 1000-key set is only a few kilobytes and would
+	// leave that loop unexecuted (issue #312 review).
 	many := make([]string, 0, 1000)
 	for i := 0; i < 1000; i++ {
 		many = append(many, strconv.Itoa(i)+"-1")
 	}
-	trimmed := trimMergedKeys(many)
-	if len(trimmed) == 0 || trimmed[len(trimmed)-1] != "999-1" {
-		t.Errorf("trimMergedKeys kept %d keys, newest last = %q", len(trimmed), trimmed[len(trimmed)-1])
+	if trimmed := trimMergedKeys(many); len(trimmed) != len(many) {
+		t.Errorf("a %d-key set was trimmed to %d keys; only sets past the %d-byte bound are", len(many), len(trimmed), maxMergedKeyBytes)
 	}
 }
 
@@ -550,4 +568,179 @@ func TestStateMergeTakesOnlyTheRunsOwnRecord(t *testing.T) {
 	if len(records) != 1 || records[0].RunID != "1" {
 		t.Errorf("records = %+v, want only run 1's own", records)
 	}
+}
+
+// TestTrimMergedKeysBoundsTheSet drives the trim loop with a set that really
+// crosses maxMergedKeyBytes — the handful-of-kilobytes sets every other test
+// builds never execute it — and checks it drops the oldest keys and keeps the
+// newest: the direction the bundle handed on depends on (issue #312 review).
+func TestTrimMergedKeysBoundsTheSet(t *testing.T) {
+	keys := []string{}
+	total := 0
+	for i := 1; total <= maxMergedKeyBytes; i++ {
+		if i > 1_000_000 {
+			t.Fatalf("the key set never reached the %d-byte bound", maxMergedKeyBytes)
+		}
+		key := strconv.Itoa(i) + "-1"
+		keys = append(keys, key)
+		total += len(key) + 1
+	}
+
+	trimmed := trimMergedKeys(keys)
+	if len(trimmed) == len(keys) {
+		t.Fatalf("a %d-byte set stayed %d keys; a set past the %d-byte bound must shrink", total, len(keys), maxMergedKeyBytes)
+	}
+	kept := 0
+	for _, key := range trimmed {
+		kept += len(key) + 1
+	}
+	if kept > maxMergedKeyBytes {
+		t.Errorf("trimmed set is %d bytes, still over the %d bound", kept, maxMergedKeyBytes)
+	}
+	// Newest last, and the survivors are the input's tail unchanged — a
+	// trim that kept the oldest head instead would fail both.
+	if trimmed[len(trimmed)-1] != keys[len(keys)-1] || trimmed[0] != keys[len(keys)-len(trimmed)] {
+		t.Errorf("trim kept %q..%q, want the input tail %q..%q", trimmed[0], trimmed[len(trimmed)-1],
+			keys[len(keys)-len(trimmed)], keys[len(keys)-1])
+	}
+
+	// The bound holds at the write seam: whatever path writes a bundle, the
+	// file it hands on must read back on the next pass.
+	dir := t.TempDir()
+	if err := writeMergedKeys(dir, keys); err != nil {
+		t.Fatalf("writeMergedKeys: %v", err)
+	}
+	round, err := readMergedKeys(dir)
+	if err != nil {
+		t.Fatalf("%v: an over-bound set was written unreadable (the write seam must trim)", err)
+	}
+	if len(round) != len(trimmed) || round[len(round)-1] != keys[len(keys)-1] {
+		t.Errorf("round trip kept %d keys, newest %q; want %d keys, newest %q",
+			len(round), round[len(round)-1], len(trimmed), keys[len(keys)-1])
+	}
+}
+
+// TestStateMergeHandsBackABoundedKeyFile covers the nothing-to-merge path with
+// a bundle whose dedup set already fills the byte bound: seeding its legacy
+// manifest window pushes the set past the bound, and what the merge hands
+// back must still be readable on the next pass (issue #312 review; this was
+// written untrimmed, a file readMergedKeys then refused).
+func TestStateMergeHandsBackABoundedKeyFile(t *testing.T) {
+	cfg, err := loadConfig("models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	legacy := t.TempDir()
+	// A legacy bundle whose key file still fits (readMergedKeys refuses
+	// anything bigger), filled right up to the bound. Run ids climb, so
+	// the newest key is last.
+	var b strings.Builder
+	total, lastKey := 0, ""
+	for i := 1; ; i++ {
+		key := strconv.Itoa(i) + "-1"
+		if total+len(key)+1 > maxMergedKeyBytes {
+			break
+		}
+		b.WriteString(key)
+		b.WriteByte('\n')
+		total += len(key) + 1
+		lastKey = key
+	}
+	writeTestFile(t, filepath.Join(legacy, mergedFile), []byte(b.String()))
+	// The window knows two runs the file has not recorded; one is
+	// re-presented, so nothing merges and the bundle is handed back.
+	writeTestFile(t, filepath.Join(legacy, manifestFile),
+		[]byte(`{"version":1,"generation":3,"merged":["9000001-1","9000002-1"],"spend":{"2026-10-16":1.25}}`))
+	run := t.TempDir()
+	writeRecordRun(t, run, "9000001", RunRecord{RunID: "9000001", Attempt: "1", Mode: "issue", Stop: stopDone, Date: "2026-10-16"}, true)
+	t.Setenv("GITHUB_OUTPUT", filepath.Join(t.TempDir(), "output"))
+
+	out := filepath.Join(t.TempDir(), "out")
+	if err := stateMerge(legacy, out, []string{run}, cfg, now); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := readMergedKeys(out)
+	if err != nil {
+		t.Fatalf("the handed-back bundle was refused by its own %s: %v", mergedFile, err)
+	}
+	if got, bound := keysBytes(keys), maxMergedKeyBytes; got > bound {
+		t.Errorf("handed-back key set is %d bytes, over the %d bound", got, bound)
+	}
+	// The seeded window keys sit at the front of the set, so under the
+	// bound they are the first the trim drops; they stay in m.Merged, which
+	// reseeds them on the next merge. What must never be dropped is the
+	// newest: the last file key.
+	if len(keys) == 0 || keys[len(keys)-1] != lastKey {
+		t.Errorf("last key = %q, want the newest file key %q", lastOf(keys), lastKey)
+	}
+	windowed := false
+	for _, key := range readManifestT(t, out).Merged {
+		if key == "9000001-1" {
+			windowed = true
+		}
+	}
+	if !windowed {
+		t.Error("the window key that was trimmed out of the key file is gone from m.Merged too")
+	}
+	m := readManifestT(t, out)
+	if m.Generation != 3 || m.Spend["2026-10-16"] != 1.25 {
+		t.Errorf("no-op merge changed the bundle: %+v", m)
+	}
+}
+
+// keysBytes totals a key set the way trimMergedKeys measures it: one key,
+// one newline.
+func keysBytes(keys []string) (total int) {
+	for _, key := range keys {
+		total += len(key) + 1
+	}
+	return total
+}
+
+func lastOf(keys []string) string {
+	if len(keys) == 0 {
+		return ""
+	}
+	return keys[len(keys)-1]
+}
+
+// TestMergeRecordsCap covers the cap on the bundle's run-record history
+// (maxRecordLines, issue #140) at its seam: re-merging a bundle with records it
+// already has adds none of them twice — the dedup-by-key the double-spend fix
+// of issue #312 rests on — and the newest maxRecordLines are what stay.
+// The name matches the issue #312 end-to-end check, which runs
+// `go test -run "TestStateMerge|TestMergeRecordsCap"`.
+func TestMergeRecordsCap(t *testing.T) {
+	rec := func(id string) RunRecord {
+		return RunRecord{RunID: id, Attempt: "1", Mode: "issue", Stop: stopDone, Date: "2026-10-16"}
+	}
+	base := make([]RunRecord, 0, maxRecordLines)
+	for i := 1; i <= maxRecordLines; i++ {
+		base = append(base, rec(strconv.Itoa(i)))
+	}
+	// Run 1 again plus two new runs: appended once, then capped at the
+	// newest maxRecordLines.
+	out := MergeRecords(base, []RunRecord{rec("1"), rec("2001"), rec("2002")})
+	if len(out) != maxRecordLines {
+		t.Fatalf("%d records, want the %d cap (2002 kept + capped, not 2003)", len(out), maxRecordLines)
+	}
+	if out[len(out)-1].RunID != "2002" || out[len(out)-2].RunID != "2001" {
+		t.Errorf("newest records = ...%s, %s; want the new runs last", out[len(out)-2].RunID, out[len(out)-1].RunID)
+	}
+	if out[0].RunID != "3" {
+		t.Errorf("oldest kept = %s, want 3 (run 1 deduped, 2 dropped by the cap)", out[0].RunID)
+	}
+	// Re-merging a bundle with itself must change nothing.
+	same := MergeRecords(base, base)
+	if len(same) != maxRecordLines || same[len(same)-1].RunID != "2000" {
+		t.Errorf("re-merge: %d records, newest %s; want %d, 2000", len(same), lastOfRunRecords(same), maxRecordLines)
+	}
+}
+
+func lastOfRunRecords(rs []RunRecord) string {
+	if len(rs) == 0 {
+		return ""
+	}
+	return rs[len(rs)-1].RunID
 }

@@ -369,6 +369,38 @@ func readMergedKeys(dir string) ([]string, error) {
 	return keys, nil
 }
 
+// mergedUnion is the full dedup set a bundle's merge decides on: the keys
+// in merged-keys.jsonl, plus any key its manifest window still knows that the
+// file has not recorded (a bundle written before issue #312 carries only the
+// window). The state workflow filters its artifact downloads by these keys,
+// so a key in the union means the run is already merged and its artifact
+// need not be fetched again.
+func mergedUnion(bundle string) ([]string, error) {
+	m, _, err := readManifest(bundle)
+	if err != nil {
+		return nil, err
+	}
+	fileKeys, err := readMergedKeys(bundle)
+	if err != nil {
+		return nil, err
+	}
+	union := []string{}
+	seen := map[string]bool{}
+	for _, key := range m.Merged {
+		if !seen[key] {
+			seen[key] = true
+			union = append(union, key)
+		}
+	}
+	for _, key := range fileKeys {
+		if !seen[key] {
+			seen[key] = true
+			union = append(union, key)
+		}
+	}
+	return union, nil
+}
+
 // trimMergedKeys drops keys from the front of the longest-lived dedup set
 // until it fits in maxMergedKeyBytes. Keys are newest last, so the ones dropped
 // are the oldest.
@@ -385,6 +417,11 @@ func trimMergedKeys(keys []string) []string {
 }
 
 func writeMergedKeys(dir string, keys []string) error {
+	// Trim at this one write seam: every path that hands a bundle on (the
+	// merge path and the nothing-to-merge path alike) then writes a
+	// byte-bounded key file by construction, and readMergedKeys never has
+	// to refuse the bundle it just read from (issue #312 review).
+	keys = trimMergedKeys(keys)
 	var b strings.Builder
 	for _, key := range keys {
 		b.WriteString(key)
@@ -584,27 +621,13 @@ func runState() error {
 		if len(args) != 1 {
 			return errors.New("usage: harness state merged BUNDLE")
 		}
-		m, _, err := readManifest(args[0])
-		if err != nil {
-			return err
-		}
 		// Print the dedup set the merge decides on, not just the manifest's
 		// newest window: the state workflow filters its downloads by these
 		// keys, so a short list means re-downloading artifacts that will be
 		// skipped (issue #312).
-		keys, err := readMergedKeys(args[0])
+		keys, err := mergedUnion(args[0])
 		if err != nil {
 			return err
-		}
-		seen := map[string]bool{}
-		for _, key := range keys {
-			seen[key] = true
-		}
-		for _, key := range m.Merged {
-			if !seen[key] {
-				fmt.Println(key)
-				seen[key] = true
-			}
 		}
 		for _, key := range keys {
 			fmt.Println(key)
@@ -626,6 +649,16 @@ func stateLoad(bundle, home string, cfg Config, now time.Time) error {
 	if err != nil {
 		return err
 	}
+	// The load is the run's gate: it must refuse a bundle the merge
+	// would refuse too, before anything is installed. merged-keys.jsonl is
+	// otherwise never looked at until stateMerge reads it, and a bad one
+	// would fail every run from then on with nothing to reload. AGENTS.md
+	// 103 asks for exactly this: what is carried is validated on every
+	// load.
+	keys, err := readMergedKeys(bundle)
+	if err != nil {
+		return err
+	}
 	files := Files{Ledger: RouterLedger{Entries: []RouterEntry{}}}
 	if found {
 		if files, err = readFiles(bundle, cfg.Models, true); err != nil {
@@ -637,8 +670,8 @@ func stateLoad(bundle, home string, cfg Config, now time.Time) error {
 	}
 	today := m.Spend[now.UTC().Format(time.DateOnly)]
 	week := weekSpend(m, now)
-	log.Printf("loaded shared state generation %d (%d ratings, %d events, memory db %d bytes); spent today $%.4f, this week $%.4f",
-		m.Generation, len(files.Ledger.Entries), len(files.Events), len(files.DB), today, week)
+	log.Printf("loaded shared state generation %d (%d ratings, %d events, memory db %d bytes, %d run keys); spent today $%.4f, this week $%.4f",
+		m.Generation, len(files.Ledger.Entries), len(files.Events), len(files.DB), len(keys), today, week)
 	log.Printf("records: %d (last 7 days: %s)", len(files.Records), recordShape(files.Records, now))
 	return setOutput("generation", strconv.Itoa(m.Generation),
 		"day_usd", strconv.FormatFloat(today, 'f', -1, 64),

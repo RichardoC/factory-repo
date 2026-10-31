@@ -411,3 +411,84 @@ func TestStateMergeSeedsMergedKeysFromALegacyBundle(t *testing.T) {
 		t.Errorf("output = %q, want changed=false", output)
 	}
 }
+
+// TestStateLoadRefusesBadMergedKeys pins where a bad merged-keys.jsonl fails:
+// at the load, before anything is installed — not for the first time at the
+// merge, where it would fail every later run with nothing to reload
+// (issue #312 review, AGENTS.md: carried data is validated on every load).
+func TestStateLoadRefusesBadMergedKeys(t *testing.T) {
+	cfg, err := loadConfig("models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	bundle := t.TempDir()
+	writeTestFile(t, filepath.Join(bundle, manifestFile),
+		[]byte(`{"version":1,"generation":3,"merged":[],"spend":{}}`))
+	writeTestFile(t, filepath.Join(bundle, mergedFile), []byte("1-1\nnot-a-key\n"))
+	home := t.TempDir()
+	t.Setenv("GITHUB_OUTPUT", filepath.Join(t.TempDir(), "output"))
+	if err := stateLoad(bundle, home, cfg, now); err == nil {
+		t.Fatalf("stateLoad accepted a bundle whose %s is malformed; the load must refuse it first", mergedFile)
+	}
+	if _, err := os.Stat(filepath.Join(home, recordsFile)); !os.IsNotExist(err) {
+		t.Error("stateLoad installed files from a bundle it refused")
+	}
+
+	// The same bundle with a well-formed key set loads.
+	writeTestFile(t, filepath.Join(bundle, mergedFile), []byte("1-1\n2-2\n"))
+	if err := stateLoad(bundle, home, cfg, now); err != nil {
+		t.Errorf("stateLoad refused a valid %s: %v", mergedFile, err)
+	}
+}
+
+// TestMergedUnion covers the `state merged` download filter: the set the
+// merge decides on is the union of merged-keys.jsonl and the manifest window,
+// so a legacy bundle still lists its window and no key is printed twice
+// (issue #312 review; reverting this to the manifest window alone means the
+// state workflow re-downloads already-merged artifacts).
+func TestMergedUnion(t *testing.T) {
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, manifestFile),
+		[]byte(`{"version":1,"generation":3,"merged":["1-1","2-1"],"spend":{}}`))
+	// A legacy bundle (no key file): the window is the whole set.
+	union, err := mergedUnion(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(union, ",") != "1-1,2-1" {
+		t.Errorf("legacy union = %v, want the window 1-1,2-1", union)
+	}
+	// The key file is the dedup set; window keys it has not recorded join
+	// it, and nothing is listed twice.
+	writeTestFile(t, filepath.Join(dir, mergedFile), []byte("2-1\n5-1\n"))
+	union, err = mergedUnion(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(union, ",") != "1-1,2-1,5-1" {
+		t.Errorf("union = %v, want 1-1,2-1,5-1 (window plus file, each key once)", union)
+	}
+	// A window that has forgotten old runs must not shrink the set: the
+	// file still holds their keys.
+	writeTestFile(t, filepath.Join(dir, manifestFile),
+		[]byte(`{"version":1,"generation":3,"merged":["9-1"],"spend":{}}`))
+	union, err = mergedUnion(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(union, ",") != "9-1,2-1,5-1" {
+		t.Errorf("union = %v, want 9-1,2-1,5-1 (no re-download of 2-1 because the window forgot it)", union)
+	}
+	// A key file with a bad line is refused here too, not at the merge.
+	writeTestFile(t, filepath.Join(dir, mergedFile), []byte("2-1\nbad key\n"))
+	if _, err := mergedUnion(dir); err == nil {
+		t.Error("mergedUnion accepted a malformed key file")
+	}
+	// A manifest that fails validation fails here too.
+	writeTestFile(t, filepath.Join(dir, manifestFile),
+		[]byte(`{"version":1,"generation":3,"merged":["9-1"],"spend":{"2026-10-16":-5}}`))
+	if _, err := mergedUnion(dir); err == nil {
+		t.Error("mergedUnion accepted an unvalidated manifest")
+	}
+}
