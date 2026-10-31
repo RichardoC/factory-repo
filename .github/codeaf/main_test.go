@@ -1959,9 +1959,22 @@ func TestDepsFromBodyStopsAtTheListEnd(t *testing.T) {
 		// A version's periods are not the end of the list.
 		{"Depends on v1.2 #12, #13\n", []int{12, 13}},
 		{"Depends on #12 and 1.2.3 #13\n", []int{12, 13}},
+		// But a sentence period is: "1." ends the sentence, so a bare or
+		// trailing period is never read as a version.
+		{"Depends on #12. #99\n", []int{12}},
+		{"Depends on 1. #12\n", []int(nil)},
+		{"Depends on #12 v1. #13\n", []int{12}},
+		// A semicolon ends the list like any sentence terminator.
+		{"Depends on #12; #99 and #42\n", []int{12}},
 		// A word that is not a list joiner ends the list.
 		{"Depends on #12, see #99\n", []int{12}},
 		{"Depends on #12. Then #99\n", []int{12}},
+		// Before the list's first item ordinary words are skipped, so a
+		// noun between the phrase and the reference keeps it.
+		{"Depends on PR #12\n", []int{12}},
+		{"Depends on the issues #12 and #13\n", []int{12, 13}},
+		// A "#" glued to a word is part of the word, not a reference.
+		{"Depends on see#12\n", []int(nil)},
 	}
 	for _, c := range cases {
 		if got := depsFromBody(c.body); !reflect.DeepEqual(got, c.want) {

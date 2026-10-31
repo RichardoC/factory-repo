@@ -3384,33 +3384,14 @@ func isRefByte(c byte) bool {
 	return c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_'
 }
 
-// hashRefs returns every #N reference in s: a '#' outside a word, digits,
-// and a word boundary after.
-func hashRefs(s string) []int {
-	var out []int
-	for i := 0; i < len(s); i++ {
-		if s[i] != '#' || (i > 0 && isRefByte(s[i-1])) {
-			continue
-		}
-		j := i + 1
-		for j < len(s) && s[j] >= '0' && s[j] <= '9' {
-			j++
-		}
-		if j == i+1 || (j < len(s) && isRefByte(s[j])) {
-			continue
-		}
-		if n, err := strconv.Atoi(s[i+1 : j]); err == nil && n > 0 {
-			out = append(out, n)
-		}
-		i = j - 1
-	}
-	return out
-}
-
-// isVersion reports whether w is a version or dotted number ("v1.2", "1.2.3"):
-// the periods in one are not the end of a sentence.
+// isVersion reports whether w is a dotted version number ("v1.2", "1.2.3"):
+// its periods are not the end of a sentence. The last byte must be a digit,
+// so a sentence period is never read as one ("1." ends the sentence).
 func isVersion(w string) bool {
 	w = strings.TrimPrefix(w, "v")
+	if w == "" || w[len(w)-1] < '0' || w[len(w)-1] > '9' {
+		return false
+	}
 	dot := false
 	for i := 0; i < len(w); i++ {
 		switch c := w[i]; {
@@ -3425,21 +3406,29 @@ func isVersion(w string) bool {
 }
 
 // depRef returns the first #N reference in s when it is the next item of a
-// dependency list, and how many bytes of s that item occupies. Only list
-// punctuation (whitespace, ',', '&', '+', ':', '-'), the word "and", an
-// abbreviation ("i.e.", "e.g.") or a version ("v1.2") may come first: any
-// other word, and any sentence terminator ('.', ';', '!', '?'), ends the list.
-// So "Depends on #12. Related: #99" keeps 12, while "Depends on #12, i.e. #13"
-// keeps both, without having to guess which period ends a sentence.
-func depRef(s string) (n, size int, ok bool) {
+// dependency list, and how many bytes of s that item occupies. Between items
+// only list punctuation (whitespace, ',', '&', '+', ':', '-'), the word
+// "and", an abbreviation ("i.e.", "e.g.") or a dotted version ("v1.2") may
+// come, and any sentence terminator ('.', ';', '!', '?') ends the list: so
+// "Depends on #12. Related: #99" keeps 12, while "Depends on #12, i.e. #13"
+// keeps both, and "Depends on #12; #99" keeps 12. Before the first item
+// ordinary words are skipped, so "Depends on PR #12" still finds 12; a
+// terminator inside such a word still ends the scan ("Depends on. #12" finds
+// nothing), and a '#' glued to a word ("see#12") is not a reference. The
+// returned size covers only what was consumed, so depsFromBody can resume
+// after the item.
+func depRef(s string, first bool) (n, size int, ok bool) {
 	for i := 0; ; {
 		if i >= len(s) {
 			return 0, 0, false
 		}
 		switch c := s[i]; {
-		case strings.IndexByte(" \t,;&+-:", c) >= 0:
+		case strings.IndexByte(" \t,&+-:", c) >= 0:
 			i++
 		case c == '#':
+			if i > 0 && isRefByte(s[i-1]) {
+				return 0, 0, false // "see#12" is one word, not a reference
+			}
 			j := i + 1
 			for j < len(s) && s[j] >= '0' && s[j] <= '9' {
 				j++
@@ -3454,14 +3443,18 @@ func depRef(s string) (n, size int, ok bool) {
 			return n, j, true
 		default:
 			j := i
-			for j < len(s) && strings.IndexByte(" \t,;&+-:#", s[j]) < 0 {
+			for j < len(s) && strings.IndexByte(" \t,&+-:#", s[j]) < 0 {
 				j++
 			}
 			switch w := asciiLower(s[i:j]); {
 			case w == "and", w == "i.e.", w == "e.g.", w == "vs.", w == "cf.", w == "etc.", isVersion(w):
 				i = j
+			case strings.ContainsAny(w, ";.!?"):
+				return 0, 0, false // a terminator in a word ends the list
+			case first:
+				i = j // prose before the first item: skip it
 			default:
-				return 0, 0, false
+				return 0, 0, false // after it, only the words above may join items
 			}
 		}
 	}
@@ -3471,7 +3464,8 @@ func depRef(s string) (n, size int, ok bool) {
 // phrase on the same line ("Depends on #12, #13"), deduplicated and sorted,
 // at most maxDeps of them. The scan takes the list that follows the phrase and
 // stops at its end, so prose after it ("Depends on #12. Related: #99") is not
-// read as part of the list.
+// read as part of the list; words before the list's first item are skipped, so
+// "Depends on PR #12" is still read.
 func depsFromBody(body string) []int {
 	seen := map[int]bool{}
 	var out []int
@@ -3483,11 +3477,13 @@ func depsFromBody(body string) []int {
 				break
 			}
 			i += j + len("depends on")
+			first := true
 			for {
-				n, size, ok := depRef(line[i:])
+				n, size, ok := depRef(line[i:], first)
 				if !ok {
 					break
 				}
+				first = false
 				i += size
 				if !seen[n] {
 					seen[n] = true
