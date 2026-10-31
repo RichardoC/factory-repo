@@ -1688,12 +1688,18 @@ func createMaintainerLabel(g github) error {
 func ensureMaintainerComment(g github, n int) error {
 	var comments []struct {
 		Body string `json:"body"`
+		User struct {
+			Type string `json:"type"`
+		} `json:"user"`
 	}
 	if err := g.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", n), &comments); err != nil {
 		return err
 	}
 	for _, c := range comments {
-		if strings.Contains(c.Body, queueIssueMaintainerMarker) {
+		// Only a bot's marker counts, as in ensureIssueRetryMarker: a
+		// copy of the hand-off comment or marker anyone can paste on a
+		// public issue must not stop the real one being posted.
+		if c.User.Type == "Bot" && strings.Contains(c.Body, queueIssueMaintainerMarker) {
 			return nil
 		}
 	}
