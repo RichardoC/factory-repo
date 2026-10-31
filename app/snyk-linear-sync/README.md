@@ -222,6 +222,12 @@ The subject portion then uses this preference:
 - set to another label name to use that label instead
 - set to `off` to disable label management
 
+`off` turns off the whole managed label set, not just the global label: the
+derived awaiting-fix, tool and origin labels are not applied either (their
+defaults and any explicit mapping are ignored), no label is recorded in the
+metadata block, and no label is looked up in Linear — so a workspace without
+`snyk-automation` or `triage-dependency` does not fail the run.
+
 When label management is enabled, the sync:
 
 - adds the configured label to newly created managed issues
@@ -269,7 +275,7 @@ When an issue is in the awaiting-fix state, the sync:
 
 The `awaiting_fix` marker is written regardless of the label configuration, so even with `LINEAR_AWAITING_FIX_LABEL=off` a later run can tell a `Backlog` placement the sync made itself from one a person made by hand: when the fix arrives, the ticket still moves back to `Todo` with a recalculated due date. Tickets written before the marker existed carry no `awaiting_fix` line; they keep the old behavior (they stay in `Backlog` once the fix arrives) until the sync rewrites their description in a later awaiting-fix run — no one-time mass update happens on upgrade. Keep the label enabled (the default) to make these tickets filterable.
 
-When tool, origin, or awaiting-fix label mapping is enabled, the sync manages the global automation label plus the derived label set recorded in the metadata block.
+When label management is enabled and tool, origin, or awaiting-fix label mapping is configured, the sync manages the global automation label plus the derived label set recorded in the metadata block.
 
 ### Label ownership
 

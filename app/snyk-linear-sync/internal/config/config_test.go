@@ -433,3 +433,56 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv("LINEAR_API_KEY", "linear-key")
 	t.Setenv("LINEAR_TEAM_ID", "team-id")
 }
+
+// TestLoadManagedLabelOffLeavesDerivedFallbacksNonEmpty pins the reason the
+// managed set needs its own off switch: LINEAR_MANAGED_LABEL=off empties only
+// Managed, while the derived awaiting-fix and tool defaults stay populated. If
+// those defaults were passed through to the sync, label management would look
+// enabled to every derived label even though the operator turned it off.
+func TestLoadManagedLabelOffLeavesDerivedFallbacksNonEmpty(t *testing.T) {
+	t.Setenv("SNYK_CLIENT_ID", "client-id")
+	t.Setenv("SNYK_CLIENT_SECRET", "client-secret")
+	t.Setenv("SNYK_ORG_ID", "org-id")
+	t.Setenv("LINEAR_API_KEY", "linear-key")
+	t.Setenv("LINEAR_TEAM_ID", "team-id")
+	t.Setenv("LINEAR_MANAGED_LABEL", "off")
+	// No other label configuration: the fallbacks keep their defaults.
+	t.Setenv("LINEAR_TOOL_LABELS", "")
+	t.Setenv("LINEAR_TOOL_LABEL_DEFAULT", "")
+	t.Setenv("LINEAR_ORIGIN_LABELS", "")
+	t.Setenv("LINEAR_ORIGIN_LABEL_DEFAULT", "")
+	t.Setenv("LINEAR_AWAITING_FIX_LABEL", "")
+
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.Linear.Labels.Managed != "" {
+		t.Fatalf("Managed label = %q, want empty for off", cfg.Linear.Labels.Managed)
+	}
+	if cfg.Linear.Labels.ToolDefault != defaultManagedLabel {
+		t.Fatalf("Tool default label = %q, want the default %q", cfg.Linear.Labels.ToolDefault, defaultManagedLabel)
+	}
+	if cfg.Linear.Labels.AwaitingFix != defaultAwaitingFixLabel {
+		t.Fatalf("AwaitingFix label = %q, want the default %q", cfg.Linear.Labels.AwaitingFix, defaultAwaitingFixLabel)
+	}
+	if cfg.Linear.Labels.Enabled() {
+		t.Fatal("Labels.Enabled() = true with LINEAR_MANAGED_LABEL=off, want false")
+	}
+}
+
+// TestLabelConfigEnabled covers the off spellings the loader normalizes to an
+// empty Managed label, and the on cases around them.
+func TestLabelConfigEnabled(t *testing.T) {
+	for _, raw := range []string{"", "off", "false", "disabled", "none", " OFF "} {
+		if enabled := (LabelConfig{Managed: normalizeManagedLabel(raw)}).Enabled(); enabled {
+			t.Fatalf("LabelConfig{Managed: %q}.Enabled() = true, want false", raw)
+		}
+	}
+	for _, managed := range []string{"snyk-automation", "security"} {
+		if enabled := (LabelConfig{Managed: managed}).Enabled(); !enabled {
+			t.Fatalf("LabelConfig{Managed: %q}.Enabled() = false, want true", managed)
+		}
+	}
+}
