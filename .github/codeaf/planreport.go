@@ -197,11 +197,21 @@ func ParseProposals(answer string, max int) []Proposal {
 			cur.Deps = appendPlanDeps(cur.Deps, line)
 		}
 	}
-	for _, raw := range strings.Split(answer, "\n") {
+	lines := strings.Split(answer, "\n")
+	// Issue #339: the fences are computed once over the whole answer, before
+	// any line is parsed, with the same span rule the review pass uses
+	// (issue #224). A fenced block — the brief's own output contract echoed
+	// back, a quoted sample, a patch — is quoted text, not answer prose, so
+	// nothing inside one may open a proposal or a field.
+	spans := parseFences(lines)
+	for i, raw := range lines {
 		if len(out) >= max {
 			break // cap reached: the rest of the answer is ignored
 		}
 		line := strings.TrimSuffix(raw, "\r")
+		if inFence, _ := fenceStateAt(spans, i); inFence {
+			continue // a fenced line is a quote: it parses as nothing
+		}
 		if m := planProposalHeader.FindStringSubmatch(line); m != nil {
 			closeCur()
 			if len(out) >= max {
