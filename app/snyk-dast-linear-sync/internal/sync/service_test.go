@@ -1083,6 +1083,55 @@ func TestManagedLabelsOmitsTargetTypeLabelWhenNoMapping(t *testing.T) {
 	}
 }
 
+// TestManagedLabelsWithMappingsEmptyWhenLabelManagementOff guards the case
+// where LINEAR_MANAGED_LABEL=off is set but the check-type and target-type
+// label mappings, or their defaults, stay configured: a naive managed set
+// would still assert the derived labels, fail the run resolving them, and
+// never remove them from tickets. Turning management off must turn off the
+// whole set — labels and the "why" reasons alike.
+func TestManagedLabelsWithMappingsEmptyWhenLabelManagementOff(t *testing.T) {
+	tests := []struct {
+		name     string
+		labelCfg config.LabelConfig
+	}{
+		{
+			name: "mappings set",
+			labelCfg: config.LabelConfig{
+				CheckType:  map[string]string{"passive": "snyk-dast-passive"},
+				TargetType: map[string]string{"api": "snyk-dast-api"},
+			},
+		},
+		{
+			name: "defaults set",
+			labelCfg: config.LabelConfig{
+				CheckTypeDefault:  "snyk-dast-check-default",
+				TargetTypeDefault: "snyk-dast-target-default",
+			},
+		},
+		{
+			name: "mappings and defaults set",
+			labelCfg: config.LabelConfig{
+				CheckType:         map[string]string{"passive": "snyk-dast-passive"},
+				TargetType:        map[string]string{"api": "snyk-dast-api"},
+				CheckTypeDefault:  "snyk-dast-check-default",
+				TargetTypeDefault: "snyk-dast-target-default",
+			},
+		},
+	}
+
+	finding := model.Finding{CheckType: "passive", TargetType: "api"}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if labels := managedLabels(tc.labelCfg, finding); len(labels) != 0 {
+				t.Fatalf("managedLabels() = %#v, want none when label management is off", labels)
+			}
+			if reasons := buildLabelReasons(tc.labelCfg, finding); len(reasons) != 0 {
+				t.Fatalf("buildLabelReasons() = %#v, want none when label management is off", reasons)
+			}
+		})
+	}
+}
+
 func TestNeedsUpdateClearsDueDateWhenDesiredIsEmpty(t *testing.T) {
 	existing := model.ExistingIssue{
 		Title:       "title",

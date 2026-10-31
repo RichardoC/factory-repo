@@ -149,7 +149,7 @@ Behavior:
 - the configured managed label is added to new synced issues
 - unrelated existing labels are preserved
 - if the configured managed label changes, the old managed label is removed and the new one is applied
-- if label management is disabled, the previously managed label is removed
+- if label management is disabled, no managed labels are asserted — the check-type and target-type labels included — and previously managed labels are removed
 
 The configured label must already exist in Linear. If it does not, the run
 fails with a clear operator-facing error.
