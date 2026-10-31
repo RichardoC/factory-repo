@@ -363,19 +363,42 @@ func TestProposalBodyWorkflowsNote(t *testing.T) {
 	}
 	// The planner already said it: the note is not added again.
 	p.What = "edit .github/workflows/ci.yml, which needs a maintainer's approval"
-	if body := ProposalBody(p); strings.Contains(body, "Note: changes to .github/workflows/") {
+	if body := ProposalBody(p); strings.Contains(body, approvalNote) {
 		t.Errorf("the note duplicated the planner's own statement:\n%s", body)
 	}
-	// No workflows mention: no note.
-	if strings.Contains(ProposalBody(Proposal{Title: "t", Problem: "plain", What: "plain"}), ".github/workflows") {
-		t.Error("the workflows note appears without a workflows mention")
+	// No .github/ mention: no note.
+	if strings.Contains(ProposalBody(Proposal{Title: "t", Problem: "plain", What: "plain"}), approvalNote) {
+		t.Error("the note appears without a .github/ mention")
+	}
+	// .github/codeaf/ is the harness's own write area and needs no note.
+	if strings.Contains(ProposalBody(Proposal{Title: "t", Problem: "edit .github/codeaf/queue.go", What: "w"}), approvalNote) {
+		t.Error("the note fired on a .github/codeaf/ mention")
 	}
 	// The Done field mentioning workflows alone does not trigger the note
 	// (the rule reads Problem and What).
-	if strings.Contains(ProposalBody(Proposal{Title: "t", Problem: "p", What: "w", Done: "see .github/workflows/"}), "maintainer's approval before merging") {
+	if strings.Contains(ProposalBody(Proposal{Title: "t", Problem: "p", What: "w", Done: "see .github/workflows/"}), approvalNote) {
 		t.Error("the note fired on a Done-only mention")
 	}
+	// A path outside .github/workflows/ is gated too (issue #307):
+	// .github/CODEOWNERS needs the same maintainer approval.
+	p = Proposal{Title: "t", Problem: "update .github/CODEOWNERS", What: "add a path"}
+	if body := ProposalBody(p); !strings.Contains(body, approvalNote) {
+		t.Errorf("the note is missing on a .github/CODEOWNERS proposal:\n%s", body)
+	}
+	// ...and the planner saying approval suppresses it there as well.
+	p.What = "add a path; a maintainer's approval is needed"
+	if body := ProposalBody(p); strings.Contains(body, approvalNote) {
+		t.Errorf("the note duplicated the planner's approval statement:\n%s", body)
+	}
+	// A plain proposal that names no gated path carries none.
+	if body := ProposalBody(Proposal{Title: "t", Problem: "app/widgets/queue.go", What: "add a retry"}); strings.Contains(body, approvalNote) {
+		t.Errorf("the note appears without a gated path mention:\n%s", body)
+	}
 }
+
+// approvalNote is the exact sentence ProposalBody appends when a gated path is
+// named and the planner did not already state the approval requirement.
+const approvalNote = "Note: changes to .github/workflows/ need a maintainer's approval before merging."
 
 func TestProposalBodyEscapesAndTemplate(t *testing.T) {
 	p := Proposal{
