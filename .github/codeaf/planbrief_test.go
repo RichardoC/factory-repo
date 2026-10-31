@@ -318,6 +318,56 @@ func TestRunPlanBriefRunReportsWindowExhausted(t *testing.T) {
 	}
 }
 
+// TestRunPlanBriefRunReportsPartialScanAtWindowBound: every page holds
+// chatter and offers a next link, and only one report sits inside the
+// scanned window, so the scan stops at maxPlanReportPages pages holding
+// fewer than maxPlanRunReports reports (issue #321) — the section must say
+// older reports may be missing while rendering the one report it found.
+func TestRunPlanBriefRunReportsPartialScanAtWindowBound(t *testing.T) {
+	var pages atomic.Int32
+	chatter := make([]string, 0, 99)
+	for i := 0; i < 99; i++ {
+		chatter = append(chatter, planChatterComment(i))
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/RichardoC/factory-repo/issues/comments" {
+			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+		pages.Add(1)
+		w.Header().Set("Link", fmt.Sprintf("<%s%s&page=%d>; rel=\"next\"", serverURL(r), r.URL.RequestURI(), pages.Load()+1))
+		comments := append([]string(nil), chatter...)
+		if pages.Load() == 1 {
+			comments = append(comments, planBotReportComment(101, 7))
+		}
+		_, _ = io.WriteString(w, "["+strings.Join(comments, ",")+"]")
+	}))
+	t.Cleanup(server.Close)
+	briefPath := planBriefEnv(t, server)
+	if err := runPlanBrief(); err != nil {
+		t.Fatalf("runPlanBrief: %v", err)
+	}
+	data, err := os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief := string(data)
+	want := fmt.Sprintf("(the scan stopped after %d comment pages with %d of the usual %d reports, so older reports may be missing)",
+		maxPlanReportPages, 1, maxPlanRunReports)
+	if !strings.Contains(brief, want) {
+		t.Errorf("brief missing %q: a partial scan stopped at the page bound must say older reports may be missing", want)
+	}
+	if !strings.Contains(brief, "### Run report on issue #7") {
+		t.Error("the one report inside the window must be rendered")
+	}
+	if strings.Contains(brief, "no recent run reports") {
+		t.Error("a scan that found a report must not print a no-reports note")
+	}
+	if n := pages.Load(); n != maxPlanReportPages {
+		t.Errorf("pages served = %d, want %d (the scan did not stop at its bound)", n, maxPlanReportPages)
+	}
+}
+
 func TestRunPlanBriefRepoFiles(t *testing.T) {
 	// A working tree with a README and AGENTS: they are embedded, capped.
 	dir := t.TempDir()
