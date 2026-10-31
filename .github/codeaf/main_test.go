@@ -4545,3 +4545,172 @@ func TestCapRefusalAfterASlotWaitIsRecorded(t *testing.T) {
 		t.Fatalf("refusal = %+v, want the queued model, a positive slot_wait_s, no usage and no cost", *refusal)
 	}
 }
+
+// TestProxyUndecodable200IsRecorded (issue #350): an upstream that answers 200
+// with a body that is not a JSON object — an HTML error page, an empty body, a
+// document truncated after the headers, the literal null — still reaches the
+// ledger, because the slot was held and released and upstream may have billed
+// the tokens. Before the fix the call was a phantom: the 502 went out and no
+// ledger line existed, so the metered spend, the run record and the model
+// stats all under-counted it. (The literal null used to decode into a nil map
+// and panic on the first assignment, cutting the caller's connection: the same
+// phantom with no line at all.) The caller's 502 is unchanged, and a 200 with
+// a valid body still records its usage exactly as today. The metered row is
+// anchored on a figure an empty ledger cannot render, so the assertion cannot
+// pass vacuously.
+func TestProxyUndecodable200IsRecorded(t *testing.T) {
+	const interval = 20 * time.Millisecond
+	// The undecodable bodies, one per call, in the classes the fix covers.
+	bodies := []struct {
+		name        string
+		contentType string
+		body        string
+	}{
+		{"html error page", "text/html", "<html>upstream exploded</html>"},
+		{"empty body", "application/json", ""},
+		{"truncated after the headers", "application/json", `{"choices":[{"message":{"content":"hi"}}`},
+		{"literal null", "application/json", "null"},
+	}
+	// The valid answer's usage is sized so its cost renders as a non-zero
+	// figure at money()'s four decimals: 1000 prompt + 100 completion at
+	// glm-5.3-flash's api rates is $0.0002, where 100/20 would render
+	// $0.0000 — byte-identical to the empty-ledger row, which is what made
+	// an earlier version of this assertion tautological.
+	const promptTokens, completionTokens = 1000, 100
+	var mu sync.Mutex
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		n := calls
+		calls++
+		mu.Unlock()
+		if n < len(bodies) {
+			w.Header().Set("Content-Type", bodies[n].contentType)
+			_, _ = io.WriteString(w, bodies[n].body)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"hi"}}],"model":"zai-org/glm-5.3-flash","usage":{"prompt_tokens":1000,"completion_tokens":100}}`)
+	}))
+	defer upstream.Close()
+
+	model := mustResolve(t, testModels(t), "zai-org/glm-5.3-flash")
+	p := proxyFor145(t, "zai-org/glm-5.3-flash", interval, upstream)
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	post := func() (int, string) {
+		response, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
+			strings.NewReader(`{"model":"zai-org/glm-5.3-flash","messages":[]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response.StatusCode, string(body)
+	}
+
+	// Each undecodable 200: the caller still sees the same 502 body as before
+	// the fix, and the ledger gains exactly one line for it.
+	for i, b := range bodies {
+		status, body := post()
+		if status != http.StatusBadGateway || !strings.Contains(body, "upstream body") {
+			t.Fatalf("%s: %d %s, want the unchanged 502 upstream-body error", b.name, status, body)
+		}
+		lines, err := readLedger(p.ledger)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(lines) != i+1 {
+			t.Fatalf("%s: ledger holds %d lines, want exactly %d (one per undecodable call): %+v", b.name, len(lines), i+1, lines)
+		}
+		line := lines[i]
+		if line.Kind != "status" || line.Status != http.StatusBadGateway {
+			t.Fatalf("%s: line = %+v, want a status line carrying 502", b.name, line)
+		}
+		if line.Model != "zai-org/glm-5.3-flash" || line.UsageSeen || line.CostUSD != 0 || line.PromptTokens != 0 || line.CompletionTokens != 0 {
+			t.Fatalf("%s: line = %+v, want the model, no usage and no cost", b.name, line)
+		}
+	}
+
+	// A 200 with a valid body still records its usage exactly as today.
+	status, body := post()
+	if status != http.StatusOK || !strings.Contains(body, `"model":"zai-org/glm-5.3-flash"`) || !strings.Contains(body, `"prompt_tokens":1000`) {
+		t.Fatalf("valid 200: %d %s, want the relayed answer with its usage", status, body)
+	}
+	lines, err := readLedger(p.ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != len(bodies)+1 {
+		t.Fatalf("ledger holds %d lines, want one 502 status line per undecodable call plus the recorded call: %+v", len(lines), lines)
+	}
+	called := lines[len(lines)-1]
+	if called.Kind != "" || !called.UsageSeen || called.PromptTokens != promptTokens || called.CompletionTokens != completionTokens || called.CostUSD <= 0 {
+		t.Fatalf("call line = %+v, want a recorded call with the upstream usage and a cost", called)
+	}
+
+	// The report's metered row is computed from that ledger, so the phantom
+	// calls are no longer invisible to it. The anchor is the recorded call's
+	// own cost, and the guard below refuses an anchor that rounds to money(0):
+	// such a figure would also be what an empty ledger renders, and the
+	// assertion would pass with no line recorded at all.
+	wantCost := CostOf(model, Usage{PromptTokens: promptTokens, CompletionTokens: completionTokens})
+	if called.CostUSD != wantCost {
+		t.Fatalf("call line cost = %v, want CostOf(%d prompt, %d completion) = %v", called.CostUSD, promptTokens, completionTokens, wantCost)
+	}
+	anchor := money(wantCost)
+	if anchor == money(0) {
+		t.Fatalf("test anchor %s equals money(0): the metered-row assertion would pass on an empty ledger too; pick a usage whose price renders non-zero", anchor)
+	}
+	cfg := Config{Limits: Limits{Plan: "big", WeeklyCreditUSD: 20, RunCreditUSD: 5}, Models: testModels(t)}
+	meteredRow := func(ls []LedgerLine) string {
+		report := Report(Result{Stop: "done"}, true, ls, cfg, nil, ReportInputs{}, func(string) string { return "" })
+		row, ok := reportTableRow(report, "metered by proxy (from its ledger)")
+		if !ok {
+			t.Fatalf("report has no metered row:\n%s", report)
+		}
+		return row
+	}
+	row := meteredRow(lines)
+	if !strings.Contains(row, "**"+anchor+"**") {
+		t.Errorf("metered row %q does not carry the recorded call's cost %s", row, anchor)
+	}
+	if got := ledgerTotal(lines); money(got) != anchor {
+		t.Errorf("ledger total = %s, want the recorded call's cost %s (the 502 lines cost nothing)", money(got), anchor)
+	}
+	// The status lines cost nothing, so the money figure above cannot show
+	// them: the row counts them instead. That count is the assertion the
+	// reviewer's probe found missing — drop the 502 lines from the ledger and
+	// the row loses the figure, so it is not vacuous the way a $0 status
+	// line inside ledgerTotal would be.
+	if want := fmt.Sprintf(" · %d recorded calls with no usage", len(bodies)); !strings.Contains(row, want) {
+		t.Errorf("metered row %q lacks %q, so the recorded 502 calls are invisible to it", row, want)
+	}
+	// The control: the same report over an empty ledger and over a ledger
+	// with the 502 lines filtered out must not render the anchor or the
+	// count, so neither assertion above can pass vacuously.
+	var priced []LedgerLine
+	for _, l := range lines {
+		if l.Kind == "" {
+			priced = append(priced, l)
+		}
+	}
+	if len(priced) != 1 {
+		t.Fatalf("filtered ledger holds %d call lines, want exactly the valid 200: %+v", len(priced), priced)
+	}
+	// An empty ledger must not render the anchor, or the spend assertion
+	// above would pass with nothing recorded; the ledger with the 502 lines
+	// filtered out must not render the count, which is exactly the probe that
+	// convicted the earlier version of this test (a status line costs $0, so
+	// every money-based figure survived filtering it).
+	if empty := meteredRow(nil); strings.Contains(empty, anchor) {
+		t.Errorf("empty-ledger metered row %q carries the anchor %s, so the spend assertion above proves nothing", empty, anchor)
+	}
+	if filtered := meteredRow(priced); strings.Contains(filtered, "recorded calls with no usage") {
+		t.Errorf("metered row %q counts status calls with the 502 lines filtered out, so the count assertion above proves nothing", filtered)
+	}
+}
