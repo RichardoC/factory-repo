@@ -184,6 +184,140 @@ func TestRunPlanBriefNoRunReports(t *testing.T) {
 	}
 }
 
+// planChatterComment builds one repo-wide comment that is not a run report
+// — the review findings, holds and human replies that fill the newest page
+// of /issues/comments on a busy repository.
+func planChatterComment(id int) string {
+	return fmt.Sprintf(`{"id":%d,"created_at":"2026-10-17T10:00:00Z","body":"a review finding %d","user":{"login":"RichardoC"},"issue_url":"https://api.github.com/repos/RichardoC/factory-repo/issues/7"}`, id, id)
+}
+
+// planBotReportComment builds one run-report comment by the report bot.
+func planBotReportComment(id, issue int) string {
+	return fmt.Sprintf(`{"id":%d,"created_at":"2026-10-18T10:00:00Z","body":"<!-- codeaf-report -->\n### CodeAF run — done","user":{"login":"github-actions[bot]"},"issue_url":"https://api.github.com/repos/RichardoC/factory-repo/issues/%d"}`, id, issue)
+}
+
+// TestRunPlanBriefRunReportsPagedPastCommentTraffic covers issue #321: a
+// first page of 100 non-report comments no longer empties the planner's
+// first source — the scan follows the next link and renders the two reports
+// that sit on the second page.
+func TestRunPlanBriefRunReportsPagedPastCommentTraffic(t *testing.T) {
+	chatter := make([]string, 0, 100)
+	for i := 0; i < 100; i++ {
+		chatter = append(chatter, planChatterComment(i))
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/RichardoC/factory-repo/issues/comments" {
+			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+		switch r.URL.Query().Get("page") {
+		case "", "1":
+			w.Header().Set("Link", fmt.Sprintf("<%s%s&page=2>; rel=\"next\"", serverURL(r), r.URL.RequestURI()))
+			_, _ = io.WriteString(w, "["+strings.Join(chatter, ",")+"]")
+		case "2":
+			_, _ = io.WriteString(w, "["+planBotReportComment(101, 7)+","+planBotReportComment(102, 3)+"]")
+		default:
+			_, _ = io.WriteString(w, `[]`)
+		}
+	}))
+	t.Cleanup(server.Close)
+	briefPath := planBriefEnv(t, server)
+	if err := runPlanBrief(); err != nil {
+		t.Fatalf("runPlanBrief: %v", err)
+	}
+	data, err := os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief := string(data)
+	for _, want := range []string{
+		"### Run report on issue #7",
+		"### Run report on issue #3",
+	} {
+		if !strings.Contains(brief, want) {
+			t.Errorf("brief missing %q: the reports past the first page were not rendered", want)
+		}
+	}
+	if strings.Contains(brief, "no recent run reports") {
+		t.Error("the brief claims no run reports although two were found past the first page")
+	}
+}
+
+// TestRunPlanBriefRunReportsPagedToEmptyPage: the scan follows the next
+// link, the second page is empty and offers no next link — the comments
+// really ran out — so the section still prints the no-reports note.
+func TestRunPlanBriefRunReportsPagedToEmptyPage(t *testing.T) {
+	chatter := make([]string, 0, 100)
+	for i := 0; i < 100; i++ {
+		chatter = append(chatter, planChatterComment(i))
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/RichardoC/factory-repo/issues/comments" {
+			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+		switch r.URL.Query().Get("page") {
+		case "", "1":
+			w.Header().Set("Link", fmt.Sprintf("<%s%s&page=2>; rel=\"next\"", serverURL(r), r.URL.RequestURI()))
+			_, _ = io.WriteString(w, "["+strings.Join(chatter, ",")+"]")
+		default:
+			_, _ = io.WriteString(w, `[]`)
+		}
+	}))
+	t.Cleanup(server.Close)
+	briefPath := planBriefEnv(t, server)
+	if err := runPlanBrief(); err != nil {
+		t.Fatalf("runPlanBrief: %v", err)
+	}
+	data, err := os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "(no recent run reports found") {
+		t.Error("a scan that ran to the end of the comments must still print the no-reports note")
+	}
+}
+
+// TestRunPlanBriefRunReportsWindowExhausted: every page holds 100 chatter
+// comments and offers a next link, so the scan stops at maxPlanReportPages
+// pages — and the note must say the window was scanned and found empty,
+// distinctly from a scan that reached the end of the comments (issue #321).
+func TestRunPlanBriefRunReportsWindowExhausted(t *testing.T) {
+	var pages atomic.Int32
+	chatter := make([]string, 0, 100)
+	for i := 0; i < 100; i++ {
+		chatter = append(chatter, planChatterComment(i))
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/RichardoC/factory-repo/issues/comments" {
+			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+		pages.Add(1)
+		w.Header().Set("Link", fmt.Sprintf("<%s%s&page=%d>; rel=\"next\"", serverURL(r), r.URL.RequestURI(), pages.Load()+1))
+		_, _ = io.WriteString(w, "["+strings.Join(chatter, ",")+"]")
+	}))
+	t.Cleanup(server.Close)
+	briefPath := planBriefEnv(t, server)
+	if err := runPlanBrief(); err != nil {
+		t.Fatalf("runPlanBrief: %v", err)
+	}
+	data, err := os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief := string(data)
+	if want := "(no recent run reports in the newest 500 comments scanned"; !strings.Contains(brief, want) {
+		t.Errorf("brief missing %q: an exhausted window must say so, not read as clean", want)
+	}
+	if strings.Contains(brief, "(no recent run reports found") {
+		t.Error("an exhausted window must not print the end-of-comments no-reports note")
+	}
+	if n := pages.Load(); n != maxPlanReportPages {
+		t.Errorf("pages served = %d, want %d (the scan did not stop at its bound)", n, maxPlanReportPages)
+	}
+}
+
 func TestRunPlanBriefRepoFiles(t *testing.T) {
 	// A working tree with a README and AGENTS: they are embedded, capped.
 	dir := t.TempDir()
@@ -499,15 +633,20 @@ func TestRunPlanBriefDegradesOnPageCap(t *testing.T) {
 	}
 }
 
-// TestRunPlanBriefWindowedReadsTakeOnePage proves the recent-items reads
-// stay one request each: the closed issues, closed pull requests and run
-// reports are windows of the newest items, and a repository with more
-// history than maxListPages pages must not lose them to the page cap.
+// TestRunPlanBriefWindowedReadsTakeOnePage proves the closed-issues and
+// closed-pull-requests reads stay one request each — windows of the newest
+// items that a repository with more history than maxListPages pages must
+// not lose to the page cap — and that the run-report scan (issue #321)
+// stops at its own maxPlanReportPages bound instead of walking history to
+// maxListPages and its page-cap error.
 func TestRunPlanBriefWindowedReadsTakeOnePage(t *testing.T) {
-	var windowed atomic.Int32
+	var closed, comments atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("state") == "closed" || r.URL.Path == "/repos/RichardoC/factory-repo/issues/comments" {
-			windowed.Add(1)
+		switch {
+		case r.URL.Query().Get("state") == "closed":
+			closed.Add(1)
+		case r.URL.Path == "/repos/RichardoC/factory-repo/issues/comments":
+			comments.Add(1)
 		}
 		// The next link keeps the query, so a followed page is counted too.
 		w.Header().Set("Link", fmt.Sprintf("<%s%s&page=2>; rel=\"next\"", serverURL(r), r.URL.RequestURI()))
@@ -518,7 +657,10 @@ func TestRunPlanBriefWindowedReadsTakeOnePage(t *testing.T) {
 	if err := runPlanBrief(); err != nil {
 		t.Fatalf("runPlanBrief: %v", err)
 	}
-	if n := windowed.Load(); n != 3 {
-		t.Errorf("windowed requests = %d, want 3 (one page each)", n)
+	if n := closed.Load(); n != 2 {
+		t.Errorf("closed-window requests = %d, want 2 (one page each)", n)
+	}
+	if n := comments.Load(); n != maxPlanReportPages {
+		t.Errorf("run-report scan requests = %d, want %d (its own page bound)", n, maxPlanReportPages)
 	}
 }
