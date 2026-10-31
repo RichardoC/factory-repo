@@ -256,9 +256,9 @@ type Alerts struct {
 	SlotWaitsPerRun *int `json:"slot_waits_per_run"`
 	// WindowHours is the default window the routine reports over.
 	WindowHours *int `json:"window_hours"`
-	// TTFTp50RatioBaselineHours is how many days of a model's own history the
-	// first-token p50 ratio is measured against. The issue calls it the
-	// trailing 7-day p50; the routine reads the number from here.
+	// TTFTp50RatioBaselineHours is how many hours of a model's own history the
+	// first-token p50 ratio is measured against (168 h = the trailing 7-day
+	// p50 the issue calls for); the routine reads the number from here.
 	TTFTp50RatioBaselineHours *int `json:"ttft_p50_ratio_baseline_hours"`
 	// HourCallsBaselineHours is the window a decode baseline is taken from,
 	// the decode counterpart of the trailing 7-day figure. It is nullable so
