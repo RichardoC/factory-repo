@@ -99,8 +99,10 @@ ever dropped this way. A fence that never closes is not a quote at all, so
 nothing in it is dropped for naming an unchanged path; remember the closing
 delimiter anyway, and write a real report outside a fence or in the
 section. A finding written in the `## Findings` section is
-always read. Report in prose outside a fence, or in the section, to be sure
-your findings are read.
+always read, even inside a closed fence: the quoted-path drop above never
+applies to a finding in the section, only the restated example does. Report
+in prose outside a fence, or in the section, to be sure your findings are
+read.
 
 Evidence rule: the `harness` binary on `PATH` was built from the default
 branch before this run started, so it is the pre-change build; when the diff
