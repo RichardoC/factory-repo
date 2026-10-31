@@ -1564,6 +1564,17 @@ func TestLeaseLossFailsSectorIOUntilRelock(t *testing.T) {
 		t.Fatalf("ReadAt with a lost lease = %v, want sqlite3vfs.BusyError (sticky)", err)
 	}
 
+	// Truncate writes and deletes sectors too, so the loss gates it as
+	// well: refused with BusyError, and with zero ConfigMap writes or
+	// deletes recorded — refused before any cluster mutation, not after.
+	callsBeforeTruncate := len(fcs.Actions())
+	if err := f.Truncate(32); !errors.Is(err, sqlite3vfs.BusyError) {
+		t.Fatalf("Truncate with a lost lease = %v, want sqlite3vfs.BusyError", err)
+	}
+	if n := len(fcs.Actions()) - callsBeforeTruncate; n != 0 {
+		t.Errorf("Truncate with a lost lease caused %d ConfigMap API calls, want 0", n)
+	}
+
 	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
 		t.Fatalf("re-Lock(Shared) after the loss: %v", err)
 	}
@@ -1577,6 +1588,17 @@ func TestLeaseLossFailsSectorIOUntilRelock(t *testing.T) {
 	}
 	if n != len(kept) || !bytes.Equal(got, kept) {
 		t.Errorf("bytes after re-lock = (%d, %v), want the pre-loss %d bytes (the refused write must not have landed)", n, got, len(kept))
+	}
+
+	// The gate clears for Truncate exactly as for ReadAt/WriteAt: the
+	// successful re-Lock re-enabled it, and the truncate lands.
+	if err := f.Truncate(32); err != nil {
+		t.Fatalf("Truncate after re-lock: %v", err)
+	}
+	got = make([]byte, len(kept))
+	n, err = f.ReadAt(got, 0)
+	if err != io.EOF || n != 32 || !bytes.Equal(got[:32], kept[:32]) {
+		t.Errorf("after re-locked Truncate(32) read = (%d, %v, %v), want (32, io.EOF, the kept pattern)", n, err, got)
 	}
 }
 

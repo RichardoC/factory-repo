@@ -174,6 +174,16 @@ func (f *file) Close() error {
 // deleting the sectors past the new end and shortening the one holding the
 // kept prefix. Growing (or no-op) truncates do nothing.
 func (f *file) Truncate(size int64) error {
+	// Truncate writes (writeSectorOnce) and deletes sectors, so it is
+	// gated on lease loss exactly like ReadAt and WriteAt: a file whose
+	// lease was pruned must not shorten the database — sqlite calls
+	// xTruncate during hot-journal rollback and after VACUUM — under
+	// whichever process took over the lock. Before this gate it was the
+	// one sector-I/O path that still mutated the cluster after a loss.
+	if err := f.renewForIO(); err != nil {
+		return ioFailure(err)
+	}
+
 	fileSize, err := f.FileSize()
 	if err != nil {
 		return err
