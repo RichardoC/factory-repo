@@ -1316,10 +1316,17 @@ const noResultRow = "| result | CodeAF produced no JSON result; see the workflow
 
 // repickMarkers collects the head SHAs the re-pick marker comments name, in
 // comment order, lowercased. A malformed marker is ignored as if absent
-// (issue #215).
+// (issue #215). Only a bot's marker counts, as in strandedByFailedRun,
+// ensureHoldCommentBody and ensureIssueRetryMarker: comments are untrusted
+// data, so a person quoting or reposting the marker on a public repository
+// must not make the queue believe its re-pick was already posted — that
+// silently strands the PR the re-pick exists for (issue #316).
 func repickMarkers(comments bodyComments) []string {
 	var shas []string
 	for _, c := range comments {
+		if c.User.Type != "Bot" {
+			continue
+		}
 		if m := repickSHARe.FindStringSubmatch(c.Body); m != nil {
 			shas = append(shas, strings.ToLower(m[1]))
 		}
