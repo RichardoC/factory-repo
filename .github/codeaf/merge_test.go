@@ -1026,6 +1026,63 @@ func TestMergeSkipsWorkflowChanges(t *testing.T) {
 	}
 }
 
+// indexTree writes a full snapshot through a scratch index. mktree cannot
+// name a nested path, so a tree that carries .github/workflows/ files is
+// built this way; a space or a non-ASCII byte in a name goes through too,
+// and a non-UTF-8 name would be pushed into git unvalidated either way.
+func (r *testRepo) indexTree(files map[string]string) string {
+	r.t.Helper()
+	blob := func(content string) string {
+		return strings.TrimSpace(gitTestIn(r.t, r.dir, content, "hash-object", "-w", "--stdin"))
+	}
+	index := filepath.Join(r.t.TempDir(), "index")
+	env := func(args ...string) string {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = r.dir
+		cmd.Env = append(os.Environ(), "GIT_INDEX_FILE="+index)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			r.t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		env("update-index", "--add", "--cacheinfo", "100644,"+blob(files[name])+","+name)
+	}
+	return env("write-tree")
+}
+
+// Issue #343: workflowChanges read git's --name-only list with Fields, so a
+// workflow path containing a space was reported as two files that do not
+// exist, and merge decisions landed on the wrong path set. It pins the fix:
+// the list is split on lines, as boundedNames reads it, and the C-style
+// quoting git applies to a non-ASCII name under core.quotePath (on by
+// default) is stripped, so the change is reported as exactly the two real
+// paths.
+func TestWorkflowChangesSplitsNamesOnLines(t *testing.T) {
+	r := newTestRepo(t)
+	base := r.commit("base", map[string]string{"f.txt": "a\n"})
+	changed := r.commitTree(r.indexTree(map[string]string{
+		"f.txt":                        "a\n",
+		".github/workflows/a b.yml":    "on: push\n",
+		".github/workflows/\u00e9.yml": "on: push\n",
+	}), []string{base}, "changes workflows with awkward names")
+	files, err := workflowChanges(r.dir, base, changed)
+	if err != nil {
+		t.Fatalf("workflowChanges: %v", err)
+	}
+	sort.Strings(files)
+	want := []string{".github/workflows/a b.yml", ".github/workflows/\u00e9.yml"}
+	if !reflect.DeepEqual(files, want) {
+		t.Fatalf("workflowChanges = %q; want exactly %q", files, want)
+	}
+}
+
 // Issue #171: a tampered or missing merge-info.json, with the run's recorded
 // base merge present in the base-commit artifact, is refused -- never
 // published as a single commit whose parents cannot show what came from the
