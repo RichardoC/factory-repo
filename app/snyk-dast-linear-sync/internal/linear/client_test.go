@@ -2016,3 +2016,109 @@ func TestCreateIssuesSendsOneMutationWhenRateLimitBudgetExhausted(t *testing.T) 
 			gotCreate, gotUnsubscribe)
 	}
 }
+
+// TestDesiredLabelIDsManagedLabelEvictsExclusiveGroupSibling guards against
+// "labelIds not exclusive child labels": when the sync asserts a managed label
+// that belongs to a Linear exclusive group, and the ticket already carries a
+// different child of that same group, the carried-forward sibling must be
+// dropped so the update names only one child of the group. The managed label
+// wins.
+func TestDesiredLabelIDsManagedLabelEvictsExclusiveGroupSibling(t *testing.T) {
+	client := &Client{
+		managedLabelIDs: map[string]string{
+			"status-confirmed": "label-confirmed",
+		},
+		managedLabelGroupIDs: map[string]string{
+			"status-confirmed": "group-status",
+		},
+	}
+
+	// The ticket already carries status-new, another child of the exclusive
+	// "status" group, applied by a human or a prior run. It is not in the
+	// sync's managed set for this finding, so it would otherwise be carried
+	// forward alongside the asserted status-confirmed and Linear would reject
+	// the update.
+	existing := model.ExistingIssue{
+		Labels: []model.IssueLabel{
+			{ID: "label-unrelated", Name: "customer-visible"},
+			{ID: "label-new", Name: "status-new", GroupID: "group-status"},
+		},
+	}
+	desired := model.DesiredIssue{
+		ManagedLabels: []string{"status-confirmed"},
+	}
+
+	labelIDs, err := client.desiredLabelIDs(existing, desired, nil)
+	if err != nil {
+		t.Fatalf("desiredLabelIDs() error = %v", err)
+	}
+	if containsString(labelIDs, "label-new") {
+		t.Fatalf("labelIDs = %#v, want carried-forward group sibling 'label-new' evicted", labelIDs)
+	}
+	if !containsString(labelIDs, "label-confirmed") {
+		t.Fatalf("labelIDs = %#v, want asserted managed group child 'label-confirmed' present", labelIDs)
+	}
+	if !containsString(labelIDs, "label-unrelated") {
+		t.Fatalf("labelIDs = %#v, want ungrouped label preserved", labelIDs)
+	}
+	if len(labelIDs) != 2 {
+		t.Fatalf("labelIDs len = %d, want 2 (at most one child per exclusive group)", len(labelIDs))
+	}
+}
+
+// TestDesiredLabelIDsDropsSecondCarriedForwardExclusiveSibling covers two
+// children of the same exclusive group present on the ticket with neither in
+// the sync's managed set — for example two labels applied before the group was
+// made exclusive. Echoing both back fails the update, so the set keeps the
+// first read and drops the rest.
+func TestDesiredLabelIDsDropsSecondCarriedForwardExclusiveSibling(t *testing.T) {
+	client := &Client{}
+
+	existing := model.ExistingIssue{
+		Labels: []model.IssueLabel{
+			{ID: "label-sev-high", Name: "sev:high", GroupID: "group-sev"},
+			{ID: "label-sev-crit", Name: "sev:critical", GroupID: "group-sev"},
+			{ID: "label-plain", Name: "backend"},
+		},
+	}
+
+	labelIDs, err := client.desiredLabelIDs(existing, model.DesiredIssue{}, nil)
+	if err != nil {
+		t.Fatalf("desiredLabelIDs() error = %v", err)
+	}
+	if !containsString(labelIDs, "label-sev-high") {
+		t.Fatalf("labelIDs = %#v, want first exclusive-group child kept", labelIDs)
+	}
+	if containsString(labelIDs, "label-sev-crit") {
+		t.Fatalf("labelIDs = %#v, want second exclusive-group child dropped", labelIDs)
+	}
+	if !containsString(labelIDs, "label-plain") {
+		t.Fatalf("labelIDs = %#v, want ungrouped label preserved", labelIDs)
+	}
+	if len(labelIDs) != 2 {
+		t.Fatalf("labelIDs len = %d, want 2", len(labelIDs))
+	}
+}
+
+// TestDesiredLabelIDsKeepsChildrenOfDistinctGroups is a regression guard: the
+// exclusive-group collapse must only fold labels that share a group. Children
+// of different groups, and ungrouped labels, are all preserved.
+func TestDesiredLabelIDsKeepsChildrenOfDistinctGroups(t *testing.T) {
+	client := &Client{}
+
+	existing := model.ExistingIssue{
+		Labels: []model.IssueLabel{
+			{ID: "label-tool", Name: "tool-a", GroupID: "group-tool"},
+			{ID: "label-origin", Name: "origin-b", GroupID: "group-origin"},
+			{ID: "label-plain", Name: "security"},
+		},
+	}
+
+	labelIDs, err := client.desiredLabelIDs(existing, model.DesiredIssue{}, nil)
+	if err != nil {
+		t.Fatalf("desiredLabelIDs() error = %v", err)
+	}
+	if len(labelIDs) != 3 {
+		t.Fatalf("labelIDs = %#v, want all three distinct-group/ungrouped labels kept", labelIDs)
+	}
+}

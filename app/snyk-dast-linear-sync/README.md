@@ -244,6 +244,8 @@ When label management is enabled, the sync:
 
 If the configured label does not exist in Linear, the run fails with a clear message telling the operator to create the label or disable label management.
 
+Linear label groups are mutually exclusive — an issue may carry at most one child of a group. If a ticket carries two children of the same group (for example, labels applied before the group was made exclusive), updates keep exactly one: the managed label when the sync asserts one for that group, otherwise the first existing one. Without this, Linear rejects every update for such a ticket ("labelIds not exclusive child labels") until the ticket is edited by hand.
+
 `LINEAR_CHECK_TYPE_LABELS` optionally maps Snyk DAST check types to additional managed Linear labels. Snyk DAST has two check types — **passive** (response analysis, e.g. missing security headers) and **active** (exploit payloads, e.g. SQL injection, XSS) — which is the DAST equivalent of Snyk's multi-product tool labels (`snyk-code`, `snyk-open-source`, etc.). Passive and active findings have different triage workflows, so labeling them separately helps route issues to the right team.
 
 - format: comma-separated `check_type:label` pairs

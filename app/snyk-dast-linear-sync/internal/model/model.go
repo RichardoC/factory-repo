@@ -85,6 +85,10 @@ type SnykDASTSnapshot struct {
 type IssueLabel struct {
 	ID   string
 	Name string
+	// GroupID is the ID of the Linear label group this label belongs to, or
+	// "" when it is ungrouped. Linear label groups are mutually exclusive: an
+	// issue may carry at most one child of a group.
+	GroupID string
 }
 
 type IssueState string
