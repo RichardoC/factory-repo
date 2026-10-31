@@ -233,6 +233,9 @@ func TestFlakyTests(t *testing.T) {
 	out.WriteString("=== RUN   TestSub/case1\n")
 	out.WriteString("--- FAIL: TestSub/case1 (0.00s)\n")
 	out.WriteString("    sub_test.go:9: case1 flaked\n")
+	// A bare marker with no test name: log noise (issue #325). It must be
+	// skipped, not counted, and must not panic.
+	out.WriteString("--- FAIL: \n")
 	out.WriteString("FAIL\n")
 	out.WriteString("FAIL\tcodeaf-harness\t1.2s\n")
 
@@ -258,6 +261,34 @@ func TestFlakyTests(t *testing.T) {
 	}
 	if strings.Contains(report, "### TestStable") {
 		t.Errorf("stable test reported as flaky:\n%s", report)
+	}
+}
+
+// TestFlakyTestsBareMarker pins the never-panic contract of the file header
+// (issue #325): a "--- FAIL: " line that carries no test name — anything a
+// test or a subprocess prints goes into the combined output — is skipped,
+// not counted and not panicked on.
+func TestFlakyTestsBareMarker(t *testing.T) {
+	for _, out := range []string{
+		"--- FAIL: \n",
+		"--- FAIL: \t\n", // trailing whitespace is not a name either
+		"--- FAIL: \r\n",
+	} {
+		report, failed := flakyTests([]byte(out))
+		if len(failed) != 0 {
+			t.Errorf("no-name FAIL marker counted a test: failed = %v", failed)
+		}
+		if !strings.Contains(report, "No intermittent test failures") {
+			t.Errorf("report for %q = %q, want the no-failure report", out, report)
+		}
+	}
+	// A real failure is still counted when noise surrounds it.
+	report, failed := flakyTests([]byte("--- FAIL: \n--- FAIL: TestReal (0.00s)\n"))
+	if len(failed) != 1 || failed[0] != "TestReal" {
+		t.Fatalf("failed = %v, want [TestReal]", failed)
+	}
+	if !strings.Contains(report, "### TestReal") {
+		t.Errorf("named failure missing from report:\n%s", report)
 	}
 }
 

@@ -385,7 +385,14 @@ func flakyTests(output []byte) (report string, failed []string) {
 	for _, line := range lines {
 		switch {
 		case strings.HasPrefix(line, "--- FAIL: "):
-			name := strings.Fields(line[len("--- FAIL: "):])[0]
+			fields := strings.Fields(line[len("--- FAIL: "):])
+			if len(fields) == 0 {
+				// A bare "--- FAIL: " marker carries no test name: log
+				// noise, not a failure. Skip it rather than panic or
+				// invent a name (untrusted log text, fail-closed).
+				continue
+			}
+			name := fields[0]
 			f, ok := found[name]
 			if !ok {
 				f = &flaky{}
