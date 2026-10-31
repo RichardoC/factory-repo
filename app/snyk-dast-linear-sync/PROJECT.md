@@ -200,6 +200,14 @@ served from the snapshot:
   radius of a misconfiguration.
 - creates need no handling: there is no pre-existing label set to replace.
 
+Linear label groups are mutually exclusive: an issue may carry at most one child
+of a group, and `issueUpdate` rejects a label set that names two ("labelIds not
+exclusive child labels"). The echoed set is therefore collapsed to at most one
+child per group: a managed label the sync asserts evicts the carried-forward
+sibling of its group, and between two carried-forward siblings the first read
+wins. Without this, a ticket that carries a second child of a managed label's
+group fails every update until a person edits the ticket by hand.
+
 The live read is skipped when the protected set is empty, keeping the extra query
 off the hot path for deployments that do not need it.
 
