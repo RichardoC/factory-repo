@@ -1184,6 +1184,21 @@ func modelStatsAlerts(in modelStatsInput, aggs []*modelAgg, cfg Config, win mode
 	baselineHours := *cfg.Alerts.TTFTp50RatioBaselineHours
 	for _, a := range aggs {
 		if a.Calls == 0 {
+			// Issue #320: a model throttled to death has no call row at all --
+			// every attempt the proxy made came back 429 and was recorded as a
+			// status marker only. The 429-rate alert is the one that carries
+			// the operational advice, so it is evaluated here on the markers
+			// alone (the denominator is the marker count; percentOf already
+			// divides by Calls+markers, and Calls is 0), in the same wording
+			// as below, instead of the bare "no calls" line.
+			if a.Four29 > 0 {
+				if rate := percentOf(float64(a.Four29), float64(countMarkers(in, a.ID))); rate > cfg.Alerts.Rate429Pct {
+					out = append(out, fmt.Sprintf("%s: 429 rate %.2f%% above the %.2f%% threshold (%d of %d); "+
+						"consider lowering max_concurrent, not raising it",
+						modelIDCell(a.ID), rate, cfg.Alerts.Rate429Pct, a.Four29, countMarkers(in, a.ID)))
+					continue
+				}
+			}
 			out = append(out, fmt.Sprintf("%s: configured model with no calls in the window", modelIDCell(a.ID)))
 			continue
 		}
