@@ -2712,3 +2712,133 @@ func TestReviewPlanCapKeepsBlockingFinding(t *testing.T) {
 			len(ties), ties[len(ties)-1].Line, maxReviewFindings)
 	}
 }
+
+// TestReviewPlanCapKeepsBlockingFindingEveryPath pins the cap's ranking
+// (issue #385) on the paths the section-only test above leaves open: the
+// inline (non-section) parse form, the first line past the cap, the shape of
+// the displacement (an earlier high survives and only lows give way) and the
+// honest verbose review, which must still pass.
+func TestReviewPlanCapKeepsBlockingFindingEveryPath(t *testing.T) {
+	// sectionAnswer builds a findings section of n bullets: every one a low
+	// nit, except a single finding of the given severity at line at.
+	sectionAnswer := func(severity string, at, n int) string {
+		var b strings.Builder
+		b.WriteString("## Findings\n\n")
+		for i := 1; i <= n; i++ {
+			if i == at {
+				fmt.Fprintf(&b, "- [%s] app/cap.go:%d - the finding that matters\n", severity, i)
+			} else {
+				fmt.Fprintf(&b, "- [low] app/cap.go:%d - nit %d\n", i, i)
+			}
+		}
+		return b.String()
+	}
+	// inlineAnswer writes the same findings in the inline (non-section)
+	// form, one per line, so the parse path that never sees a section
+	// header is exercised at the cap too.
+	inlineAnswer := func(severity string, at, n int) string {
+		var b strings.Builder
+		b.WriteString("Review notes follow.\n\n")
+		for i := 1; i <= n; i++ {
+			if i == at {
+				fmt.Fprintf(&b, "[%s] app/cap.go:%d - the finding that matters\n", severity, i)
+			} else {
+				fmt.Fprintf(&b, "[low] app/cap.go:%d - nit %d\n", i, i)
+			}
+		}
+		return b.String()
+	}
+	const n = maxReviewFindings + 10 // 60 findings: the cap cuts ten of them
+	server := commentsServer(t, reportComments(0), http.StatusOK)
+	ghEnv(t, server)
+
+	// The first finding past the cap is a high: it is kept, the action is a
+	// fix run, and the comment names exactly that finding with no pass
+	// label — the false pass the cap used to produce.
+	findings, sawSection := parseFindings(sectionAnswer("high", maxReviewFindings+1, n))
+	if len(findings) != maxReviewFindings || len(blockingFindings(findings)) != 1 {
+		t.Fatalf("a high on the first line past the cap = %d findings, %d blocking, want the cap and the high kept",
+			len(findings), len(blockingFindings(findings)))
+	}
+	action, body, _, err := reviewPlan(newGitHub(), 7,
+		Result{Stop: stopDone, Model: "deepseek-ai/deepseek-v4.1-flash"}, true, findings, sawSection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "fix" {
+		t.Fatalf("action = %q, want fix", action)
+	}
+	if want := command + " fix: 1 blocking finding - high app/cap.go:51"; !strings.HasPrefix(body, want) {
+		t.Errorf("the fix comment = %q, want it to start with %q", body, want)
+	}
+	if strings.Contains(body, reviewPassedLabel) {
+		t.Errorf("the fix comment carries the pass label: %q", body)
+	}
+	assertReviewBodyClean(t, body)
+
+	// The inline (non-section) parse path keeps a late high too: a review
+	// that never reached the section cannot hide its blocking finding past
+	// the cap by leaving the header out.
+	inline, sawInline := parseFindings(inlineAnswer("high", n, n))
+	if sawInline {
+		t.Fatal("an inline-only answer reported a section header")
+	}
+	if len(blockingFindings(inline)) != 1 {
+		t.Fatalf("an inline high past the cap = %d blocking findings, want 1: %+v", len(blockingFindings(inline)), inline)
+	}
+	action, _, _, err = reviewPlan(newGitHub(), 7,
+		Result{Stop: stopDone, Model: "deepseek-ai/deepseek-v4.1-flash"}, true, inline, sawInline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "fix" {
+		t.Fatalf("an inline high past the cap: action = %q, want fix", action)
+	}
+
+	// Displacement keeps its shape: an earlier high survives a flood of
+	// lows that fills the rest of the cap, and only lows give way — every
+	// kept low is one that arrived before the high.
+	var b strings.Builder
+	b.WriteString("## Findings\n\n")
+	fmt.Fprintf(&b, "- [high] app/cap.go:10 - the early high\n")
+	for i := 1; i <= n; i++ {
+		fmt.Fprintf(&b, "- [low] app/cap.go:%d - nit %d\n", 100+i, i)
+	}
+	displaced, _ := parseFindings(b.String())
+	if len(displaced) != maxReviewFindings {
+		t.Fatalf("displacement = %d findings, want the cap", len(displaced))
+	}
+	keptHigh := false
+	for _, f := range displaced {
+		if f.Severity == "high" {
+			keptHigh = true
+			continue
+		}
+		// The flood of lows fills the rest of the cap in arrival order, so
+		// the ones the cap gives way are the last to arrive: no low past
+		// the forty-ninth nit survives.
+		if f.Line > 100+maxReviewFindings-1 {
+			t.Errorf("a low that arrived late survived the cap: %+v", f)
+		}
+	}
+	if !keptHigh {
+		t.Errorf("an earlier high did not survive the displacement: %+v", displaced)
+	}
+
+	// A clean verbose review still passes: sixty low findings truncate to
+	// the cap, nothing blocks, and the label is added — the ranking only
+	// rescues findings that change the decision, it does not punish length.
+	clean, sawClean := parseFindings(sectionAnswer("", 0, n))
+	if len(clean) != maxReviewFindings || len(blockingFindings(clean)) != 0 {
+		t.Fatalf("a clean 60-low answer = %d findings, %d blocking, want the cap and no blocking",
+			len(clean), len(blockingFindings(clean)))
+	}
+	action, body, _, err = reviewPlan(newGitHub(), 7,
+		Result{Stop: stopDone, Model: "deepseek-ai/deepseek-v4.1-flash"}, true, clean, sawClean)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != "label" || !strings.Contains(body, reviewPassedLabel) {
+		t.Errorf("a clean 60-low answer = action %q, label present %v, want the pass label added", action, strings.Contains(body, reviewPassedLabel))
+	}
+}
