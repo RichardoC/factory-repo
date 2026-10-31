@@ -747,3 +747,125 @@ func TestParseProposalsEndToEndField(t *testing.T) {
 		t.Fatalf("placeholder missing from body:\n%s", body)
 	}
 }
+
+// Issue #339: the planner brief ends with its output contract inside a fence
+// (planOutputContract), and plan-instructions.md repeats it. An answer that
+// quotes that contract — or any proposal-shaped text — must mint no proposal
+// from it: ParseProposals is fence-aware (issue #224's rule, brought to the
+// plan parser) and reads nothing inside a ``` or ~~~ span.
+func TestParseProposalsFencedContractEchoDropped(t *testing.T) {
+	echo := "## Final answer\n\n" +
+		"The output contract is:\n\n" +
+		"```\n" +
+		"### Proposal: <one-line title>\n" +
+		"- Problem: <text>\n" +
+		"- What to do: <text>\n" +
+		"- Done when: <text>\n" +
+		"- End-to-end check: <text>   (optional line)\n" +
+		"- Area: harness | app/<name>\n" +
+		"- Depends on: #12, #34   (optional line)\n" +
+		"```\n"
+	if props := ParseProposals(echo, 5); len(props) != 0 {
+		t.Errorf("fenced contract echo opened %d proposal(s): %+v", len(props), props)
+	}
+	// The same text without the fence is answer prose, not a quote: it
+	// parses as the one proposal the unfenced contract format always did —
+	// which is why the guard must be on the fence, not on the shapes.
+	if props := ParseProposals(strings.ReplaceAll(echo, "```\n", ""), 5); len(props) != 1 {
+		t.Errorf("unfenced echo gave %d proposal(s), want 1: %+v", len(props), props)
+	}
+}
+
+func TestParseProposalsFenceMixedWithRealProposal(t *testing.T) {
+	answer := "## Final answer\n\n" +
+		"Here is the contract, for reference:\n\n" +
+		"```\n" +
+		"### Proposal: <one-line title>\n" +
+		"- Problem: <text>\n" +
+		"- What to do: <text>\n" +
+		"- Done when: <text>\n" +
+		"- Area: harness | app/<name>\n" +
+		"```\n\n" +
+		"### Proposal: Fix the fence-blind plan parser\n\n" +
+		"- Problem: ParseProposals reads proposal headers inside code fences.\n" +
+		"- What to do: track fenced blocks with parseFences and skip them.\n" +
+		"- Done when: the fenced contract yields zero proposals.\n" +
+		"- Area: harness\n"
+	props := ParseProposals(answer, 5)
+	if len(props) != 1 {
+		t.Fatalf("len(props) = %d, want 1: %+v", len(props), props)
+	}
+	if props[0].Title != "Fix the fence-blind plan parser" {
+		t.Errorf("Title = %q", props[0].Title)
+	}
+	if props[0].Area != "harness" {
+		t.Errorf("Area = %q, want harness", props[0].Area)
+	}
+}
+
+func TestParseProposalsFenceKeepsOutsideProseAndLaterProposals(t *testing.T) {
+	// A fence quotes only its own span: a proposal opened before it keeps
+	// the field lines written outside the fence, and a proposal after it
+	// still parses whole.
+	answer := "### Proposal: Real before the fence\n\n" +
+		"- Problem: the fence comes later and must not eat this.\n\n" +
+		"```\n" +
+		"- Problem: fenced lookalike field inside a sample\n" +
+		"```\n\n" +
+		"### Proposal: Real after the fence\n\n" +
+		"- Problem: the fence closed, so this one parses too.\n" +
+		"- What to do: keep parsing after the closing delimiter.\n"
+	props := ParseProposals(answer, 5)
+	if len(props) != 2 {
+		t.Fatalf("len(props) = %d, want 2: %+v", len(props), props)
+	}
+	if props[0].Title != "Real before the fence" || props[1].Title != "Real after the fence" {
+		t.Errorf("titles = %q, %q", props[0].Title, props[1].Title)
+	}
+	// The fence sits under the open Problem field, so it is that field's
+	// text, kept whole as a quote: its lookalike "- Problem:" line opens no
+	// field of its own.
+	if want := "the fence comes later and must not eat this.\n```\n- Problem: fenced lookalike field inside a sample\n```"; props[0].Problem != want {
+		t.Errorf("first Problem = %q, want %q", props[0].Problem, want)
+	}
+	if !strings.Contains(props[1].What, "keep parsing") {
+		t.Errorf("second What = %q", props[1].What)
+	}
+}
+
+// TestParseProposalsFencedFieldContentKept pins the other half of issue
+// #339: a fence is a quote, not a hole. A proposal whose End-to-end check
+// carries its command in a fence keeps that command, so the issue still has
+// the section the queue's readiness gate reads.
+func TestParseProposalsFencedFieldContentKept(t *testing.T) {
+	answer := "### Proposal: Fenced check\n\n" +
+		"- Problem: something is wrong.\n" +
+		"- What to do: fix it.\n" +
+		"- End-to-end check:\n" +
+		"```sh\n" +
+		"go -C .github/codeaf test -run TestSomething .\n" +
+		"```\n"
+	props := ParseProposals(answer, 5)
+	if len(props) != 1 {
+		t.Fatalf("len(props) = %d, want 1: %+v", len(props), props)
+	}
+	if !strings.Contains(props[0].EndToEnd, "go -C .github/codeaf test -run TestSomething .") {
+		t.Errorf("EndToEnd = %q, want the fenced command kept", props[0].EndToEnd)
+	}
+}
+
+// TestParseProposalsUnterminatedFenceIsNotAQuote: a fence that never closes
+// runs to the end of the answer, so reading it as a quote would swallow
+// every proposal after it. Like the review pass (issue #224), only a closed
+// fence is a confirmed quote.
+func TestParseProposalsUnterminatedFenceIsNotAQuote(t *testing.T) {
+	answer := "### Proposal: Before\n\n" +
+		"- Problem: first.\n" +
+		"```\n" +
+		"### Proposal: After an unclosed fence\n\n" +
+		"- Problem: second.\n"
+	props := ParseProposals(answer, 5)
+	if len(props) != 2 || props[1].Title != "After an unclosed fence" {
+		t.Fatalf("props = %+v, want the proposal after the unclosed fence parsed", props)
+	}
+}
