@@ -2450,6 +2450,40 @@ func nextLink(h string) string {
 // API and this repository's prefix, and anything else — another host, a
 // relative link outside /repos/<repo>/, an unparseable URL — is an error,
 // because a listing that cannot be continued safely is a truncated one.
+// repoIDs caches repository ids the paged reads have looked up, keyed by
+// "api repo" (issue #390): GitHub's real next links are relative to
+// /repositories/<id>/, and following one means checking <id> against this
+// repository's own id, read once from GET /repos/<repo>. The key carries
+// the API base so a stub server in a test never answers for another.
+var repoIDs sync.Map // string -> int64
+
+// repositoryID returns this repository's numeric id, read once from
+// GET /repos/<repo> and cached per API base and repository.
+func (g github) repositoryID() (int64, error) {
+	key := g.api + " " + g.repo
+	if id, ok := repoIDs.Load(key); ok {
+		return id.(int64), nil
+	}
+	var repo struct {
+		ID int64 `json:"id"`
+	}
+	// An empty path lands doGet on exactly /repos/<repo>.
+	if err := g.get("", &repo); err != nil {
+		return 0, err
+	}
+	if repo.ID == 0 {
+		return 0, fmt.Errorf("GET /repos/%s answered no repository id", g.repo)
+	}
+	repoIDs.LoadOrStore(key, repo.ID)
+	return repo.ID, nil
+}
+
+// listNext reduces a next link to the path the next page is read with. The
+// link is untrusted data: it is followed only when it leads back to this
+// API and this repository, and anything else — another host, a relative
+// link outside /repos/<repo>/ or an unrecognised /repositories/<id>/, an
+// unparseable URL — is an error, because a listing that cannot be
+// continued safely is a truncated one.
 func (g github) listNext(h string) (string, error) {
 	next := nextLink(h)
 	if next == "" {
@@ -2464,13 +2498,35 @@ func (g github) listNext(h string) (string, error) {
 	}
 	uri := u.RequestURI() // path and query, never a scheme or host
 	prefix := "/repos/" + g.repo + "/"
-	if !strings.HasPrefix(uri, prefix) {
-		return "", fmt.Errorf("next link %q leaves the repository", next)
+	if strings.HasPrefix(uri, prefix) {
+		// The prefix ends with the repository's separator, so what follows it
+		// is the path below /repos/<repo> without its leading slash — which
+		// doGet expects, like the one-shot paths it is handed.
+		return "/" + strings.TrimPrefix(uri, prefix), nil
 	}
-	// The prefix ends with the repository's separator, so what follows it
-	// is the path below /repos/<repo> without its leading slash — which
-	// doGet expects, like the one-shot paths it is handed.
-	return "/" + strings.TrimPrefix(uri, prefix), nil
+	// GitHub's real next links are numeric (issue #390): the issues list, for
+	// one, is offered as <https://api.github.com/repositories/<id>/issues?...>;
+	// rel="next". The id segment is untrusted, so it is checked against this
+	// repository's own id — read once from GET /repos/<repo> — and only an
+	// exact match is translated to the /repos/<owner>/<repo>/ form doGet
+	// builds its requests with. A link naming another id still names
+	// another repository's data, however the segments are spelled.
+	if rest, ok := strings.CutPrefix(uri, "/repositories/"); ok {
+		id, tail, _ := strings.Cut(rest, "/")
+		number, err := strconv.ParseInt(id, 10, 64)
+		if err != nil {
+			return "", fmt.Errorf("next link %q names repository %q, not an id", next, id)
+		}
+		mine, err := g.repositoryID()
+		if err != nil {
+			return "", fmt.Errorf("checking next link %q: %v", next, err)
+		}
+		if number != mine {
+			return "", fmt.Errorf("next link %q leaves the repository: it names repository id %d, this repository is id %d", next, number, mine)
+		}
+		return "/" + tail, nil
+	}
+	return "", fmt.Errorf("next link %q leaves the repository", next)
 }
 
 // isPageCapError reports whether err is getList's page-cap error, the one
