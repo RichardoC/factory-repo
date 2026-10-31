@@ -2253,9 +2253,30 @@ func TestFailedRunReportCountsRefusedNoChanges(t *testing.T) {
 // (incomplete / false) does not: its patch landed and continue-plan already
 // handles it, so it stays not-failed (2026-10-31 triage on issue #310).
 func TestFailedRunReportCountsNoResult(t *testing.T) {
-	noResult := "\n" + noResultRow + "\n"
+	// The no-result body is taken from the report writer itself, not from
+	// the noResultRow constant failedRunReport matches on: building it from
+	// the constant would keep the two coupled in name only, and the report
+	// main.go actually writes (Report with haveResult false, issue #310)
+	// could drift away from the matcher with every test still green.
+	written := Report(Result{}, false, nil, Config{}, nil, ReportInputs{}, func(string) string { return "" })
+	if !strings.Contains(written, "| result |") {
+		t.Fatalf("no-result report lacks a result row:\n%s", written)
+	}
+	row, ok := reportTableRow(written, "result")
+	if !ok {
+		t.Fatalf("no-result report has no parseable result row:\n%s", written)
+	}
+	if !strings.Contains(written, "\n"+noResultRow+"\n") {
+		t.Errorf("the no-result report the writer wrote does not carry noResultRow %q:\n%s", noResultRow, written)
+	}
+	noResult := "\n| result | " + row + " |\n"
 	headedNoResult := reportMarker + "\n### CodeAF run — finished\n\n| | |\n|---|---|\n" + noResult
 	headinglessNoResult := reportMarker + "\n\n| | |\n|---|---|\n" + noResult
+	// The writer's own report, verbatim, whatever heading the workflow gave
+	// it: it is the one body the real fallback produces.
+	if !failedRunReport(written) {
+		t.Errorf("failedRunReport(the written no-result report) = false, want true:\n%s", written)
+	}
 	for _, tc := range []struct {
 		body string
 		want bool
