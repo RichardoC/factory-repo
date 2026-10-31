@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -499,18 +500,20 @@ func TestRunPlanBriefDegradesOnPageCap(t *testing.T) {
 	}
 }
 
-// TestRunPlanBriefWindowedReadsTakeOnePage proves the recent-items reads
-// stay one request each: the closed issues, closed pull requests and run
-// reports are windows of the newest items, and a repository with more
-// history than maxListPages pages must not lose them to the page cap.
+// TestRunPlanBriefWindowedReadsTakeOnePage proves the one-page windowed
+// reads stay one request each: the closed pull requests and the run reports
+// are windows of the newest items, and a repository with more history than
+// maxListPages pages must not lose them to the page cap. The closed issues
+// read is a window too, but of a different shape (issue #322): it pages
+// past the closed pull requests that share its endpoint, so it is covered
+// by TestPlanClosedIssuesPagesPastPullRequests and never here.
 func TestRunPlanBriefWindowedReadsTakeOnePage(t *testing.T) {
 	var windowed atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("state") == "closed" || r.URL.Path == "/repos/RichardoC/factory-repo/issues/comments" {
+		if r.URL.Path == "/repos/RichardoC/factory-repo/pulls" || r.URL.Path == "/repos/RichardoC/factory-repo/issues/comments" {
 			windowed.Add(1)
+			w.Header().Set("Link", fmt.Sprintf("<%s%s&page=2>; rel=\"next\"", serverURL(r), r.URL.RequestURI()))
 		}
-		// The next link keeps the query, so a followed page is counted too.
-		w.Header().Set("Link", fmt.Sprintf("<%s%s&page=2>; rel=\"next\"", serverURL(r), r.URL.RequestURI()))
 		_, _ = io.WriteString(w, `[]`)
 	}))
 	t.Cleanup(server.Close)
@@ -518,7 +521,123 @@ func TestRunPlanBriefWindowedReadsTakeOnePage(t *testing.T) {
 	if err := runPlanBrief(); err != nil {
 		t.Fatalf("runPlanBrief: %v", err)
 	}
-	if n := windowed.Load(); n != 3 {
-		t.Errorf("windowed requests = %d, want 3 (one page each)", n)
+	if n := windowed.Load(); n != 2 {
+		t.Errorf("one-page windowed requests = %d, want 2 (closed pulls and run reports, one page each)", n)
+	}
+}
+
+// TestPlanClosedIssuesPagesPastPullRequests pins issue #322: the issues
+// endpoint lists closed pull requests too, so a first page of 20 closed
+// pull requests must not empty the section — the read follows the next link
+// and renders the closed issue waiting on page 2, which a one-page window
+// (and a 20-item budget spent on pull requests) would have lost.
+func TestPlanClosedIssuesPagesPastPullRequests(t *testing.T) {
+	var pages atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/RichardoC/factory-repo/issues" || r.URL.Query().Get("state") != "closed" {
+			_, _ = io.WriteString(w, `[]`)
+			return
+		}
+		switch r.URL.Query().Get("page") {
+		case "":
+			pages.Add(1)
+			w.Header().Set("Link", fmt.Sprintf("<%s/repos/RichardoC/factory-repo/issues?state=closed&sort=updated&per_page=20&page=2>; rel=\"next\"", serverURL(r)))
+			var b strings.Builder
+			b.WriteString("[")
+			for i := 0; i < 20; i++ {
+				if i > 0 {
+					b.WriteString(",")
+				}
+				fmt.Fprintf(&b, `{"number":%d,"title":"Closed pull request %d","body":"x","pull_request":{}}`, 500+i, i)
+			}
+			b.WriteString("]")
+			_, _ = io.WriteString(w, b.String())
+		case "2":
+			pages.Add(1)
+			_, _ = io.WriteString(w, `[{"number":3,"title":"Recently closed issue","body":"Out of scope: a widgets export."}]`)
+		default:
+			http.Error(w, "unexpected page: "+r.URL.RequestURI(), http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(server.Close)
+	briefPath := planBriefEnv(t, server)
+	if err := runPlanBrief(); err != nil {
+		t.Fatalf("runPlanBrief: %v", err)
+	}
+	data, err := os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := closedIssueSection(string(data))
+	if !strings.Contains(body, "### #3 — Recently closed issue") {
+		t.Errorf("the closed issue behind a page of closed pull requests is missing:\n%s", body)
+	}
+	if !strings.Contains(body, "Out of scope: a widgets export.") {
+		t.Errorf("the closed issue's body is missing:\n%s", body)
+	}
+	if strings.Contains(body, "(no recently closed issues)") {
+		t.Errorf("a page of closed pull requests emptied the section:\n%s", body)
+	}
+	if n := pages.Load(); n != 2 {
+		t.Errorf("closed-issue pages served = %d, want exactly 2 (the next link was not followed, or followed too far)", n)
+	}
+}
+
+// TestPlanClosedIssuesBudgetCountsOnlyIssues pins the other half of issue
+// #322: the 20-slot budget counts the issues the section renders, not the
+// items the API returned, so the read keeps paging while pull requests sit
+// in front of it and stops as soon as 20 issues are in hand — never reading
+// a page it does not need.
+func TestPlanClosedIssuesBudgetCountsOnlyIssues(t *testing.T) {
+	var pages atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/RichardoC/factory-repo/issues" || r.URL.Query().Get("state") != "closed" {
+			_, _ = io.WriteString(w, `[]`)
+			return
+		}
+		page, err := strconv.Atoi(r.URL.Query().Get("page"))
+		if r.URL.Query().Get("page") == "" {
+			page, err = 1, nil
+		}
+		if err != nil || page < 1 {
+			http.Error(w, "unexpected page: "+r.URL.RequestURI(), http.StatusBadRequest)
+			return
+		}
+		pages.Add(1)
+		// Every page is 10 closed pull requests plus 10 closed issues, and
+		// every page offers a next one: only the 20-issue budget ends the
+		// read, so a budget that counted pull requests would stop early.
+		w.Header().Set("Link", fmt.Sprintf("<%s/repos/RichardoC/factory-repo/issues?state=closed&sort=updated&per_page=20&page=%d>; rel=\"next\"", serverURL(r), page+1))
+		n := page
+		var b strings.Builder
+		b.WriteString("[")
+		for i := 0; i < 10; i++ {
+			fmt.Fprintf(&b, `{"number":%d,"title":"PR %d-%d","body":"x","pull_request":{}},`, 9000+i, n, i)
+			fmt.Fprintf(&b, `{"number":%d,"title":"Issue %d-%d","body":"note"}`, 100*n+i, n, i)
+			if i < 9 {
+				b.WriteString(",")
+			}
+		}
+		b.WriteString("]")
+		_, _ = io.WriteString(w, b.String())
+	}))
+	t.Cleanup(server.Close)
+	briefPath := planBriefEnv(t, server)
+	if err := runPlanBrief(); err != nil {
+		t.Fatalf("runPlanBrief: %v", err)
+	}
+	data, err := os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := closedIssueSection(string(data))
+	if got := strings.Count(body, "### #"); got != maxPlanClosedIssues {
+		t.Errorf("closed issues rendered = %d, want exactly %d", got, maxPlanClosedIssues)
+	}
+	if strings.Contains(body, "Issue 3-") {
+		t.Errorf("the window read past the 20-issue budget:\n%s", body)
+	}
+	if n := pages.Load(); n != 2 {
+		t.Errorf("closed-issue pages served = %d, want exactly 2 (20 issues at 10 a page)", n)
 	}
 }
