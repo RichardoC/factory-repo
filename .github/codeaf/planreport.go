@@ -197,11 +197,31 @@ func ParseProposals(answer string, max int) []Proposal {
 			cur.Deps = appendPlanDeps(cur.Deps, line)
 		}
 	}
-	for _, raw := range strings.Split(answer, "\n") {
+	lines := strings.Split(answer, "\n")
+	// Issue #339: the fences are computed once over the whole answer, before
+	// any line is parsed, with the same span rule the review pass uses
+	// (issue #224). A closed fenced block — the brief's own output contract
+	// echoed back, a quoted sample, a patch — is quoted text, not answer
+	// prose, so nothing inside one may open a proposal or a field. Its lines
+	// still belong to the field that is open around it: a proposal's End-
+	// to-end check or What to do may carry its command or sample in a fence,
+	// and dropping it would leave the issue short of the section the queue's
+	// gate reads. An unterminated fence is not a confirmed quote (the review
+	// pass's rule too): it runs to the end of the answer and would otherwise
+	// swallow every proposal after it, so its lines parse as usual.
+	spans := parseFences(lines)
+	for i, raw := range lines {
 		if len(out) >= max {
 			break // cap reached: the rest of the answer is ignored
 		}
 		line := strings.TrimSuffix(raw, "\r")
+		if _, quoted := fenceStateAt(spans, i); quoted {
+			// A quoted line opens nothing; it is text of the open field.
+			if cur != nil && field != "" && strings.TrimSpace(line) != "" {
+				appendTo(field, planClean(line))
+			}
+			continue
+		}
 		if m := planProposalHeader.FindStringSubmatch(line); m != nil {
 			closeCur()
 			if len(out) >= max {
