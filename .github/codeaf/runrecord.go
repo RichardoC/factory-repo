@@ -537,7 +537,9 @@ func metricsSummary(records []RunRecord, days int, now time.Time) string {
 }
 
 // recordShape is the one-line shape `state load` logs: how the last seven
-// days ran, from the bundle's records.
+// days ran, from the bundle's records. The done/incomplete figures count
+// issue-mode runs only, so a `pr`, `review`, `plan` or `experiment` run that
+// ended done or incomplete does not inflate the issue figures.
 func recordShape(records []RunRecord, now time.Time) string {
 	start := now.UTC().Add(-6 * 24 * time.Hour).Format(time.DateOnly)
 	today := now.UTC().Format(time.DateOnly)
@@ -548,16 +550,17 @@ func recordShape(records []RunRecord, now time.Time) string {
 			continue
 		}
 		switch r.Mode {
+		case "issue":
+			switch r.Stop {
+			case stopDone:
+				done++
+			case stopIncomplete:
+				incomplete++
+			}
 		case "review":
 			review++
 		case "plan":
 			plan++
-		}
-		switch r.Stop {
-		case stopDone:
-			done++
-		case stopIncomplete:
-			incomplete++
 		}
 	}
 	return fmt.Sprintf("issue %d done/%d incomplete, review %d, plan %d",

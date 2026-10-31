@@ -744,3 +744,37 @@ func lastOfRunRecords(rs []RunRecord) string {
 	}
 	return rs[len(rs)-1].RunID
 }
+
+func TestRecordShape(t *testing.T) {
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	rec := func(mode, stop, date string) RunRecord {
+		return RunRecord{RunID: "1", Attempt: "1", Mode: mode, Stop: stop, Date: date}
+	}
+
+	// Records with issue, pr and review runs that ended done or
+	// incomplete: only the issue records may feed the done/incomplete
+	// figures, and only inside the seven-day window (2026-10-10 .. today).
+	records := []RunRecord{
+		rec("issue", stopDone, "2026-10-16"),
+		rec("issue", stopDone, "2026-10-10"),
+		rec("issue", stopIncomplete, "2026-10-14"),
+		rec("issue", stopBudget, "2026-10-15"), // not done/incomplete
+		rec("issue", stopDone, "2026-10-09"),   // before the window
+		rec("issue", stopDone, "2026-10-17"),   // after today
+		rec("pr", stopDone, "2026-10-15"),
+		rec("pr", stopIncomplete, "2026-10-16"),
+		rec("pr", stopDone, "2026-10-09"), // outside the window either way
+		rec("review", stopDone, "2026-10-13"),
+		rec("review", stopIncomplete, "2026-10-16"),
+		rec("plan", stopIncomplete, "2026-10-12"),
+		rec("experiment", stopDone, "2026-10-16"),
+	}
+	want := "issue 2 done/1 incomplete, review 2, plan 1"
+	if got := recordShape(records, now); got != want {
+		t.Errorf("recordShape = %q, want %q", got, want)
+	}
+
+	if got, want := recordShape(nil, now), "issue 0 done/0 incomplete, review 0, plan 0"; got != want {
+		t.Errorf("recordShape(nil) = %q, want %q", got, want)
+	}
+}
