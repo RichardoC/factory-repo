@@ -923,6 +923,24 @@ func linearGraphQLData(operation string) map[string]any {
 			"success": true,
 			"issue":   map[string]any{"id": "issue-1", "identifier": "PRJ-100"},
 		}}
+	case "issueLabelsByID":
+		// The live label read every update batch issues immediately before
+		// its write; report the fixture ticket's current labels so the update
+		// carries them forward instead of refusing the issue as unreadable.
+		return map[string]any{"issues": map[string]any{
+			"nodes": []any{
+				map[string]any{
+					"id": "issue-1",
+					"labels": map[string]any{
+						"nodes": []any{
+							map[string]any{"id": "label-1", "name": "snyk-dast-automation", "parent": nil},
+						},
+						"pageInfo": map[string]any{"hasNextPage": false},
+					},
+				},
+			},
+			"pageInfo": map[string]any{"hasNextPage": false, "endCursor": nil},
+		}}
 	case "issueUpdateBatch":
 		return map[string]any{"issueUpdate0": map[string]any{"success": true}}
 	case "issueUnsubscribeBatch":
