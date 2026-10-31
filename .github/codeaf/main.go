@@ -2087,11 +2087,12 @@ func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, st
 	var payload map[string]json.RawMessage
 	err := json.NewDecoder(upstream).Decode(&payload)
 	if err == nil && payload == nil {
-		// A body that decodes to a nil map — literal null, or an empty
-		// document — is as unusable as one that fails to decode: the relay
-		// below assigns into payload and would panic on a nil map, so the
-		// caller would see a cut connection and the call would be the exact
-		// phantom issue #350 is about. Treat it as an undecodable body.
+		// A body that decodes to a nil map — the literal null, which is the
+		// one such document (an empty body fails the decode above as io.EOF)
+		// — is as unusable as one that fails to decode: the relay below
+		// assigns into payload and would panic on a nil map, so the caller
+		// would see a cut connection and the call would be the exact phantom
+		// issue #350 is about. Treat it as an undecodable body.
 		err = errors.New("body is not a JSON object")
 	}
 	if err != nil {
@@ -4517,9 +4518,18 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 		return ApiCostOf(m, usage)
 	}
 	var overage float64
+	statusCalls := 0 // recorded calls with no usage to price
 	totals := map[string]*modelTotals{}
 	for _, l := range lines {
 		if l.Kind != "" {
+			if l.Kind == "status" {
+				// A status line is a call the run made that carries no usage:
+				// an upstream refusal (issue #140) or a 200 body the proxy
+				// could not decode (issue #350). It costs nothing in the
+				// total, so the metered row counts it instead — otherwise a
+				// ledger of such calls renders exactly like an empty one.
+				statusCalls++
+			}
 			continue // marker lines are not calls
 		}
 		id := ledgerModel(l.Model)
@@ -4676,8 +4686,15 @@ func Report(result Result, haveResult bool, lines []LedgerLine, cfg Config, wall
 	if weekKnown {
 		weekCell = money(weekBefore + total)
 	}
-	fmt.Fprintf(&b, "| metered by proxy (from its ledger) | **%s** this run at overage prices · %s this week (cap $%s/run, $%s/week) · %s overage |\n",
-		money(total), weekCell, trimNumber(cfg.Limits.RunCreditUSD), trimNumber(cfg.Limits.WeeklyCreditUSD), money(overage))
+	// Calls recorded without usage cost nothing, so the total cannot show
+	// them; the row names their number instead (issue #350), and omits it on
+	// a ledger that has none so the usual row is unchanged.
+	statusCell := ""
+	if statusCalls > 0 {
+		statusCell = fmt.Sprintf(" · %d recorded calls with no usage", statusCalls)
+	}
+	fmt.Fprintf(&b, "| metered by proxy (from its ledger) | **%s** this run at overage prices · %s this week (cap $%s/run, $%s/week) · %s overage%s |\n",
+		money(total), weekCell, trimNumber(cfg.Limits.RunCreditUSD), trimNumber(cfg.Limits.WeeklyCreditUSD), money(overage), statusCell)
 	// The quota state synthetic.new reported at proxy start, re-parsed from
 	// the ledger's "quotas" marker. Omitted when the marker is absent or
 	// its body does not parse; the units are undocumented, so the row says

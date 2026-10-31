@@ -4682,9 +4682,35 @@ func TestProxyUndecodable200IsRecorded(t *testing.T) {
 	if got := ledgerTotal(lines); money(got) != anchor {
 		t.Errorf("ledger total = %s, want the recorded call's cost %s (the 502 lines cost nothing)", money(got), anchor)
 	}
-	// The control: the same report over an empty ledger must not render the
-	// anchor, or the assertion above would be vacuous.
+	// The status lines cost nothing, so the money figure above cannot show
+	// them: the row counts them instead. That count is the assertion the
+	// reviewer's probe found missing — drop the 502 lines from the ledger and
+	// the row loses the figure, so it is not vacuous the way a $0 status
+	// line inside ledgerTotal would be.
+	if want := fmt.Sprintf(" · %d recorded calls with no usage", len(bodies)); !strings.Contains(row, want) {
+		t.Errorf("metered row %q lacks %q, so the recorded 502 calls are invisible to it", row, want)
+	}
+	// The control: the same report over an empty ledger and over a ledger
+	// with the 502 lines filtered out must not render the anchor or the
+	// count, so neither assertion above can pass vacuously.
+	var priced []LedgerLine
+	for _, l := range lines {
+		if l.Kind == "" {
+			priced = append(priced, l)
+		}
+	}
+	if len(priced) != 1 {
+		t.Fatalf("filtered ledger holds %d call lines, want exactly the valid 200: %+v", len(priced), priced)
+	}
+	// An empty ledger must not render the anchor, or the spend assertion
+	// above would pass with nothing recorded; the ledger with the 502 lines
+	// filtered out must not render the count, which is exactly the probe that
+	// convicted the earlier version of this test (a status line costs $0, so
+	// every money-based figure survived filtering it).
 	if empty := meteredRow(nil); strings.Contains(empty, anchor) {
-		t.Errorf("empty-ledger metered row %q carries the anchor %s, so the assertion above proves nothing", empty, anchor)
+		t.Errorf("empty-ledger metered row %q carries the anchor %s, so the spend assertion above proves nothing", empty, anchor)
+	}
+	if filtered := meteredRow(priced); strings.Contains(filtered, "recorded calls with no usage") {
+		t.Errorf("metered row %q counts status calls with the 502 lines filtered out, so the count assertion above proves nothing", filtered)
 	}
 }
