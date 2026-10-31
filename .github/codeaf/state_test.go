@@ -313,7 +313,7 @@ func TestReadManifestRefusesPoisonedSpend(t *testing.T) {
 	}
 	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
 	dir := t.TempDir()
-	writeTestFile(t, filepath.Join(dir, manifestFile), []byte(`{"version":1,"generation":2,"merged":[],"spend":{"2026-10-16":-20}}`))
+	writeTestFile(t, filepath.Join(dir, manifestFile), []byte(`{"version":1,"generation":2,"merged":[],"updated":"2026-10-16T11:00:00Z","spend":{"2026-10-16":-20}}`))
 	if _, _, err := readManifest(dir, now, cfg.Limits.WeeklyCreditUSD); err == nil {
 		t.Error("negative spend accepted")
 	}
@@ -328,18 +328,39 @@ func TestReadManifestRejectsOutOfRangeSpend(t *testing.T) {
 		return now.Add(time.Duration(offset) * 24 * time.Hour).Format(time.DateOnly)
 	}
 	// Each of these is parseable as a date and a valid USD value, but the
-	// write path (SpendDate, RunSpend) can never produce them, so the
-	// read path must not accept them from a merged bundle.
+	// write path (SpendDate, RunSpend, pruneSpend) can never produce them,
+	// so the read path must not accept them from a merged bundle. The
+	// fixtures carry the manifest's own updated timestamp, so what is
+	// refused is the entry, not a missing write time.
 	for name, entry := range map[string]string{
-		"future day":              `"2099-01-01": 0.5`,
-		"a day 30 days old":       fmt.Sprintf("%q: 0.5", day(-30)),
-		"above the weekly credit": fmt.Sprintf("%q: %v", day(0), cfg.Limits.WeeklyCreditUSD+0.01),
+		"future day":                  `"2099-01-01": 0.5`,
+		"a day 30 days old":           fmt.Sprintf("%q: 0.5", day(-30)),
+		"a day the queue cannot fund": fmt.Sprintf("%q: %v", day(0), 3*cfg.Limits.WeeklyCreditUSD+0.01),
 	} {
 		dir := t.TempDir()
-		writeTestFile(t, filepath.Join(dir, manifestFile), []byte(fmt.Sprintf(`{"version":1,"generation":2,"merged":[],"spend":{"2026-10-16":0.5,%s}}`, entry)))
+		writeTestFile(t, filepath.Join(dir, manifestFile), []byte(fmt.Sprintf(`{"version":1,"generation":2,"merged":[],"updated":"2026-10-16T11:00:00Z","spend":{"2026-10-16":0.5,%s}}`, entry)))
 		if _, _, err := readManifest(dir, now, cfg.Limits.WeeklyCreditUSD); err == nil {
 			t.Errorf("%s (%s) accepted", name, entry)
 		}
+	}
+
+	// A past its own boundary day: a bundle the 2026-10-15 merge wrote,
+	// keeping 2026-10-08 at pruneSpend's edge. The gate must read it back
+	// (the reader's now is a day later than the writer's).
+	boundary := t.TempDir()
+	writeTestFile(t, filepath.Join(boundary, manifestFile), []byte(`{"version":1,"generation":2,"merged":[],"updated":"2026-10-15T23:00:00Z","spend":{"2026-10-08":0.5}}`))
+	if _, _, err := readManifest(boundary, now, cfg.Limits.WeeklyCreditUSD); err != nil {
+		t.Errorf("a harness-written boundary day refused: %v", err)
+	}
+
+	// A day total past the weekly credit is still a day the write path
+	// produces: RunSpend believes up to 2*run_cap+1 per run, so ten runs
+	// merged onto one UTC day sum past the cap ($109 > $100). It reads
+	// back; only a day far past it (see above) is refused.
+	over := t.TempDir()
+	writeTestFile(t, filepath.Join(over, manifestFile), []byte(fmt.Sprintf(`{"version":1,"generation":2,"merged":[],"updated":"2026-10-16T11:00:00Z","spend":{"2026-10-16":%v}}`, cfg.Limits.WeeklyCreditUSD+9)))
+	if _, _, err := readManifest(over, now, cfg.Limits.WeeklyCreditUSD); err != nil {
+		t.Errorf("a day total of ten overlapped runs refused: %v", err)
 	}
 
 	// A manifest of ordinary in-week entries reads back unchanged.
@@ -350,6 +371,42 @@ func TestReadManifestRejectsOutOfRangeSpend(t *testing.T) {
 	if m.Generation != 4 || strings.Join(m.Merged, ",") != "10-1,11-1" || len(m.Spend) != 3 ||
 		m.Spend["2026-10-16"] != 1.25 || m.Spend["2026-10-15"] != 0.5 || m.Spend["2026-10-13"] != 2 {
 		t.Errorf("ordinary manifest changed: %+v", m)
+	}
+}
+
+// TestReadManifestRereadsHarnessWrittenBundle merges two runs through the
+// real write path a week apart, so the second merge keeps the first run's
+// day exactly at pruneSpend's boundary, then reads the bundle back a day
+// later. A now-based gate refused that load (finding on #311); the manifest
+// has to be read by its own write time, whatever the loader's clock says.
+func TestReadManifestRereadsHarnessWrittenBundle(t *testing.T) {
+	cfg, err := loadConfig("models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LEDGER_PATH", filepath.Join(t.TempDir(), "none.jsonl"))
+	empty := filepath.Join(t.TempDir(), "no-bundle")
+	day1 := time.Date(2026, 10, 9, 0, 30, 0, 0, time.UTC)
+	run10 := pack(t, cfg, day1, empty, "10", 1.5, func(home string) {})
+	gen1 := filepath.Join(t.TempDir(), "gen1")
+	if err := stateMerge(empty, gen1, []string{run10}, cfg, day1); err != nil {
+		t.Fatal(err)
+	}
+	// Seven days and an hour later the same bundle feeds a second run, whose
+	// merge prunes at its own now-7d and so keeps 2026-10-09 at the boundary.
+	day2 := day1.Add(7*24*time.Hour + time.Hour)
+	run11 := pack(t, cfg, day2, gen1, "11", 2, func(home string) {})
+	gen2 := filepath.Join(t.TempDir(), "gen2")
+	if err := stateMerge(gen1, gen2, []string{run11}, cfg, day2); err != nil {
+		t.Fatal(err)
+	}
+	day3 := day2.Add(24 * time.Hour)
+	m := readManifestT(t, gen2, cfg, day3)
+	if m.Spend["2026-10-09"] != 1.5 || m.Spend["2026-10-16"] != 2 {
+		t.Errorf("spend = %v, want the 2026-10-09 boundary day and the new run", m.Spend)
+	}
+	if got := weekSpend(m, day3); got != 2 {
+		t.Errorf("weekSpend = %v, want 2 (the boundary day is counted by no week)", got)
 	}
 }
 
@@ -397,10 +454,14 @@ func TestStateLoadOutputsWeekSpend(t *testing.T) {
 	dir := t.TempDir()
 	m := newManifest()
 	m.Generation = 4
+	// The merge of 2026-10-15 (a day before this load) wrote this bundle;
+	// it kept 2026-10-08, its own pruneSpend boundary day: a harness-written
+	// entry the gate must accept even though no week counts it.
+	m.Updated = time.Date(2026, 10, 15, 23, 0, 0, 0, time.UTC)
 	m.Spend["2026-10-16"] = 1.5 // today
 	m.Spend["2026-10-15"] = 2   // yesterday
 	m.Spend["2026-10-13"] = 4   // earlier in the week
-	m.Spend["2026-10-09"] = 1.5 // 7 days back: kept by pruning, counted by no week
+	m.Spend["2026-10-08"] = 1.5 // the 10-15 merge's boundary day: kept, counted by no week
 	data, _ := json.MarshalIndent(m, "", "  ")
 	writeTestFile(t, filepath.Join(dir, manifestFile), append(data, '\n'))
 	t.Setenv("GITHUB_OUTPUT", filepath.Join(t.TempDir(), "output"))

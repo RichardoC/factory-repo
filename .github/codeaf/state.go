@@ -320,17 +320,27 @@ func readManifest(dir string, now time.Time, weekCap float64) (Manifest, bool, e
 		return Manifest{}, false, fmt.Errorf("%s: unsupported version %d / generation %d", manifestFile, m.Version, m.Generation)
 	}
 	// The spend is re-checked here on every load because the queue holds
-	// new starts on it (CODEAF_WEEK_SPENT_USD). The write path clamps both
-	// halves: SpendDate keeps a day at most 24h ahead, RunSpend a value at
-	// most the per-run cap. So a day older than pruneSpend would keep (or
-	// further ahead than SpendDate allows), or a single day past the weekly
-	// credit, is not a manifest this harness wrote:
-	// refuse it rather than carry an entry no week sums and no pruning
-	// deletes.
-	oldest := now.UTC().Add(-spendDays * 24 * time.Hour).Format(time.DateOnly)
-	latest := now.UTC().Add(24 * time.Hour).Format(time.DateOnly)
+	// new starts on it (CODEAF_WEEK_SPENT_USD). The bounds mirror the write
+	// path at the moment the manifest was written (stateMerge): pruneSpend
+	// keeps a day back to that merge's own now-7d (boundary included), and
+	// SpendDate puts one at most a day ahead of it. So the days are checked
+	// against the manifest's Updated timestamp, not against this load's
+	// now: a bundle written on day D holds day D-7 by design and must still
+	// read on day D+1, however much later it is loaded. Only the timestamp
+	// itself is checked against now, so a made-up future Updated cannot
+	// widen the window. Per day, the write path merges runs of at most
+	// 2*RunCreditUSD+1 each (RunSpend), so a real day total crosses the
+	// weekly credit once enough overlapped runs land on one UTC day
+	// (~$109 at ten runs); refuse only far past that, at three times the
+	// weekly credit, which no day the queue's weekly pacing can fund will
+	// ever carry, while validUSD alone would admit up to $1e6 per day.
+	if m.Updated.IsZero() || m.Updated.After(now.Add(24*time.Hour)) {
+		return Manifest{}, false, fmt.Errorf("%s: updated %s is not a past write time", manifestFile, m.Updated.Format(time.RFC3339))
+	}
+	oldest := m.Updated.UTC().Add(-spendDays * 24 * time.Hour).Format(time.DateOnly)
+	latest := m.Updated.UTC().Add(24 * time.Hour).Format(time.DateOnly)
 	for day, usd := range m.Spend {
-		if _, err := time.Parse(time.DateOnly, day); err != nil || day < oldest || day > latest || !validUSD(usd) || (weekCap > 0 && usd > weekCap) {
+		if _, err := time.Parse(time.DateOnly, day); err != nil || day < oldest || day > latest || !validUSD(usd) || (weekCap > 0 && usd > 3*weekCap) {
 			return Manifest{}, false, fmt.Errorf("%s: invalid spend %q: %v", manifestFile, day, usd)
 		}
 	}

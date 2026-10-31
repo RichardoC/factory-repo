@@ -285,7 +285,7 @@ func TestStateLoadDropsBadRecordLines(t *testing.T) {
 	}
 	records := strings.Join([]string{valid("1"), `{"mode":"$(id)"}`, "not json at all", valid("2")}, "\n") + "\n"
 	writeTestFile(t, filepath.Join(bundle, recordsFile), []byte(records))
-	manifest := `{"version":1,"generation":3,"merged":[],"spend":{}}`
+	manifest := `{"version":1,"generation":3,"merged":[],"updated":"2026-10-16T11:00:00Z","spend":{}}`
 	writeTestFile(t, filepath.Join(bundle, manifestFile), []byte(manifest))
 
 	var logs strings.Builder
