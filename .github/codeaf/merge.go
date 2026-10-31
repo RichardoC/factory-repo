@@ -51,6 +51,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -357,7 +358,32 @@ func workflowChanges(dir, from, to string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return strings.Fields(out), nil
+	// One path per line, as boundedNames reads the same list: a name may
+	// contain spaces (#343), so splitting on whitespace would turn one file
+	// into two paths that do not exist. git C-quotes a non-ASCII name when
+	// core.quotePath is on (the default), so those lines are unquoted.
+	var files []string
+	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		files = append(files, unquoteGitPath(line))
+	}
+	return files, nil
+}
+
+// unquoteGitPath unquotes one path from git's --name-only output, which names
+// a non-ASCII or otherwise special path as a C string when core.quotePath is
+// on. A line git did not quote is returned unchanged; one whose quoting
+// strconv cannot parse has its quote marks trimmed rather than trusted.
+func unquoteGitPath(line string) string {
+	if !strings.HasPrefix(line, `"`) || !strings.HasSuffix(line, `"`) {
+		return line
+	}
+	if u, err := strconv.Unquote(line); err == nil {
+		return u
+	}
+	return strings.Trim(line, `"`)
 }
 
 // runMerge is the run-job half of issue #57: it merges the base branch tip
