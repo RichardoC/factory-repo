@@ -356,10 +356,13 @@ const proposalE2EPlaceholder = "(fill in before queueing: the one command or run
 // ProposalBody renders one proposal as the body of the issue the publish job
 // opens: a fixed markdown template, every untrusted text passed through
 // escapeMD (the title on one line), the dependencies rendered as plain
-// numbers. When the Problem or What mentions ".github/workflows" and the
-// proposal does not already say the word "approval", the note that workflow
-// changes need a maintainer's approval is appended — the planner was told
-// to state it, and the factory does not rely on it having listened.
+// numbers. When the Problem or What names a path under .github/ outside
+// .github/codeaf/ and the proposal does not already say the word "approval",
+// the note that such changes need a maintainer's approval is appended — the
+// planner was told to state it, and the factory does not rely on it having
+// listened. The path rule is underGithub (patchsplit.go), the same one the
+// patch gate and the publish job's package step apply, so .github/CODEOWNERS
+// gets the note too.
 func ProposalBody(p Proposal) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "### Proposal: %s\n\n", escapeMD(p.Title, maxProposalTitle, true))
@@ -390,10 +393,41 @@ func ProposalBody(p Proposal) string {
 		fmt.Fprintf(&b, "\n**Depends on**: %s\n", strings.Join(nums, ", "))
 	}
 	text := strings.ToLower(p.Problem + "\n" + p.What)
-	if strings.Contains(text, ".github/workflows") && !strings.Contains(text, "approval") {
-		b.WriteString("\nNote: changes to .github/workflows/ need a maintainer's approval before merging.\n")
+	if namesApprovalPath(text) && !strings.Contains(text, "approval") {
+		b.WriteString("\nNote: changes under .github/ outside .github/codeaf/ (workflows, CODEOWNERS) need a maintainer's approval before merging.\n")
 	}
 	return b.String()
+}
+
+// namesApprovalPath reports whether text names a path that underGithub guards:
+// under .github/ but not .github/codeaf/. text is already lower-cased. A
+// mention starts at ".github/" and runs over path characters; trailing
+// punctuation or a closing slash is not part of the path. Keeping the
+// predicate on underGithub rather than on the ".github/workflows" spelling
+// means the note follows the gate for every path it protects.
+func namesApprovalPath(text string) bool {
+	const marker = ".github/"
+	for rest := text; ; {
+		i := strings.Index(rest, marker)
+		if i < 0 {
+			return false
+		}
+		path := rest[i:]
+		if j := strings.IndexFunc(path, func(r rune) bool { return !approvalPathChar(r) }); j >= 0 {
+			path = path[:j]
+		}
+		path = strings.TrimRight(path, "/.")
+		if underGithub(path) {
+			return true
+		}
+		rest = rest[i+len(marker):]
+	}
+}
+
+// approvalPathChar reports whether r can appear in a lower-cased path mention.
+func approvalPathChar(r rune) bool {
+	return r >= 'a' && r <= 'z' || r >= '0' && r <= '9' ||
+		r == '/' || r == '.' || r == '-' || r == '_'
 }
 
 // planProposalOut is one entry of the JSON the publish workflow reads.
