@@ -193,6 +193,38 @@ func TestPRSweep(t *testing.T) {
 	}
 }
 
+// TestPRSweepNullAuthor pins issue #326: a PR whose only review is
+// CHANGES_REQUESTED with a null author — what `gh pr list --json` sends for
+// a deleted account — is a standing finding and is reported under
+// "@nobody (reviewer unknown)", while a PR with no review stays unreported.
+func TestPRSweepNullAuthor(t *testing.T) {
+	at := func(s string) time.Time {
+		ts, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			t.Fatalf("fixture stamp: %v", err)
+		}
+		return ts
+	}
+	prs := []prStatus{
+		{Number: 31, HeadRefName: "codeaf/deleted-reviewer", State: "OPEN", Mergeable: "MERGEABLE",
+			Reviews: []prReview{{State: "CHANGES_REQUESTED", SubmittedAt: at("2026-10-17T09:00:00Z")}}},
+		{Number: 33, HeadRefName: "codeaf/no-review", State: "OPEN", Mergeable: "MERGEABLE"},
+	}
+	report, free := prSweep(prs)
+	if !strings.Contains(report, "## PR sweep: 2 open `codeaf/*` PR(s) checked") {
+		t.Errorf("header does not count the 2 examined PRs:\n%s", report)
+	}
+	if !strings.Contains(report, "#31 `codeaf/deleted-reviewer` — unaddressed finding: @nobody (reviewer unknown)") {
+		t.Errorf("null-author finding not reported under @nobody:\n%s", report)
+	}
+	if strings.Contains(report, "#33") {
+		t.Errorf("review-less PR reported, must stay unreported:\n%s", report)
+	}
+	if len(free) != 0 {
+		t.Errorf("conflictedFree = %v, want empty", free)
+	}
+}
+
 // TestPRSweepClean pins the empty case: a clean queue says so, and
 // conflictedFree stays empty.
 func TestPRSweepClean(t *testing.T) {
