@@ -2085,7 +2085,16 @@ func (p *proxy) acquire(ctx context.Context, m Model, beat func()) (func(), time
 // header_ms and there is no gap and no cut. DurMs is the call as a whole.
 func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, started time.Time, slotWait, headerWait time.Duration, repaired int) {
 	var payload map[string]json.RawMessage
-	if err := json.NewDecoder(upstream).Decode(&payload); err != nil {
+	err := json.NewDecoder(upstream).Decode(&payload)
+	if err == nil && payload == nil {
+		// A body that decodes to a nil map — literal null, or an empty
+		// document — is as unusable as one that fails to decode: the relay
+		// below assigns into payload and would panic on a nil map, so the
+		// caller would see a cut connection and the call would be the exact
+		// phantom issue #350 is about. Treat it as an undecodable body.
+		err = errors.New("body is not a JSON object")
+	}
+	if err != nil {
 		// A 200 whose body does not decode is a real call all the same
 		// (issue #350): the slot was held and released and upstream may have
 		// billed the tokens, so the call reaches the ledger before the 502
