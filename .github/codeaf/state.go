@@ -304,7 +304,7 @@ func newManifest() Manifest {
 // readManifest reads a bundle's manifest. No bundle at all (the first run) is
 // generation 0; a bundle that is present but unreadable is an error, since the
 // bundle is written only by the codeaf-state workflow.
-func readManifest(dir string) (Manifest, bool, error) {
+func readManifest(dir string, now time.Time, weekCap float64) (Manifest, bool, error) {
 	data, err := readRegular(filepath.Join(dir, manifestFile), maxMetaBytes)
 	if err != nil {
 		return Manifest{}, false, err
@@ -319,8 +319,18 @@ func readManifest(dir string) (Manifest, bool, error) {
 	if m.Version != stateVersion || m.Generation < 0 {
 		return Manifest{}, false, fmt.Errorf("%s: unsupported version %d / generation %d", manifestFile, m.Version, m.Generation)
 	}
+	// The spend is re-checked here on every load because the queue holds
+	// new starts on it (CODEAF_WEEK_SPENT_USD). The write path clamps both
+	// halves: SpendDate keeps a day at most 24h ahead, RunSpend a value at
+	// most the per-run cap. So a day older than pruneSpend would keep (or
+	// further ahead than SpendDate allows), or a single day past the weekly
+	// credit, is not a manifest this harness wrote:
+	// refuse it rather than carry an entry no week sums and no pruning
+	// deletes.
+	oldest := now.UTC().Add(-spendDays * 24 * time.Hour).Format(time.DateOnly)
+	latest := now.UTC().Add(24 * time.Hour).Format(time.DateOnly)
 	for day, usd := range m.Spend {
-		if _, err := time.Parse(time.DateOnly, day); err != nil || !validUSD(usd) {
+		if _, err := time.Parse(time.DateOnly, day); err != nil || day < oldest || day > latest || !validUSD(usd) || (weekCap > 0 && usd > weekCap) {
 			return Manifest{}, false, fmt.Errorf("%s: invalid spend %q: %v", manifestFile, day, usd)
 		}
 	}
@@ -521,7 +531,7 @@ func runState() error {
 		if len(args) != 1 {
 			return errors.New("usage: harness state merged BUNDLE")
 		}
-		m, _, err := readManifest(args[0])
+		m, _, err := readManifest(args[0], time.Now(), cfg.Limits.WeeklyCreditUSD)
 		if err != nil {
 			return err
 		}
@@ -541,7 +551,7 @@ func runState() error {
 // stateLoad installs the shared bundle into CodeAF's home and outputs its
 // generation and today's and this week's credit spend for the run job.
 func stateLoad(bundle, home string, cfg Config, now time.Time) error {
-	m, found, err := readManifest(bundle)
+	m, found, err := readManifest(bundle, now, cfg.Limits.WeeklyCreditUSD)
 	if err != nil {
 		return err
 	}
@@ -651,7 +661,7 @@ func readRunMeta(dir string) (RunMeta, error) {
 // result to out. Runs already merged are skipped; the rest are applied in run
 // order. It outputs changed=false when there was nothing to merge.
 func stateMerge(bundle, out string, runDirs []string, cfg Config, now time.Time) error {
-	m, found, err := readManifest(bundle)
+	m, found, err := readManifest(bundle, now, cfg.Limits.WeeklyCreditUSD)
 	if err != nil {
 		return err
 	}

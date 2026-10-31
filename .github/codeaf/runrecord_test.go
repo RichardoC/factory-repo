@@ -236,7 +236,7 @@ func TestStateMergeAppendsRecordsAndCaps(t *testing.T) {
 	if err := stateMerge(empty, out, dirs, cfg, now); err != nil {
 		t.Fatal(err)
 	}
-	m := readManifestT(t, out)
+	m := readManifestT(t, out, cfg, now)
 	if len(m.Merged) != maxMergedRuns {
 		t.Fatalf("%d runs merged, want the %d cap", len(m.Merged), maxMergedRuns)
 	}

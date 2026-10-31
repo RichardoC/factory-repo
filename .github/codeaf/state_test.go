@@ -175,9 +175,9 @@ func pack(t *testing.T, cfg Config, now time.Time, bundle, runID string, spent f
 	return out
 }
 
-func readManifestT(t *testing.T, dir string) Manifest {
+func readManifestT(t *testing.T, dir string, cfg Config, now time.Time) Manifest {
 	t.Helper()
-	m, found, err := readManifest(dir)
+	m, found, err := readManifest(dir, now, cfg.Limits.WeeklyCreditUSD)
 	if err != nil || !found {
 		t.Fatalf("manifest in %s: found=%v err=%v", dir, found, err)
 	}
@@ -203,7 +203,7 @@ func TestStateRoundTripWithOverlappingRuns(t *testing.T) {
 	if err := stateMerge(empty, gen1, []string{run10}, cfg, now); err != nil {
 		t.Fatal(err)
 	}
-	m := readManifestT(t, gen1)
+	m := readManifestT(t, gen1, cfg, now)
 	if m.Generation != 1 || m.Spend["2026-10-16"] != 0.5 || len(m.Merged) != 1 {
 		t.Fatalf("after run 10: %+v", m)
 	}
@@ -231,7 +231,7 @@ func TestStateRoundTripWithOverlappingRuns(t *testing.T) {
 	if err := stateMerge(gen1, gen2, []string{run12, run11, run10}, cfg, now); err != nil {
 		t.Fatal(err)
 	}
-	m = readManifestT(t, gen2)
+	m = readManifestT(t, gen2, cfg, now)
 	if m.Generation != 3 {
 		t.Errorf("generation = %d, want 3 (run 10 skipped as already merged)", m.Generation)
 	}
@@ -294,7 +294,7 @@ func TestStateMergeRefusesBadRuns(t *testing.T) {
 	if err := stateMerge(filepath.Join(t.TempDir(), "none"), out, []string{bad, noMeta, badID}, cfg, now); err != nil {
 		t.Fatal(err)
 	}
-	m := readManifestT(t, out)
+	m := readManifestT(t, out, cfg, now)
 	if m.Spend["2026-10-16"] != cfg.Limits.RunCreditUSD {
 		t.Errorf("a negative spend should count as the run cap, got %v", m.Spend)
 	}
@@ -307,12 +307,52 @@ func TestStateMergeRefusesBadRuns(t *testing.T) {
 }
 
 func TestReadManifestRefusesPoisonedSpend(t *testing.T) {
+	cfg, err := loadConfig("models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
 	dir := t.TempDir()
 	writeTestFile(t, filepath.Join(dir, manifestFile), []byte(`{"version":1,"generation":2,"merged":[],"spend":{"2026-10-16":-20}}`))
-	if _, _, err := readManifest(dir); err == nil {
+	if _, _, err := readManifest(dir, now, cfg.Limits.WeeklyCreditUSD); err == nil {
 		t.Error("negative spend accepted")
 	}
 }
+func TestReadManifestRejectsOutOfRangeSpend(t *testing.T) {
+	cfg, err := loadConfig("models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	day := func(offset int) string {
+		return now.Add(time.Duration(offset) * 24 * time.Hour).Format(time.DateOnly)
+	}
+	// Each of these is parseable as a date and a valid USD value, but the
+	// write path (SpendDate, RunSpend) can never produce them, so the
+	// read path must not accept them from a merged bundle.
+	for name, entry := range map[string]string{
+		"future day":              `"2099-01-01": 0.5`,
+		"a day 30 days old":       fmt.Sprintf("%q: 0.5", day(-30)),
+		"above the weekly credit": fmt.Sprintf("%q: %v", day(0), cfg.Limits.WeeklyCreditUSD+0.01),
+	} {
+		dir := t.TempDir()
+		writeTestFile(t, filepath.Join(dir, manifestFile), []byte(fmt.Sprintf(`{"version":1,"generation":2,"merged":[],"spend":{"2026-10-16":0.5,%s}}`, entry)))
+		if _, _, err := readManifest(dir, now, cfg.Limits.WeeklyCreditUSD); err == nil {
+			t.Errorf("%s (%s) accepted", name, entry)
+		}
+	}
+
+	// A manifest of ordinary in-week entries reads back unchanged.
+	dir := t.TempDir()
+	ordinary := `{"version":1,"generation":4,"merged":["10-1","11-1"],"updated":"2026-10-16T11:00:00Z","spend":{"2026-10-16":1.25,"2026-10-15":0.5,"2026-10-13":2}}`
+	writeTestFile(t, filepath.Join(dir, manifestFile), []byte(ordinary))
+	m := readManifestT(t, dir, cfg, now)
+	if m.Generation != 4 || strings.Join(m.Merged, ",") != "10-1,11-1" || len(m.Spend) != 3 ||
+		m.Spend["2026-10-16"] != 1.25 || m.Spend["2026-10-15"] != 0.5 || m.Spend["2026-10-13"] != 2 {
+		t.Errorf("ordinary manifest changed: %+v", m)
+	}
+}
+
 func TestWeekSpend(t *testing.T) {
 	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
 	day := func(offset int) string {
@@ -360,7 +400,7 @@ func TestStateLoadOutputsWeekSpend(t *testing.T) {
 	m.Spend["2026-10-16"] = 1.5 // today
 	m.Spend["2026-10-15"] = 2   // yesterday
 	m.Spend["2026-10-13"] = 4   // earlier in the week
-	m.Spend["2026-10-08"] = 100 // 8 days back: outside the rolling week
+	m.Spend["2026-10-09"] = 1.5 // 7 days back: kept by pruning, counted by no week
 	data, _ := json.MarshalIndent(m, "", "  ")
 	writeTestFile(t, filepath.Join(dir, manifestFile), append(data, '\n'))
 	t.Setenv("GITHUB_OUTPUT", filepath.Join(t.TempDir(), "output"))
