@@ -218,6 +218,7 @@ Snyk DAST (Probely) finding states map to Linear workflow states as follows:
 - `accepted` with a future `expiration_date` (time-limited risk acceptance) -> `Todo` (SLA clock restarts from the acceptance expiry)
 - `accepted` with a past `expiration_date` (lapsed risk acceptance) -> `Todo` (due date is the acceptance expiry plus the configured severity offset)
 - `accepted` without an `expiration_date` (permanent risk acceptance) -> `Cancelled`
+- `accepted` with an `expiration_date` that cannot be parsed -> `Cancelled` (treated as a permanent acceptance; a warning naming the finding and the unparseable value is logged)
 - `invalid` (false positive) -> `Cancelled`
 - `fixed` -> `Done`
 - missing finding in an existing Snyk DAST target -> `Done`

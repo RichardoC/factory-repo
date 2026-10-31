@@ -21,6 +21,8 @@ import (
 func TestMapStatus(t *testing.T) {
 	future := "2126-06-01"
 	past := "2000-01-01"
+	malformed := "soon-ish"
+	blank := "   "
 
 	cases := []struct {
 		name           string
@@ -34,6 +36,9 @@ func TestMapStatus(t *testing.T) {
 		{"fixed", "fixed", nil, model.FindingFixed, false},
 		{"invalid is ignored", "invalid", nil, model.FindingIgnored, false},
 		{"accepted without expiry is ignored", "accepted", nil, model.FindingIgnored, false},
+		{"accepted with unparseable expiry is ignored", "accepted", &malformed, model.FindingIgnored, false},
+		{"accepted with whitespace-only expiry is ignored", "accepted", &blank, model.FindingIgnored, false},
+		{"accepted with unparseable expiry ignores case", "Accepted", &malformed, model.FindingIgnored, false},
 		{"accepted with lapsed expiry reopens", "accepted", &past, model.FindingOpen, true},
 		{"accepted with future expiry is snoozed", "accepted", &future, model.FindingSnoozed, true},
 		{"unknown state defaults to open", "unknown", nil, model.FindingOpen, false},
@@ -498,5 +503,139 @@ func TestLoadSnapshotFailsFastWithoutCorrelationViewer(t *testing.T) {
 	// a 403: exactly one correlation request must reach the server.
 	if got := correlationRequests.Load(); got != 1 {
 		t.Fatalf("correlation endpoint received %d requests, want 1 (fails fast, no retries for a 403)", got)
+	}
+}
+
+// --- tests for the unparseable-acceptance-expiry warning ---
+
+// captureHandler is a slog handler that records every record so tests can
+// assert on what the client logged.
+type captureHandler struct {
+	records []slog.Record
+}
+
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
+	h.records = append(h.records, r)
+	return nil
+}
+func (h *captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *captureHandler) WithGroup(string) slog.Handler      { return h }
+
+// loadSnapshotWithExpiry serves a minimal Snyk DAST API with one target and
+// one accepted finding carrying the given expiration_date, then loads a
+// snapshot through a client logging to a captureHandler.
+func loadSnapshotWithExpiry(t *testing.T, expirationDate *string) (*captureHandler, model.SnykDASTSnapshot) {
+	t.Helper()
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	target := targetNode{ID: "target-a", Type: "web"}
+	target.Site.Name = "project-a"
+	target.Site.URL = "https://project-a.example.test/"
+	target.Site.Host = "project-a.example.test"
+
+	passive := false
+	definition := definitionNode{ID: "def-1", Name: "Cross-site scripting", Passive: &passive}
+
+	var fn findingNode
+	fn.ID = json.Number("1")
+	fn.State = "accepted"
+	fn.Severity = 30
+	fn.ExpirationDate = expirationDate
+	fn.Definition.ID = "def-1"
+	fn.Definition.Name = "Cross-site scripting"
+	fn.Target.ID = "target-a"
+	fn.Target.Name = "project-a"
+
+	mux.HandleFunc("/targets/", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(correlationTestPageNoT([]targetNode{target}))
+	})
+	mux.HandleFunc("/findings/", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(correlationTestPageNoT([]findingNode{fn}))
+	})
+	mux.HandleFunc("/definitions/", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(correlationTestPageNoT([]definitionNode{definition}))
+	})
+
+	base, _ := url.Parse(server.URL + "/")
+	handler := &captureHandler{}
+	c := &Client{
+		apiBase:     base,
+		httpClient:  server.Client(),
+		logger:      slog.New(handler),
+		concurrency: 2,
+	}
+	snapshot, err := c.LoadSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("LoadSnapshot() error = %v, want success", err)
+	}
+	if len(snapshot.Findings) != 1 {
+		t.Fatalf("LoadSnapshot() returned %d findings, want 1", len(snapshot.Findings))
+	}
+	return handler, snapshot
+}
+
+// TestLoadSnapshotWarnsOnUnparseableAcceptanceExpiry: an accepted finding
+// whose expiration_date is present but unparseable still maps to ignored
+// (a permanent acceptance, so the sync cancels the ticket), and LoadSnapshot
+// logs a warning naming the finding and the value, so the cancellation is
+// visible instead of silent.
+func TestLoadSnapshotWarnsOnUnparseableAcceptanceExpiry(t *testing.T) {
+	malformed := "soon-ish"
+	handler, snapshot := loadSnapshotWithExpiry(t, &malformed)
+
+	if got := snapshot.Findings[0].Status; got != model.FindingIgnored {
+		t.Fatalf("status = %q, want %q (an unparseable acceptance stays a permanent cancellation)", got, model.FindingIgnored)
+	}
+
+	warned := false
+	for _, r := range handler.records {
+		if r.Level != slog.LevelWarn {
+			continue
+		}
+		var id, raw string
+		r.Attrs(func(a slog.Attr) bool {
+			switch a.Key {
+			case "finding_id":
+				id = a.Value.String()
+			case "expiration_date":
+				raw = a.Value.String()
+			}
+			return true
+		})
+		if id != "1" || raw != malformed {
+			t.Fatalf("warning %q has finding_id=%q expiration_date=%q, want finding_id=%q expiration_date=%q", r.Message, id, raw, "1", malformed)
+		}
+		warned = true
+	}
+	if !warned {
+		t.Fatal("LoadSnapshot logged no warning naming the finding and the unparseable expiration_date")
+	}
+}
+
+// TestLoadSnapshotDoesNotWarnOnParseableAcceptanceExpiry: an accepted finding
+// with a well-formed (or absent) expiration_date follows the documented
+// mappings and produces no warning.
+func TestLoadSnapshotDoesNotWarnOnParseableAcceptanceExpiry(t *testing.T) {
+	future := "2126-06-01"
+	for name, expirationDate := range map[string]*string{"future": &future, "absent": nil} {
+		t.Run(name, func(t *testing.T) {
+			handler, snapshot := loadSnapshotWithExpiry(t, expirationDate)
+			for _, r := range handler.records {
+				if r.Level == slog.LevelWarn && strings.Contains(r.Message, "unparseable") {
+					t.Fatalf("LoadSnapshot logged an unexpected warning: %q", r.Message)
+				}
+			}
+			want := model.FindingSnoozed
+			if expirationDate == nil {
+				want = model.FindingIgnored
+			}
+			if got := snapshot.Findings[0].Status; got != want {
+				t.Fatalf("status = %q, want %q", got, want)
+			}
+		})
 	}
 }
