@@ -1242,7 +1242,7 @@ func modelStatsAlerts(in modelStatsInput, aggs []*modelAgg, cfg Config, win mode
 			// token times in seconds, and this line is read beside them.
 			out = append(out, fmt.Sprintf("%s: %d hour(s) with at least %d calls above %gx the trailing %.1f h first-token p50 ("+
 				"%s over %.1f s vs a %.1f s baseline; first was %s UTC with %d calls)",
-				modelIDCell(a.ID), overCount, *cfg.Alerts.HourCalls, cfg.Alerts.TTFTp50Ratio, float64(baselineHours)/24,
+				modelIDCell(a.ID), overCount, *cfg.Alerts.HourCalls, cfg.Alerts.TTFTp50Ratio, float64(baselineHours),
 				modelIDCell(a.ID), avgMsOf(a, firstHour)/1000, base/1000, firstHour, firstCount))
 		}
 		decode := summarize(a.Decode)

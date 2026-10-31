@@ -610,7 +610,7 @@ func TestModelStatsTrailingP50AlertReachable(t *testing.T) {
 	for _, want := range []string{
 		// The baseline is the older hour's p50, measured inside the 72 h
 		// window; the recent hour is 5000 ms against a 2x limit of 2000 ms.
-		"- **`alpha`: 1 hour(s) with at least 30 calls above 2x the trailing 7.0 h first-token p50 " +
+		"- **`alpha`: 1 hour(s) with at least 30 calls above 2x the trailing 168.0 h first-token p50 " +
 			"(`alpha` over 5.0 s vs a 1.0 s baseline; first was 2026-10-21 09:00 UTC with 30 calls)**",
 		"### Alerts (1)",
 	} {
