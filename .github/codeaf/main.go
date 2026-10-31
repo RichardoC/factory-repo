@@ -2684,6 +2684,13 @@ func Decide(name string, ev event, labelName string, lookupPR, lookupIssue func(
 		if len(ev.Issue.PullRequest) > 0 {
 			return skip("labelled a PR; PRs act on " + command + " commands"), nil
 		}
+		// A closed issue runs nothing: labelling it (or commenting a
+		// command on it below) must not spend a run on a PR that would
+		// say it closes an already-closed issue. Same check as the
+		// dispatch path.
+		if ev.Issue.State != "open" {
+			return skip("issue is not open"), nil
+		}
 		if ev.Issue.labelled(experimentLabel) {
 			return skip("experiment issues run only by a profile dispatch"), nil
 		}
@@ -2865,6 +2872,11 @@ func Decide(name string, ev event, labelName string, lookupPR, lookupIssue func(
 		return skip("experiment issues run only by a profile dispatch"), nil
 	}
 	if name == "issue_comment" && len(target.PullRequest) == 0 {
+		// A command on a closed issue runs nothing, for the same reason
+		// the label path above refuses one.
+		if target.State != "open" {
+			return skip("issue is not open"), nil
+		}
 		return issueRun(*target, "command on issue", 0, "")
 	}
 	pr, err := lookupPR(target.Number)

@@ -501,7 +501,14 @@ func TestDecide(t *testing.T) {
 		mode   string
 		branch string
 	}{
-		{"issue labelled", "issues", with(func(e *event) { e.Label = &label{Name: "codeaf"}; e.Issue = &item{Number: 3, Labels: labelled} }), noLookup, true, "issue", "codeaf/issue-3-42"},
+		{"issue labelled", "issues", with(func(e *event) {
+			e.Label = &label{Name: "codeaf"}
+			e.Issue = &item{Number: 3, State: "open", Labels: labelled}
+		}), noLookup, true, "issue", "codeaf/issue-3-42"},
+		{"label on a closed issue", "issues", with(func(e *event) {
+			e.Label = &label{Name: "codeaf"}
+			e.Issue = &item{Number: 3, State: "closed", Labels: labelled}
+		}), noLookup, false, "", ""},
 		{"other label", "issues", with(func(e *event) { e.Label = &label{Name: "bug"}; e.Issue = &item{Number: 3} }), noLookup, false, "", ""},
 		{"label on a PR", "issues", with(func(e *event) {
 			e.Label = &label{Name: "codeaf"}
@@ -516,7 +523,14 @@ func TestDecide(t *testing.T) {
 			e.Issue = &item{Number: 3, Labels: labelled}
 			e.Comment = &comment{Body: "looks good", AuthorAssociation: "OWNER", User: user{Type: "User"}}
 		}), noLookup, false, "", ""},
-		{"command on issue", "issue_comment", with(func(e *event) { e.Issue = &item{Number: 3, Labels: labelled}; e.Comment = owner }), noLookup, true, "issue", "codeaf/issue-3-42"},
+		{"command on issue", "issue_comment", with(func(e *event) {
+			e.Issue = &item{Number: 3, State: "open", Labels: labelled}
+			e.Comment = owner
+		}), noLookup, true, "issue", "codeaf/issue-3-42"},
+		{"command on a closed issue", "issue_comment", with(func(e *event) {
+			e.Issue = &item{Number: 3, State: "closed", Labels: labelled}
+			e.Comment = owner
+		}), noLookup, false, "", ""},
 		{"command on PR", "issue_comment", with(func(e *event) {
 			e.Issue = &item{Number: 7, Labels: labelled, PullRequest: prMarker}
 			e.Comment = owner
@@ -558,6 +572,38 @@ func TestDecide(t *testing.T) {
 			}
 			if got.Run != c.run || got.Mode != c.mode || got.Branch != c.branch {
 				t.Fatalf("Decide = %+v", got)
+			}
+		})
+	}
+
+	// A closed issue starts no run on either comment/label path, and the
+	// skip says so: issue #336, where only the dispatch and PR-comment
+	// paths refused.
+	closedIssue := item{Number: 3, State: "closed", Labels: labelled}
+	for _, c := range []struct {
+		name  string
+		event string
+		ev    event
+	}{
+		{"label", "issues", with(func(e *event) {
+			e.Label = &label{Name: "codeaf"}
+			e.Issue = &closedIssue
+		})},
+		{"comment", "issue_comment", with(func(e *event) {
+			e.Issue = &closedIssue
+			e.Comment = owner
+		})},
+	} {
+		t.Run("closed issue "+c.name, func(t *testing.T) {
+			got, err := Decide(c.event, c.ev, "codeaf", noLookup, noLookup)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Run || got.Reason != "issue is not open" {
+				t.Fatalf("Decide = %+v", got)
+			}
+			if got.Branch != "" {
+				t.Fatalf("closed issue got a branch: %+v", got)
 			}
 		})
 	}
@@ -681,7 +727,7 @@ func TestDecideLane(t *testing.T) {
 	t.Run("label event is lane 0", func(t *testing.T) {
 		ev := event{Inputs: map[string]string{"lane": "2"}}
 		ev.Label = &label{Name: "codeaf"}
-		ev.Issue = &item{Number: 3, Labels: labelled}
+		ev.Issue = &item{Number: 3, State: "open", Labels: labelled}
 		got, err := Decide("issues", ev, "codeaf", lookup, lookupIssue)
 		if err != nil || !got.Run || got.Lane != 0 {
 			t.Fatalf("Decide = %+v, %v; want a run at lane 0", got, err)
@@ -689,7 +735,7 @@ func TestDecideLane(t *testing.T) {
 	})
 	t.Run("comment event is lane 0", func(t *testing.T) {
 		ev := event{}
-		ev.Issue = &item{Number: 3, Labels: labelled}
+		ev.Issue = &item{Number: 3, State: "open", Labels: labelled}
 		ev.Comment = &comment{Body: "/codeaf go", AuthorAssociation: "OWNER", User: user{Login: "RichardoC", Type: "User"}}
 		got, err := Decide("issue_comment", ev, "codeaf", lookup, lookupIssue)
 		if err != nil || !got.Run || got.Lane != 0 {
@@ -719,7 +765,7 @@ func TestDecideRefusesABadRunID(t *testing.T) {
 	base.Repository.DefaultBranch = "main"
 	ev := base
 	ev.Label = &label{Name: "codeaf"}
-	ev.Issue = &item{Number: 3, Labels: []label{{Name: "codeaf"}}}
+	ev.Issue = &item{Number: 3, State: "open", Labels: []label{{Name: "codeaf"}}}
 	if _, err := Decide("issues", ev, "codeaf", func(int) (item, error) {
 		t.Fatal("unexpected PR lookup")
 		return item{}, nil
