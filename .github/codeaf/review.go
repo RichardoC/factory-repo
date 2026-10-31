@@ -122,6 +122,12 @@ func parseFindings(answer string) (findings []Finding, sawSection bool) {
 //   - anything else is kept, because a reviewer may put a real finding in a
 //     fence and dropping it would be a false pass.
 //
+// The quoted-path filter never applies to a finding the section pass read:
+// a `## Findings` bullet is dropped only when it is the contract echo
+// (issue #334) — the instructions promise the section is always read, and
+// dropping a real blocking bullet there, because it sat inside a closed
+// fence and named an untouched path, yielded a false pass label.
+//
 // Outside a fence nothing is dropped: the unfenced leniency of issue #49
 // stands, contract echo and absent path included.
 func parseFindingsIn(answer string, known map[string]bool) (findings []Finding, sawSection bool) {
@@ -164,14 +170,35 @@ func parseFindingsIn(answer string, known map[string]bool) (findings []Finding, 
 		if inSection {
 			if f, ok := parseFinding(line); ok {
 				f.fenced, f.quoted = inFence, quoted
-				if !dropQuotedFinding(f, known) && !duplicateFinding(findings, f) {
+				// A finding written in the section is always read (issue
+				// #334): the quoted-path filter never reaches a section
+				// finding, so a real blocking finding inside a closed fence
+				// cannot end the review with the pass label. Only the
+				// contract-echo phantom — the one bullet that names a file
+				// this repository does not have — is still a quote here.
+				// The inline pass below reads the same line too; this pass
+				// has kept the finding first, so a duplicate copy there is
+				// dropped — and the same exemption covers the inline pass
+				// itself, for the written forms this bullet parser misses.
+				if !quotedEcho(f) && !duplicateFinding(findings, f) {
 					findings = append(findings, f)
 				}
 			}
 		}
 		for _, f := range parseInlineFindings(line) {
 			f.fenced, f.quoted = inFence, quoted
-			if !dropQuotedFinding(f, known) && !duplicateFinding(findings, f) {
+			// The section's promise (issue #334) covers findings in
+			// every written form: inside the section this pass is exempt
+			// from the quoted-path filter too — only the contract-echo
+			// phantom is still a quote there — so an inline-form finding
+			// (prose before the severity token, a chained finding) inside
+			// a fenced section cannot end the review with the pass label.
+			// Outside the section the full filter stands.
+			dropped := dropQuotedFinding(f, known)
+			if inSection {
+				dropped = quotedEcho(f)
+			}
+			if !dropped && !duplicateFinding(findings, f) {
 				findings = append(findings, f)
 			}
 		}
@@ -315,6 +342,16 @@ func fenceRunLength(line string) int {
 	return i
 }
 
+// quotedEcho reports whether a finding restated inside a fence is the
+// harness's own output contract echoed back — the [high]
+// app/zip/queue.go:42 example bullet, a file this repository does not have.
+// It is the one thing a fenced finding can be dropped for even in the
+// `## Findings` section (issue #334); everywhere else it is the first of
+// the two quote cases dropQuotedFinding rules on.
+func quotedEcho(f Finding) bool {
+	return f.fenced && contractExampleFinding(f)
+}
+
 // dropQuotedFinding reports whether a fenced finding is quoted text rather
 // than a report (issue #224). Nothing unfenced is ever dropped — the issue
 // #49 leniency stands, so an unfenced echo of the contract still parses —
@@ -345,7 +382,7 @@ func dropQuotedFinding(f Finding, known map[string]bool) bool {
 	if !f.fenced {
 		return false
 	}
-	if contractExampleFinding(f) {
+	if quotedEcho(f) {
 		return true // the phantom: the brief's example echoed back
 	}
 	if !f.quoted {
