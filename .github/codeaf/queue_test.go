@@ -2245,6 +2245,76 @@ func TestFailedRunReportCountsRefusedNoChanges(t *testing.T) {
 	}
 }
 
+// A run whose result.json was missing or unparseable reports no stop / ok
+// row, only the fixed no-result line the report writer falls back to, with
+// whatever heading the workflow gave it (issue #310): that counts as a
+// failed run, whatever the heading says, so its issue or PR is re-picked
+// instead of sitting stranded. A changes-pushed report that stopped early
+// (incomplete / false) does not: its patch landed and continue-plan already
+// handles it, so it stays not-failed (2026-10-31 triage on issue #310).
+func TestFailedRunReportCountsNoResult(t *testing.T) {
+	// The no-result body is taken from the report writer itself, not from
+	// the noResultRow constant failedRunReport matches on: building it from
+	// the constant would keep the two coupled in name only, and the report
+	// main.go actually writes (Report with haveResult false, issue #310)
+	// could drift away from the matcher with every test still green.
+	written := Report(Result{}, false, nil, Config{}, nil, ReportInputs{}, func(string) string { return "" })
+	if !strings.Contains(written, "| result |") {
+		t.Fatalf("no-result report lacks a result row:\n%s", written)
+	}
+	row, ok := reportTableRow(written, "result")
+	if !ok {
+		t.Fatalf("no-result report has no parseable result row:\n%s", written)
+	}
+	if !strings.Contains(written, "\n"+noResultRow+"\n") {
+		t.Errorf("the no-result report the writer wrote does not carry noResultRow %q:\n%s", noResultRow, written)
+	}
+	noResult := "\n| result | " + row + " |\n"
+	headedNoResult := reportMarker + "\n### CodeAF run — finished\n\n| | |\n|---|---|\n" + noResult
+	headinglessNoResult := reportMarker + "\n\n| | |\n|---|---|\n" + noResult
+	// The writer's own report, verbatim, whatever heading the workflow gave
+	// it: it is the one body the real fallback produces.
+	if !failedRunReport(written) {
+		t.Errorf("failedRunReport(the written no-result report) = false, want true:\n%s", written)
+	}
+	for _, tc := range []struct {
+		body string
+		want bool
+	}{
+		{headedNoResult, true},
+		{headinglessNoResult, true},
+		{headedNoResult + "| verdict | ok |\n", true},
+		{reportMarker + "\n### CodeAF run — no changes\n\n| | |\n|---|---|\n| stop / ok | `incomplete` / `false` |\n", true},
+		{reportMarker + "\n### CodeAF run — changes pushed\n\n| | |\n|---|---|\n| stop / ok | `incomplete` / `false` |\n", false},
+	} {
+		if got := failedRunReport(tc.body); got != tc.want {
+			t.Errorf("failedRunReport(%q) = %v, want %v", tc.body, got, tc.want)
+		}
+	}
+	bot := bodyComments{{Body: headedNoResult}}
+	bot[0].User.Type = "Bot"
+	if got := strandedIssueState(bot); got != strandRetry {
+		t.Errorf("no-result issue state = %q, want %q", got, strandRetry)
+	}
+}
+
+// A changes-pushed run that ended done and ok is a succeeded run (issue
+// #310): it is not a failed report, so nothing it left is stranded.
+func TestFailedRunReportIgnoresDoneRunIsNotStranded(t *testing.T) {
+	done := reportMarker + "\n### CodeAF run — changes pushed\n\n| | |\n|---|---|\n| stop / ok | `done` / `true` |\n"
+	if failedRunReport(done) {
+		t.Errorf("failedRunReport(done changes pushed) = true, want false")
+	}
+	bot := bodyComments{{Body: done}}
+	bot[0].User.Type = "Bot"
+	if got := strandedIssueState(bot); got != strandNone {
+		t.Errorf("done issue state = %q, want %q", got, strandNone)
+	}
+	if got := strandedByFailedRun(bot); got {
+		t.Errorf("strandedByFailedRun(done changes pushed) = true, want false")
+	}
+}
+
 // prFilesIssues is the queue input the fetchPRFiles tests run on: one open
 // pull request, #7, with an in-flight run on it.
 func prFilesIssues() ([]item, []runStatus) {
