@@ -1606,6 +1606,7 @@ index 1111111..2222222 100644
 +++ b/app/mod.go
 @@ -1,3 +1,3 @@
  context
+
 --- a/fake header
 +++ b/fake header
 -old line
@@ -1641,7 +1642,7 @@ index 5555555..6666666 100644
 	}
 	want := []fileDiff{
 		{Path: "app/new.go", Add: 3},
-		{Path: "app/mod.go", Add: 2, Del: 2}, // the fake header lines are hunk lines
+		{Path: "app/mod.go", Add: 2, Del: 2}, // the empty line and the fake header lines count nothing as adds or deletes
 		{Path: "app/gone.go", Del: 1},
 		{Path: "renamed.go → moved.go"},
 		{Path: "bin.dat", Binary: true},
