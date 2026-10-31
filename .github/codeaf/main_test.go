@@ -4544,3 +4544,99 @@ func TestCapRefusalAfterASlotWaitIsRecorded(t *testing.T) {
 		t.Fatalf("refusal = %+v, want the queued model, a positive slot_wait_s, no usage and no cost", *refusal)
 	}
 }
+
+// TestProxyUndecodable200IsRecorded (issue #350): an upstream that answers 200
+// with a body that does not decode as JSON — empty, truncated after the
+// headers, an HTML error page — still reaches the ledger, because the slot was
+// held and released and upstream may have billed the tokens. Before the fix
+// the call was a phantom: the 502 went out and no ledger line existed, so the
+// metered spend, the run record and the model stats all under-counted it. The
+// caller's 502 is unchanged, and a 200 with a valid body still records its
+// usage exactly as before.
+func TestProxyUndecodable200IsRecorded(t *testing.T) {
+	const interval = 20 * time.Millisecond
+	var mu sync.Mutex
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		first := calls == 1
+		mu.Unlock()
+		if first {
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = io.WriteString(w, "<html>upstream exploded</html>")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"hi"}}],"model":"zai-org/glm-5.3-flash","usage":{"prompt_tokens":100,"completion_tokens":20}}`)
+	}))
+	defer upstream.Close()
+
+	p := proxyFor145(t, "zai-org/glm-5.3-flash", interval, upstream)
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	post := func() (int, string) {
+		response, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
+			strings.NewReader(`{"model":"zai-org/glm-5.3-flash","messages":[]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response.StatusCode, string(body)
+	}
+
+	// The undecodable 200: the caller still sees the same 502 body as before
+	// the fix, but the call is now in the ledger.
+	status, body := post()
+	if status != http.StatusBadGateway || !strings.Contains(body, "upstream body") {
+		t.Fatalf("undecodable 200: %d %s, want the unchanged 502 upstream-body error", status, body)
+	}
+	lines, err := readLedger(p.ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != 1 {
+		t.Fatalf("ledger holds %d lines, want exactly one for the undecodable call: %+v", len(lines), lines)
+	}
+	line := lines[0]
+	if line.Kind != "status" || line.Status != http.StatusBadGateway {
+		t.Fatalf("line = %+v, want a status line carrying 502", line)
+	}
+	if line.Model != "zai-org/glm-5.3-flash" || line.UsageSeen || line.CostUSD != 0 || line.PromptTokens != 0 || line.CompletionTokens != 0 {
+		t.Fatalf("line = %+v, want the model, no usage and no cost", line)
+	}
+
+	// A 200 with a valid body still records its usage exactly as today.
+	status, body = post()
+	if status != http.StatusOK || !strings.Contains(body, `"model":"zai-org/glm-5.3-flash"`) || !strings.Contains(body, `"prompt_tokens":100`) {
+		t.Fatalf("valid 200: %d %s, want the relayed answer with its usage", status, body)
+	}
+	lines, err = readLedger(p.ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != 2 {
+		t.Fatalf("ledger holds %d lines, want the 502 status line and the recorded call: %+v", len(lines), lines)
+	}
+	called := lines[1]
+	if called.Kind != "" || !called.UsageSeen || called.PromptTokens != 100 || called.CompletionTokens != 20 || called.CostUSD <= 0 {
+		t.Fatalf("call line = %+v, want a recorded call with the upstream usage and a cost", called)
+	}
+
+	// The report's metered row is computed from the ledger that now holds the
+	// status line, and its figure is the ledger's total — the line is not a
+	// phantom the row never sees.
+	report := Report(Result{Stop: "done"}, true, lines, Config{Limits: Limits{Plan: "big", WeeklyCreditUSD: 20, RunCreditUSD: 5}, Models: testModels(t)}, nil, ReportInputs{}, func(string) string { return "" })
+	row, ok := reportTableRow(report, "metered by proxy (from its ledger)")
+	if !ok {
+		t.Fatalf("report has no metered row:\n%s", report)
+	}
+	if !strings.Contains(row, money(ledgerTotal(lines))) {
+		t.Errorf("metered row %q does not carry the ledger total %s", row, money(ledgerTotal(lines)))
+	}
+}

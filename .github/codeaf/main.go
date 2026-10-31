@@ -2086,6 +2086,14 @@ func (p *proxy) acquire(ctx context.Context, m Model, beat func()) (func(), time
 func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, started time.Time, slotWait, headerWait time.Duration, repaired int) {
 	var payload map[string]json.RawMessage
 	if err := json.NewDecoder(upstream).Decode(&payload); err != nil {
+		// A 200 whose body does not decode is a real call all the same
+		// (issue #350): the slot was held and released and upstream may have
+		// billed the tokens, so the call reaches the ledger before the 502
+		// goes out — as a status line with no usage and no cost, like the
+		// non-200 refusals. Without this the call is a phantom: it is in no
+		// ledger line, so the metered spend, the run record and the model
+		// stats all under-count it.
+		p.record(m, nil, false, started, slotWait, headerWait, charCounts{}, repaired, http.StatusBadGateway, timingOf(started))
 		writeError(w, http.StatusBadGateway, "upstream body: "+err.Error())
 		return
 	}
