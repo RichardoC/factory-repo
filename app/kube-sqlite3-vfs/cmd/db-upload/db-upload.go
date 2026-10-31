@@ -115,6 +115,12 @@ func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Lo
 	}
 	defer f.Close()
 
+	fi, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat local file: %w", err)
+	}
+	localSize := fi.Size()
+
 	buf := make([]byte, vfs.SectorSize)
 
 	fileA := vfs.NewFile(fn, vfsN)
@@ -135,5 +141,25 @@ func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Lo
 		}
 		index++
 	}
+
+	// WriteSector only creates and overwrites sectors: uploading a smaller
+	// file over a larger remote left every trailing sector of the old
+	// database in place, so FileSize kept reporting the old size and the
+	// tail held stale bytes (issue #332). Truncate deletes the sectors past
+	// the new end the way SQLite itself shortens a file, and the size check
+	// afterwards fails the run rather than leaving a silently stale remote.
+	if err := fileA.Truncate(localSize); err != nil {
+		return fmt.Errorf("truncate remote to %d bytes: %w", localSize, err)
+	}
+
+	rSize, err := fileA.FileSize()
+	if err != nil {
+		return fmt.Errorf("remote FileSize: %w", err)
+	}
+	if rSize != localSize {
+		return fmt.Errorf("size mismatch: local file is %d bytes, remote file is %d bytes", localSize, rSize)
+	}
+	logger.Info("Local and remote file sizes are the same", "size", localSize)
+
 	return nil
 }
