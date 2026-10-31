@@ -74,3 +74,40 @@ func TestRefusedComment(t *testing.T) {
 		t.Error("diff content leaked outside the fence")
 	}
 }
+
+func TestRefusedCommentStripsControlBytes(t *testing.T) {
+	// A refused diff is raw git-diff --binary output: a binary file under
+	// .github/, or a crafted patch, can carry NUL, ESC and CR. None of them
+	// may reach the comment body a maintainer posts; newline and tab must
+	// survive so the diff still renders inside its fence.
+	diff := "@@ -1,3 +1,3 @@\n" +
+		" \x00GIT binary patch\x1b[31m\n" +
+		"-old line\r\n" +
+		"+\tnew line with a tab\n" +
+		"+`````\n"
+	got := refusedComment(diff, "")
+
+	// Exactly the one 5-backtick fence pair is left: the diff's own run of
+	// five was replaced, so the content cannot close the fence early.
+	if strings.Count(got, "`````") != 2 {
+		t.Errorf("want exactly one 5-backtick fence (open+close) in body:\n%q", got)
+	}
+	fenceStart := strings.Index(got, "`````") + len("`````")
+	fenceEnd := strings.LastIndex(got, "`````")
+	inside := got[fenceStart:fenceEnd]
+	if !strings.Contains(inside, "GIT binary patch") {
+		t.Errorf("the diff content is missing from its fence: %q", inside)
+	}
+	for _, r := range []rune{'\x00', '\x1b', '\r'} {
+		if strings.ContainsRune(inside, r) {
+			t.Errorf("control byte %q survives inside the fence: %q", r, inside)
+		}
+	}
+	// Newline and tab must survive: the diff is not flattened.
+	if !strings.Contains(inside, "\n") {
+		t.Error("newline was stripped from the diff")
+	}
+	if !strings.Contains(inside, "\tnew line with a tab") {
+		t.Errorf("tab was stripped from the diff: %q", inside)
+	}
+}
