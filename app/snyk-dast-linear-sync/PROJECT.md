@@ -178,24 +178,28 @@ from, an existing ticket, for labels another actor owns as control state.
 - `off`: disables protection entirely
 
 Linear's `issueUpdate` replaces a ticket's whole label set rather than applying a
-delta, so every update echoes back the label set the run's opening snapshot saw —
-which deletes anything another actor added since. Protection therefore cannot be
-served from the snapshot:
+delta, so every update restates the label set the ticket should end up with. The
+sync owns only its managed labels; every other label — protected, human-applied,
+or from a different automation — belongs to someone else and is carried forward
+untouched. Restating the opening snapshot would delete any label another actor
+added since that snapshot, so labels the sync does not own are never taken from
+the snapshot:
 
-- when any label is protected, each update batch re-reads the live labels of the
-  issues it is about to write, and protected labels are taken from that read and
-  from nowhere else. This preserves one added mid-run and equally respects one
-  removed mid-run (an absent label is never re-added).
+- each update batch re-reads the live labels of the issues it is about to write,
+  immediately before the write, and every unmanaged label is taken from that
+  read and from nowhere else. This preserves one added mid-run and equally
+  respects one removed mid-run (an absent label is never re-added).
 - an issue missing from that read is indistinguishable from one carrying no
-  protected label, so the batch is failed rather than guessed at. The caller
+  unmanaged label, so the batch is failed rather than guessed at. The caller
   already retries issues individually, so only the unreadable issue is reported
   failed, and it lands in `FailedOps`, which fails the run.
 - the labels connection is checked for truncation (`pageInfo.hasNextPage`) and a
-  truncated page fails the issue closed too: a protected label past the page
-  boundary would be absent from the read and then deleted by the update, which is
-  the exact failure the read exists to prevent. Refusing beats paginating — a
-  nested connection cannot be paged within the one query, and an issue with more
-  than 250 labels is pathological rather than a case worth serving.
+  truncated page fails the issue closed too: a label past the page boundary —
+  including a protected control label — would be absent from the read and then
+  deleted by the update, which is the exact failure the read exists to prevent.
+  Refusing beats paginating — a nested connection cannot be paged within the one
+  query, and an issue with more than 250 labels is pathological rather than a
+  case worth serving.
 - protected labels are never asserted from the managed set, bounding the blast
   radius of a misconfiguration.
 - creates need no handling: there is no pre-existing label set to replace.
@@ -208,8 +212,9 @@ sibling of its group, and between two carried-forward siblings the first read
 wins. Without this, a ticket that carries a second child of a managed label's
 group fails every update until a person edits the ticket by hand.
 
-The live read is skipped when the protected set is empty, keeping the extra query
-off the hot path for deployments that do not need it.
+The live read always runs, whether or not the protected set is empty: a human's
+or another automation's label needs it exactly as much as a protected control
+label does, and a mid-run edit is just as lost when no labels are protected.
 
 `LINEAR_UNSUBSCRIBE_ACTOR` is an optional operator control for notification
 behavior.
@@ -435,7 +440,8 @@ instead, and the next run re-examines everything against live data.
   bound the result set.
 - Labels are *not* owned by this tool. Unrelated labels are preserved, and any
   label named in `LINEAR_PROTECTED_LABELS` is treated as another actor's state:
-  never written, never deleted, and read live rather than from the snapshot.
+  never written, never deleted. Every label the sync does not own is read live
+  immediately before an update rather than taken from the run's opening snapshot.
 - Linear issue history matters, so deleting and recreating all issues is a last resort, not a normal repair path.
 - Cache bypass is the correct operator action when the rendering schema or compare logic changes.
 - The Snyk DAST snapshot is verified complete against the API reported `count` before any resolve or cancel is planned: a paginated listing shorter than its reported `count` fails the run instead of being treated as the full target/finding set.
