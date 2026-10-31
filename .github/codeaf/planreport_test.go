@@ -822,10 +822,50 @@ func TestParseProposalsFenceKeepsOutsideProseAndLaterProposals(t *testing.T) {
 	if props[0].Title != "Real before the fence" || props[1].Title != "Real after the fence" {
 		t.Errorf("titles = %q, %q", props[0].Title, props[1].Title)
 	}
-	if props[0].Problem != "the fence comes later and must not eat this." {
-		t.Errorf("first Problem = %q", props[0].Problem)
+	// The fence sits under the open Problem field, so it is that field's
+	// text, kept whole as a quote: its lookalike "- Problem:" line opens no
+	// field of its own.
+	if want := "the fence comes later and must not eat this.\n```\n- Problem: fenced lookalike field inside a sample\n```"; props[0].Problem != want {
+		t.Errorf("first Problem = %q, want %q", props[0].Problem, want)
 	}
 	if !strings.Contains(props[1].What, "keep parsing") {
 		t.Errorf("second What = %q", props[1].What)
+	}
+}
+
+// TestParseProposalsFencedFieldContentKept pins the other half of issue
+// #339: a fence is a quote, not a hole. A proposal whose End-to-end check
+// carries its command in a fence keeps that command, so the issue still has
+// the section the queue's readiness gate reads.
+func TestParseProposalsFencedFieldContentKept(t *testing.T) {
+	answer := "### Proposal: Fenced check\n\n" +
+		"- Problem: something is wrong.\n" +
+		"- What to do: fix it.\n" +
+		"- End-to-end check:\n" +
+		"```sh\n" +
+		"go -C .github/codeaf test -run TestSomething .\n" +
+		"```\n"
+	props := ParseProposals(answer, 5)
+	if len(props) != 1 {
+		t.Fatalf("len(props) = %d, want 1: %+v", len(props), props)
+	}
+	if !strings.Contains(props[0].EndToEnd, "go -C .github/codeaf test -run TestSomething .") {
+		t.Errorf("EndToEnd = %q, want the fenced command kept", props[0].EndToEnd)
+	}
+}
+
+// TestParseProposalsUnterminatedFenceIsNotAQuote: a fence that never closes
+// runs to the end of the answer, so reading it as a quote would swallow
+// every proposal after it. Like the review pass (issue #224), only a closed
+// fence is a confirmed quote.
+func TestParseProposalsUnterminatedFenceIsNotAQuote(t *testing.T) {
+	answer := "### Proposal: Before\n\n" +
+		"- Problem: first.\n" +
+		"```\n" +
+		"### Proposal: After an unclosed fence\n\n" +
+		"- Problem: second.\n"
+	props := ParseProposals(answer, 5)
+	if len(props) != 2 || props[1].Title != "After an unclosed fence" {
+		t.Fatalf("props = %+v, want the proposal after the unclosed fence parsed", props)
 	}
 }
