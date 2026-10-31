@@ -1,8 +1,8 @@
 {
   "api_key": "via-local-proxy",
   "models.tiers.worker": "zai-org/glm-5.3-flash",
-  "models.tiers.mastermind": "deepseek-ai/deepseek-v4.1-flash",
-  "models.tiers.high": "deepseek-ai/deepseek-v4.1-flash",
+  "models.tiers.mastermind": "deepseek-ai/deepseek-v4.1-flash-1017",
+  "models.tiers.high": "deepseek-ai/deepseek-v4.1-flash-1017",
   "models.crew.task_cap": 5,
   "models.crew.cap": 20,
   "task.parallel": 2,

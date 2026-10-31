@@ -1129,7 +1129,7 @@ func TestReviewerModel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ID != "deepseek-ai/deepseek-v4.1-flash" || got.Role != "mid" {
+	if got.ID != "deepseek-ai/deepseek-v4.1-flash-1017" || got.Role != "mid" {
 		t.Errorf("reviewer = %q (role %q), want the mid model", got.ID, got.Role)
 	}
 	// Whatever the worker is, the reviewer never is.
@@ -1181,7 +1181,7 @@ func TestRunReviewConfig(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &got); err != nil {
 		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
 	}
-	if got["models.tiers.worker"] != "deepseek-ai/deepseek-v4.1-flash" {
+	if got["models.tiers.worker"] != "deepseek-ai/deepseek-v4.1-flash-1017" {
 		t.Errorf("worker tier = %v, want the reviewer model", got["models.tiers.worker"])
 	}
 	cfg, err := loadConfig("models.json")
