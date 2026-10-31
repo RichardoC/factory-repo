@@ -1365,8 +1365,15 @@ func (v *vfs) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sql
 			}
 			// Fresh (or externally emptied) file: create the empty sector 0
 			// that the size computation and reads expect. Known to be new,
-			// so this is one CREATE, with the usual conflict fallback.
-			if err := f.writeSectorOnce(0, nil, false); err != nil {
+			// so this is one CREATE — but with no overwrite fallback, unlike
+			// the lock-gated write path: this file holds no lock here, and a
+			// second client may have created sector 0 between our LIST and
+			// our CREATE. Its bytes are then that client's page 1, so an
+			// AlreadyExists answer is "re-read", the casLock rule: retry the
+			// open and let the next LIST see their sector instead of
+			// force-updating zero bytes over the first sector of a database
+			// that now exists (issue #393).
+			if err := f.createSector0IfAbsent(); err != nil {
 				v.logger.Error("Open: create initial empty sector", "err", err)
 				lastErr = err
 				continue
