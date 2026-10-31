@@ -603,7 +603,9 @@ func mapStatus(state string, expirationDate *string) (model.FindingStatus, time.
 // log a warning naming the finding and the value, so the permanent
 // cancellation is visible instead of silent.
 func unparseableAcceptanceExpiry(state string, expirationDate *string) (raw string, unparseable bool) {
-	if expirationDate == nil || !strings.EqualFold(strings.TrimSpace(state), "accepted") {
+	// An empty or blank value is no expiry at all, which mapStatus already
+	// documents as a permanent acceptance: nothing failed to parse.
+	if expirationDate == nil || strings.TrimSpace(*expirationDate) == "" || !strings.EqualFold(strings.TrimSpace(state), "accepted") {
 		return "", false
 	}
 	if _, _, ok := parseExpirationDate(*expirationDate); ok {

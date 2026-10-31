@@ -621,7 +621,8 @@ func TestLoadSnapshotWarnsOnUnparseableAcceptanceExpiry(t *testing.T) {
 // mappings and produces no warning.
 func TestLoadSnapshotDoesNotWarnOnParseableAcceptanceExpiry(t *testing.T) {
 	future := "2126-06-01"
-	for name, expirationDate := range map[string]*string{"future": &future, "absent": nil} {
+	empty := ""
+	for name, expirationDate := range map[string]*string{"future": &future, "absent": nil, "empty": &empty} {
 		t.Run(name, func(t *testing.T) {
 			handler, snapshot := loadSnapshotWithExpiry(t, expirationDate)
 			for _, r := range handler.records {
@@ -630,7 +631,7 @@ func TestLoadSnapshotDoesNotWarnOnParseableAcceptanceExpiry(t *testing.T) {
 				}
 			}
 			want := model.FindingSnoozed
-			if expirationDate == nil {
+			if expirationDate == nil || *expirationDate == "" {
 				want = model.FindingIgnored
 			}
 			if got := snapshot.Findings[0].Status; got != want {
