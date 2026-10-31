@@ -1934,8 +1934,27 @@ func TestBriefTriggerExcludedFromFindings(t *testing.T) {
 	}
 }
 
+func TestDepsFromBodyStopsAtTheSentenceBoundary(t *testing.T) {
+	cases := []struct {
+		body string
+		want []int
+	}{
+		{"Depends on #12. Related: #99 and #42.\n", []int{12}},
+		{"Depends on #12, #13\n", []int{12, 13}},
+		{"Depends on #12 and #13.", []int{12, 13}},
+		{"Depends on #12; see also #99\n", []int{12}},
+		{"Depends on #12! Related: #99?\n", []int{12}},
+		{"Depends on #12. Related: #99\nalso depends on #13\n", []int{12, 13}},
+	}
+	for _, c := range cases {
+		if got := depsFromBody(c.body); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("depsFromBody(%q) = %v, want %v", c.body, got, c.want)
+		}
+	}
+}
+
 func TestBriefDependencies(t *testing.T) {
-	body := "Do the thing.\nDepends on #12 and #13\nBlocked by #15\nalso depends on #14 and depends on #12 (again)\n"
+	body := "Do the thing.\nDepends on #12 and #13\nBlocked by #15\nalso depends on #14 and depends on #12 (again)\nDepends on #12. Related: #99.\n"
 	var files []string
 	for i := 0; i < 25; i++ {
 		files = append(files, fmt.Sprintf(`{"filename":"f%02d.go"}`, i))
@@ -1977,6 +1996,9 @@ func TestBriefDependencies(t *testing.T) {
 	}
 	if strings.Contains(deps, "- #15") {
 		t.Errorf("a reference with no depends-on phrase became a dependency: %q", deps)
+	}
+	if strings.Contains(deps, "- #99") {
+		t.Errorf("a reference after the stored list's sentence became a dependency: %q", deps)
 	}
 
 	// No depends-on phrases: the none line.

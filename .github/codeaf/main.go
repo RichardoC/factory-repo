@@ -3397,9 +3397,21 @@ func hashRefs(s string) []int {
 	return out
 }
 
+// depListEnd returns the length of the list that starts at s: everything up
+// to the first sentence boundary, so prose after the list ("Depends on #12.
+// Related: #99") is not read as part of it.
+func depListEnd(s string) int {
+	if i := strings.IndexAny(s, ".;!?"); i >= 0 {
+		return i
+	}
+	return len(s)
+}
+
 // depsFromBody collects the issue references that follow a "depends on"
 // phrase on the same line ("Depends on #12, #13"), deduplicated and sorted,
-// at most maxDeps of them.
+// at most maxDeps of them. The scan stops at the end of the sentence that
+// carries the phrase, so a later reference on the same line ("Depends on #12.
+// Related: #99") is not a dependency.
 func depsFromBody(body string) []int {
 	seen := map[int]bool{}
 	var out []int
@@ -3411,7 +3423,7 @@ func depsFromBody(body string) []int {
 				break
 			}
 			i += j + len("depends on")
-			for _, n := range hashRefs(line[i:]) {
+			for _, n := range hashRefs(line[i : i+depListEnd(line[i:])]) {
 				if !seen[n] {
 					seen[n] = true
 					out = append(out, n)
