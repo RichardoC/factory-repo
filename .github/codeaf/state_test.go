@@ -177,7 +177,7 @@ func pack(t *testing.T, cfg Config, now time.Time, bundle, runID string, spent f
 
 func readManifestT(t *testing.T, dir string, cfg Config, now time.Time) Manifest {
 	t.Helper()
-	m, found, err := readManifest(dir, now, cfg.Limits.WeeklyCreditUSD)
+	m, found, err := readManifest(dir, cfg, now)
 	if err != nil || !found {
 		t.Fatalf("manifest in %s: found=%v err=%v", dir, found, err)
 	}
@@ -314,7 +314,7 @@ func TestReadManifestRefusesPoisonedSpend(t *testing.T) {
 	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
 	dir := t.TempDir()
 	writeTestFile(t, filepath.Join(dir, manifestFile), []byte(`{"version":1,"generation":2,"merged":[],"updated":"2026-10-16T11:00:00Z","spend":{"2026-10-16":-20}}`))
-	if _, _, err := readManifest(dir, now, cfg.Limits.WeeklyCreditUSD); err == nil {
+	if _, _, err := readManifest(dir, cfg, now); err == nil {
 		t.Error("negative spend accepted")
 	}
 }
@@ -332,14 +332,21 @@ func TestReadManifestRejectsOutOfRangeSpend(t *testing.T) {
 	// so the read path must not accept them from a merged bundle. The
 	// fixtures carry the manifest's own updated timestamp, so what is
 	// refused is the entry, not a missing write time.
+	dayCap := cfg.Limits.WeeklyCreditUSD + float64(cfg.Queue.MaxParallelRuns)*maxRunSpend(cfg.Limits.RunCreditUSD)
 	for name, entry := range map[string]string{
-		"future day":                  `"2099-01-01": 0.5`,
-		"a day 30 days old":           fmt.Sprintf("%q: 0.5", day(-30)),
-		"a day the queue cannot fund": fmt.Sprintf("%q: %v", day(0), 3*cfg.Limits.WeeklyCreditUSD+0.01),
+		"future day":        `"2099-01-01": 0.5`,
+		"a day 30 days old": fmt.Sprintf("%q: 0.5", day(-30)),
+		// Two oversized days: one just past the write-path ceiling (the
+		// weekly credit plus every parallel run in flight when the cap was
+		// crossed), one well under the old three-weekly ceiling that
+		// admitted it — neither is a day the queue funds, so both are
+		// refused.
+		"a day just over the write-path ceiling":    fmt.Sprintf("%q: %v", day(0), dayCap+0.01),
+		"an oversized day the old ceiling admitted": fmt.Sprintf("%q: %v", day(0), 2*cfg.Limits.WeeklyCreditUSD),
 	} {
 		dir := t.TempDir()
 		writeTestFile(t, filepath.Join(dir, manifestFile), []byte(fmt.Sprintf(`{"version":1,"generation":2,"merged":[],"updated":"2026-10-16T11:00:00Z","spend":{"2026-10-16":0.5,%s}}`, entry)))
-		if _, _, err := readManifest(dir, now, cfg.Limits.WeeklyCreditUSD); err == nil {
+		if _, _, err := readManifest(dir, cfg, now); err == nil {
 			t.Errorf("%s (%s) accepted", name, entry)
 		}
 	}
@@ -349,7 +356,7 @@ func TestReadManifestRejectsOutOfRangeSpend(t *testing.T) {
 	// (the reader's now is a day later than the writer's).
 	boundary := t.TempDir()
 	writeTestFile(t, filepath.Join(boundary, manifestFile), []byte(`{"version":1,"generation":2,"merged":[],"updated":"2026-10-15T23:00:00Z","spend":{"2026-10-08":0.5}}`))
-	if _, _, err := readManifest(boundary, now, cfg.Limits.WeeklyCreditUSD); err != nil {
+	if _, _, err := readManifest(boundary, cfg, now); err != nil {
 		t.Errorf("a harness-written boundary day refused: %v", err)
 	}
 
@@ -359,8 +366,17 @@ func TestReadManifestRejectsOutOfRangeSpend(t *testing.T) {
 	// back; only a day far past it (see above) is refused.
 	over := t.TempDir()
 	writeTestFile(t, filepath.Join(over, manifestFile), []byte(fmt.Sprintf(`{"version":1,"generation":2,"merged":[],"updated":"2026-10-16T11:00:00Z","spend":{"2026-10-16":%v}}`, cfg.Limits.WeeklyCreditUSD+9)))
-	if _, _, err := readManifest(over, now, cfg.Limits.WeeklyCreditUSD); err != nil {
+	if _, _, err := readManifest(over, cfg, now); err != nil {
 		t.Errorf("a day total of ten overlapped runs refused: %v", err)
+	}
+
+	// A day exactly at the write-path ceiling — the weekly credit plus the
+	// overshoot of every parallel run in flight when the cap was crossed —
+	// is still a day the queue funds.
+	atCap := t.TempDir()
+	writeTestFile(t, filepath.Join(atCap, manifestFile), []byte(fmt.Sprintf(`{"version":1,"generation":2,"merged":[],"updated":"2026-10-16T11:00:00Z","spend":{"2026-10-16":%v}}`, cfg.Limits.WeeklyCreditUSD+float64(cfg.Queue.MaxParallelRuns)*maxRunSpend(cfg.Limits.RunCreditUSD))))
+	if _, _, err := readManifest(atCap, cfg, now); err != nil {
+		t.Errorf("a day at the write-path ceiling refused: %v", err)
 	}
 
 	// A manifest of ordinary in-week entries reads back unchanged.
@@ -371,6 +387,36 @@ func TestReadManifestRejectsOutOfRangeSpend(t *testing.T) {
 	if m.Generation != 4 || strings.Join(m.Merged, ",") != "10-1,11-1" || len(m.Spend) != 3 ||
 		m.Spend["2026-10-16"] != 1.25 || m.Spend["2026-10-15"] != 0.5 || m.Spend["2026-10-13"] != 2 {
 		t.Errorf("ordinary manifest changed: %+v", m)
+	}
+}
+
+// TestReadManifestRejectsBadUpdated pins the bound on the manifest's own
+// write time: the spend days are checked against Updated's window, so a
+// made-up future Updated would widen that window, and a manifest without a
+// write time has no window at all. Either is refused. A write time a little
+// ahead of the loader's clock is still a write time — the merge's clock can
+// lead this load's by up to a day.
+func TestReadManifestRejectsBadUpdated(t *testing.T) {
+	cfg, err := loadConfig("models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	for name, updated := range map[string]string{
+		"a write time over a day ahead": now.Add(25 * time.Hour).Format(time.RFC3339),
+		"a week ahead":                  now.Add(7 * 24 * time.Hour).Format(time.RFC3339),
+		"no write time":                 "0001-01-01T00:00:00Z",
+	} {
+		dir := t.TempDir()
+		writeTestFile(t, filepath.Join(dir, manifestFile), []byte(fmt.Sprintf(`{"version":1,"generation":2,"merged":[],"updated":%q,"spend":{"2026-10-16":0.5}}`, updated)))
+		if _, _, err := readManifest(dir, cfg, now); err == nil {
+			t.Errorf("manifest with %s accepted", name)
+		}
+	}
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, manifestFile), []byte(fmt.Sprintf(`{"version":1,"generation":2,"merged":[],"updated":%q,"spend":{"2026-10-16":0.5}}`, now.Add(time.Hour).Format(time.RFC3339))))
+	if _, _, err := readManifest(dir, cfg, now); err != nil {
+		t.Errorf("manifest written an hour ahead of this clock refused: %v", err)
 	}
 }
 
