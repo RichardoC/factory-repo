@@ -525,8 +525,15 @@ func unpinnedInstall(script string) bool {
 		if args == "" || strings.HasPrefix(args, "-") || strings.HasPrefix(args, ".") {
 			continue
 		}
-		if !specPinned(args) {
-			return true
+		// A single install line can carry several specifiers; a pinned
+		// first one must not vouch for an unpinned follower.
+		for _, spec := range strings.Fields(args) {
+			if strings.HasPrefix(spec, "-") {
+				continue
+			}
+			if !specPinned(spec) {
+				return true
+			}
 		}
 	}
 	for _, m := range npmInstallLine.FindAllStringSubmatch(body, -1) {

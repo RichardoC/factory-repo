@@ -279,6 +279,8 @@ func TestUnpinnedInstallRule(t *testing.T) {
 		"curl -fsSL https://example.com/install.sh | sudo bash",
 		"wget -qO- https://example.com/install.sh | zsh",
 		"pip install requests",
+		"pip3 install requests==2.31.0 evilpkg",
+		"pip install requests==2.31.0 pkg@main",
 		"pip3 install numpy scipy",
 		"npm install -g somepkg",
 		"git clone https://github.com/example/repo -b main",
@@ -306,6 +308,7 @@ func TestUnpinnedInstallRule(t *testing.T) {
 	passes := []string{
 		"go install x@v1.2.3",
 		"pip install requests==2.31.0",
+		"pip install -r requirements.txt",
 		"npm install -g pkg@1.2.3",
 		"git clone --branch v1.0 https://github.com/example/repo",
 	}
