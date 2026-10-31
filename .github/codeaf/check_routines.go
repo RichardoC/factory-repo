@@ -220,6 +220,7 @@ var prFailingStates = map[string]bool{
 // free slot is a workflow decision, not this routine's.
 func prSweep(prs []prStatus) (report string, conflictedFree []int) {
 	var red, conflicted, unaddressed []prStatus
+	examined := 0
 	for _, pr := range prs {
 		if !strings.HasPrefix(pr.HeadRefName, "codeaf/") {
 			continue // only the factory's own branches count
@@ -227,6 +228,7 @@ func prSweep(prs []prStatus) (report string, conflictedFree []int) {
 		if pr.State != "" && pr.State != "OPEN" {
 			continue // merged and closed PRs need no sweep
 		}
+		examined++ // healthy PRs are still part of the checked queue
 		fails := 0
 		for _, c := range pr.StatusCheckRollup {
 			if prFailingStates[c.State] || prFailingStates[c.Conclusion] {
@@ -250,7 +252,7 @@ func prSweep(prs []prStatus) (report string, conflictedFree []int) {
 	sort.Ints(conflictedFree)
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "## PR sweep: %d open `codeaf/*` PR(s) checked\n\n", len(red)+len(conflicted)+len(unaddressed))
+	fmt.Fprintf(&b, "## PR sweep: %d open `codeaf/*` PR(s) checked\n\n", examined)
 	line := func(label string, pr prStatus, detail string) {
 		fmt.Fprintf(&b, "- #%d `%s` — %s", pr.Number, escapeMD(pr.HeadRefName, 80, true), label)
 		if detail != "" {
@@ -259,7 +261,7 @@ func prSweep(prs []prStatus) (report string, conflictedFree []int) {
 		b.WriteString("\n")
 	}
 	if len(red) == 0 && len(conflicted) == 0 && len(unaddressed) == 0 {
-		b.WriteString("No red, conflicted or unaddressed-review PRs.\n")
+		fmt.Fprintf(&b, "No red, conflicted or unaddressed-review PR(s) among the %d checked.\n", examined)
 		return b.String(), conflictedFree
 	}
 	if len(red) > 0 {

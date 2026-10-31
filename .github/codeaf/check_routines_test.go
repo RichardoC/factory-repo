@@ -166,6 +166,14 @@ func TestPRSweep(t *testing.T) {
 			}},
 	}
 	report, free := prSweep(prs)
+	// Five PRs were examined (12, 14, 17, 19 and 25 are open `codeaf/*`);
+	// only three carry findings, but the header counts the whole queue.
+	if !strings.Contains(report, "## PR sweep: 5 open `codeaf/*` PR(s) checked") {
+		t.Errorf("header does not count the 5 examined PRs:\\n%s", report)
+	}
+	if strings.Contains(report, "## PR sweep: 3 open") {
+		t.Errorf("header counts findings, not the checked queue:\\n%s", report)
+	}
 	for _, want := range []string{
 		"#12 `codeaf/fix-quota` — merge conflict",
 		"#14 `codeaf/hedge` — failing checks: 1 failing check(s)",
@@ -192,8 +200,11 @@ func TestPRSweepClean(t *testing.T) {
 		{Number: 9, HeadRefName: "codeaf/clean", State: "OPEN", Mergeable: "MERGEABLE",
 			StatusCheckRollup: []prCheck{{State: "SUCCESS"}}},
 	})
-	if !strings.Contains(report, "No red, conflicted or unaddressed-review PRs") {
-		t.Errorf("clean sweep reported findings:\n%s", report)
+	if !strings.Contains(report, "## PR sweep: 1 open `codeaf/*` PR(s) checked") {
+		t.Errorf("clean header does not count the 1 examined PR:\n%s", report)
+	}
+	if !strings.Contains(report, "No red, conflicted or unaddressed-review PR(s) among the 1 checked.") {
+		t.Errorf("clean line does not carry the checked count:\n%s", report)
 	}
 	if len(free) != 0 {
 		t.Errorf("conflictedFree = %v, want empty", free)
