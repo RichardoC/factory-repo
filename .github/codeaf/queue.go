@@ -1318,9 +1318,10 @@ func strandedByFailedRun(comments bodyComments) bool {
 // before it could say anything, so it counts as failed; without this it was
 // never counted and its issue or PR sat with nothing to retry it.
 func failedRunReport(body string) bool {
-	if strings.HasPrefix(body, reportMarker+"\n### CodeAF run — publishing failed\n") ||
-		strings.HasPrefix(body, reportMarker+"\n### CodeAF run — run job failed\n") {
-		return true
+	for _, heading := range failedReportHeadings {
+		if strings.HasPrefix(body, heading) {
+			return true
+		}
 	}
 	// Only a report with no stop / ok row to parse counts on the fixed
 	// line: a literal this package writes itself (main.go), so a report

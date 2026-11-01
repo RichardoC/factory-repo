@@ -202,6 +202,34 @@ func TestCountReports(t *testing.T) {
 	if got := countReports(runJobFailed); got != 3 {
 		t.Errorf("countReports(run job failed) = %d, want 3", got)
 	}
+
+	// A run whose result.json was missing or unparseable reports only the
+	// fixed no-result row, no stop / ok row at all (issue #310): it fell
+	// over before it could say anything, so like the failed headings its
+	// report must not spend a continuation slot (issue #415).
+	noResult := append(mixed,
+		issueComment{ID: 16, User: bot, Body: reportMarker + "\n### CodeAF run — finished\n\n| | |\n|---|---|\n" + noResultRow + "\n"},
+	)
+	if got := countReports(noResult); got != 3 {
+		t.Errorf("countReports(no-result report) = %d, want 3", got)
+	}
+
+	// A "no changes" report that ended not ok is what a run the proxy
+	// refused from its first call writes (the 2026-10-19 quota stall): its
+	// patch never landed either, so it spends no continuation slot
+	// (issue #415). A "no changes" report that ended ok is not excluded.
+	refused := append(mixed,
+		issueComment{ID: 17, User: bot, Body: reportMarker + "\n### CodeAF run — no changes\n\n| | |\n|---|---|\n| stop / ok | `incomplete` / `false` |\n"},
+	)
+	if got := countReports(refused); got != 3 {
+		t.Errorf("countReports(refused no-changes report) = %d, want 3", got)
+	}
+	okNoChanges := append(mixed,
+		issueComment{ID: 18, User: bot, Body: reportMarker + "\n### CodeAF run — no changes\n\n| | |\n|---|---|\n| stop / ok | `done` / `true` |\n"},
+	)
+	if got := countReports(okNoChanges); got != 4 {
+		t.Errorf("countReports(ok no-changes report) = %d, want 4 (an ok no-changes run is not failed)", got)
+	}
 }
 
 // reportComments builds a comment list of n run reports plus one ordinary
@@ -1514,6 +1542,29 @@ func TestContinuePlanFailedReportsDoNotReachTheCap(t *testing.T) {
 	}
 	if action != "continue" || used != 1 {
 		t.Fatalf("action = %q, used = %d, want continue/1: failed reports must not spend the cap", action, used)
+	}
+
+	// The two failure shapes failedRunReport knows beyond the failed
+	// headings behave the same (issue #415): a fixed no-result report
+	// (result.json missing or unparseable) and a "no changes" report that
+	// ended not ok (a run the proxy refused from its first call) never
+	// landed a patch, so the plan still continues with one used slot.
+	noResult := reportMarker + "\n### CodeAF run — finished\n\n| | |\n|---|---|\n" + noResultRow + "\n"
+	refused := reportMarker + "\n### CodeAF run — no changes\n\n| | |\n|---|---|\n| stop / ok | `incomplete` / `false` |\n"
+	for name, body := range map[string]string{"no-result": noResult, "no-changes not ok": refused} {
+		comments := append(reportComments(1),
+			issueComment{ID: 504, User: user{Login: planReportBotLogin}, Body: body},
+			issueComment{ID: 505, User: user{Login: planReportBotLogin}, Body: body},
+		)
+		server := commentsServer(t, comments, http.StatusOK)
+		ghEnv(t, server)
+		action, _, used, err := continuePlan(newGitHub(), 7, stopDeadline)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if action != "continue" || used != 1 {
+			t.Fatalf("%s: action = %q, used = %d, want continue/1: the report shape must not spend the cap", name, action, used)
+		}
 	}
 }
 

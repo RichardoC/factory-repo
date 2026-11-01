@@ -111,27 +111,14 @@ func continuationCapReached(used int) bool { return used >= maxContinuations }
 // and codeaf.yml's report step sets that outcome to "publishing failed" when
 // the publish job failed and to "run job failed" when the run job itself did.
 // queue.go's strandedByFailedRun treats both as the same stranded state
-// (issue #215), so both must be excluded here too: a run that stopped with
-// either heading did not land its work, and spending a continuation slot on
-// it would let a later continuation push the pull request one run past the
-// cap. Each entry is an exact prefix, never a search inside the body, because
-// a comment is untrusted data; the strings are fixed literals this package
-// writes itself, so a comment is excluded only by reproducing one exactly,
-// and only a comment by the workflow bot reaches this check at all.
+// (issue #215), so both must be excluded here too. Each entry is an exact
+// prefix, never a search inside the body, because a comment is untrusted
+// data; the strings are fixed literals this package writes itself, so a
+// comment matches only by reproducing one exactly, and only bot comments
+// reach the checks that use them (failedRunReport's callers).
 var failedReportHeadings = []string{
 	reportMarker + "\n### CodeAF run — publishing failed\n",
 	reportMarker + "\n### CodeAF run — run job failed\n",
-}
-
-// isFailedReportHeading reports whether a comment body begins with one of the
-// failed-run report headings above.
-func isFailedReportHeading(body string) bool {
-	for _, heading := range failedReportHeadings {
-		if strings.HasPrefix(body, heading) {
-			return true
-		}
-	}
-	return false
 }
 
 // countReports counts the comments on a pull request that carry a CodeAF
@@ -140,17 +127,20 @@ func isFailedReportHeading(body string) bool {
 // posts, carry no report marker and are not counted. Two comments that
 // carry the marker are still not reports: one by anyone but the workflow
 // bot (a forged marker on a public repository can neither inflate nor
-// suppress the count), and one whose outcome heading says the run did not
-// land — publish failed, or the run job failed — because its patch never
-// landed, so it must not spend a continuation slot that a later run's
-// report can only undercount.
+// suppress the count), and one whose report says the run did not land —
+// publishing failed, the run job failed, a fixed no-result row in place
+// of a stop / ok row, or a "no changes" report that ended not ok (issue
+// #415). All four shapes are what failedRunReport knows (queue.go), so it
+// is the one predicate here too: a report whose patch never landed must
+// not spend a continuation slot that a later run's report can only
+// undercount.
 func countReports(comments []issueComment) int {
 	n := 0
 	for _, c := range comments {
 		if c.User.Login != planReportBotLogin || !strings.Contains(c.Body, reportMarker) {
 			continue
 		}
-		if isFailedReportHeading(c.Body) {
+		if failedRunReport(c.Body) {
 			continue
 		}
 		n++
