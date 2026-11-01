@@ -63,20 +63,7 @@ func (f *file) deleteSector(sectorIndex int64) error {
 // rewrites pages in place — cost two API calls every time.
 func (f *file) writeSectorOnce(index int64, data []byte, exists bool) error {
 	f.vfs.logger.Debug("writeSectorOnce", "sectorIndex", index, "exists", exists)
-	sectorName := f.sectorNameFromSectorIndex(index)
-	cm := &corev1.ConfigMap{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "ConfigMap",
-			APIVersion: "v1",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      sectorName,
-			Namespace: f.vfs.namespace,
-			Labels:    f.SectorLabels,
-		},
-		BinaryData: map[string][]byte{"sector": data},
-		Data:       map[string]string{"filename": f.RawName},
-	}
+	cm := f.sectorConfigMap(index, data)
 	var err error
 	if exists {
 		_, err = f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Update(f.vfs.ctx, cm, metav1.UpdateOptions{})
@@ -100,10 +87,48 @@ func (f *file) writeSectorOnce(index int64, data []byte, exists bool) error {
 }
 
 // WriteSector writes one sector, known to be new (CREATE, with the UPDATE
-// conflict fallback). Used by Open for the empty first sector and by
-// cmd/db-upload, which streams fresh sectors.
+// conflict fallback). Used by cmd/db-upload, which streams the sectors of a
+// whole-database upload; a sector another client created first is
+// overwritten, which the upload's replace-the-database-outright semantics
+// authorise (issue #332) — no SQLite lock is held on this path.
 func (f *file) WriteSector(s *Sector) error {
 	return f.writeSectorOnce(s.Index, s.Data, false)
+}
+
+// sectorConfigMap builds the ConfigMap that stores one sector of this file.
+func (f *file) sectorConfigMap(index int64, data []byte) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ConfigMap",
+			APIVersion: "v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      f.sectorNameFromSectorIndex(index),
+			Namespace: f.vfs.namespace,
+			Labels:    f.SectorLabels,
+		},
+		BinaryData: map[string][]byte{"sector": data},
+		Data:       map[string]string{"filename": f.RawName},
+	}
+}
+
+// createSector0IfAbsent creates the empty sector 0 that a read-write Open
+// adds to a file with no sectors. Unlike writeSectorOnce it has NO overwrite
+// fallback: Open holds no lock, so an AlreadyExists answer means another
+// client created sector 0 between our LIST and this CREATE, and its bytes
+// are that client's page 1 — a real database header, or the journal header
+// SQLite decides hot-or-cold from. Replacing them with zero bytes would
+// corrupt the file silently, which is exactly what Open's fresh-file check
+// exists to prevent (issue #393). The caller treats AlreadyExists as
+// "re-read": it lists the sectors again within the same open attempt and
+// opens over the other writer's sector instead of its own empty one.
+func (f *file) createSector0IfAbsent() error {
+	f.vfs.logger.Debug("createSector0IfAbsent", "sectorIndex", int64(0))
+	_, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Create(f.vfs.ctx, f.sectorConfigMap(0, nil), metav1.CreateOptions{})
+	if err != nil && !kerrors.IsAlreadyExists(err) {
+		f.vfs.logger.Error("createSector0IfAbsent", "err", err)
+	}
+	return err
 }
 
 func (f *file) sectorNameFromSectorIndex(sectorIndex int64) string {

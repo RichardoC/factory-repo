@@ -307,6 +307,192 @@ func TestOpenFreshFileCreatesLockfileAndEmptySector(t *testing.T) {
 	}
 }
 
+// TestOpenLostFreshFileRaceKeepsConcurrentWritersSector0 is the regression
+// test for issue #393. Open decides a file is fresh from a zero-sector LIST
+// and then CREATEs an empty sector 0. A second client that created sector 0
+// between that LIST and that CREATE owns the real page 1 — the 64-byte
+// database header, or the journal header SQLite reads hot-or-cold from — so
+// the CREATE may only fail with AlreadyExists, never be turned into an
+// unconditional Update of zero bytes over their data. The reactor below
+// reproduces exactly that interleaving: it lets the competing writer create
+// sector 0 and then answers our CREATE with the API server's AlreadyExists.
+//
+// The fix is the casLock rule applied to the open: AlreadyExists means
+// "re-read", so the open re-lists the sectors and sees the other writer's
+// sector, whose header is untouched. Before the fix Open returned success
+// while sector 0 read back as zero bytes.
+//
+// The re-read runs inside the open attempt rather than as another pass of
+// the outer retry loop: Open loops "for range v.retries" and the shipped
+// --retries default is 1 (main.go), so a re-read that cost an outer attempt
+// would be unreachable in production — every lost race would end in
+// "file metadata did not settle after 1 attempts". The test therefore runs
+// at retries=1 (the shipped default) as well as at the test suite's usual 3.
+func TestOpenLostFreshFileRaceKeepsConcurrentWritersSector0(t *testing.T) {
+	name := "race.db"
+	for _, retries := range []int{1, 3} {
+		t.Run(fmt.Sprintf("retries=%d", retries), func(t *testing.T) {
+			fcs := fake.NewSimpleClientset()
+			v := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), retries)
+			f := NewFile(name, v)
+			sector0 := f.sectorNameFromSectorIndex(0)
+
+			// The 64-byte SQLite header another writer's page 1 holds.
+			header := make([]byte, 64)
+			copy(header, "SQLite format 3\x00")
+			header[16], header[17] = 0x10, 0x00 // 4096-byte pages
+
+			// Write the competitor's sector 0 as a side effect of our CREATE and
+			// fail that CREATE the way the API server does.
+			var creates, injected int32
+			fcs.PrependReactor("create", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				ca, ok := action.(k8stesting.CreateAction)
+				if !ok {
+					return false, nil, nil
+				}
+				cm, ok := ca.GetObject().(*v1.ConfigMap)
+				if !ok || cm.Name != sector0 {
+					return false, nil, nil
+				}
+				atomic.AddInt32(&creates, 1)
+				if atomic.LoadInt32(&injected) > 0 {
+					return false, nil, nil
+				}
+				atomic.AddInt32(&injected, 1)
+				competitor := f.sectorConfigMap(0, header)
+				competitor.ResourceVersion = ""
+				if err := fcs.Tracker().Create(configMapGVR, competitor, testNamespace); err != nil {
+					t.Fatalf("seed competitor sector 0: %v", err)
+				}
+				return true, nil, kerrors.NewAlreadyExists(v1.Resource("configmaps"), sector0)
+			})
+
+			sf, _, err := v.Open(name, 0)
+			if err != nil {
+				t.Fatalf("Open(%q) under a lost fresh-file race = %v, want nil (AlreadyExists is re-read)", name, err)
+			}
+			if injected != 1 {
+				t.Errorf("injected AlreadyExists count = %d, want exactly 1", injected)
+			}
+			if creates != 1 {
+				t.Errorf("sector-0 CREATE attempts = %d, want 1 (the retry finds the sector in its LIST)", creates)
+			}
+
+			// The other writer's bytes must still be there: no Update may ever have
+			// replaced them with zero bytes.
+			for _, a := range fcs.Actions() {
+				if a.GetVerb() != "update" || a.GetResource().Resource != "configmaps" {
+					continue
+				}
+				ua, ok := a.(k8stesting.UpdateAction)
+				if !ok {
+					continue
+				}
+				if cm, ok := ua.GetObject().(*v1.ConfigMap); ok && cm.Name == sector0 {
+					t.Errorf("sector 0 was UPDATEd after the lost CREATE race: %q", cm.BinaryData["sector"])
+				}
+			}
+			sectors := listSectorConfigMaps(t, fcs, f)
+			if len(sectors) != 1 {
+				t.Fatalf("file has %d sector configmaps after the race, want exactly 1", len(sectors))
+			}
+			if got := sectors[0].BinaryData["sector"]; !bytes.Equal(got, header) {
+				t.Fatalf("sector 0 after the lost race = %d bytes %x, want the other writer's %d-byte header", len(got), got, len(header))
+			}
+
+			// And the reopened file serves those bytes, so Open succeeded over the
+			// database that now exists rather than over a zeroed sector.
+			rf, ok := sf.(*file)
+			if !ok {
+				t.Fatalf("Open(%q) returned %T, want *file", name, sf)
+			}
+			buf := make([]byte, len(header))
+			if _, err := rf.ReadAt(buf, 0); err != nil && !errors.Is(err, io.EOF) {
+				t.Fatalf("ReadAt(0) after the lost race: %v", err)
+			}
+			if !bytes.Equal(buf, header) {
+				t.Errorf("ReadAt(0) after the lost race = %x, want the header %x", buf, header)
+			}
+		})
+	}
+}
+
+// TestOpenLostRaceSector0VanishedAgain covers the tail of the lost fresh-file
+// race: the CREATE answered AlreadyExists, but by the time the in-attempt
+// re-read lists the sectors, the race winner's sector 0 has been deleted
+// again. There is no settled state to open, so the open must fail — but the
+// error must say why. The LIST that found nothing succeeded, so its nil error
+// must not be stored as lastErr: a nil lastErr falls through to the
+// "no open attempt was made" fallback, which blames the retry budget instead
+// of the race (the medium review finding at vfs.go).
+//
+// At the shipped --retries 1 default the open fails with the race reported;
+// with a budget left the next attempt's LIST sees no sectors and the CREATE
+// succeeds, so the open goes through.
+func TestOpenLostRaceSector0VanishedAgain(t *testing.T) {
+	name := "vanished.db"
+	for _, tc := range []struct {
+		retries   int
+		wantOpen  bool
+		wantInErr string
+		notInErr  string
+	}{
+		{retries: 1, wantOpen: false, wantInErr: "deleted again before the re-read", notInErr: "no open attempt was made"},
+		{retries: 3, wantOpen: true},
+	} {
+		t.Run(fmt.Sprintf("retries=%d", tc.retries), func(t *testing.T) {
+			fcs := fake.NewSimpleClientset()
+			v := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), tc.retries)
+			f := NewFile(name, v)
+			sector0 := f.sectorNameFromSectorIndex(0)
+
+			// The first sector-0 CREATE is answered AlreadyExists with
+			// nothing actually created: the winner's sector existed when the
+			// API server answered and was deleted before our re-read.
+			var injected int32
+			fcs.PrependReactor("create", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				ca, ok := action.(k8stesting.CreateAction)
+				if !ok {
+					return false, nil, nil
+				}
+				cm, ok := ca.GetObject().(*v1.ConfigMap)
+				if !ok || cm.Name != sector0 {
+					return false, nil, nil
+				}
+				if !atomic.CompareAndSwapInt32(&injected, 0, 1) {
+					return false, nil, nil
+				}
+				return true, nil, kerrors.NewAlreadyExists(v1.Resource("configmaps"), sector0)
+			})
+
+			sf, _, err := v.Open(name, 0)
+			if tc.wantOpen {
+				if err != nil {
+					t.Fatalf("Open(%q) with retries=%d = %v, want success: the retry's LIST sees no sectors and the CREATE goes through", name, tc.retries, err)
+				}
+				rf, ok := sf.(*file)
+				if !ok {
+					t.Fatalf("Open(%q) returned %T, want *file", name, sf)
+				}
+				buf := make([]byte, 8)
+				if _, err := rf.ReadAt(buf, 0); err != nil && !errors.Is(err, io.EOF) {
+					t.Fatalf("ReadAt(0) after the retry: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Open(%q) with retries=%d = nil error, want the vanished-sector race reported", name, tc.retries)
+			}
+			if !strings.Contains(err.Error(), tc.wantInErr) {
+				t.Errorf("Open(%q) error = %q, want it to contain %q", name, err, tc.wantInErr)
+			}
+			if tc.notInErr != "" && strings.Contains(err.Error(), tc.notInErr) {
+				t.Errorf("Open(%q) error = %q, want it to NOT contain %q: the retry budget is not what failed", name, err, tc.notInErr)
+			}
+		})
+	}
+}
+
 // --- Label limits (issue #351) ---
 
 // longNameDB is the 40-byte database name of issue #351: its base32
