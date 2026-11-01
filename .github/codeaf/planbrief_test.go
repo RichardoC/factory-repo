@@ -269,13 +269,16 @@ func TestRunPlanBriefRunReportsPagedPastCommentTraffic(t *testing.T) {
 		chatter = append(chatter, planChatterComment(i))
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveRepoID(w, r) {
+			return
+		}
 		if r.URL.Path != "/repos/RichardoC/factory-repo/issues/comments" {
 			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
 			return
 		}
 		switch r.URL.Query().Get("page") {
 		case "", "1":
-			w.Header().Set("Link", fmt.Sprintf("<%s%s&page=2>; rel=\"next\"", serverURL(r), r.URL.RequestURI()))
+			w.Header().Set("Link", idNextLink(r, idTail(r)+"&page=2"))
 			_, _ = io.WriteString(w, "["+strings.Join(chatter, ",")+"]")
 		case "2":
 			_, _ = io.WriteString(w, "["+planBotReportComment(101, 7)+","+planBotReportComment(102, 3)+"]")
@@ -315,13 +318,16 @@ func TestRunPlanBriefRunReportsPagedToEmptyPage(t *testing.T) {
 		chatter = append(chatter, planChatterComment(i))
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveRepoID(w, r) {
+			return
+		}
 		if r.URL.Path != "/repos/RichardoC/factory-repo/issues/comments" {
 			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
 			return
 		}
 		switch r.URL.Query().Get("page") {
 		case "", "1":
-			w.Header().Set("Link", fmt.Sprintf("<%s%s&page=2>; rel=\"next\"", serverURL(r), r.URL.RequestURI()))
+			w.Header().Set("Link", idNextLink(r, idTail(r)+"&page=2"))
 			_, _ = io.WriteString(w, "["+strings.Join(chatter, ",")+"]")
 		default:
 			_, _ = io.WriteString(w, `[]`)
@@ -352,12 +358,15 @@ func TestRunPlanBriefRunReportsWindowExhausted(t *testing.T) {
 		chatter = append(chatter, planChatterComment(i))
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveRepoID(w, r) {
+			return
+		}
 		if r.URL.Path != "/repos/RichardoC/factory-repo/issues/comments" {
 			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
 			return
 		}
 		pages.Add(1)
-		w.Header().Set("Link", fmt.Sprintf("<%s%s&page=%d>; rel=\"next\"", serverURL(r), r.URL.RequestURI(), pages.Load()+1))
+		w.Header().Set("Link", idNextLink(r, fmt.Sprintf("%s&page=%d", idTail(r), pages.Load()+1)))
 		_, _ = io.WriteString(w, "["+strings.Join(chatter, ",")+"]")
 	}))
 	t.Cleanup(server.Close)
@@ -393,12 +402,15 @@ func TestRunPlanBriefRunReportsPartialScanAtWindowBound(t *testing.T) {
 		chatter = append(chatter, planChatterComment(i))
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveRepoID(w, r) {
+			return
+		}
 		if r.URL.Path != "/repos/RichardoC/factory-repo/issues/comments" {
 			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
 			return
 		}
 		pages.Add(1)
-		w.Header().Set("Link", fmt.Sprintf("<%s%s&page=%d>; rel=\"next\"", serverURL(r), r.URL.RequestURI(), pages.Load()+1))
+		w.Header().Set("Link", idNextLink(r, fmt.Sprintf("%s&page=%d", idTail(r), pages.Load()+1)))
 		comments := append([]string(nil), chatter...)
 		if pages.Load() == 1 {
 			comments = append(comments, planBotReportComment(101, 7))
@@ -658,6 +670,9 @@ func jsonString(s string) string {
 func TestRunPlanBriefOpenIssuesFollowsPages(t *testing.T) {
 	var pages atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveRepoID(w, r) {
+			return
+		}
 		if r.URL.Path != "/repos/RichardoC/factory-repo/issues" {
 			// The other three list reads answer an empty page and no next
 			// link: this test is about the open-issues read alone.
@@ -674,7 +689,7 @@ func TestRunPlanBriefOpenIssuesFollowsPages(t *testing.T) {
 				return
 			}
 			pages.Add(1)
-			w.Header().Set("Link", fmt.Sprintf("<%s/repos/RichardoC/factory-repo/issues?state=open&per_page=100&page=2>; rel=\"next\"", serverURL(r)))
+			w.Header().Set("Link", idNextLink(r, "/issues?state=open&per_page=100&page=2"))
 			_, _ = io.WriteString(w, `[{"number":11,"title":"First page issue","body":"one"}]`)
 		case "2":
 			pages.Add(1)
@@ -711,7 +726,10 @@ func TestRunPlanBriefOpenIssuesFollowsPages(t *testing.T) {
 // used is `(... unavailable: ...)`).
 func TestRunPlanBriefDegradesOnPageCap(t *testing.T) {
 	forever := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Link", fmt.Sprintf("<%s%s?per_page=100&page=2>; rel=\"next\"", serverURL(r), r.URL.Path))
+		if serveRepoID(w, r) {
+			return
+		}
+		w.Header().Set("Link", idNextLink(r, strings.TrimPrefix(r.URL.Path, stubRepoPath)+"?per_page=100&page=2"))
 		_, _ = io.WriteString(w, `[]`)
 	})
 	server := httptest.NewServer(forever)
@@ -758,6 +776,9 @@ func TestRunPlanBriefDegradesOnPageCap(t *testing.T) {
 func TestRunPlanBriefWindowedReadsTakeOnePage(t *testing.T) {
 	var pulls, comments atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveRepoID(w, r) {
+			return
+		}
 		switch r.URL.Path {
 		case "/repos/RichardoC/factory-repo/pulls":
 			pulls.Add(1)
@@ -768,7 +789,7 @@ func TestRunPlanBriefWindowedReadsTakeOnePage(t *testing.T) {
 			return
 		}
 		// The next link keeps the query, so a followed page is counted too.
-		w.Header().Set("Link", fmt.Sprintf("<%s%s&page=2>; rel=\"next\"", serverURL(r), r.URL.RequestURI()))
+		w.Header().Set("Link", idNextLink(r, idTail(r)+"&page=2"))
 		_, _ = io.WriteString(w, `[]`)
 	}))
 	t.Cleanup(server.Close)
@@ -792,6 +813,9 @@ func TestRunPlanBriefWindowedReadsTakeOnePage(t *testing.T) {
 func TestPlanClosedIssuesPagesPastPullRequests(t *testing.T) {
 	var pages atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveRepoID(w, r) {
+			return
+		}
 		if r.URL.Path != "/repos/RichardoC/factory-repo/issues" || r.URL.Query().Get("state") != "closed" {
 			_, _ = io.WriteString(w, `[]`)
 			return
@@ -799,7 +823,7 @@ func TestPlanClosedIssuesPagesPastPullRequests(t *testing.T) {
 		switch r.URL.Query().Get("page") {
 		case "":
 			pages.Add(1)
-			w.Header().Set("Link", fmt.Sprintf("<%s/repos/RichardoC/factory-repo/issues?state=closed&sort=updated&direction=desc&per_page=20&page=2>; rel=\"next\"", serverURL(r)))
+			w.Header().Set("Link", idNextLink(r, "/issues?state=closed&sort=updated&direction=desc&per_page=20&page=2"))
 			var b strings.Builder
 			b.WriteString("[")
 			for i := 0; i < 20; i++ {
@@ -849,6 +873,9 @@ func TestPlanClosedIssuesPagesPastPullRequests(t *testing.T) {
 func TestPlanClosedIssuesBudgetCountsOnlyIssues(t *testing.T) {
 	var pages atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveRepoID(w, r) {
+			return
+		}
 		if r.URL.Path != "/repos/RichardoC/factory-repo/issues" || r.URL.Query().Get("state") != "closed" {
 			_, _ = io.WriteString(w, `[]`)
 			return
@@ -865,7 +892,7 @@ func TestPlanClosedIssuesBudgetCountsOnlyIssues(t *testing.T) {
 		// Every page is 10 closed pull requests plus 10 closed issues, and
 		// every page offers a next one: only the 20-issue budget ends the
 		// read, so a budget that counted pull requests would stop early.
-		w.Header().Set("Link", fmt.Sprintf("<%s/repos/RichardoC/factory-repo/issues?state=closed&sort=updated&direction=desc&per_page=20&page=%d>; rel=\"next\"", serverURL(r), page+1))
+		w.Header().Set("Link", idNextLink(r, fmt.Sprintf("/issues?state=closed&sort=updated&direction=desc&per_page=20&page=%d", page+1)))
 		n := page
 		var b strings.Builder
 		b.WriteString("[")

@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -4404,6 +4405,106 @@ func TestNextLink(t *testing.T) {
 		if got := nextLink(c.header); got != c.want {
 			t.Errorf("nextLink(%q) = %q, want %q", c.header, got, c.want)
 		}
+	}
+}
+
+// TestListNextFollowsGitHubLinkForms proves listNext follows both real
+// forms of GitHub's rel="next" link (issue #390): the /repos/<owner>/<repo>/
+// form the fixtures always used, and the /repositories/<id>/ form the live
+// API actually returns today. The id segment is untrusted, so a link
+// naming another repository's id, and a link on another host, are refused
+// rather than followed.
+func TestListNextFollowsGitHubLinkForms(t *testing.T) {
+	const repoID = 4242 // a made-up repository id
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/o/r":
+			_, _ = io.WriteString(w, fmt.Sprintf(`{"id":%d}`, repoID))
+		case "/repos/o/r/issues/7/comments":
+			_, _ = io.WriteString(w, `[]`)
+		default:
+			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	g := github{api: server.URL, repo: "o/r", token: "t", client: server.Client()}
+	for _, c := range []struct {
+		name   string
+		header string
+		want   string
+		errex  *regexp.Regexp
+	}{
+		{
+			name:   "the /repos/ form the fixtures always used",
+			header: fmt.Sprintf(`<%s/repos/o/r/issues/7/comments?page=2>; rel="next"`, server.URL),
+			want:   "/issues/7/comments?page=2",
+		},
+		{
+			name:   "the /repositories/<id>/ form the live API returns",
+			header: fmt.Sprintf(`<%s/repositories/%d/issues/7/comments?page=2>; rel="next"`, server.URL, repoID),
+			want:   "/issues/7/comments?page=2",
+		},
+		{
+			name:   "a numeric link naming another repository's id",
+			header: fmt.Sprintf(`<%s/repositories/999999/issues/7/comments?page=2>; rel="next"`, server.URL),
+			errex:  regexp.MustCompile(`leaves the repository.*id 999999`),
+		},
+		{
+			name:   "a numeric link whose id segment is not a number",
+			header: fmt.Sprintf(`<%s/repositories/o/r/issues/7/comments?page=2>; rel="next"`, server.URL),
+			errex:  regexp.MustCompile(`names repository "o", not an id`),
+		},
+		{
+			name:   "a /repos/ link that climbs out with dot segments",
+			header: fmt.Sprintf(`<%s/repos/o/r/../../orgs/x/repos?page=2>; rel="next"`, server.URL),
+			errex:  regexp.MustCompile(`relative path segment`),
+		},
+		{
+			name:   "a numeric link that climbs out with escaped dot segments",
+			header: fmt.Sprintf(`<%s/repositories/%d/%%2e%%2e/%%2e%%2e/orgs/x?page=2>; rel="next"`, server.URL, repoID),
+			errex:  regexp.MustCompile(`relative path segment`),
+		},
+		{
+			name:   "a link on another host",
+			header: `<https://evil.example.com/repositories/4242/issues/7/comments?page=2>; rel="next"`,
+			errex:  regexp.MustCompile(`leaves the API host`),
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := g.listNext(c.header)
+			if c.errex != nil {
+				if err == nil || !c.errex.MatchString(err.Error()) {
+					t.Fatalf("listNext(%q) = %q, %v; want error matching %v", c.header, got, err, c.errex)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("listNext(%q): %v", c.header, err)
+			}
+			if got != c.want {
+				t.Fatalf("listNext(%q) = %q, want %q", c.header, got, c.want)
+			}
+		})
+	}
+	// The id is read once: a second numeric link in the same process is
+	// resolved from the cache, not by another GET /repos/<repo>.
+	served := 0
+	idServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repos/o/r" {
+			served++
+		}
+		_, _ = io.WriteString(w, `{"id":1}`)
+	}))
+	t.Cleanup(idServer.Close)
+	g2 := github{api: idServer.URL, repo: "o/r", token: "t", client: idServer.Client()}
+	link := fmt.Sprintf(`<%s/repositories/1/issues?per_page=100&page=%d>; rel="next"`, idServer.URL, 0)
+	for range 2 {
+		if _, err := g2.listNext(link); err != nil {
+			t.Fatalf("listNext: %v", err)
+		}
+	}
+	if served != 1 {
+		t.Errorf("GET /repos/o/r served %d times, want once", served)
 	}
 }
 

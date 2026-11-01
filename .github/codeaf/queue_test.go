@@ -2349,6 +2349,9 @@ func prFilesServer(t *testing.T, perPage, total int, endless bool) (*httptest.Se
 	t.Helper()
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveRepoID(w, r) {
+			return
+		}
 		if r.URL.Path != "/repos/RichardoC/factory-repo/pulls/7/files" {
 			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
 			return
@@ -2376,7 +2379,7 @@ func prFilesServer(t *testing.T, perPage, total int, endless bool) (*httptest.Se
 		}
 		b.WriteString("]")
 		if endless || end < total {
-			link := fmt.Sprintf("<%s%s?per_page=%d&page=%d>; rel=\"next\"", serverURL(r), r.URL.Path, perPage, page+1)
+			link := idNextLink(r, fmt.Sprintf("/pulls/7/files?per_page=%d&page=%d", perPage, page+1))
 			w.Header().Set("Link", link)
 		}
 		_, _ = io.WriteString(w, b.String())
