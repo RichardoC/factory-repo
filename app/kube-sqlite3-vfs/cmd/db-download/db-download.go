@@ -1,8 +1,10 @@
-// Command db-download "uploads" a local SQLite database file into the
-// cluster through the VFS's WriteAt (the reverse of db-upload's
-// sector-by-sector upload), verifies that the stored bytes and size match
-// the local file, and then reads the row count back through database/sql
-// over the VFS. The remote file name is fixed ("file2.db").
+// Command db-download replaces the remote image with a local SQLite
+// database file: it writes the whole file into the cluster through the
+// VFS's WriteAt (the reverse of db-upload's sector-by-sector upload),
+// truncates the remote to the local size so no sector of a larger previous
+// image survives, verifies that the stored bytes and size match the local
+// file, and then reads the row count back through database/sql over the
+// VFS. The remote file name is fixed ("file2.db").
 package main
 
 import (
@@ -230,6 +232,17 @@ func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Lo
 	}
 	if n != int(fSize) {
 		return fmt.Errorf("failed to write all of the source file: wrote %d of %d bytes", n, fSize)
+	}
+
+	// WriteAt only creates and overwrites sectors: downloading a smaller
+	// file over a larger remote left every trailing sector of the old
+	// database in place, so FileSize kept reporting the old size and the
+	// size check below failed the run (issue #413). Truncate deletes the
+	// sectors past the new end the way SQLite itself shortens a file,
+	// symmetrically with db-upload's fix for the same problem on the
+	// reverse path (issue #332).
+	if err := fileA.Truncate(fSize); err != nil {
+		return fmt.Errorf("truncate remote to %d bytes: %w", fSize, err)
 	}
 
 	// Confirm that remote and local files the same size

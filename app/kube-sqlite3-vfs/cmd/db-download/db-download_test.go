@@ -206,6 +206,48 @@ func TestRunWithClientFailsOnSizeMismatch(t *testing.T) {
 	}
 }
 
+// TestRunWithClientReplacesLargerRemote covers the reachable case
+// TestRunWithClientFailsOnSizeMismatch pins only the mirror image of: a
+// SMALLER local image written over a LARGER remote. WriteAt only creates
+// and overwrites sectors, so before the Truncate (issue #413) the remote
+// kept every trailing sector of the old database, FileSize kept reporting
+// the old size, and the command failed its own size check after the image
+// had already been written.
+func TestRunWithClientReplacesLargerRemote(t *testing.T) {
+	fcs := fake.NewSimpleClientset()
+	// Seed the cluster with the larger image first, through the command
+	// itself, so the remote holds sectors past the smaller download's end.
+	bigPath, bigData := buildSQLiteFile(t, 2000)
+	if err := runWithClient(fcs, Options{FileName: bigPath, Retries: 1}, testLogger()); err != nil {
+		t.Fatalf("seed the remote with the larger image: %v", err)
+	}
+
+	smallPath, smallData := buildSQLiteFile(t, 400)
+	if int64(len(smallData)) >= int64(len(bigData)) {
+		t.Fatalf("built the smaller image at %d bytes, want it smaller than the seeded %d-byte remote", len(smallData), len(bigData))
+	}
+
+	// The download itself ends with the row-count read-back through
+	// database/sql, so a nil error covers that check too.
+	if err := runWithClient(fcs, Options{FileName: smallPath, Retries: 1}, testLogger()); err != nil {
+		t.Fatalf("runWithClient over the larger remote: %v", err)
+	}
+
+	// The remote now holds exactly the small image — the sector count and
+	// bytes match it, so no stale sector beyond the new end survives.
+	assertSectorsMatch(t, fcs, smallData)
+
+	// FileSize reports the local size, not the seeded image's.
+	vfsN := vfs.NewVFS(context.Background(), fcs, "test", testLogger(), 1)
+	size, err := vfs.NewFile("file2.db", vfsN).FileSize()
+	if err != nil {
+		t.Fatalf("remote FileSize: %v", err)
+	}
+	if size != int64(len(smallData)) {
+		t.Errorf("remote FileSize = %d, want %d", size, len(smallData))
+	}
+}
+
 func TestRunWithClientFailsOnByteMismatch(t *testing.T) {
 	path, _ := buildSQLiteFile(t, 2000)
 	fcs := fake.NewSimpleClientset()
