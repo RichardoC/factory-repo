@@ -70,6 +70,9 @@ type linearIssueNode struct {
 				ID string `json:"id"`
 			} `json:"parent"`
 		} `json:"nodes"`
+		PageInfo struct {
+			HasNextPage bool `json:"hasNextPage"`
+		} `json:"pageInfo"`
 	} `json:"labels"`
 }
 
@@ -122,7 +125,14 @@ func (c *Client) LoadIssueByIdentifier(ctx context.Context, identifier string) (
 		Number: &linearapi.NumberComparator{Eq: &number},
 	}
 
-	op := gqlclient.NewOperation(`
+	// Labels are paged at maxLiveLabelPage with a pageInfo check, like the
+	// live label read: a bare `labels { nodes }` silently truncates at
+	// Linear's default page size of 50, and a partial label set would both
+	// hide a removed managed label from the cache hash and misstate the
+	// labels an update must preserve. If the page can still truncate, the
+	// issue fails closed rather than returning a set a label may be missing
+	// from.
+	op := gqlclient.NewOperation(fmt.Sprintf(`
 query issueByIdentifier($filter: IssueFilter!) {
   issues(filter: $filter, first: 1, includeArchived: true) {
     nodes {
@@ -138,7 +148,7 @@ query issueByIdentifier($filter: IssueFilter!) {
         id
         name
       }
-      labels {
+      labels(first: %d) {
         nodes {
           id
           name
@@ -146,10 +156,13 @@ query issueByIdentifier($filter: IssueFilter!) {
             id
           }
         }
+        pageInfo {
+          hasNextPage
+        }
       }
     }
   }
-}`)
+}`, maxLiveLabelPage))
 	op.Var("filter", filter)
 
 	var resp struct {
@@ -162,6 +175,9 @@ query issueByIdentifier($filter: IssueFilter!) {
 	}
 	if len(resp.Issues.Nodes) == 0 {
 		return model.ExistingIssue{}, fmt.Errorf("Linear issue %q not found", identifier)
+	}
+	if node := resp.Issues.Nodes[0]; node.Labels.PageInfo.HasNextPage {
+		return model.ExistingIssue{}, fmt.Errorf("Linear issue %q carries more labels than one page of %d; refusing to return a label set a label may be missing from", identifier, maxLiveLabelPage)
 	}
 
 	return linearIssueToModel(resp.Issues.Nodes[0]), nil
@@ -777,7 +793,16 @@ func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) 
 	var issues []model.ExistingIssue
 
 	for {
-		op := gqlclient.NewOperation(`
+		// Labels are paged at maxLiveLabelPage with a pageInfo check, like the
+		// live label read: a bare `labels { nodes }` silently truncates at
+		// Linear's default page size of 50, so a managed label removed by hand
+		// past the page boundary would read as absent both before and after and
+		// the cache hash would never change, while one present past the
+		// boundary would trigger a spurious update. A truncated label page
+		// fails the snapshot closed rather than emitting a partial set: an
+		// issue omitted from the snapshot would look like a ticket Linear no
+		// longer has, and the sync would mint a duplicate for it.
+		op := gqlclient.NewOperation(fmt.Sprintf(`
 query existingIssues($filter: IssueFilter!, $after: String) {
   issues(first: 100, after: $after, filter: $filter, includeArchived: true) {
     nodes {
@@ -793,13 +818,16 @@ query existingIssues($filter: IssueFilter!, $after: String) {
         id
         name
       }
-      labels {
+      labels(first: %d) {
         nodes {
           id
           name
           parent {
             id
           }
+        }
+        pageInfo {
+          hasNextPage
         }
       }
     }
@@ -808,7 +836,7 @@ query existingIssues($filter: IssueFilter!, $after: String) {
       endCursor
     }
   }
-}`)
+}`, maxLiveLabelPage))
 		op.Var("filter", filter)
 		op.Var("after", after)
 
@@ -825,8 +853,16 @@ query existingIssues($filter: IssueFilter!, $after: String) {
 			return nil, fmt.Errorf("fetch Linear issues: %w", err)
 		}
 
-		for _, issue := range resp.Issues.Nodes {
-			issues = append(issues, linearIssueToModel(issue))
+		for _, node := range resp.Issues.Nodes {
+			if node.Labels.PageInfo.HasNextPage {
+				c.log.Warn("Linear issue carries more labels than one page of the snapshot; refusing to return a label set a label may be missing from",
+					slog.String("issue_id", node.ID),
+					slog.String("identifier", node.Identifier),
+					slog.Int("page_size", maxLiveLabelPage),
+				)
+				return nil, fmt.Errorf("Linear issue %s (%s) carries more labels than one page of %d; the snapshot would be a partial label set, so it is refused rather than emitted", node.Identifier, node.ID, maxLiveLabelPage)
+			}
+			issues = append(issues, linearIssueToModel(node))
 		}
 
 		if !resp.Issues.PageInfo.HasNextPage || resp.Issues.PageInfo.EndCursor == nil {
