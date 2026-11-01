@@ -2662,6 +2662,13 @@ func TestProxyRepairsInvalidToolArgs(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("stream status %d", response.StatusCode)
 	}
+	// The proxy writes a streamed call's ledger line once the stream ends, so
+	// read the body to EOF first: the handler has returned, and recorded the
+	// call, by the time the client sees the end of the chunked body. Reading
+	// the ledger straight after the status raced the write.
+	if _, err := io.ReadAll(response.Body); err != nil {
+		t.Fatal(err)
+	}
 	lines, err := readLedger(p.ledger)
 	if err != nil {
 		t.Fatal(err)
