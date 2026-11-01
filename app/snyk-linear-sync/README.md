@@ -364,6 +364,13 @@ retitled ticket, or one whose label was removed by hand, is still found rather
 than being invisible and duplicated. With `LINEAR_MANAGED_LABEL=off` the label
 clause is omitted rather than matching nothing.
 
+Each ticket is loaded with its labels (up to 250 per ticket). A ticket whose
+labels do not fit one page returns a truncated set, which is not trusted as
+complete: the run fails with an error naming the ticket rather than hashing a
+partial label set into the cache or rebuilding ticket labels from it. The same
+refusal applies to the single-issue lookup used by diagnostic and reconciliation
+paths, and mirrors the live label read described under "Label Preservation".
+
 This matters because the Linear team is shared with `snyk-dast-linear-sync`: the
 scope must exclude the other tool's tickets. The fingerprint metadata block is
 deliberately **not** used as a query predicate -- `description: { contains: ... }`

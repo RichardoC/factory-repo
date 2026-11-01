@@ -1830,6 +1830,178 @@ func TestFetchLabelsByIssueIDRequestsLabelPageInfo(t *testing.T) {
 	}
 }
 
+// TestLoadSnapshotRefusesSnapshotWhenLabelPageTruncated covers the pagination
+// edge of the snapshot's labels connection. A ticket carrying more labels than
+// one page returns a truncated set, and the snapshot feeds both the cache hash
+// and full-set rebuilds: a managed label past the page boundary — one removed
+// by hand, say — would read as absent before and after, so the cache fast path
+// would suppress re-asserting it indefinitely, while a rebuild from the partial
+// snapshot would delete the labels it never saw. So a truncating snapshot must
+// fail closed, not be trusted as complete.
+func TestLoadSnapshotRefusesSnapshotWhenLabelPageTruncated(t *testing.T) {
+	client := &Client{
+		cfg: config.LinearConfig{
+			TeamID: "11111111-1111-1111-1111-111111111111",
+		},
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Query string `json:"query"`
+				}
+				body, _ := io.ReadAll(req.Body)
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
+				}
+				if strings.Contains(payload.Query, "query teamStates") {
+					return jsonResponse(t, `{"data":{"team":{"states":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}`), nil
+				}
+				if strings.Contains(payload.Query, "query existingIssues") {
+					// The ticket's labels do not fit one page, so the
+					// snapshot would be a partial label set.
+					return jsonResponse(t, `{"data":{"issues":{"nodes":[
+						{"id":"issue-1","identifier":"SNYK-1","title":"Snyk: title","state":{"id":"state-1","name":"Todo"},"labels":{
+							"nodes":[{"id":"label-1","name":"customer-visible"}],
+							"pageInfo":{"hasNextPage":true}
+						}}
+					],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`), nil
+				}
+				t.Fatalf("unexpected GraphQL query: %s", payload.Query)
+				return nil, nil
+			}),
+		}),
+		log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName: map[string]string{},
+		statesByType: map[string]string{},
+	}
+
+	_, err := client.LoadSnapshot(t.Context())
+	if err == nil {
+		t.Fatal("LoadSnapshot() error = nil, want a refusal when the snapshot's label page is truncated")
+	}
+	if !strings.Contains(err.Error(), "SNYK-1") {
+		t.Fatalf("LoadSnapshot() error = %v, want it to name the truncated issue", err)
+	}
+}
+
+// TestLoadIssueByIdentifierRefusesLookupWhenLabelPageTruncated covers the same
+// pagination edge in the single-issue lookup. Diagnostic and reconciliation
+// paths hash the labels this lookup returns, so a truncated page would read a
+// hand-removed managed label as absent both before and after; the lookup must
+// fail closed rather than return a partial set.
+func TestLoadIssueByIdentifierRefusesLookupWhenLabelPageTruncated(t *testing.T) {
+	client := &Client{
+		cfg: config.LinearConfig{TeamID: "team-1"},
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Query string `json:"query"`
+				}
+				body, _ := io.ReadAll(req.Body)
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
+				}
+				if !strings.Contains(payload.Query, "query issueByIdentifier") {
+					t.Fatalf("unexpected GraphQL query: %s", payload.Query)
+				}
+				// The ticket's labels do not fit one page, so the lookup
+				// would return a partial label set.
+				return jsonResponse(t, `{"data":{"issues":{"nodes":[
+					{"id":"issue-1","identifier":"SNYK-1","title":"Snyk: title","state":{"id":"state-1","name":"Todo"},"labels":{
+						"nodes":[{"id":"label-1","name":"customer-visible"}],
+						"pageInfo":{"hasNextPage":true}
+					}}
+				]}}}`), nil
+			}),
+		}),
+		log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName: map[string]string{},
+		statesByType: map[string]string{},
+	}
+
+	_, err := client.LoadIssueByIdentifier(t.Context(), "SNYK-1")
+	if err == nil {
+		t.Fatal("LoadIssueByIdentifier() error = nil, want a refusal when the label page is truncated")
+	}
+	if !strings.Contains(err.Error(), "SNYK-1") {
+		t.Fatalf("LoadIssueByIdentifier() error = %v, want it to name the truncated issue", err)
+	}
+}
+
+// TestSnapshotAndLookupQueriesRequestLabelPageInfo pins the query shape of the
+// snapshot and single-issue lookups: without pageInfo on the nested labels
+// connection there is no way to tell a complete label set from a truncated
+// one, and a partial set would be trusted as complete.
+func TestSnapshotAndLookupQueriesRequestLabelPageInfo(t *testing.T) {
+	fetch := func(t *testing.T, run func(c *Client) error) string {
+		t.Helper()
+		var capturedQuery string
+		client := &Client{
+			cfg: config.LinearConfig{TeamID: "11111111-1111-1111-1111-111111111111"},
+			gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+				Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					var payload struct {
+						Query string `json:"query"`
+					}
+					body, _ := io.ReadAll(req.Body)
+					if err := json.Unmarshal(body, &payload); err != nil {
+						t.Fatalf("json.Unmarshal() error = %v", err)
+					}
+					if !strings.Contains(payload.Query, "query teamStates") {
+						capturedQuery = payload.Query
+					}
+					// One ticket whose labels fit one page: the shape test
+					// only pins the query text, and the lookup needs a node
+					// to reach the return path.
+					return jsonResponse(t, `{"data":{"issues":{"nodes":[
+						{"id":"issue-1","identifier":"SNYK-1","title":"Snyk: title","state":{"id":"state-1","name":"Todo"},"labels":{
+							"nodes":[],
+							"pageInfo":{"hasNextPage":false}
+						}}
+					]}}}`), nil
+				}),
+			}),
+			log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+			statesByName: map[string]string{},
+			statesByType: map[string]string{},
+		}
+		if err := run(client); err != nil {
+			t.Fatalf("query errored: %v", err)
+		}
+		if capturedQuery == "" {
+			t.Fatal("no issue query captured")
+		}
+		return capturedQuery
+	}
+
+	snapshotQuery := fetch(t, func(c *Client) error {
+		_, err := c.LoadSnapshot(t.Context())
+		return err
+	})
+	lookupQuery := fetch(t, func(c *Client) error {
+		_, err := c.LoadIssueByIdentifier(t.Context(), "SNYK-1")
+		return err
+	})
+
+	// The snapshot query also carries the issues-level pageInfo, so it must
+	// request hasNextPage twice: once for the labels connection and once for
+	// the issues connection. The lookup has no issues-level pageInfo.
+	for _, tc := range []struct {
+		name  string
+		query string
+		want  int
+	}{
+		{"snapshot", snapshotQuery, 2},
+		{"lookup", lookupQuery, 1},
+	} {
+		if got := strings.Count(tc.query, "hasNextPage"); got != tc.want {
+			t.Fatalf("%s query requests hasNextPage %d times, want %d (the labels connection must request pageInfo):\n%s", tc.name, got, tc.want, tc.query)
+		}
+	}
+	if !strings.Contains(lookupQuery, fmt.Sprintf("labels(first: %d)", maxLiveLabelPage)) {
+		t.Fatalf("lookup query must request %d labels per issue, got:\n%s", maxLiveLabelPage, lookupQuery)
+	}
+}
+
 // TestUpdateIssuesAlwaysReadsLiveLabels pins that the live label read runs for
 // every update batch, not only when protected labels are configured. The read
 // is what makes the live set — rather than the run's opening snapshot — the
