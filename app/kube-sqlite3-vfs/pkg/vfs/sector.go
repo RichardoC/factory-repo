@@ -87,9 +87,10 @@ func (f *file) writeSectorOnce(index int64, data []byte, exists bool) error {
 }
 
 // WriteSector writes one sector, known to be new (CREATE, with the UPDATE
-// conflict fallback). Used by cmd/db-upload, which streams fresh sectors
-// while it holds the lock; a sector another client created first is
-// overwritten, which is what the lock authorises.
+// conflict fallback). Used by cmd/db-upload, which streams the sectors of a
+// whole-database upload; a sector another client created first is
+// overwritten, which the upload's replace-the-database-outright semantics
+// authorise (issue #332) — no SQLite lock is held on this path.
 func (f *file) WriteSector(s *Sector) error {
 	return f.writeSectorOnce(s.Index, s.Data, false)
 }
@@ -119,8 +120,8 @@ func (f *file) sectorConfigMap(index int64, data []byte) *corev1.ConfigMap {
 // SQLite decides hot-or-cold from. Replacing them with zero bytes would
 // corrupt the file silently, which is exactly what Open's fresh-file check
 // exists to prevent (issue #393). The caller treats AlreadyExists as
-// "re-read": it retries the whole open, and the next LIST sees the other
-// writer's sector.
+// "re-read": it lists the sectors again within the same open attempt and
+// opens over the other writer's sector instead of its own empty one.
 func (f *file) createSector0IfAbsent() error {
 	f.vfs.logger.Debug("createSector0IfAbsent", "sectorIndex", int64(0))
 	_, err := f.vfs.kc.CoreV1().ConfigMaps(f.vfs.namespace).Create(f.vfs.ctx, f.sectorConfigMap(0, nil), metav1.CreateOptions{})

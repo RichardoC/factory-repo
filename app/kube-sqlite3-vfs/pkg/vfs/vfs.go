@@ -1369,14 +1369,40 @@ func (v *vfs) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sql
 			// the lock-gated write path: this file holds no lock here, and a
 			// second client may have created sector 0 between our LIST and
 			// our CREATE. Its bytes are then that client's page 1, so an
-			// AlreadyExists answer is "re-read", the casLock rule: retry the
-			// open and let the next LIST see their sector instead of
-			// force-updating zero bytes over the first sector of a database
-			// that now exists (issue #393).
+			// AlreadyExists answer means "re-read", the casLock rule (issue
+			// #393): the re-LIST below must see their sector instead of this
+			// open force-updating zero bytes over the first sector of a
+			// database that now exists.
 			if err := f.createSector0IfAbsent(); err != nil {
-				v.logger.Error("Open: create initial empty sector", "err", err)
-				lastErr = err
-				continue
+				if !kerrors.IsAlreadyExists(err) {
+					v.logger.Error("Open: create initial empty sector", "err", err)
+					lastErr = err
+					continue
+				}
+				// Lost the fresh-file race. Re-read within this attempt, the
+				// way casLock re-reads within its own bound: the continue
+				// below spends one of v.retries outer attempts, and at the
+				// shipped --retries 1 default there is no second attempt, so
+				// the re-read must not depend on the retry budget.
+				cms, err = f.listSectorConfigMaps()
+				if err != nil {
+					v.logger.Error("Open: list sector configmaps after lost fresh-file race", "err", err)
+					lastErr = err
+					continue
+				}
+				if len(cms) == 0 {
+					// The race winner's sector 0 is gone again (deleted
+					// between our CREATE and this LIST). There is no settled
+					// state to open; report the race and let the retry budget
+					// (if any) start over.
+					lastErr = err
+					continue
+				}
+				names = names[:0]
+				for _, cm := range cms {
+					names = append(names, cm.Name)
+				}
+				v.logger.Debug("Re-read sectors after lost fresh-file race", "sectors", names, "len(cms)", len(cms))
 			}
 		}
 		v.logger.Debug("Opened file successfully", "name", name, "flags", flags)
