@@ -969,11 +969,12 @@ func runNext() error {
 			log.Printf("area labels: %v", err)
 		}
 	}
-	prFiles := fetchPRFiles(gh, issues, runs, log.Printf)
+	label := envOr("CODEAF_LABEL", "codeaf")
+	prFiles := fetchPRFiles(gh, issues, runs, label, log.Printf)
 	var noArea []int
 	notReady := map[int][]string{}
 	opts := queueOptions{
-		Label:           envOr("CODEAF_LABEL", "codeaf"),
+		Label:           label,
 		QueuedLabel:     envOr("CODEAF_QUEUED_LABEL", "codeaf-queued"),
 		PriorityLabel:   envOr("CODEAF_PRIORITY_LABEL", "codeaf-priority"),
 		WeekCap:         cfg.Limits.WeeklyCreditUSD,
@@ -1054,15 +1055,20 @@ func runNext() error {
 const maxPRFiles = 100
 
 // fetchPRFiles fetches the changed-file paths of every open pull request an
-// in-flight run is working on (issue #132): a PR item carries no area of its
-// own, so the queue reads what the PR touched. A number whose item is not an
-// open PR in the issues list is skipped, and a failure — a fetch error,
-// or a listing that may be truncated (issue #223) — leaves the entry
-// absent, which makes that run's area set empty and conflict with
-// everything, fail closed. Review titles (`CodeAF review #N`, issue #137) do
-// not parse through runTitleFields and are skipped here: a review holds no
-// area, so it needs no files.
-func fetchPRFiles(g github, issues []item, runs []runStatus, logf func(string, ...any)) map[int][]string {
+// in-flight run is working on (issue #132), and of every open pull request
+// that is a continuation candidate (issue #411): a PR item carries no area
+// of its own, so the queue reads what the PR touched. A continuation
+// candidate — a PR labelled the queue label and codeaf-continue-needed
+// with no in-flight run — has no run title naming it, so the run loop
+// never reaches it; its pull request is fetched too, so prAreas sees the
+// same three sources for the continuation that the run it continues had. A
+// number whose item is not an open PR in the issues list is skipped, and a
+// failure — a fetch error, or a listing that may be truncated (issue
+// #223) — leaves the entry absent, which makes that run's or candidate's
+// area set empty and conflict with everything, fail closed. Review titles
+// (`CodeAF review #N`, issue #137) do not parse through runTitleFields and
+// are skipped here: a review holds no area, so it needs no files.
+func fetchPRFiles(g github, issues []item, runs []runStatus, label string, logf func(string, ...any)) map[int][]string {
 	prFiles := map[int][]string{}
 	if g.token == "" {
 		return prFiles
@@ -1073,11 +1079,16 @@ func fetchPRFiles(g github, issues []item, runs []runStatus, logf func(string, .
 			byNumber[it.Number] = it
 		}
 	}
-	seen := map[int]bool{}
+	// Queued counts like in_progress here, as it does in Next.
+	var inflight []runStatus
 	for _, r := range runs {
-		if r.Status != "queued" && r.Status != "in_progress" {
-			continue
+		if r.Status == "queued" || r.Status == "in_progress" {
+			inflight = append(inflight, r)
 		}
+	}
+	seen := map[int]bool{}
+	var want []int
+	for _, r := range inflight {
 		n, _ := runTitleFields(r.DisplayTitle)
 		if n <= 0 || seen[n] {
 			continue
@@ -1087,12 +1098,28 @@ func fetchPRFiles(g github, issues []item, runs []runStatus, logf func(string, .
 			continue
 		}
 		seen[n] = true
-		// The listing is read paged, to the maxListPages cap; an error — a
-		// failed page, or a listing still offering a next page at the cap,
-		// so possibly truncated — leaves the entry absent and the run's
-		// area set empty, conflicting with everything: the guard fails
-		// closed (issue #223), where it used to slice a full page to 100
-		// paths and silently drop the tail.
+		want = append(want, n)
+	}
+	for _, it := range issues {
+		// The same candidate shape Next considers for kindContinue: an
+		// open pull request, labelled the queue label and
+		// codeaf-continue-needed, with no in-flight run already on it.
+		if it.State != "open" || len(it.PullRequest) == 0 || seen[it.Number] {
+			continue
+		}
+		if !it.labelled(label) || !it.labelled(labelContinueNeeded) || prInFlight(it.Number, inflight) {
+			continue
+		}
+		seen[it.Number] = true
+		want = append(want, it.Number)
+	}
+	// The listing is read paged, to the maxListPages cap; an error — a
+	// failed page, or a listing still offering a next page at the cap, so
+	// possibly truncated — leaves the entry absent and the run's area set
+	// empty, conflicting with everything: the guard fails closed
+	// (issue #223), where it used to slice a full page to 100 paths and
+	// silently drop the tail.
+	for _, n := range want {
 		var files []prFile
 		if err := g.getList(fmt.Sprintf("/pulls/%d/files?per_page=%d", n, maxPRFiles), &files); err != nil {
 			logf("pr files for #%d: %v", n, err)
