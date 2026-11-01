@@ -458,11 +458,13 @@ type planProposalOut struct {
 }
 
 // planOpenItems reads the open issues from OPEN_ISSUES_PATH — the JSON that
-// `gh api repos/$REPO/issues?state=open&per_page=100` prints, produced by
-// the workflow and read here as untrusted data. A missing, unreadable or
-// malformed file degrades to no open issues: the dedupe then keeps
-// everything, which is the safe direction for proposals (a person still
-// triages each one).
+// `gh api --paginate repos/$REPO/issues?state=open&per_page=100` prints,
+// produced by the workflow and read here as untrusted data. Past one page of
+// open issues and pull requests the file holds several top-level arrays back
+// to back, which decodeItems decodes as one stream (issue #426). A missing,
+// unreadable or malformed file degrades to no open issues: the dedupe then
+// keeps everything, which is the safe direction for proposals (a person
+// still triages each one).
 func planOpenItems() []item {
 	path := os.Getenv("OPEN_ISSUES_PATH")
 	if path == "" {
@@ -472,8 +474,8 @@ func planOpenItems() []item {
 	if err != nil {
 		return nil
 	}
-	var items []item
-	if json.Unmarshal(data, &items) != nil {
+	items, err := decodeItems(data)
+	if err != nil {
 		return nil
 	}
 	return items

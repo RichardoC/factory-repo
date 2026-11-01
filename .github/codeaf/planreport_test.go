@@ -443,13 +443,19 @@ func TestRunPlanReportWritesJSONAndCounts(t *testing.T) {
 	}
 	proposalsPath := filepath.Join(dir, "nested", "proposals.json")
 	openPath := filepath.Join(dir, "open.json")
-	// One open issue whose title dedupes the first proposal
-	// ("Fix the queue drain" normalizes the same); the second survives.
-	openJSON, err := json.Marshal([]item{{Number: 1, Title: "Fix: the queue drain!"}})
+	// Two pages of open issues as `gh api --paginate` writes them
+	// (issue #426): page 1 holds an unrelated issue, page 2 the one whose
+	// title dedupes the first proposal ("Fix the queue drain" normalizes
+	// the same); the second proposal survives.
+	page1, err := json.Marshal([]item{{Number: 1, Title: "unrelated issue"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(openPath, openJSON, 0o644); err != nil {
+	page2, err := json.Marshal([]item{{Number: 2, Title: "Fix: the queue drain!"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(openPath, append(page1, page2...), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("RESULT_PATH", resultPath)
@@ -488,6 +494,51 @@ func TestRunPlanReportWritesJSONAndCounts(t *testing.T) {
 	}
 	if !strings.Contains(e.Body, "**Problem**") {
 		t.Errorf("Body = %q", e.Body)
+	}
+}
+
+// TestRunPlanReportTwoPageOpenIssues covers issue #426 on the plan-report
+// side: `gh api --paginate` writes one top-level array per page back to
+// back, and the proposal that duplicates an issue on page 2 must still be
+// held. planOpenItems has to read every page; a single-array reader would
+// see no open issues at all here and let both proposals through.
+func TestRunPlanReportTwoPageOpenIssues(t *testing.T) {
+	dir := t.TempDir()
+	resultPath := filepath.Join(dir, "result.json")
+	if err := os.WriteFile(resultPath, []byte(`{"stop":"deadline","ok":true,"answer":`+planJSONString(planReportAnswer)+`}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	proposalsPath := filepath.Join(dir, "proposals.json")
+	openPath := filepath.Join(dir, "open.json")
+	// Written by hand rather than marshalled: the fixture is exactly what
+	// the workflow writes to $OPEN_ISSUES_PATH, two concatenated arrays.
+	pages := `[{"number":1,"title":"unrelated page one"}]` +
+		`[{"number":2,"title":"Fix the queue drain"}]
+`
+	if err := os.WriteFile(openPath, []byte(pages), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RESULT_PATH", resultPath)
+	t.Setenv("PROPOSALS_PATH", proposalsPath)
+	t.Setenv("OPEN_ISSUES_PATH", openPath)
+
+	out, err := captureStdout(t, func() error { return runPlanReport() })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(out); got != "proposals=1 held=1" {
+		t.Errorf("stdout = %q, want %q", got, "proposals=1 held=1")
+	}
+	data, err := os.ReadFile(proposalsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []planProposalOut
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatalf("PROPOSALS_PATH is not valid JSON: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Title != "add a widgets TODO list" {
+		t.Fatalf("entries = %+v, want only %q", entries, "add a widgets TODO list")
 	}
 }
 
