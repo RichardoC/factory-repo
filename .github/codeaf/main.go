@@ -630,6 +630,59 @@ func ApiCostOf(m Model, u Usage) float64 {
 	return (float64(u.PromptTokens-cached)*m.APIInput + float64(cached)*m.APICached + float64(u.CompletionTokens)*m.APIOutput) / 1e6
 }
 
+// maxUsageTokens is the ceiling on any one token count a usage block may
+// carry (issue #410). No real call comes near it -- the biggest models are
+// quoted at a 200k-1M context -- so a figure above it is garbled or hostile,
+// not a call, and pricing it would let the ledger line carry a cost the run
+// never spent.
+const maxUsageTokens = 10_000_000
+
+// unusable reports whether a usage block cannot be priced (issue #410). The
+// usage block is upstream data relayed through relayJSON and RewriteChunk, and
+// ApiCostOf has no floor: a negative prompt_tokens prices as a negative cost,
+// which record then adds to runSpent and lets overCap pass for the rest of the
+// run. So any negative field, or a count past maxUsageTokens, makes the whole
+// block unusable -- a partly bad block is not worth trusting field by field.
+func (u Usage) unusable() bool {
+	over := func(n int) bool { return n < 0 || n > maxUsageTokens }
+	if over(u.PromptTokens) || over(u.CompletionTokens) || over(u.TotalTokens) || u.Cost < 0 {
+		return true
+	}
+	if d := u.PromptTokensDetails; d != nil && over(d.CachedTokens) {
+		return true
+	}
+	if n, ok := u.reasoningTokens(); ok && over(n) {
+		return true
+	}
+	return false
+}
+
+// boundedUsage prices a usage block, or returns nil when the block cannot be
+// trusted (issue #410): the call is then recorded exactly like the existing
+// "no usage" path -- no usage, no cost, runSpent unchanged -- with one warning
+// naming the figures (dropped says so, so record does not warn again). Both
+// relay paths price usage here and nowhere else, and the 200 response the
+// caller sees keeps upstream's own usage block untouched.
+func boundedUsage(m Model, u *Usage) (usage *Usage, dropped bool) {
+	if u == nil {
+		return nil, false
+	}
+	if u.unusable() {
+		cached, reasoning := 0, 0
+		if u.PromptTokensDetails != nil {
+			cached = u.PromptTokensDetails.CachedTokens
+		}
+		if n, ok := u.reasoningTokens(); ok {
+			reasoning = n
+		}
+		log.Printf("warning: %s sent an unusable usage block (prompt %d, completion %d, total %d, cached %d, reasoning %d, cost %v); this call is unpriced",
+			m.Upstream, u.PromptTokens, u.CompletionTokens, u.TotalTokens, cached, reasoning, u.Cost)
+		return nil, true
+	}
+	u.Cost = CostOf(m, *u)
+	return u, false
+}
+
 // ---------------------------------------------------------------- proxy
 
 type proxy struct {
@@ -1187,7 +1240,7 @@ func timingOf(started time.Time) callTiming {
 	return callTiming{Dur: time.Since(started)}
 }
 
-func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slotWait, headerWait time.Duration, chars charCounts, repaired, status int, timing callTiming) {
+func (p *proxy) record(m Model, usage *Usage, usageDropped, stream bool, start time.Time, slotWait, headerWait time.Duration, chars charCounts, repaired, status int, timing callTiming) {
 	line := LedgerLine{Time: time.Now().UTC(), Model: m.ID, Upstream: m.Upstream, Stream: stream,
 		Start: start.UTC(), SlotWaitS: slotWait.Seconds(), HeaderMs: headerWait.Milliseconds(),
 		ReasoningChars: chars.reasoning, OutputChars: chars.output, RepairedToolArgs: repaired,
@@ -1210,9 +1263,11 @@ func (p *proxy) record(m Model, usage *Usage, stream bool, start time.Time, slot
 		if n, ok := usage.reasoningTokens(); ok {
 			line.ReasoningTokens = &n
 		}
-	} else if status == 0 {
+	} else if status == 0 && !usageDropped {
 		// A refused call has no usage by construction; only a 200 without
-		// usage is worth a warning.
+		// usage is worth a warning. A block that arrived but was unusable
+		// (issue #410) was already warned about, with its figures, by
+		// boundedUsage -- one warning per call, not two.
 		log.Printf("warning: %s returned no usage; this call is unpriced", m.Upstream)
 	}
 	p.mu.Lock()
@@ -1599,7 +1654,7 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		// no cost and no timing of its own: kind "status", like a refusal
 		// from upstream.
 		started := time.Now()
-		p.record(m, nil, wantsStream(body), started, slotWait, 0, charCounts{}, 0, http.StatusPaymentRequired, timingOf(started))
+		p.record(m, nil, false, wantsStream(body), started, slotWait, 0, charCounts{}, 0, http.StatusPaymentRequired, timingOf(started))
 		p.fail(w, out, http.StatusPaymentRequired, reason)
 		return
 	}
@@ -1662,7 +1717,7 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 		// The refusal goes in the ledger too (issue #140): a run whose
 		// upstream kept answering 429 costs real time, and the record
 		// counts it. No usage, no cost.
-		p.record(m, nil, stream, started, slotWait, headerWait, charCounts{}, repaired, response.StatusCode, timingOf(started))
+		p.record(m, nil, false, stream, started, slotWait, headerWait, charCounts{}, repaired, response.StatusCode, timingOf(started))
 		if out == nil {
 			w.Header().Set("Content-Type", response.Header.Get("Content-Type"))
 			w.WriteHeader(response.StatusCode)
@@ -2103,18 +2158,22 @@ func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, st
 		// non-200 refusals. Without this the call is a phantom: it is in no
 		// ledger line, so the metered spend, the run record and the model
 		// stats all under-count it.
-		p.record(m, nil, false, started, slotWait, headerWait, charCounts{}, repaired, http.StatusBadGateway, timingOf(started))
+		p.record(m, nil, false, false, started, slotWait, headerWait, charCounts{}, repaired, http.StatusBadGateway, timingOf(started))
 		writeError(w, http.StatusBadGateway, "upstream body: "+err.Error())
 		return
 	}
 	var usage *Usage
+	dropped := false
 	if raw, ok := payload["usage"]; ok && string(raw) != "null" {
-		usage = new(Usage)
-		if err := json.Unmarshal(raw, usage); err == nil {
-			usage.Cost = CostOf(m, *usage)
-			payload["usage"], _ = json.Marshal(usage)
-		} else {
-			usage = nil
+		var found Usage
+		if err := json.Unmarshal(raw, &found); err == nil {
+			// boundedUsage refuses an unusable block (issue #410); the payload
+			// then keeps upstream's block exactly as sent and gains no cost,
+			// so the 200 the caller sees is unchanged.
+			usage, dropped = boundedUsage(m, &found)
+			if usage != nil {
+				payload["usage"], _ = json.Marshal(usage)
+			}
 		}
 	}
 	// The characters are counted out of the decode above: the choices are
@@ -2125,30 +2184,35 @@ func (p *proxy) relayJSON(w http.ResponseWriter, upstream io.Reader, m Model, st
 		chars.addChoices(choices, "message")
 	}
 	payload["model"], _ = json.Marshal(m.ID)
-	p.record(m, usage, false, started, slotWait, headerWait, chars, repaired, 0,
+	p.record(m, usage, dropped, false, started, slotWait, headerWait, chars, repaired, 0,
 		callTiming{TTFT: headerWait, Dur: time.Since(started)})
 	writeJSON(w, http.StatusOK, payload)
 }
 
 // RewriteChunk rewrites one SSE data payload: the model id back to CodeAF's,
-// and usage.cost added when the chunk carries usage. It returns the usage it
-// found, if any, and adds the chunk's reasoning and output characters to
-// chars when it is not nil. The payload is decoded once, and the choices are
-// read out of that decode, so counting adds no second parse of the chunk.
-func RewriteChunk(data []byte, m Model, chars *charCounts) ([]byte, *Usage) {
+// and usage.cost added when the chunk carries usage. The chunk's reasoning and
+// output characters are added to chars when it is not nil. It returns the usage
+// it priced, if any -- nil for a chunk with none and for one whose block
+// boundedUsage refuses, in which case dropped is true and the block is relayed
+// unchanged (issue #410) -- so the stream relay asks record for no second
+// warning. The payload is decoded once, and the choices are read out of that
+// decode, so counting adds no second parse of the chunk.
+func RewriteChunk(data []byte, m Model, chars *charCounts) (out []byte, usage *Usage, dropped bool) {
 	var chunk map[string]json.RawMessage
 	if json.Unmarshal(data, &chunk) != nil {
-		return data, nil
+		return data, nil, false
 	}
 	chunk["model"], _ = json.Marshal(m.ID)
-	var usage *Usage
 	if raw, ok := chunk["usage"]; ok && string(raw) != "null" {
-		usage = new(Usage)
-		if json.Unmarshal(raw, usage) == nil {
-			usage.Cost = CostOf(m, *usage)
-			chunk["usage"], _ = json.Marshal(usage)
-		} else {
-			usage = nil
+		var found Usage
+		if json.Unmarshal(raw, &found) == nil {
+			// Same bound as relayJSON (issue #410): an unusable block is
+			// relayed unchanged and the call is recorded with no usage, so a
+			// garbled count can never move the run's spend.
+			usage, dropped = boundedUsage(m, &found)
+			if usage != nil {
+				chunk["usage"], _ = json.Marshal(usage)
+			}
 		}
 	}
 	if chars != nil {
@@ -2159,9 +2223,9 @@ func RewriteChunk(data []byte, m Model, chars *charCounts) ([]byte, *Usage) {
 	}
 	out, err := json.Marshal(chunk)
 	if err != nil {
-		return data, usage
+		return data, usage, dropped
 	}
-	return out, usage
+	return out, usage, dropped
 }
 
 // relayStream relays the upstream SSE stream to the client, one line at a
@@ -2175,6 +2239,9 @@ func (p *proxy) relayStream(out *sseSink, upstream io.Reader, m Model, started t
 	out.commit()
 	var usage *Usage
 	var chars charCounts
+	// dropped records that a usage chunk arrived but could not be trusted
+	// (issue #410); boundedUsage already warned about it.
+	dropped := false
 	reader := bufio.NewReaderSize(upstream, 1<<16)
 	quiet := time.NewTicker(out.every)
 	defer quiet.Stop()
@@ -2237,10 +2304,11 @@ func (p *proxy) relayStream(out *sseSink, upstream io.Reader, m Model, started t
 			if data, ok := bytes.CutPrefix(trimmed, []byte("data:")); ok {
 				data = bytes.TrimSpace(data)
 				if len(data) > 0 && !bytes.Equal(data, []byte("[DONE]")) {
-					rewritten, found := RewriteChunk(data, m, &chars)
+					rewritten, found, badUsage := RewriteChunk(data, m, &chars)
 					if found != nil {
 						usage = found
 					}
+					dropped = dropped || badUsage
 					trimmed = append([]byte("data: "), rewritten...)
 					// Issue #145: this is the first data line the wait for
 					// upstream was really about; the header-wait heartbeat
@@ -2271,7 +2339,7 @@ func (p *proxy) relayStream(out *sseSink, upstream io.Reader, m Model, started t
 	// Issue #131: cut is the loop leaving without a `data: [DONE]` line --
 	// upstream's error, a bare EOF, or the client going away and cancelling
 	// the body out from under the read.
-	p.record(m, usage, true, started, slotWait, headerWait, chars, repaired, 0, callTiming{
+	p.record(m, usage, dropped, true, started, slotWait, headerWait, chars, repaired, 0, callTiming{
 		TTFT: ttft, Dur: time.Since(started), MaxGap: timingGap, Cut: !sawDone})
 }
 
