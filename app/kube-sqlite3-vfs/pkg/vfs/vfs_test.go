@@ -417,6 +417,82 @@ func TestOpenLostFreshFileRaceKeepsConcurrentWritersSector0(t *testing.T) {
 	}
 }
 
+// TestOpenLostRaceSector0VanishedAgain covers the tail of the lost fresh-file
+// race: the CREATE answered AlreadyExists, but by the time the in-attempt
+// re-read lists the sectors, the race winner's sector 0 has been deleted
+// again. There is no settled state to open, so the open must fail — but the
+// error must say why. The LIST that found nothing succeeded, so its nil error
+// must not be stored as lastErr: a nil lastErr falls through to the
+// "no open attempt was made" fallback, which blames the retry budget instead
+// of the race (the medium review finding at vfs.go).
+//
+// At the shipped --retries 1 default the open fails with the race reported;
+// with a budget left the next attempt's LIST sees no sectors and the CREATE
+// succeeds, so the open goes through.
+func TestOpenLostRaceSector0VanishedAgain(t *testing.T) {
+	name := "vanished.db"
+	for _, tc := range []struct {
+		retries   int
+		wantOpen  bool
+		wantInErr string
+		notInErr  string
+	}{
+		{retries: 1, wantOpen: false, wantInErr: "deleted again before the re-read", notInErr: "no open attempt was made"},
+		{retries: 3, wantOpen: true},
+	} {
+		t.Run(fmt.Sprintf("retries=%d", tc.retries), func(t *testing.T) {
+			fcs := fake.NewSimpleClientset()
+			v := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), tc.retries)
+			f := NewFile(name, v)
+			sector0 := f.sectorNameFromSectorIndex(0)
+
+			// The first sector-0 CREATE is answered AlreadyExists with
+			// nothing actually created: the winner's sector existed when the
+			// API server answered and was deleted before our re-read.
+			var injected int32
+			fcs.PrependReactor("create", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				ca, ok := action.(k8stesting.CreateAction)
+				if !ok {
+					return false, nil, nil
+				}
+				cm, ok := ca.GetObject().(*v1.ConfigMap)
+				if !ok || cm.Name != sector0 {
+					return false, nil, nil
+				}
+				if !atomic.CompareAndSwapInt32(&injected, 0, 1) {
+					return false, nil, nil
+				}
+				return true, nil, kerrors.NewAlreadyExists(v1.Resource("configmaps"), sector0)
+			})
+
+			sf, _, err := v.Open(name, 0)
+			if tc.wantOpen {
+				if err != nil {
+					t.Fatalf("Open(%q) with retries=%d = %v, want success: the retry's LIST sees no sectors and the CREATE goes through", name, tc.retries, err)
+				}
+				rf, ok := sf.(*file)
+				if !ok {
+					t.Fatalf("Open(%q) returned %T, want *file", name, sf)
+				}
+				buf := make([]byte, 8)
+				if _, err := rf.ReadAt(buf, 0); err != nil && !errors.Is(err, io.EOF) {
+					t.Fatalf("ReadAt(0) after the retry: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Open(%q) with retries=%d = nil error, want the vanished-sector race reported", name, tc.retries)
+			}
+			if !strings.Contains(err.Error(), tc.wantInErr) {
+				t.Errorf("Open(%q) error = %q, want it to contain %q", name, err, tc.wantInErr)
+			}
+			if tc.notInErr != "" && strings.Contains(err.Error(), tc.notInErr) {
+				t.Errorf("Open(%q) error = %q, want it to NOT contain %q: the retry budget is not what failed", name, err, tc.notInErr)
+			}
+		})
+	}
+}
+
 // --- Label limits (issue #351) ---
 
 // longNameDB is the 40-byte database name of issue #351: its base32

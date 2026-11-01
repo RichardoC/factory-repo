@@ -1394,8 +1394,12 @@ func (v *vfs) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sql
 					// The race winner's sector 0 is gone again (deleted
 					// between our CREATE and this LIST). There is no settled
 					// state to open; report the race and let the retry budget
-					// (if any) start over.
-					lastErr = err
+					// (if any) start over. lastErr must be set to a real error
+					// here: err is the successful re-read LIST's nil, and a nil
+					// lastErr falls through to the "no open attempt was made"
+					// fallback below, which blames the retry budget instead of
+					// the race that actually failed the open.
+					lastErr = errors.New("sector 0 of the fresh-file race winner was deleted again before the re-read")
 					continue
 				}
 				names = names[:0]
