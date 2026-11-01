@@ -217,6 +217,83 @@ func TestRunWithClientFailsOnCommitError(t *testing.T) {
 	}
 }
 
+// TestRunWithClientFailsOnCountReadError covers the post-commit COUNT
+// read-back (issue #427): a read failure there must fail the run, not be
+// logged away with the process exiting 0.
+//
+// The count query runs through the same connection that did the inserts,
+// so its pages come from sqlite's cache and it touches the cluster only
+// for locks: taking the SHARED lock of a read statement is a CAS on the
+// lock ConfigMap. Failing every lock ConfigMap read or write after the
+// commit has finished therefore fails exactly the COUNT's read-back —
+// sqlite cannot start the implicit read transaction, so the query yields
+// no row with an error in rows.Err, which runWithClient must return.
+//
+// The commit boundary is observable and deterministic: DELETE journal
+// mode deletes the journal on the cluster, its lockfile ConfigMap last of
+// all. The run has two write transactions (CREATE TABLE, then the insert
+// transaction), so the database file's own lockfile is never deleted but
+// the run's second deleted lockfile is the insert commit's journal — from
+// there on, every lockfile operation belongs to the COUNT and LIMIT
+// read-back queries. A Retries: 1 option makes the injected failure
+// terminal after the VFS's one retry instead of twice in a row.
+func TestRunWithClientFailsOnCountReadError(t *testing.T) {
+	fcs := fake.NewSimpleClientset()
+
+	deletedLockfiles := 0
+	commitDone := false
+	failCountReads := false
+	reaction := func(action clienttesting.Action) (bool, runtime.Object, error) {
+		// Lock ConfigMaps are named "<base32 file name>-lockfile", and only
+		// the two journals' lockfiles are ever deleted during the run: the
+		// database file's own survives. The second deleted one is therefore
+		// the insert commit's journal lockfile. The commit is not over yet
+		// though: inside tx.Commit sqlite next downgrades the write
+		// transaction's EXCLUSIVE lock to SHARED and then to NONE, and the
+		// first lock ConfigMap update writing LockNone after the journal
+		// lockfile is gone is the commit's last act. From there on, every
+		// lock operation belongs to the read-back queries — the COUNT goes
+		// first and must take the read lock that its step needs, so failing
+		// every lock ConfigMap read and write fails exactly the COUNT's
+		// read-back.
+		switch a := action.(type) {
+		case clienttesting.DeleteAction:
+			if strings.HasSuffix(a.GetName(), "-lockfile") {
+				deletedLockfiles++
+				if deletedLockfiles == 2 {
+					commitDone = true
+				}
+			}
+		case clienttesting.UpdateAction:
+			cm, ok := a.GetObject().(*corev1.ConfigMap)
+			if !ok || !strings.HasSuffix(cm.Name, "-lockfile") {
+				return false, nil, nil
+			}
+			if commitDone && cm.Data["lock"] == sqlite3vfs.LockNone.String() {
+				failCountReads = true
+				return false, nil, nil
+			}
+			if failCountReads {
+				return true, nil, fmt.Errorf("injected lock write failure")
+			}
+		case clienttesting.GetAction:
+			if failCountReads && strings.HasSuffix(a.GetName(), "-lockfile") {
+				return true, nil, fmt.Errorf("injected lock read failure")
+			}
+		}
+		return false, nil, nil
+	}
+	fcs.PrependReactor("*", "configmaps", reaction)
+
+	err := runWithClient(fcs, Options{Retries: 1}, testLogger())
+	if err == nil {
+		t.Fatal("runWithClient succeeded despite injected count read failures")
+	}
+	if !strings.Contains(err.Error(), "scan row count: no row") {
+		t.Errorf("error = %v, want it to report the failed count read-back (not an earlier or later step)", err)
+	}
+}
+
 // TestJournalModeValidation covers --journal-mode's validation: the modes a
 // writer may run under (DELETE, TRUNCATE, PERSIST, case-insensitively, and
 // the flag's empty default, which is DELETE), the modes it must refuse with

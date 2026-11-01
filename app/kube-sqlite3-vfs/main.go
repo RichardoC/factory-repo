@@ -251,9 +251,22 @@ func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Lo
 	}
 
 	var count int
-	rows.Next()
-	err = rows.Scan(&count)
-	logger.Info("Got rows of books", "count", count, "err", err)
+	// The count read is the run's proof that the committed rows round-trip,
+	// so a failed read fails the run instead of being logged away — the
+	// COUNT verification of the download command already worked this way
+	// (cmd/db-download) and a command whose purpose is to prove the write
+	// must not exit 0 when the proof cannot be read (issue #427). A COUNT
+	// always yields exactly one row: a false Next is a read error
+	// (rows.Err), never an empty result.
+	if !rows.Next() {
+		rows.Close()
+		return fmt.Errorf("scan row count: no row: %w", rows.Err())
+	}
+	if err := rows.Scan(&count); err != nil {
+		rows.Close()
+		return fmt.Errorf("scan row count: %w", err)
+	}
+	logger.Info("Got rows of books", "count", count)
 
 	// explicitly close out the old query since we only allow one at a time
 	rows.Close()
