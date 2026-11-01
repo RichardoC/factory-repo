@@ -80,6 +80,12 @@ type linearIssueNode struct {
 				ID string `json:"id"`
 			} `json:"parent"`
 		} `json:"nodes"`
+		// PageInfo is requested so a truncated label page (more labels
+		// than first: 250) can be told apart from a complete one; a
+		// partial set is refused rather than trusted, see loadIssues.
+		PageInfo struct {
+			HasNextPage bool `json:"hasNextPage"`
+		} `json:"pageInfo"`
 	} `json:"labels"`
 }
 
@@ -159,6 +165,9 @@ query issueByIdentifier($filter: IssueFilter!) {
             id
           }
         }
+        pageInfo {
+          hasNextPage
+        }
       }
     }
   }
@@ -177,7 +186,22 @@ query issueByIdentifier($filter: IssueFilter!) {
 		return model.ExistingIssue{}, fmt.Errorf("Linear issue %q not found", identifier)
 	}
 
-	return linearIssueToModel(resp.Issues.Nodes[0]), nil
+	node := resp.Issues.Nodes[0]
+	// A truncated label page is an incomplete picture of the issue's
+	// labels, and callers hash this set to decide whether a ticket needs
+	// re-asserting; a label past the page boundary — including one removed
+	// by hand — would read as absent both before and after, so refuse
+	// rather than return a partial set.
+	if node.Labels.PageInfo.HasNextPage {
+		c.log.Warn("Linear issue carries more labels than one page of the single-issue lookup; refusing to return a label set a label may be missing from",
+			slog.String("issue_id", node.ID),
+			slog.String("identifier", node.Identifier),
+			slog.Int("page_size", maxLiveLabelPage),
+		)
+		return model.ExistingIssue{}, fmt.Errorf("Linear issue %s (%s) carries more labels than one page of %d; the lookup would return a partial label set, so it is refused rather than emitted", node.Identifier, node.ID, maxLiveLabelPage)
+	}
+
+	return linearIssueToModel(node), nil
 }
 
 // parseLinearIdentifier splits a Linear identifier such as "SNYK-12127" into
@@ -886,6 +910,9 @@ query existingIssues($filter: IssueFilter!, $after: String) {
             id
           }
         }
+        pageInfo {
+          hasNextPage
+        }
       }
     }
     pageInfo {
@@ -910,8 +937,22 @@ query existingIssues($filter: IssueFilter!, $after: String) {
 			return nil, fmt.Errorf("fetch Linear issues: %w", err)
 		}
 
-		for _, issue := range resp.Issues.Nodes {
-			issues = append(issues, linearIssueToModel(issue))
+		for _, node := range resp.Issues.Nodes {
+			// A truncated label page is an incomplete picture of the
+			// ticket's labels, and the snapshot feeds the cache hash and
+			// full-set rebuilds; a label past the page boundary would read
+			// as absent both before and after, and a rebuild from the
+			// partial snapshot would delete it. So refuse the snapshot
+			// rather than emit a partial set.
+			if node.Labels.PageInfo.HasNextPage {
+				c.log.Warn("Linear issue carries more labels than one page of the snapshot; refusing to return a label set a label may be missing from",
+					slog.String("issue_id", node.ID),
+					slog.String("identifier", node.Identifier),
+					slog.Int("page_size", maxLiveLabelPage),
+				)
+				return nil, fmt.Errorf("Linear issue %s (%s) carries more labels than one page of %d; the snapshot would be a partial label set, so it is refused rather than emitted", node.Identifier, node.ID, maxLiveLabelPage)
+			}
+			issues = append(issues, linearIssueToModel(node))
 		}
 
 		if !resp.Issues.PageInfo.HasNextPage || resp.Issues.PageInfo.EndCursor == nil {
