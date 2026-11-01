@@ -1409,6 +1409,66 @@ func TestNextContinueHoldsPRAreas(t *testing.T) {
 	}
 }
 
+// TestNextContinueFetchesChangedFileAreas pins the fix for issue #411: a
+// continuation candidate has no in-flight run, so fetchPRFiles' run-title
+// loop never named its pull request and the PR's changed-file areas were
+// lost at pick time — the continuation started while an in-flight run was
+// already working the same app directory. The candidate's pull request is
+// fetched too, so its changed files (app/b here) join the linked issue's
+// areas (app/a), and the continuation is held while app/b is busy.
+func TestNextContinueFetchesChangedFileAreas(t *testing.T) {
+	// The changed-files listing for continuation candidate #5: the PR
+	// touches app/b, while the issue it closes is on app/a.
+	var listed atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveRepoID(w, r) {
+			return
+		}
+		if r.URL.Path == stubRepoPath+"/pulls/5/files" {
+			listed.Store(true)
+			fmt.Fprint(w, `[{"filename":"app/b/changed.go"}]`)
+			return
+		}
+		http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
+	}))
+	defer server.Close()
+	g := github{api: server.URL, repo: "RichardoC/factory-repo", token: "t", client: server.Client()}
+
+	pr := queuedIssue(5, "2024-01-01T00:00:00Z", "codeaf", "codeaf-continue-needed")
+	pr.Body = "Closes #119"
+	pr.PullRequest = json.RawMessage(`{"number":5}`)
+	issues := []item{
+		pr,
+		areaIssue(119, "2024-01-01T00:00:00Z", "app/a"), // the issue the PR closes
+		areaIssue(3, "2024-01-01T00:00:00Z", "app/b"),   // what the in-flight run works on
+	}
+	// No run is in flight for #5 — a continuation candidate by definition
+	// — so the fetch must reach the pull request through the candidate
+	// itself, not through a run title.
+	files := fetchPRFiles(g, issues, nil, "codeaf", t.Logf)
+	if !listed.Load() || !slices.Equal(files[5], []string{"app/b/changed.go"}) {
+		t.Fatalf("fetchPRFiles = %v (listed=%v); want #5's changed files fetched for the continuation candidate", files, listed.Load())
+	}
+
+	// The continuation holds: the PR's changed-file area app/b joins the
+	// linked issue's app/a, and an in-flight run is already on app/b.
+	o := nextOpts()
+	o.MaxParallelRuns = 2
+	o.PRFiles = files
+	// The area guard holds and keeps scanning, so the pick may name
+	// another candidate; the continuation itself must not start.
+	held, lines := nextPick(issues, []runStatus{running(3, 1, 100)}, o)
+	if held.Number == 5 || !slices.ContainsFunc(lines, func(s string) bool {
+		return strings.Contains(s, "area app/b busy (run 100)")
+	}) {
+		t.Fatalf("Next = %+v, log %v; want #5 held with area app/b busy (run 100)", held, lines)
+	}
+	// Once app/b is free the continuation starts, holding app/a and app/b.
+	if p := Next(issues, nil, o); p.Kind != kindContinue || p.Number != 5 {
+		t.Fatalf("Next = %+v; want continue #5 once app/b is free", p)
+	}
+}
+
 // TestNextCountsReviewsAgainstLanes covers the capacity rule across kinds
 // (issue #137): in-flight runs of every kind — reviews, continuations, plan
 // runs and issue runs — count against max_parallel_runs alike, so with four
@@ -2396,7 +2456,7 @@ func TestFetchPRFilesPaginates(t *testing.T) {
 	server, requests := prFilesServer(t, 100, 120, false)
 	g := github{api: server.URL, repo: "RichardoC/factory-repo", token: "t", client: server.Client()}
 	issues, runs := prFilesIssues()
-	files := fetchPRFiles(g, issues, runs, t.Logf)
+	files := fetchPRFiles(g, issues, runs, "codeaf", t.Logf)
 	if got := len(files[7]); got != 120 {
 		t.Fatalf("paths for #%d = %d, want 120: `e/changed-100.go` to `e/changed-119.go` must be seen", 7, got)
 	}
@@ -2420,7 +2480,7 @@ func TestFetchPRFilesFailsClosed(t *testing.T) {
 	g := github{api: server.URL, repo: "RichardoC/factory-repo", token: "t", client: server.Client()}
 	issues, runs := prFilesIssues()
 	var logged strings.Builder
-	files := fetchPRFiles(g, issues, runs, func(format string, args ...any) {
+	files := fetchPRFiles(g, issues, runs, "codeaf", func(format string, args ...any) {
 		fmt.Fprintf(&logged, format, args...)
 	})
 	if _, ok := files[7]; ok {
