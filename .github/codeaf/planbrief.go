@@ -39,7 +39,11 @@ const (
 	// planClosedIssuesPath is the closed-issues window's first page. The
 	// issues endpoint lists closed pull requests too, so this read pages on
 	// (issue #322) instead of trusting the first 20 items to be issues.
-	planClosedIssuesPath = "/issues?state=closed&sort=updated&per_page=20"
+	// direction=desc is spelled out because GitHub defaults it to desc only
+	// when sort is created or unspecified — with sort=updated it would
+	// default to asc and page backwards from the repository's first day
+	// (issue #391). The run-report scan (planRunReports) spells it out too.
+	planClosedIssuesPath = "/issues?state=closed&sort=updated&direction=desc&per_page=20"
 )
 
 // planHarnessPreChangeSentence is the evidence rule plan-instructions.md
@@ -292,12 +296,15 @@ func (g github) closedIssuesWindow(path string, budget int) (issues []item, trun
 
 // planClosedPulls lists the recently closed pull requests, titles only:
 // what was already done keeps the planner from proposing it again, and the
-// full bodies would only repeat the issues they closed.
+// full bodies would only repeat the issues they closed. Like the closed
+// issues window, direction=desc is explicit: sort=updated would otherwise
+// default to asc on GitHub and answer with the least recently updated pull
+// requests first (issue #391).
 func planClosedPulls(gh github) string {
 	var b strings.Builder
 	b.WriteString("## Recently closed pull requests\n\n")
 	var pulls []item
-	if err := gh.get("/pulls?state=closed&sort=updated&per_page=20", &pulls); err != nil {
+	if err := gh.get("/pulls?state=closed&sort=updated&direction=desc&per_page=20", &pulls); err != nil {
 		fmt.Fprintf(&b, "(recently closed pull requests unavailable: %s)\n", escapeMD(err.Error(), 200, true))
 		return strings.TrimRight(b.String(), "\n")
 	}

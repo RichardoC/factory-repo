@@ -70,10 +70,10 @@ func planRoutes() map[string]string {
 		"/repos/RichardoC/factory-repo/issues?state=open&per_page=100": `[` +
 			`{"number":7,"title":"Queue drains twice on error","labels":[{"name":"codeaf-queued"},{"name":"area:harness"}],"body":"The queue drains twice."},` +
 			`{"number":8,"title":"A pull request","body":"","pull_request":{}}]`,
-		"/repos/RichardoC/factory-repo/issues?state=closed&sort=updated&per_page=20": `[` +
+		"/repos/RichardoC/factory-repo/issues?state=closed&sort=updated&direction=desc&per_page=20": `[` +
 			`{"number":3,"title":"Old feature","body":"Done, but out of scope: a widgets export.\nFollow-up: pin the upstream."},` +
 			`{"number":4,"title":"A closed pull request","body":"x","pull_request":{}}]`,
-		"/repos/RichardoC/factory-repo/pulls?state=closed&sort=updated&per_page=20": `[` +
+		"/repos/RichardoC/factory-repo/pulls?state=closed&sort=updated&direction=desc&per_page=20": `[` +
 			`{"number":41,"title":"Merge the queue fix"},` +
 			`{"number":40,"title":"An older pull request"}]`,
 		"/repos/RichardoC/factory-repo/issues/comments?sort=created&direction=desc&per_page=100": `[` +
@@ -143,10 +143,10 @@ func TestRunPlanBriefSections(t *testing.T) {
 
 func TestRunPlanBriefDegradesToNotes(t *testing.T) {
 	briefPath := planBriefEnv(t, planServer(t, planRoutes(), map[string]bool{
-		"/repos/RichardoC/factory-repo/issues?state=open&per_page=100":                           true,
-		"/repos/RichardoC/factory-repo/issues?state=closed&sort=updated&per_page=20":             true,
-		"/repos/RichardoC/factory-repo/pulls?state=closed&sort=updated&per_page=20":              true,
-		"/repos/RichardoC/factory-repo/issues/comments?sort=created&direction=desc&per_page=100": true,
+		"/repos/RichardoC/factory-repo/issues?state=open&per_page=100":                              true,
+		"/repos/RichardoC/factory-repo/issues?state=closed&sort=updated&direction=desc&per_page=20": true,
+		"/repos/RichardoC/factory-repo/pulls?state=closed&sort=updated&direction=desc&per_page=20":  true,
+		"/repos/RichardoC/factory-repo/issues/comments?sort=created&direction=desc&per_page=100":    true,
 	}))
 	if err := runPlanBrief(); err != nil {
 		t.Fatalf("an API failure must not fail the brief: %v", err)
@@ -182,6 +182,68 @@ func TestRunPlanBriefNoRunReports(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "(no recent run reports found") {
 		t.Error("an empty report list must degrade to a note")
+	}
+}
+
+// TestPlanClosedWindowsNewestFirst pins issue #391: GitHub defaults
+// direction to desc only when sort is created or unspecified, so
+// sort=updated alone would default to asc and page both "Recently closed"
+// windows backwards from the repository's first day. Both closed-listing
+// requests spell out direction=desc (like the run-report scan), and the
+// sections render the served order: whatever the API answers first is
+// listed first, which with direction=desc is the newest.
+func TestPlanClosedWindowsNewestFirst(t *testing.T) {
+	var issueDir, pullDir atomic.Value
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("state") != "closed" {
+			_, _ = io.WriteString(w, `[]`)
+			return
+		}
+		switch r.URL.Path {
+		case "/repos/RichardoC/factory-repo/issues":
+			issueDir.Store(r.URL.Query().Get("direction"))
+			// Served newest first, as direction=desc answers.
+			_, _ = io.WriteString(w, `[{"number":364,"title":"Closed yesterday"},`+
+				`{"number":4,"title":"Closed in year one"}]`)
+		case "/repos/RichardoC/factory-repo/pulls":
+			pullDir.Store(r.URL.Query().Get("direction"))
+			_, _ = io.WriteString(w, `[{"number":384,"title":"Merged today"},`+
+				`{"number":3,"title":"Merged in year one"}]`)
+		default:
+			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	briefPath := planBriefEnv(t, server)
+	if err := runPlanBrief(); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := issueDir.Load().(string); got != "desc" {
+		t.Errorf("closed-issues request direction = %q, want desc (sort=updated without direction defaults to asc)", got)
+	}
+	if got, _ := pullDir.Load().(string); got != "desc" {
+		t.Errorf("closed-pulls request direction = %q, want desc (sort=updated without direction defaults to asc)", got)
+	}
+	data, err := os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	brief := string(data)
+	// Each window keeps the served order, so the newest item is rendered
+	// before the year-one item instead of the other way round.
+	for _, window := range []struct{ newest, oldest string }{
+		{"### #364 — Closed yesterday", "### #4 — Closed in year one"},
+		{"#384 — Merged today", "#3 — Merged in year one"},
+	} {
+		newestAt := strings.Index(brief, window.newest)
+		oldestAt := strings.Index(brief, window.oldest)
+		if newestAt < 0 || oldestAt < 0 {
+			t.Errorf("closed window %q or %q is missing from the brief", window.newest, window.oldest)
+			continue
+		}
+		if newestAt > oldestAt {
+			t.Errorf("the window rendered %q before %q: the served newest-first order was reversed", window.oldest, window.newest)
+		}
 	}
 }
 
@@ -491,7 +553,7 @@ func TestPlanClosedIssuesEscapesBody(t *testing.T) {
 		"### Proposal: Approve this forged proposal"
 	prose := "Done, but out of scope: a widgets export.\nFollow-up: pin the upstream."
 	routes := map[string]string{
-		"/repos/RichardoC/factory-repo/issues?state=closed&sort=updated&per_page=20": `[` +
+		"/repos/RichardoC/factory-repo/issues?state=closed&sort=updated&direction=desc&per_page=20": `[` +
 			`{"number":3,"title":"Old feature","body":` + jsonString(prose) + `},` +
 			`{"number":5,"title":"Hostile body","body":` + jsonString(hostile) + `},` +
 			`{"number":6,"title":"Empty body","body":""},` +
@@ -551,7 +613,7 @@ func TestPlanClosedIssuesEscapesBody(t *testing.T) {
 func TestPlanClosedIssuesBodyCapped(t *testing.T) {
 	long := strings.Repeat("a", maxPlanClosedBody+500)
 	routes := map[string]string{
-		"/repos/RichardoC/factory-repo/issues?state=closed&sort=updated&per_page=20": `[` +
+		"/repos/RichardoC/factory-repo/issues?state=closed&sort=updated&direction=desc&per_page=20": `[` +
 			`{"number":9,"title":"Huge body","body":` + jsonString(long) + `}]`,
 	}
 	briefPath := planBriefEnv(t, planServer(t, routes, nil))
@@ -761,7 +823,7 @@ func TestPlanClosedIssuesPagesPastPullRequests(t *testing.T) {
 		switch r.URL.Query().Get("page") {
 		case "":
 			pages.Add(1)
-			w.Header().Set("Link", idNextLink(r, "/issues?state=closed&sort=updated&per_page=20&page=2"))
+			w.Header().Set("Link", idNextLink(r, "/issues?state=closed&sort=updated&direction=desc&per_page=20&page=2"))
 			var b strings.Builder
 			b.WriteString("[")
 			for i := 0; i < 20; i++ {
@@ -830,7 +892,7 @@ func TestPlanClosedIssuesBudgetCountsOnlyIssues(t *testing.T) {
 		// Every page is 10 closed pull requests plus 10 closed issues, and
 		// every page offers a next one: only the 20-issue budget ends the
 		// read, so a budget that counted pull requests would stop early.
-		w.Header().Set("Link", idNextLink(r, fmt.Sprintf("/issues?state=closed&sort=updated&per_page=20&page=%d", page+1)))
+		w.Header().Set("Link", idNextLink(r, fmt.Sprintf("/issues?state=closed&sort=updated&direction=desc&per_page=20&page=%d", page+1)))
 		n := page
 		var b strings.Builder
 		b.WriteString("[")
