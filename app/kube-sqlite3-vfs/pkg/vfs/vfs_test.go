@@ -240,6 +240,32 @@ func writerIn(tb testing.TB, fcs *fake.Clientset, f *file) *writerEntry {
 	return w
 }
 
+// pruneHolderFromLockCM simulates another process pruning this file's lock
+// entries: it rewrites the shared-holders map and the writer slot of the
+// lock ConfigMap directly, dropping this file's own entries wherever
+// asked. The fake clientset's Update keeps the ResourceVersion, so this
+// file's next CAS reads exactly the pruned state a real pruneExpired by
+// another process would have left behind.
+func pruneHolderFromLockCM(tb testing.TB, fcs *fake.Clientset, f *file, shared, writer bool) {
+	tb.Helper()
+	cm := getLockfileConfigMap(tb, fcs, f)
+	if shared {
+		holders := sharedHoldersIn(tb, fcs, f)
+		delete(holders, f.holderID)
+		raw, err := json.Marshal(holders)
+		if err != nil {
+			tb.Fatalf("marshal pruned shared-holders: %v", err)
+		}
+		cm.Data["shared-holders"] = string(raw)
+	}
+	if writer {
+		cm.Data["writer"] = ""
+	}
+	if _, err := fcs.CoreV1().ConfigMaps(testNamespace).Update(tb.Context(), cm, metav1.UpdateOptions{}); err != nil {
+		tb.Fatalf("prune this file's entries in the lock configmap: %v", err)
+	}
+}
+
 func mustWriteAt(tb testing.TB, f *file, p []byte, off int64) int {
 	tb.Helper()
 	n, err := f.WriteAt(p, off)
@@ -1792,6 +1818,115 @@ func TestLeaseLossDetected(t *testing.T) {
 	if holders := sharedHoldersIn(t, fcs, fa); len(holders) != 1 {
 		t.Errorf("shared-holders after re-acquire = %v, want exactly one entry", holders)
 	}
+}
+
+// assertLossGatesSectorWrite checks both halves of a lease loss found by an
+// upgrade mutation (issue #412): the sticky loss must gate the sector write
+// path — WriteAt refused with sqlite3vfs.BusyError and no ConfigMap API
+// call, so not a single sector is written — and the refused write must not
+// have landed: after re-acquiring SHARED the file still reads back the
+// bytes committed before the loss, not the pattern WriteAt carried.
+func assertLossGatesSectorWrite(t *testing.T, fcs *fake.Clientset, f *file, kept []byte) {
+	t.Helper()
+	alt := make([]byte, len(kept))
+	fillPatternAlt(alt)
+	callsBefore := len(fcs.Actions())
+	if _, err := f.WriteAt(alt, 0); !errors.Is(err, sqlite3vfs.BusyError) {
+		t.Fatalf("WriteAt after the upgrade lease loss = %v, want sqlite3vfs.BusyError", err)
+	}
+	if n := len(fcs.Actions()) - callsBefore; n != 0 {
+		t.Errorf("refused WriteAt caused %d ConfigMap API calls, want 0 (refused before any sector write)", n)
+	}
+
+	// Re-acquire SHARED as a fresh holder, and read back what is stored:
+	// the refused write must not have landed.
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("re-Lock(Shared) after the loss: %v", err)
+	}
+	got := make([]byte, len(kept))
+	if n, err := f.ReadAt(got, 0); err != nil && !errors.Is(err, io.EOF) {
+		t.Fatalf("ReadAt after re-lock: %v", err)
+	} else if !bytes.Equal(got[:n], kept[:n]) {
+		t.Errorf("stored bytes after the refused write = %q, want the pre-loss pattern (the write must not have landed)", got[:n])
+	}
+}
+
+// TestLeaseLossOnReservedUpgrade pins the lapsed-lease behaviour of the
+// SHARED->RESERVED upgrade (issue #412): with this file's shared entry
+// pruned from the lock ConfigMap — the lease lapsed and another process
+// took the holder away — Lock(RESERVED) must report errLockLeaseLost, not
+// a plain "invalid lock transition" that leaves the file writing sectors
+// under a lock the cluster has given away. noteLeaseLost resets the local
+// state, so the sticky loss gates the sector write path next.
+func TestLeaseLossOnReservedUpgrade(t *testing.T) {
+	fcs := fake.NewSimpleClientset()
+	v := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3)
+
+	f := openTestFile(t, v, "lost-upgrade.db")
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("Lock(Shared): %v", err)
+	}
+	kept := make([]byte, 64)
+	fillPattern(kept)
+	mustWriteAt(t, f, kept, 0)
+
+	// Another process prunes this file's shared entry while the local
+	// state still believes SHARED.
+	pruneHolderFromLockCM(t, fcs, f, true, false)
+	err := f.Lock(sqlite3vfs.LockReserved)
+	if !errors.Is(err, errLockLeaseLost) {
+		t.Fatalf("Lock(Reserved) after the shared entry was pruned = %v, want errLockLeaseLost", err)
+	}
+	if errors.Is(err, sqlite3vfs.BusyError) {
+		t.Fatalf("Lock(Reserved) after the prune = %v, want the distinct lease-loss error and not sqlite3vfs.BusyError: BUSY would make sqlite retry a request whose holder state is gone", err)
+	}
+	if f.lockLevel != sqlite3vfs.LockNone || !f.lockKnown || !f.leaseLost {
+		t.Errorf("after the upgrade lease loss local state = (level %v, known %v, lost %v), want (NONE, true, true)", f.lockLevel, f.lockKnown, f.leaseLost)
+	}
+
+	assertLossGatesSectorWrite(t, fcs, f, kept)
+}
+
+// TestLeaseLossOnExclusiveClaim pins the lapsed-lease behaviour of the
+// first CAS step of Lock(EXCLUSIVE) (issue #412): with this file's writer
+// and shared entries pruned from the lock ConfigMap while the local state
+// still believes RESERVED, the PENDING claim must report errLockLeaseLost,
+// not a plain "invalid lock transition request" that leaves the file
+// writing sectors under a lock the cluster has given away. (A prune of the
+// writer entry alone leaves a live shared entry, which is a re-claim, not
+// a lease loss; pruneExpired drops all of a lapsed holder's entries, whose
+// leases are stamped together, so both go here.)
+func TestLeaseLossOnExclusiveClaim(t *testing.T) {
+	fcs := fake.NewSimpleClientset()
+	v := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3)
+
+	f := openTestFile(t, v, "lost-claim.db")
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("Lock(Shared): %v", err)
+	}
+	if err := f.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatalf("Lock(Reserved): %v", err)
+	}
+	kept := make([]byte, 64)
+	fillPattern(kept)
+	mustWriteAt(t, f, kept, 0)
+
+	// Another process prunes this file's writer entry — with its shared
+	// entry, whose lease is the same — while the local state still
+	// believes RESERVED.
+	pruneHolderFromLockCM(t, fcs, f, true, true)
+	err := f.Lock(sqlite3vfs.LockExclusive)
+	if !errors.Is(err, errLockLeaseLost) {
+		t.Fatalf("Lock(Exclusive) after the writer entry was pruned = %v, want errLockLeaseLost", err)
+	}
+	if errors.Is(err, sqlite3vfs.BusyError) {
+		t.Fatalf("Lock(Exclusive) after the prune = %v, want the distinct lease-loss error and not sqlite3vfs.BusyError: BUSY would make sqlite retry a request whose holder state is gone", err)
+	}
+	if f.lockLevel != sqlite3vfs.LockNone || !f.lockKnown || !f.leaseLost {
+		t.Errorf("after the claim lease loss local state = (level %v, known %v, lost %v), want (NONE, true, true)", f.lockLevel, f.lockKnown, f.leaseLost)
+	}
+
+	assertLossGatesSectorWrite(t, fcs, f, kept)
 }
 
 // fakeClock is the injectable clock the lease tests drive: the test advances
