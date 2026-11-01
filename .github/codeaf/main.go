@@ -3872,16 +3872,30 @@ func readLedger(path string) ([]LedgerLine, error) {
 	}
 	defer f.Close()
 	var lines []LedgerLine
+	torn := 0
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 1<<20), 1<<20)
 	for scanner.Scan() {
 		var line LedgerLine
 		if err := json.Unmarshal(scanner.Bytes(), &line); err != nil {
-			return nil, fmt.Errorf("%s: %w", path, err)
+			// Issue #392: the ledger is appended one bare write per line
+			// while the run job has a hard wall clock, so a proxy killed
+			// mid-write leaves a partial final line -- and that is exactly
+			// the timed-out run whose figures matter most. The good lines
+			// still decode per line, so skip the torn one and say the
+			// figures are a lower bound; only a scanner error stays fatal.
+			torn++
+			continue
 		}
 		lines = append(lines, line)
 	}
-	return lines, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if torn > 0 {
+		log.Printf("ledger: %s: skipped %d torn line(s); the cost and timing figures are a lower bound", path, torn)
+	}
+	return lines, nil
 }
 
 func ledgerTotal(lines []LedgerLine) float64 {
