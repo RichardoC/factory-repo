@@ -197,6 +197,14 @@ func prMode() error {
 // The returned body is built only from fixed sentences, the sanitized stop
 // word and counters — never from remote text — so it is safe to post as a
 // comment.
+//
+// A comment listing that stops at getList's page cap (issue #416) cannot be
+// counted: a thread longer than maxListPages pages is left uncounted and
+// treated as the cap case — the hand-over comment, no continuation started —
+// rather than returned as an error. Before, the raw page-cap error failed the
+// continue-plan step, which the workflow runs continue-on-error, so a long
+// thread silently ended the continuation chain; failing safe keeps a person
+// in the loop. Every other getList failure is still an error.
 func continuePlan(gh github, pr int, stop string) (action string, body string, used int, err error) {
 	stop = sanitizeStop(stop)
 	if !earlyStop(stop) || !continuesAfter(stop) {
@@ -212,6 +220,13 @@ func continuePlan(gh github, pr int, stop string) (action string, body string, u
 	}
 	var comments []issueComment
 	if err := gh.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", pr), &comments); err != nil {
+		if isPageCapError(err) {
+			// Issue #416: the listing is truncated, not broken. A thread
+			// that long has spent the continuations, so hand over exactly
+			// as the cap case does; used is maxContinuations because no
+			// smaller count can be proved from the pages read.
+			return "cap", capBody(stop), maxContinuations, nil
+		}
 		return "", "", 0, err
 	}
 	// The count is the continuations already run (issue #219): continue-plan
@@ -294,14 +309,31 @@ func (g github) mergeableState(pr int) (string, error) {
 // already used up does not drop the pull request silently either: like the
 // early-stop path, it hands over with a "cap" comment, worded for a run
 // that finished, not one that stopped early.
+//
+// A comment listing that stops at getList's page cap (issue #416) is the
+// same cap case as in continuePlan: the count is unreadable, so the pull
+// request is handed over with the cap comment instead of failing the step —
+// but only once the mergeable_state probe says it really conflicts, since a
+// clean pull request needs no comment at all. Any other listing failure is
+// still returned.
 func continueConflicted(gh github, pr int) (action string, body string, used int, err error) {
 	var comments []issueComment
+	capped := false
 	if err := gh.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", pr), &comments); err != nil {
-		return "", "", 0, err
+		if !isPageCapError(err) {
+			return "", "", 0, err
+		}
+		capped = true
 	}
 	// Same semantics as continuePlan (issue #219): the plain report count,
-	// not one less — this run's own report is not posted yet either.
-	used = countReports(comments)
+	// not one less — this run's own report is not posted yet either. A
+	// capped listing cannot be counted, so it is taken as the cap reached,
+	// like the early-stop path above.
+	if capped {
+		used = maxContinuations
+	} else {
+		used = countReports(comments)
+	}
 	state, err := gh.mergeableState(pr)
 	if err != nil {
 		return "", "", 0, err
@@ -309,7 +341,7 @@ func continueConflicted(gh github, pr int) (action string, body string, used int
 	if state != mergeableDirty {
 		return "", "", 0, nil
 	}
-	if continuationCapReached(used) {
+	if capped || continuationCapReached(used) {
 		return "cap", conflictCapBody(), used, nil
 	}
 	return "continue", conflictBody, used, nil

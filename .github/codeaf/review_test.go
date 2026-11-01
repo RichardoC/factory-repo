@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"unicode/utf8"
 )
@@ -886,6 +887,113 @@ func reviewHostileFindings() []Finding {
 		{Severity: "high", Path: "app/x/main.go", Line: 42, Text: "| pipes | <!-- html --> and @alice and [link](https://x)", Recognized: true},
 		{Severity: "medium", Path: "a$(reboot).go", Line: 7, Text: "missing error check", Recognized: true},
 	}
+}
+
+// reviewCappedServer is review-report's API when the pull request's comment
+// listing cannot be read to its end (issue #416): every comments page claims
+// another one, so getList stops at maxListPages with the page-cap error. The
+// pull request route answers its diff when asked for it, so the findings in
+// the answer are judged against a real diff. The counter is how many comment
+// pages were asked for.
+func reviewCappedServer(t *testing.T) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var pages atomic.Int32
+	diff := "diff --git a/app/x/main.go b/app/x/main.go\n" +
+		"--- a/app/x/main.go\n+++ b/app/x/main.go\n" +
+		"@@ -1,2 +1,3 @@\n context\n-removed\n+added\n"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveRepoID(w, r) {
+			return
+		}
+		switch {
+		case r.URL.Path == stubRepoPath+"/issues/7/comments":
+			n := pages.Add(1)
+			w.Header().Set("Link", idNextLink(r, fmt.Sprintf("/issues/7/comments?per_page=100&page=%d", n+1)))
+			_, _ = io.WriteString(w, `[{"id":1,"body":"a comment","user":{"login":"alice","type":"User"},"author_association":"MEMBER"}]`)
+		case r.URL.Path == stubRepoPath+"/pulls/7":
+			if strings.Contains(r.Header.Get("Accept"), "diff") {
+				_, _ = io.WriteString(w, diff)
+				return
+			}
+			_, _ = io.WriteString(w, `{"number":7,"title":"t","state":"open","draft":false}`)
+		default:
+			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server, &pages
+}
+
+// TestReviewPlanDegradesOnListPageCap is issue #416's review-report half: the
+// continuation count is read from the pull request's comment listing, and a
+// thread longer than maxListPages pages made reviewPlan return getList's raw
+// page-cap error, so review-report exited 1 before its gh pr comment and the
+// findings — the only place the blocking severities and file:lines exist —
+// never posted. The listing is truncated, not broken: the findings comment
+// must still be built, on the budget-spent report-only path (a thread that
+// long has certainly spent the continuations), with no error.
+func TestReviewPlanDegradesOnListPageCap(t *testing.T) {
+	hostile := reviewHostileFindings()
+	t.Run("the plan reports the findings at the budget", func(t *testing.T) {
+		server, pages := reviewCappedServer(t)
+		ghEnv(t, server)
+		action, body, used, err := reviewPlan(newGitHub(), 7, Result{Stop: stopDone, Model: "deepseek-ai/deepseek-v4.1-flash"},
+			true, hostile, true)
+		if err != nil {
+			t.Fatalf("reviewPlan on a capped listing: %v, want the findings comment", err)
+		}
+		if action != "report-only" || used != maxContinuations {
+			t.Fatalf("action = %q, used = %d; want report-only/%d on a capped listing", action, used, maxContinuations)
+		}
+		if strings.HasPrefix(body, command+" fix:") {
+			t.Errorf("the capped listing starts a fix run: %q", body)
+		}
+		for _, want := range []string{
+			fmt.Sprintf("automatic fix budget of %d", maxContinuations),
+			"| severity | location | finding |",
+			"app/x/main.go:42",
+			"a$(reboot).go:7",
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("the findings comment is missing %q: %q", want, body)
+			}
+		}
+		assertReviewBodyClean(t, body)
+		if n := pages.Load(); n != maxListPages {
+			t.Errorf("pages requested = %d, want exactly maxListPages (%d)", n, maxListPages)
+		}
+	})
+	t.Run("review-report exits 0 with the findings comment written", func(t *testing.T) {
+		oldArgs := os.Args
+		t.Cleanup(func() { os.Args = oldArgs })
+		os.Args = []string{"harness", "review-report", "7"}
+		server, _ := reviewCappedServer(t)
+		ghEnv(t, server)
+		writeReviewResult(t, stopDone, "## Findings\n\n- [high] app/x/main.go:42 - the mutex is released twice\n")
+		reviewLedger(t)
+		comment := filepath.Join(t.TempDir(), "review-comment.md")
+		t.Setenv("REVIEW_COMMENT_PATH", comment)
+		out, err := captureStdout(t, runReviewReport)
+		if err != nil {
+			t.Fatalf("review-report on a capped listing: %v, want exit 0", err)
+		}
+		if out != fmt.Sprintf("action=report-only\nused=%d\nblocking=1\n", maxContinuations) {
+			t.Errorf("stdout = %q; want the report-only budget-spent line", out)
+		}
+		data, err := os.ReadFile(comment)
+		if err != nil {
+			t.Fatalf("the findings comment was not written: %v", err)
+		}
+		if strings.HasPrefix(string(data), command+" fix:") {
+			t.Errorf("the findings comment starts a fix run: %q", data)
+		}
+		for _, want := range []string{"automatic fix budget", "| severity | location | finding |", "app/x/main.go:42"} {
+			if !strings.Contains(string(data), want) {
+				t.Errorf("the findings comment is missing %q: %q", want, data)
+			}
+		}
+		assertReviewBodyClean(t, string(data))
+	})
 }
 
 func TestReviewPlan(t *testing.T) {
