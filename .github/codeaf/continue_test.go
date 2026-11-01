@@ -651,6 +651,105 @@ func nextPageForeverServer(t *testing.T) (*httptest.Server, *atomic.Int32) {
 	return server, &requests
 }
 
+// cappedListServer serves a comment listing that always offers a next page
+// (issue #416): a getList reading it stops at maxListPages with the page-cap
+// error, which no fixture reached before. The pull request route says the PR
+// 7 branch conflicts with its base, so continueConflicted has a state to act
+// on; every other route is served as usual. The counter is how many comment
+// pages were asked for.
+func cappedListServer(t *testing.T) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var pages atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveRepoID(w, r) {
+			return
+		}
+		switch r.URL.Path {
+		case stubRepoPath + "/issues/7/comments":
+			n := pages.Add(1)
+			w.Header().Set("Link", idNextLink(r, fmt.Sprintf("/issues/7/comments?per_page=100&page=%d", n+1)))
+			// Every page carries a report comment, so a read that trusted the
+			// pages it saw would count them; the cap, not the count, decides.
+			fmt.Fprintf(w, `[{"id":%d,"body":%q,"user":{"login":%q}}]`,
+				n, reportMarker+"\n### CodeAF run — done\n\n| stop / ok | done / `true` |\n", planReportBotLogin)
+		case stubRepoPath + "/pulls/7":
+			_, _ = io.WriteString(w, `{"number":7,"title":"t","state":"open","draft":false,"mergeable_state":"dirty"}`)
+		default:
+			http.Error(w, "not served: "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server, &pages
+}
+
+// TestContinuePlanDegradesOnListPageCap is issue #416's continue-plan half:
+// a thread longer than maxListPages comment pages used to come back as
+// getList's raw page-cap error, which failed the continue-plan step (the
+// workflow runs it continue-on-error) before it posted anything, so an
+// early-stop run was silently never continued. The listing is truncated, not
+// broken: continue-plan must take the cap case — the hand-over comment, no
+// continuation started — and answer with no error.
+func TestContinuePlanDegradesOnListPageCap(t *testing.T) {
+	t.Run("the plan hands over at the cap", func(t *testing.T) {
+		server, pages := cappedListServer(t)
+		ghEnv(t, server)
+		action, body, used, err := continuePlan(newGitHub(), 7, stopDeadline)
+		if err != nil {
+			t.Fatalf("continuePlan on a capped listing: %v, want the cap case", err)
+		}
+		if action != "cap" {
+			t.Errorf("action = %q, want %q: a capped listing is the cap case", action, "cap")
+		}
+		if want := capBody(stopDeadline); body != want {
+			t.Errorf("body = %q, want the hand-over comment %q", body, want)
+		}
+		if used != maxContinuations {
+			t.Errorf("used = %d, want %d (the unreadable count is taken as the cap)", used, maxContinuations)
+		}
+		if n := pages.Load(); n != maxListPages {
+			t.Errorf("pages requested = %d, want exactly maxListPages (%d)", n, maxListPages)
+		}
+	})
+	t.Run("the conflicted path hands over at the cap too", func(t *testing.T) {
+		server, _ := cappedListServer(t)
+		ghEnv(t, server)
+		action, body, used, err := continuePlan(newGitHub(), 7, stopDone)
+		if err != nil {
+			t.Fatalf("continueConflicted on a capped listing: %v, want the cap case", err)
+		}
+		if action != "cap" || used != maxContinuations {
+			t.Fatalf("action = %q, used = %d; want cap/%d on a conflicted capped listing", action, used, maxContinuations)
+		}
+		if want := conflictCapBody(); body != want {
+			t.Errorf("body = %q, want %q", body, want)
+		}
+	})
+	t.Run("the command exits 0 with the cap comment written", func(t *testing.T) {
+		oldArgs := os.Args
+		t.Cleanup(func() { os.Args = oldArgs })
+		os.Args = []string{"harness", "continue-plan", "7"}
+		server, _ := cappedListServer(t)
+		ghEnv(t, server)
+		writeResult(t, stopDeadline)
+		comment := filepath.Join(t.TempDir(), "cap-comment.md")
+		t.Setenv("CONTINUE_COMMENT_PATH", comment)
+		out, err := captureStdout(t, runContinuePlan)
+		if err != nil {
+			t.Fatalf("continue-plan on a capped listing: %v, want exit 0", err)
+		}
+		if out != "action=cap\n" {
+			t.Errorf("stdout = %q, want action=cap", out)
+		}
+		data, err := os.ReadFile(comment)
+		if err != nil {
+			t.Fatalf("the cap comment was not written: %v", err)
+		}
+		if want := capBody(stopDeadline); string(data) != want {
+			t.Errorf("comment = %q, want %q", data, want)
+		}
+	})
+}
+
 func TestContinuePlan(t *testing.T) {
 	// Issue #219: continue-plan runs before the stopping run has posted its
 	// own report, so every report comment is a run that came before and

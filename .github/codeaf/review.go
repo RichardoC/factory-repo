@@ -942,7 +942,10 @@ func reviewerModel(cfg Config, workerID string) (Model, error) {
 // whose remote-derived strings are escaped and capped; it never carries the
 // run-report marker, so it is never mistaken for a run report, and no raw
 // answer text reaches it unescaped. A failing comments or pull request
-// fetch is an error, like continuePlan.
+// fetch is an error, like continuePlan — except a comment listing that stops
+// at getList's page cap (issue #416): that is a truncated listing, not a
+// failed one, so the findings comment is still built on the budget-spent
+// report-only path rather than dropped.
 func reviewPlan(gh github, pr int, result Result, haveResult bool, findings []Finding, sawSection bool) (action string, body string, used int, err error) {
 	stop := sanitizeStop(result.Stop)
 	blocking := blockingFindings(findings)
@@ -1009,11 +1012,25 @@ func reviewPlan(gh github, pr int, result Result, haveResult bool, findings []Fi
 	// #32) or stopped early (issue #49): an incomplete review with findings
 	// is a review with findings, not one with none.
 	var comments []issueComment
+	capped := false
 	if err := gh.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", pr), &comments); err != nil {
-		return "", "", 0, err
+		if !isPageCapError(err) {
+			return "", "", 0, err
+		}
+		// Issue #416: the listing is truncated, not broken, so it must
+		// never cost the findings comment — the only place the blocking
+		// severities and file:lines exist. A thread longer than
+		// maxListPages pages has certainly spent the fix budget, so the
+		// report-only path is taken with the findings in hand, exactly as
+		// when the cap is counted; used reports the whole budget.
+		capped = true
 	}
-	used = continuationsUsed(countReports(comments))
-	if !continuationCapReached(used) {
+	if capped {
+		used = maxContinuations
+	} else {
+		used = continuationsUsed(countReports(comments))
+	}
+	if !capped && !continuationCapReached(used) {
 		return "fix", reviewFixBody(blocking, findings, used, result.Model, stop), used, nil
 	}
 	return "report-only", reviewReportBody(fmt.Sprintf(
