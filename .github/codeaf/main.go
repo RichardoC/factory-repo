@@ -3863,12 +3863,20 @@ func runSummary() error {
 }
 
 func readLedger(path string) ([]LedgerLine, error) {
+	lines, _, err := readLedgerTorn(path)
+	return lines, err
+}
+
+// readLedgerTorn is readLedger that also returns how many torn lines it
+// skipped, for the one caller that must not take a lower bound: the spend
+// state pack hands on, which the weekly hold is computed from (issue #392).
+func readLedgerTorn(path string) ([]LedgerLine, int, error) {
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return nil, 0, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer f.Close()
 	var lines []LedgerLine
@@ -3890,12 +3898,12 @@ func readLedger(path string) ([]LedgerLine, error) {
 		lines = append(lines, line)
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if torn > 0 {
 		log.Printf("ledger: %s: skipped %d torn line(s); the cost and timing figures are a lower bound", path, torn)
 	}
-	return lines, nil
+	return lines, torn, nil
 }
 
 func ledgerTotal(lines []LedgerLine) float64 {

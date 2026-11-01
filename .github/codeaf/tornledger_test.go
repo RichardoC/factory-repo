@@ -2,10 +2,13 @@ package main
 
 import (
 	"log"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestReportSurvivesTornLedger (issue #392): the ledger is appended one bare
@@ -54,5 +57,58 @@ func TestReportSurvivesTornLedger(t *testing.T) {
 	}
 	if !strings.Contains(out, "$0.2500") {
 		t.Errorf("the report does not show the valid line's cost: %.600q", out)
+	}
+}
+
+// TestStatePackCountsRunCapOnTornLedger keeps the spend handed on
+// fail-closed (issue #392 review): the report may show a torn ledger's good
+// lines as a lower bound, but state pack's fallback feeds the weekly hold, so
+// with the proxy unreachable and a torn line in the ledger it counts the whole
+// run cap, as it always has for an unreadable ledger, while a clean ledger
+// still counts exactly what it holds.
+func TestStatePackCountsRunCapOnTornLedger(t *testing.T) {
+	cfg, err := loadConfig("models.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	// A port nothing listens on, so meteredRunSpend fails and the ledger is read.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := strconv.Itoa(l.Addr().(*net.TCPAddr).Port)
+	_ = l.Close()
+	t.Setenv("PROXY_PORT", port)
+	t.Setenv("GITHUB_RUN_ID", "88")
+	t.Setenv("GITHUB_RUN_ATTEMPT", "1")
+	t.Setenv("BASE_GENERATION", "0")
+	good := `{"ts":"2026-10-16T11:00:00Z","model":"m","cost_usd":0.1}` + "\n"
+	for _, c := range []struct {
+		name   string
+		ledger string
+		want   float64
+	}{
+		{"clean ledger", good, 0.1},
+		{"torn last line", good + `{"ts":"2026-10-16T11:0`, cfg.Limits.RunCreditUSD},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "ledger.jsonl")
+			if err := os.WriteFile(path, []byte(c.ledger), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("LEDGER_PATH", path)
+			out := filepath.Join(t.TempDir(), "codeaf-state")
+			if err := statePack(t.TempDir(), out, cfg, now); err != nil {
+				t.Fatalf("pack: %v", err)
+			}
+			meta, err := readRunMeta(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if meta.RunUSD != c.want {
+				t.Errorf("RunUSD = %v, want %v", meta.RunUSD, c.want)
+			}
+		})
 	}
 }
