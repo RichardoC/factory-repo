@@ -301,6 +301,10 @@ the authority for which labels the ticket carries:
   that might drop a label the sync does not own is worse than skipping one issue
   for one run. The caller retries issues individually, so the rest of the batch
   still lands, and the refusal is counted in `failed_ops`, which fails the run.
+- the run's opening snapshot pages labels the same way and refuses a truncated
+  page, because the snapshot feeds the cache hash: a label read that truncates
+  at Linear's default page size would stop the hash from seeing a managed
+  label removed by hand past the boundary.
 - protected labels are never asserted from the managed set either, so a
   misconfiguration cannot stamp another actor's control label onto a ticket that
   does not carry one.

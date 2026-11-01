@@ -200,6 +200,13 @@ the snapshot:
   Refusing beats paginating — a nested connection cannot be paged within the one
   query, and an issue with more than 250 labels is pathological rather than a
   case worth serving.
+- the run's opening snapshot pages labels the same way (`labels(first: 250)`
+  with a `pageInfo` check): a bare label read truncates at Linear's default
+  page size of 50, so a managed label past the boundary would be missing from
+  the snapshot's label set — hiding a manually removed managed label from the
+  cache hash, or manufacturing a spurious update and change comment. A
+  truncated snapshot page fails the snapshot, and with it the run, rather than
+  emitting a label set a label may be missing from.
 - protected labels are never asserted from the managed set, bounding the blast
   radius of a misconfiguration.
 - creates need no handling: there is no pre-existing label set to replace.
