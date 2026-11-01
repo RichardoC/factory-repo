@@ -262,6 +262,29 @@ func TestReadItems(t *testing.T) {
 	if _, err := readItems(path); err == nil {
 		t.Fatal("readItems accepted an object where an array belongs")
 	}
+	// `gh api --paginate` writes one array per page back to back: past 100
+	// open issues and pull requests the file is a stream of arrays
+	// (issue #426).
+	if err := os.WriteFile(path, []byte(`[{"number":1,"title":"first"}][{"number":2,"title":"second"},{"number":3,"title":"third"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	issues, err = readItems(path)
+	if err != nil {
+		t.Fatalf("readItems on concatenated arrays: %v", err)
+	}
+	if len(issues) != 3 || issues[0].Number != 1 || issues[1].Number != 2 || issues[2].Number != 3 {
+		t.Fatalf("readItems on concatenated arrays = %v, want numbers 1,2,3 in order", issues)
+	}
+	if issues[2].Title != "third" {
+		t.Fatalf("readItems on concatenated arrays lost page 2 fields: %+v", issues[2])
+	}
+	// An empty file holds no pages: no items, no error.
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if empty, err := readItems(path); err != nil || len(empty) != 0 {
+		t.Fatalf("readItems on an empty file = %v, %v", empty, err)
+	}
 	if _, err := readItems(filepath.Join(dir, "missing.json")); err == nil {
 		t.Fatal("readItems accepted a missing file")
 	}
@@ -2596,5 +2619,61 @@ func TestRunNextMaintainerCommentIgnoresHumanMarker(t *testing.T) {
 	}
 	if posts != 0 {
 		t.Fatalf("posts = %d; want the bot's marker to keep suppressing the comment", posts)
+	}
+}
+
+// TestNextPaginatedItems proves the queue survives a listing past one
+// page (issue #426): `gh api --paginate` writes one top-level JSON array per
+// page back to back, so with more than 100 open issues+pull requests the
+// file `harness next` reads is a stream of arrays. runNext read it as one
+// array, failed on the second '[' and exited non-zero — and the queue job is
+// fail-closed on a non-zero exit, so no run started to bring the count back
+// under 100. This fixture has 150 open items over two pages: 100 on page 1
+// (none queued) and 50 on page 2, the queued+priority issue among them. The
+// pick must come from page 2 and the command must not fail on the file.
+func TestNextPaginatedItems(t *testing.T) {
+	if _, err := loadConfig("models.json"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PROXY_MODELS", "models.json")
+	t.Setenv("CODEAF_WEEK_SPENT_USD", "1")
+
+	// page builds n open issues numbered from first, carrying labels; only
+	// the page-2 fixture queues one of them.
+	page := func(first, n int, labels string) string {
+		var b strings.Builder
+		b.WriteByte('[')
+		for i := range n {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, `{"number":%d,"state":"open","created_at":"2024-01-01T00:00:00Z","labels":%s}`,
+				first+i, labels)
+		}
+		b.WriteByte(']')
+		return b.String()
+	}
+	// 100 unqueued issues on page 1, then 50 on page 2 where #250 is the
+	// queued, priority, area-carrying issue the tick must pick.
+	const pick = 250
+	page2 := page(201, pick-201, `[{"name":"codeaf"}]`) +
+		`[{"number":250,"state":"open","created_at":"2024-01-01T00:00:00Z","body":"## Done when\n\n- tests pass\n\n## End-to-end check\n\nharness next prints number=250\n","labels":[{"name":"codeaf-queued"},{"name":"codeaf-priority"},{"name":"area:app/x"}]},` +
+		page(251, 300-pick, `[{"name":"codeaf"}]`)[1:]
+
+	dir := t.TempDir()
+	issuesPath := filepath.Join(dir, "issues.json")
+	runsPath := filepath.Join(dir, "runs.json")
+	if err := os.WriteFile(issuesPath, []byte(page(1, 100, `[{"name":"codeaf"}]`)+page2), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(runsPath, []byte(`[]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runNextStdout(t, issuesPath, runsPath)
+	if err != nil {
+		t.Fatalf("runNext on a two-page listing of 150 open items: %v", err)
+	}
+	if want := fmt.Sprintf("kind=issue\nnumber=%d\nlane=0\n", pick); out != want {
+		t.Fatalf("runNext on a two-page listing printed %q; want %q", out, want)
 	}
 }

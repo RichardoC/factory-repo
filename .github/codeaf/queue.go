@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"regexp"
@@ -893,15 +895,39 @@ func cappedBody(s string) string {
 	return s
 }
 
-// readItems reads a JSON array of issues, as
-// `gh api "repos/$REPO/issues?state=open&per_page=100"` prints it.
+// decodeItems decodes the open issues as the workflow writes them.
+// `gh api --paginate` prints one top-level JSON array per page, back to
+// back with nothing between them, so the data holds one or more
+// concatenated arrays. A single array decodes in one iteration. An object
+// where an array belongs is an error, and an empty file yields no items and
+// no error: there is nothing to decode, which is not a malformed file.
+func decodeItems(data []byte) ([]item, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	var items []item
+	for {
+		var page []item
+		err := dec.Decode(&page)
+		if errors.Is(err, io.EOF) {
+			return items, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, page...)
+	}
+}
+
+// readItems reads the open issues from path: one or more concatenated JSON
+// arrays, as `gh api --paginate "repos/$REPO/issues?state=open&per_page=100"`
+// prints them once there is more than a page of open issues and pull
+// requests (issue #426).
 func readItems(path string) ([]item, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	var items []item
-	if err := json.Unmarshal(data, &items); err != nil {
+	items, err := decodeItems(data)
+	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return items, nil
