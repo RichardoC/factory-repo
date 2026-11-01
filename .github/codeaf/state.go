@@ -735,11 +735,20 @@ func statePack(home, out string, cfg Config, now time.Time) error {
 	meta.BaseGeneration = base
 	if meta.RunUSD, err = meteredRunSpend(); err != nil {
 		log.Printf("warning: proxy unreachable (%v); using the ledger file", err)
-		lines, err := readLedger(os.Getenv("LEDGER_PATH"))
-		if err != nil {
+		lines, torn, err := readLedgerTorn(os.Getenv("LEDGER_PATH"))
+		switch {
+		case err != nil:
 			log.Printf("warning: ledger unreadable (%v); counting the whole run cap", err)
 			meta.RunUSD = cfg.Limits.RunCreditUSD
-		} else {
+		case torn > 0:
+			// The report may show a lower bound (issue #392), but the spend
+			// handed on is what the weekly hold is computed from, and a
+			// skipped line is a call whose cost is unknown: count the whole
+			// run cap, as an unreadable ledger always has, so a torn ledger
+			// can only over-count.
+			log.Printf("warning: ledger has %d torn line(s); counting the whole run cap", torn)
+			meta.RunUSD = max(cfg.Limits.RunCreditUSD, ledgerTotal(lines))
+		default:
 			meta.RunUSD = ledgerTotal(lines)
 		}
 	}

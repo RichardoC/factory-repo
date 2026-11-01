@@ -2445,11 +2445,40 @@ func nextLink(h string) string {
 	return ""
 }
 
+// repoIDs caches repository ids the paged reads have looked up, keyed by
+// "api repo" (issue #390): GitHub's real next links are relative to
+// /repositories/<id>/, and following one means checking <id> against this
+// repository's own id, read once from GET /repos/<repo>. The key carries
+// the API base so a stub server in a test never answers for another.
+var repoIDs sync.Map // string -> int64
+
+// repositoryID returns this repository's numeric id, read once from
+// GET /repos/<repo> and cached per API base and repository.
+func (g github) repositoryID() (int64, error) {
+	key := g.api + " " + g.repo
+	if id, ok := repoIDs.Load(key); ok {
+		return id.(int64), nil
+	}
+	var repo struct {
+		ID int64 `json:"id"`
+	}
+	// An empty path lands doGet on exactly /repos/<repo>.
+	if err := g.get("", &repo); err != nil {
+		return 0, err
+	}
+	if repo.ID == 0 {
+		return 0, fmt.Errorf("GET /repos/%s answered no repository id", g.repo)
+	}
+	repoIDs.LoadOrStore(key, repo.ID)
+	return repo.ID, nil
+}
+
 // listNext reduces a next link to the path the next page is read with. The
 // link is untrusted data: it is followed only when it leads back to this
-// API and this repository's prefix, and anything else — another host, a
-// relative link outside /repos/<repo>/, an unparseable URL — is an error,
-// because a listing that cannot be continued safely is a truncated one.
+// API and this repository, and anything else — another host, a relative
+// link outside /repos/<repo>/ or an unrecognised /repositories/<id>/, an
+// unparseable URL — is an error, because a listing that cannot be
+// continued safely is a truncated one.
 func (g github) listNext(h string) (string, error) {
 	next := nextLink(h)
 	if next == "" {
@@ -2463,14 +2492,45 @@ func (g github) listNext(h string) (string, error) {
 		return "", fmt.Errorf("next link %q leaves the API host", next)
 	}
 	uri := u.RequestURI() // path and query, never a scheme or host
-	prefix := "/repos/" + g.repo + "/"
-	if !strings.HasPrefix(uri, prefix) {
-		return "", fmt.Errorf("next link %q leaves the repository", next)
+	// A "." or ".." segment could climb out of the repository's path once a
+	// server or proxy normalises it ("/repos/<repo>/../../orgs/x"), so the
+	// prefix checks below are only meaningful on a path without them.
+	path, _, _ := strings.Cut(uri, "?")
+	for _, seg := range strings.Split(path, "/") {
+		if unescaped, err := url.PathUnescape(seg); err != nil || unescaped == "." || unescaped == ".." {
+			return "", fmt.Errorf("next link %q has a relative path segment", next)
+		}
 	}
-	// The prefix ends with the repository's separator, so what follows it
-	// is the path below /repos/<repo> without its leading slash — which
-	// doGet expects, like the one-shot paths it is handed.
-	return "/" + strings.TrimPrefix(uri, prefix), nil
+	prefix := "/repos/" + g.repo + "/"
+	if strings.HasPrefix(uri, prefix) {
+		// The prefix ends with the repository's separator, so what follows it
+		// is the path below /repos/<repo> without its leading slash — which
+		// doGet expects, like the one-shot paths it is handed.
+		return "/" + strings.TrimPrefix(uri, prefix), nil
+	}
+	// GitHub's real next links are numeric (issue #390): the issues list, for
+	// one, is offered as <https://api.github.com/repositories/<id>/issues?...>;
+	// rel="next". The id segment is untrusted, so it is checked against this
+	// repository's own id — read once from GET /repos/<repo> — and only an
+	// exact match is translated to the /repos/<owner>/<repo>/ form doGet
+	// builds its requests with. A link naming another id still names
+	// another repository's data, however the segments are spelled.
+	if rest, ok := strings.CutPrefix(uri, "/repositories/"); ok {
+		id, tail, _ := strings.Cut(rest, "/")
+		number, err := strconv.ParseInt(id, 10, 64)
+		if err != nil {
+			return "", fmt.Errorf("next link %q names repository %q, not an id", next, id)
+		}
+		mine, err := g.repositoryID()
+		if err != nil {
+			return "", fmt.Errorf("checking next link %q: %v", next, err)
+		}
+		if number != mine {
+			return "", fmt.Errorf("next link %q leaves the repository: it names repository id %d, this repository is id %d", next, number, mine)
+		}
+		return "/" + tail, nil
+	}
+	return "", fmt.Errorf("next link %q leaves the repository", next)
 }
 
 // isPageCapError reports whether err is getList's page-cap error, the one
@@ -3803,25 +3863,47 @@ func runSummary() error {
 }
 
 func readLedger(path string) ([]LedgerLine, error) {
+	lines, _, err := readLedgerTorn(path)
+	return lines, err
+}
+
+// readLedgerTorn is readLedger that also returns how many torn lines it
+// skipped, for the one caller that must not take a lower bound: the spend
+// state pack hands on, which the weekly hold is computed from (issue #392).
+func readLedgerTorn(path string) ([]LedgerLine, int, error) {
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return nil, 0, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer f.Close()
 	var lines []LedgerLine
+	torn := 0
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 1<<20), 1<<20)
 	for scanner.Scan() {
 		var line LedgerLine
 		if err := json.Unmarshal(scanner.Bytes(), &line); err != nil {
-			return nil, fmt.Errorf("%s: %w", path, err)
+			// Issue #392: the ledger is appended one bare write per line
+			// while the run job has a hard wall clock, so a proxy killed
+			// mid-write leaves a partial final line -- and that is exactly
+			// the timed-out run whose figures matter most. The good lines
+			// still decode per line, so skip the torn one and say the
+			// figures are a lower bound; only a scanner error stays fatal.
+			torn++
+			continue
 		}
 		lines = append(lines, line)
 	}
-	return lines, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return nil, 0, err
+	}
+	if torn > 0 {
+		log.Printf("ledger: %s: skipped %d torn line(s); the cost and timing figures are a lower bound", path, torn)
+	}
+	return lines, torn, nil
 }
 
 func ledgerTotal(lines []LedgerLine) float64 {

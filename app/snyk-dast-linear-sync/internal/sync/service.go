@@ -1563,6 +1563,16 @@ func stripVisibleFingerprintLine(description string) string {
 }
 
 func managedLabels(labelCfg config.LabelConfig, finding model.Finding) []string {
+	// Label management off (LINEAR_MANAGED_LABEL=off) turns off the whole
+	// managed set, derived labels included. The check-type and target-type
+	// labels can still be configured (mappings or defaults), so returning
+	// early here is what stops them being asserted — and resolved, and
+	// failing the run when the label is missing in Linear — after the
+	// operator disabled label management.
+	if !labelCfg.Enabled() {
+		return nil
+	}
+
 	labels := make([]string, 0, 4)
 	if managed := strings.TrimSpace(labelCfg.Managed); managed != "" {
 		labels = append(labels, managed)
@@ -1594,6 +1604,12 @@ func managedLabels(labelCfg config.LabelConfig, finding model.Finding) []string 
 // change comments a "why" instead of just listing added labels.
 func buildLabelReasons(labelCfg config.LabelConfig, finding model.Finding) map[string]string {
 	reasons := make(map[string]string)
+
+	// Mirror managedLabels: with label management off no managed label is
+	// written, so no label needs a "why" in the change comment either.
+	if !labelCfg.Enabled() {
+		return reasons
+	}
 
 	checkType := strings.ToLower(strings.TrimSpace(finding.CheckType))
 	if checkType != "" {

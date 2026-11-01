@@ -136,6 +136,17 @@ type LabelConfig struct {
 	Protected []string
 }
 
+// Enabled reports whether label management is on. An empty Managed label means
+// the operator turned label management off (LINEAR_MANAGED_LABEL=off), and
+// that turns off the whole managed set, not just the global label: the
+// derived check-type and target-type labels can come from mappings that stay
+// configured after management was switched off, so without this gate they
+// would keep being asserted — and failing the run when Linear cannot resolve
+// them — even though LINEAR_MANAGED_LABEL=off promised no label management.
+func (c LabelConfig) Enabled() bool {
+	return strings.TrimSpace(c.Managed) != ""
+}
+
 type DueDateConfig struct {
 	CriticalDays int
 	HighDays     int
