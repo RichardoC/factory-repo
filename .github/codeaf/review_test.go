@@ -1306,8 +1306,10 @@ func TestReviewFooter(t *testing.T) {
 			t.Errorf("footer missing %q: %q", want, body)
 		}
 	}
-	// A missing ledger reads as zero; an unreadable one as unknown, not as
-	// zero; and the stop word is sanitized however it arrives.
+	// A missing ledger reads as zero; a real read error as unknown, not as
+	// zero; and the stop word is sanitized however it arrives. Since issue
+	// #392 a ledger whose lines do not decode is no longer an error: the
+	// bad lines are skipped and the spend reads as the lower bound $0.0000.
 	t.Setenv("LEDGER_PATH", "")
 	if body := reviewFooter("", ""); !strings.Contains(body, "$0.0000") || !strings.Contains(body, "`(unknown)`") {
 		t.Errorf("footer with no ledger and no model: %q", body)
@@ -1316,6 +1318,15 @@ func TestReviewFooter(t *testing.T) {
 	if err := os.WriteFile(path, []byte("not json\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("LEDGER_PATH", path)
+	if body := reviewFooter("", ""); !strings.Contains(body, "metered spend this run: $0.0000") {
+		t.Errorf("footer with a ledger of torn lines: %q", body)
+	}
+	// A ledger that cannot be read at all still reads as unknown.
+	t.Setenv("LEDGER_PATH", filepath.Join(t.TempDir(), "missing-dir", "ledger.jsonl"))
+	// The directory does not exist, so readLedger reports it as missing, not
+	// broken; use a directory as the path for a real read error.
+	path = t.TempDir()
 	t.Setenv("LEDGER_PATH", path)
 	if body := reviewFooter("", ""); !strings.Contains(body, "metered spend this run: (unknown)") || strings.Contains(body, "$0.0000") {
 		t.Errorf("footer with an unreadable ledger: %q", body)
