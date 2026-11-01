@@ -1078,7 +1078,10 @@ func (f *file) Lock(elock sqlite3vfs.LockType) error {
 // mutateLock returns the CAS mutation for a single-step Lock transition
 // (NONE->SHARED or SHARED->RESERVED). The decision is made from the state
 // just read, so it holds even when this file's local belief is stale; the
-// invalid-request errors match the ones Lock rejects locally.
+// invalid-request errors match the ones Lock rejects locally. A state
+// holding no entry for a file that believes it holds SHARED means its lease
+// lapsed and another process pruned it: errLockLeaseLost makes Lock reset
+// the local state instead of writing under a false belief.
 func (f *file) mutateLock(elock sqlite3vfs.LockType) func(*lockView) error {
 	return func(st *lockView) error {
 		own := st.levelOf(f.holderID)
@@ -1101,6 +1104,17 @@ func (f *file) mutateLock(elock sqlite3vfs.LockType) func(*lockView) error {
 		case sqlite3vfs.LockReserved:
 			// SHARED -> RESERVED. At most one writer of any kind may exist.
 			if own != sqlite3vfs.LockShared {
+				if own == sqlite3vfs.LockNone && f.lockKnown && f.lockLevel == sqlite3vfs.LockShared {
+					// The state just read no longer has this file's shared
+					// entry although this file believes it holds SHARED: the
+					// lease lapsed and another process pruned it. Report the
+					// loss (mirroring mutateLockExclusiveAcquire) so
+					// noteLeaseLost resets the local state and the sector
+					// write path fails with BusyError, instead of a plain
+					// "invalid transition" that leaves the file writing
+					// under a lock the cluster has given away.
+					return errLockLeaseLost
+				}
 				return errors.New("can only transition to Reserved lock from Shared lock")
 			}
 			if st.writer != nil {
@@ -1117,13 +1131,28 @@ func (f *file) mutateLock(elock sqlite3vfs.LockType) func(*lockView) error {
 // mutateLockExclusiveClaim is the first CAS step of Lock(EXCLUSIVE): claim
 // the writer slot for this file at PENDING, promoting its own RESERVED
 // writer in place. A writer held by another file is a conflict; this file
-// already holding PENDING is a no-op (a retry after BusyError).
+// already holding PENDING is a no-op (a retry after BusyError). A state
+// holding no entry for this file, which believed it held SHARED or better,
+// means the lease lapsed and another process pruned it: errLockLeaseLost
+// makes Lock reset the local state instead of writing under a false belief.
 func (f *file) mutateLockExclusiveClaim(st *lockView) error {
 	own := st.levelOf(f.holderID)
 	if sqlite3vfs.LockExclusive <= own {
 		return nil // already exclusive: nothing to claim
 	}
 	if own == sqlite3vfs.LockNone {
+		// The state just read no longer has any entry for this file. When
+		// this file believed it held SHARED or better, that belief rests on
+		// a lease that lapsed and was pruned by another process: report
+		// errLockLeaseLost (mirroring mutateLockExclusiveAcquire, the
+		// acquire step below) so noteLeaseLost resets the local state and
+		// the sector write path fails with BusyError, instead of a plain
+		// "invalid transition" that leaves the file writing under a lock
+		// the cluster has given away. A file that never held the lock at
+		// all is a genuinely invalid request and keeps the plain error.
+		if f.lockKnown && f.lockLevel >= sqlite3vfs.LockShared {
+			return errLockLeaseLost
+		}
 		return errors.New("invalid lock transition requested")
 	}
 	if st.writer == nil {
