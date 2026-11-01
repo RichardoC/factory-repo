@@ -2445,11 +2445,6 @@ func nextLink(h string) string {
 	return ""
 }
 
-// listNext reduces a next link to the path the next page is read with. The
-// link is untrusted data: it is followed only when it leads back to this
-// API and this repository's prefix, and anything else — another host, a
-// relative link outside /repos/<repo>/, an unparseable URL — is an error,
-// because a listing that cannot be continued safely is a truncated one.
 // repoIDs caches repository ids the paged reads have looked up, keyed by
 // "api repo" (issue #390): GitHub's real next links are relative to
 // /repositories/<id>/, and following one means checking <id> against this
@@ -2497,6 +2492,15 @@ func (g github) listNext(h string) (string, error) {
 		return "", fmt.Errorf("next link %q leaves the API host", next)
 	}
 	uri := u.RequestURI() // path and query, never a scheme or host
+	// A "." or ".." segment could climb out of the repository's path once a
+	// server or proxy normalises it ("/repos/<repo>/../../orgs/x"), so the
+	// prefix checks below are only meaningful on a path without them.
+	path, _, _ := strings.Cut(uri, "?")
+	for _, seg := range strings.Split(path, "/") {
+		if unescaped, err := url.PathUnescape(seg); err != nil || unescaped == "." || unescaped == ".." {
+			return "", fmt.Errorf("next link %q has a relative path segment", next)
+		}
+	}
 	prefix := "/repos/" + g.repo + "/"
 	if strings.HasPrefix(uri, prefix) {
 		// The prefix ends with the repository's separator, so what follows it

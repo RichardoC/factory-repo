@@ -4415,7 +4415,7 @@ func TestNextLink(t *testing.T) {
 // naming another repository's id, and a link on another host, are refused
 // rather than followed.
 func TestListNextFollowsGitHubLinkForms(t *testing.T) {
-	const repoID = 1420977662 // the id GitHub answers for RichardoC/factory-repo
+	const repoID = 4242 // a made-up repository id
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/o/r":
@@ -4455,8 +4455,18 @@ func TestListNextFollowsGitHubLinkForms(t *testing.T) {
 			errex:  regexp.MustCompile(`names repository "o", not an id`),
 		},
 		{
+			name:   "a /repos/ link that climbs out with dot segments",
+			header: fmt.Sprintf(`<%s/repos/o/r/../../orgs/x/repos?page=2>; rel="next"`, server.URL),
+			errex:  regexp.MustCompile(`relative path segment`),
+		},
+		{
+			name:   "a numeric link that climbs out with escaped dot segments",
+			header: fmt.Sprintf(`<%s/repositories/%d/%%2e%%2e/%%2e%%2e/orgs/x?page=2>; rel="next"`, server.URL, repoID),
+			errex:  regexp.MustCompile(`relative path segment`),
+		},
+		{
 			name:   "a link on another host",
-			header: `<https://evil.example.com/repositories/1420977662/issues/7/comments?page=2>; rel="next"`,
+			header: `<https://evil.example.com/repositories/4242/issues/7/comments?page=2>; rel="next"`,
 			errex:  regexp.MustCompile(`leaves the API host`),
 		},
 	} {
