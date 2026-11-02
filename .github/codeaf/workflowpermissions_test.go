@@ -802,7 +802,7 @@ func TestWorkflowPermissionsCoverAPIUse(t *testing.T) {
 		// The copied line goes into the run: block of the queue job, at
 		// the same indentation as the surrounding script.
 		body := string(text)
-		marker := "          gh workflow run codeaf.yml --ref \"$DEFAULT_BRANCH\" -f plan=true -f \"lane=$LANE\""
+		marker := "          \"$HARNESS\" gh-retry -- gh workflow run codeaf.yml --ref \"$DEFAULT_BRANCH\" -f plan=true -f \"lane=$LANE\"" // issue #429 wrapped the dispatch
 		if !strings.Contains(body, marker) {
 			t.Fatalf("the queue job's plan dispatch line moved; update this subtest's anchor")
 		}
