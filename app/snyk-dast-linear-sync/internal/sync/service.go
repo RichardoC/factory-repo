@@ -1003,6 +1003,20 @@ func truncateForTitle(value string) string {
 	return value[:77] + "..."
 }
 
+// sanitizeSnykProse neutralizes HTML-comment openings in Snyk-controlled free
+// text by replacing "<!--" with "<!- -", mirroring embedSnykProse in the
+// sibling app/snyk-linear-sync. Without this, scanned-application content that
+// reaches finding.Fix or finding.CorrelationMarkdown could carry a
+// line-anchored "<!-- snyk-dast-linear-sync" marker and a fake "Fingerprint:"
+// line, spoofing the ticket fingerprint or hiding it. The replacement never
+// reintroduces the substring "<!--" (the inserted space always separates the
+// two dashes), so the transformation is idempotent:
+// sanitizeSnykProse(sanitizeSnykProse(x)) == sanitizeSnykProse(x). That keeps
+// description comparison/hashing stable between runs.
+func sanitizeSnykProse(text string) string {
+	return strings.ReplaceAll(text, "<!--", "<!- -")
+}
+
 // issueDescription builds the managed Linear issue body. It is optimized for
 // fast developer triage: the vulnerability and severity lead, the target and
 // vulnerable request context follow, then the fix and Snyk DAST links, then the
@@ -1060,7 +1074,7 @@ func issueDescription(managedLabels []string, finding model.Finding) string {
 	if fix := strings.TrimSpace(finding.Fix); fix != "" {
 		lines = append(lines, "")
 		lines = append(lines, "### Fix")
-		lines = append(lines, fix)
+		lines = append(lines, sanitizeSnykProse(fix))
 	}
 
 	if len(finding.CorrelationMarkdown) > 0 {
@@ -1069,7 +1083,7 @@ func issueDescription(managedLabels []string, finding model.Finding) string {
 		lines = append(lines, "_Linked Snyk Code source vulnerability responsible for this runtime finding._")
 		for _, block := range finding.CorrelationMarkdown {
 			lines = append(lines, "")
-			lines = append(lines, block)
+			lines = append(lines, sanitizeSnykProse(block))
 		}
 	}
 
@@ -1528,22 +1542,34 @@ func upsertManagedMetadata(description, fingerprint string, managedLabels []stri
 // prevents false matches where the marker string appears mid-sentence in
 // user-written text (e.g. "See <!-- snyk-dast-linear-sync notes -->"), which
 // could corrupt the description if treated as a metadata block.
+//
+// It returns the LAST line-anchored occurrence, not the first. Ticket
+// descriptions embed free-form Snyk-controlled prose (finding.Fix and
+// finding.CorrelationMarkdown) ABOVE the real metadata block, since the sync
+// always appends the managed metadata block last. If that prose contains a
+// line-anchored marker (scanned-application content can reach
+// CorrelationMarkdown), returning the first occurrence would hijack this
+// function with a bogus block and corrupt the description, and could also
+// break ticket matching via extractFingerprint/extractManagedLabels in the
+// Linear client. The real, sync-managed block is always the last one.
+// Keep this in sync with the equivalent function in internal/linear/client.go.
 func findMetadataBlockStart(description string) int {
 	header := metadataHeaderStart()
+	last := -1
 	for i := 0; i <= len(description)-len(header); {
 		idx := strings.Index(description[i:], header)
 		if idx < 0 {
-			return -1
+			break
 		}
 		absIdx := i + idx
 		// The marker must be at the start of a line: either position 0
 		// or preceded by a newline.
 		if absIdx == 0 || description[absIdx-1] == '\n' {
-			return absIdx
+			last = absIdx
 		}
 		i = absIdx + 1
 	}
-	return -1
+	return last
 }
 
 func metadataHeaderStart() string {

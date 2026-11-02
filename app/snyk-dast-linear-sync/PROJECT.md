@@ -132,6 +132,19 @@ target (host, falling back to target name) and the vulnerable request
 The metadata block also records the managed automation label set when label
 management is enabled.
 
+Snyk DAST controls part of the body it does not own the meaning of: the fix
+text and every Snyk Code correlation block are embedded free text, and scanned
+application content can reach the correlation markdown. Each such block is
+therefore sanitized before embedding: every HTML comment opening (`<!--`)
+becomes `<!- -`. The replacement can never reintroduce `<!--`, so sanitizing is
+idempotent and description comparison stays stable. As a second line of
+defence, metadata block detection returns the *last* line-anchored
+`snyk-dast-linear-sync` marker rather than the first, because the sync always
+appends the managed block last. Together these stop embedded prose from
+spoofing (or hiding) the fingerprint and managed labels, and stop
+`upsertManagedMetadata` from rewriting the prose region instead of the real
+block.
+
 Linear may rewrite parts of the description body when rendering or storing
 markdown. The sync therefore normalizes known Linear formatting changes during
 compare and cache hashing.
@@ -439,7 +452,9 @@ instead, and the next run re-examines everything against live data.
 
 ## Safety Assumptions
 
-- The metadata block must remain intact.
+- The metadata block must remain intact. It is the last line-anchored
+  `<!-- snyk-dast-linear-sync` marker in the description; embedded Snyk DAST
+  prose has its comment openings neutralized and cannot displace it.
 - The managed description body is owned by this tool.
 - The Linear team may be shared with another sync, so the snapshot query must
   scope to this tool's own tickets by exact predicates (title prefix, managed

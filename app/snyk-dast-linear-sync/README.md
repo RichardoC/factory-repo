@@ -212,6 +212,13 @@ managed_labels: snyk-dast-automation,snyk-dast-api
 
 Changing or removing that block can cause duplicate issues or prevent updates from matching the correct Linear issue.
 
+Because Snyk-supplied text (the fix description and the Snyk Code correlation
+block) is embedded in the body and can quote scanned-application content, any
+HTML comment opening in it is neutralized (`<!--` becomes `<!- -`) before it is
+embedded. Metadata block detection also takes the *last* line-anchored marker,
+since the managed block is always appended last. Prose therefore cannot spoof or
+hide the fingerprint, and an update rewrites only the real block.
+
 ## Issue Format
 
 The synced issue body is optimized for fast developer triage:
