@@ -154,6 +154,41 @@ func TestRewriteRequest(t *testing.T) {
 			t.Errorf("%s should have been removed", key)
 		}
 	}
+
+	// Issue #452: an infinite-mode model must be forced to stream, even when
+	// the client sends no "stream" field at all, so the request upstream
+	// requires is what every client sends.
+	infinite := mustResolve(t, testModels(t), "synthetic/deepseek-v4.1-flash-infinite")
+	if err := json.Unmarshal([]byte(`{"model":"synthetic/deepseek-v4.1-flash-infinite","messages":[]}`), &body); err != nil {
+		t.Fatal(err)
+	}
+	stream, err = RewriteRequest(body, infinite)
+	if err != nil || !stream {
+		t.Fatalf("infinite: stream=%v err=%v, want forced streaming", stream, err)
+	}
+	if got := string(body["stream"]); got != "true" {
+		t.Errorf("infinite: stream = %s, want forced true", got)
+	}
+	if got := string(body["stream_options"]); got != `{"include_usage":true}` {
+		t.Errorf("infinite: stream_options = %s, want include_usage", got)
+	}
+	// An ordinary model with no "stream" field is untouched: no field added,
+	// no stream_options, and the proxy relays a non-streaming response. A
+	// fresh map: Unmarshal into the old one would keep the forced "stream".
+	body = nil
+	if err := json.Unmarshal([]byte(`{"model":"zai-org/glm-5.3-flash","messages":[]}`), &body); err != nil {
+		t.Fatal(err)
+	}
+	stream, err = RewriteRequest(body, flash)
+	if err != nil || stream {
+		t.Fatalf("ordinary: stream=%v err=%v, want false/nil", stream, err)
+	}
+	if _, ok := body["stream"]; ok {
+		t.Error("ordinary: stream should stay unset")
+	}
+	if _, ok := body["stream_options"]; ok {
+		t.Error("ordinary: stream_options should stay unset")
+	}
 }
 
 func TestCatalogIsParseableByCodeAF(t *testing.T) {
@@ -3840,6 +3875,51 @@ func proxyFor145(t *testing.T, modelID string, interval time.Duration, upstream 
 	return &proxy{upstream: upstream.URL, apiKey: "k", ledger: filepath.Join(t.TempDir(), "l.jsonl"),
 		runCap: 5, weekCap: 20, models: models, client: upstream.Client(),
 		slots: newSlots(models, 1), heartbeatEvery: interval, headerGrace: time.Second}
+}
+
+// TestProxyForcesStreamingForInfiniteModel (issue #452): synthetic.new
+// requires stream:true for infinite-mode models, so the proxy must add it to a
+// non-streaming client request and relay the answer as a stream. The ordinary
+// model case (stream stays unset) is covered at the RewriteRequest level.
+func TestProxyForcesStreamingForInfiniteModel(t *testing.T) {
+	var seen map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = map[string]any{}
+		_ = json.NewDecoder(r.Body).Decode(&seen)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"choices":[{"delta":{"content":"hi"}}],"model":"x"}`+"\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	p := proxyFor145(t, "synthetic/deepseek-v4.1-flash-infinite", 20*time.Millisecond, upstream)
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	// No "stream" field in the client request at all.
+	resp, err := http.Post(server.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"synthetic/deepseek-v4.1-flash-infinite","messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("response %d %s, want a streamed 200\n%s", resp.StatusCode, resp.Header.Get("Content-Type"), body)
+	}
+	if seen["stream"] != true {
+		t.Errorf("upstream saw stream = %v, want forced true", seen["stream"])
+	}
+	options, _ := seen["stream_options"].(map[string]any)
+	if options == nil || options["include_usage"] != true {
+		t.Errorf("upstream saw stream_options = %v, want include_usage", seen["stream_options"])
+	}
+	got := string(body)
+	for _, want := range []string{`"content":"hi"`, "data: [DONE]"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("stream is not intact: missing %q\n%s", want, got)
+		}
+	}
 }
 
 // TestProxyHeartbeatsWhileWaitingForUpstreamHeaders (issue #145): an upstream
