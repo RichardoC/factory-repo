@@ -987,6 +987,15 @@ func RewriteRequest(body map[string]json.RawMessage, m Model) (stream bool, err 
 	if raw, ok := body["stream"]; ok {
 		_ = json.Unmarshal(raw, &stream)
 	}
+	if strings.HasPrefix(m.Upstream, "infinite:") {
+		// Issue #452: synthetic.new requires stream:true for infinite-mode
+		// models (the "infinite:" upstream alias), whatever the client sent
+		// -- a non-streaming request dies upstream with a request-shape
+		// error. Force it and take the stream_options branch below, so the
+		// proxy relays the response as a stream too.
+		body["stream"] = json.RawMessage("true")
+		stream = true
+	}
 	if stream {
 		options := map[string]json.RawMessage{}
 		if raw, ok := body["stream_options"]; ok {
