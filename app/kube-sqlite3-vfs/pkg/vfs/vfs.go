@@ -1234,6 +1234,22 @@ func (f *file) mutateUnlock(elock sqlite3vfs.LockType) func(*lockView) error {
 	return func(st *lockView) error {
 		own := st.levelOf(f.holderID)
 		if own < elock {
+			// The state just read holds nothing for this file although this
+			// file believed it held elock or more — its pre-CAS local level,
+			// still in f.lockLevel because adoptLockState runs only on
+			// success: the lease lapsed and another process pruned the
+			// entries. Report errLockLeaseLost (mirroring the issue #412
+			// guards on the Lock path) so noteLeaseLost resets the local
+			// state and sticks the loss for the sector read/write path,
+			// instead of the plain transition error that leaves
+			// renewForIO's guards unset — lockKnown false, leaseLost false —
+			// and WriteAt writing sectors under a lock the cluster has given
+			// away. A file whose local level never reached elock never held
+			// what it is unlocking: a genuinely invalid request keeps the
+			// plain error.
+			if f.lockLevel >= elock {
+				return errLockLeaseLost
+			}
 			return fmt.Errorf("cannot unlock to a level %s above the current lock level %s", elock, own)
 		}
 		if own == elock {

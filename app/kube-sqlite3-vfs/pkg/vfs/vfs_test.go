@@ -1929,6 +1929,50 @@ func TestLeaseLossOnExclusiveClaim(t *testing.T) {
 	assertLossGatesSectorWrite(t, fcs, f, kept)
 }
 
+// TestLeaseLossOnUnlockDowngrade pins the lapsed-lease behaviour of the
+// downgrade step of Unlock (issue #437): with this file's writer and shared
+// entries pruned from the lock ConfigMap while the local state still
+// believes RESERVED, Unlock(SHARED) must report errLockLeaseLost, not the
+// plain "cannot unlock to a level above the current lock level" transition
+// error. The plain error leaves leaseLost unset while Unlock has already
+// cleared lockKnown, so renewForIO finds both guards down and WriteAt goes
+// on writing sectors under a lock the cluster has given away. (A file that
+// never held the lock keeps the plain transition error: Unlock's early
+// guard rejects it before the CAS, and mutateUnlock only reports the loss
+// when the pre-CAS local level reached elock.)
+func TestLeaseLossOnUnlockDowngrade(t *testing.T) {
+	fcs := fake.NewSimpleClientset()
+	v := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3)
+
+	f := openTestFile(t, v, "lost-unlock.db")
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("Lock(Shared): %v", err)
+	}
+	if err := f.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatalf("Lock(Reserved): %v", err)
+	}
+	kept := make([]byte, 64)
+	fillPattern(kept)
+	mustWriteAt(t, f, kept, 0)
+
+	// Another process prunes this file's writer entry — with its shared
+	// entry, whose lease is the same — while the local state still
+	// believes RESERVED.
+	pruneHolderFromLockCM(t, fcs, f, true, true)
+	err := f.Unlock(sqlite3vfs.LockShared)
+	if !errors.Is(err, errLockLeaseLost) {
+		t.Fatalf("Unlock(Shared) after the entries were pruned = %v, want errLockLeaseLost", err)
+	}
+	if errors.Is(err, sqlite3vfs.BusyError) {
+		t.Fatalf("Unlock(Shared) after the prune = %v, want the distinct lease-loss error and not sqlite3vfs.BusyError: BUSY would make sqlite retry a request whose holder state is gone", err)
+	}
+	if f.lockLevel != sqlite3vfs.LockNone || !f.lockKnown || !f.leaseLost {
+		t.Errorf("after the unlock lease loss local state = (level %v, known %v, lost %v), want (NONE, true, true)", f.lockLevel, f.lockKnown, f.leaseLost)
+	}
+
+	assertLossGatesSectorWrite(t, fcs, f, kept)
+}
+
 // fakeClock is the injectable clock the lease tests drive: the test advances
 // it instead of sleeping, and the VFS's whole lock path stamps, prunes and
 // renews against it through vfs.clock. It is called from the test goroutine
