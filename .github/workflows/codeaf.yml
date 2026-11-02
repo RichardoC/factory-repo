@@ -884,7 +884,7 @@ jobs:
               fi
               echo "::notice::the pull request for $BRANCH already exists (#$pr); a create that timed out had opened it"
             fi
-            gh pr edit "$pr" --add-label "$CODEAF_LABEL"
+            "$HARNESS" gh-retry -- gh pr edit "$pr" --add-label "$CODEAF_LABEL"
           else
             # This run went onto an existing PR's branch (a /codeaf comment or
             # a continuation): flip the draft marker to how the run ended.
@@ -901,7 +901,7 @@ jobs:
           # review run passes it (codeaf-review-passed).
           if [ "$POLICY_APPROVED" = true ]; then
             gh label create codeaf-workflow-change --color B60205 --description "Workflow change published on the workflow policy; merge only after the independent review passes" 2>/dev/null || true
-            gh pr edit "$pr" --add-label codeaf-workflow-change || echo "::warning::could not label #$pr codeaf-workflow-change"
+            "$HARNESS" gh-retry -- gh pr edit "$pr" --add-label codeaf-workflow-change || echo "::warning::could not label #$pr codeaf-workflow-change"
           fi
           # The labels that name a PR for its own review or continuation run
           # (issue #137): publish only adds one, the queue starts the run.
@@ -910,7 +910,13 @@ jobs:
           gh label create codeaf-review-needed --color 1d76db --description "The queue starts a read-only review run for this PR" 2>/dev/null || true
           gh label create codeaf-continue-needed --color d4c5f9 --description "The queue continues this PR (brings the base branch in and resolves conflicts)" 2>/dev/null || true
           echo "number=$pr" >> "$GITHUB_OUTPUT"
-          gh workflow run ci.yml --ref "$BRANCH" || echo "::warning::could not dispatch CI"
+          # Issue #429: the fail-soft gh calls in this step and the
+          # queue-start dispatch below go through gh-retry, so one
+          # transient GitHub 5xx cannot silently drop a label (and with
+          # it the review, continuation or fix run) or skip CI. gh-retry
+          # retries a 5xx or a network error and never a 4xx; the
+          # ::warning stays as the after-retries fallback.
+          "$HARNESS" gh-retry -- gh workflow run ci.yml --ref "$BRANCH" || echo "::warning::could not dispatch CI"
 
       - name: Continue or hand over
         # Between the PR step and Report on purpose: continue-plan counts the
@@ -941,7 +947,7 @@ jobs:
               # #137): it dispatches with the `pr` input and a free lane. If
               # the label fails, a maintainer can continue it by hand.
               gh pr comment "$PR_NUMBER" --body-file "$CONTINUE_COMMENT_PATH" || true
-              gh pr edit "$PR_NUMBER" --add-label codeaf-continue-needed \
+              "$HARNESS" gh-retry -- gh pr edit "$PR_NUMBER" --add-label codeaf-continue-needed \
                 || echo "::warning::could not queue the continuation of #$PR_NUMBER automatically; a maintainer can continue it by hand with a /codeaf comment on the PR"
               ;;
             cap)
@@ -964,7 +970,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
-          gh pr edit "$PR_NUMBER" --add-label codeaf-review-needed \
+          "$HARNESS" gh-retry -- gh pr edit "$PR_NUMBER" --add-label codeaf-review-needed \
             || echo "::warning::could not queue the independent review of #$PR_NUMBER automatically; a maintainer can start it by hand"
 
       - name: Independent review findings
@@ -994,15 +1000,15 @@ jobs:
               # the queue starts the fix run on its branch (issue #137; the
               # gate's `pr` input, with a free lane). If the label fails, a
               # maintainer can start it by hand.
-              gh pr edit "$NUMBER" --remove-label "$label" || true
-              gh pr edit "$NUMBER" --add-label codeaf-continue-needed \
+              "$HARNESS" gh-retry -- gh pr edit "$NUMBER" --remove-label "$label" || true
+              "$HARNESS" gh-retry -- gh pr edit "$NUMBER" --add-label codeaf-continue-needed \
                 || echo "::warning::could not queue the fix run for #$NUMBER automatically; a maintainer can start it by hand with a /codeaf comment on the PR"
               ;;
             label)
               # Nothing blocking: make sure the label exists, then add it, so
               # a person (or a merge rule) can merge with confidence.
               gh label create "$label" --color 0e8a16 --description "Independent CodeAF review found no blocking findings" || true
-              gh pr edit "$NUMBER" --add-label "$label"
+              "$HARNESS" gh-retry -- gh pr edit "$NUMBER" --add-label "$label"
               ;;
           esac
 
@@ -1145,9 +1151,32 @@ jobs:
     permissions:
       actions: write
     steps:
+      - name: Paths
+        run: echo "HARNESS=$RUNNER_TEMP/harness/harness" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Always the default branch: this job holds a token with write
+          # scopes, so it must never build or run PR code.
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/codeaf
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: .github/codeaf/go.mod
+          cache: false
+      - name: Build the harness
+        # Issue #429: the dispatch below goes through gh-retry, so this
+        # job needs the harness. Exactly as in the queue and publish
+        # jobs: from the default branch's checkout, never from a PR or
+        # anything an earlier job produced.
+        run: |
+          cp -r .github/codeaf "$RUNNER_TEMP/harness"
+          (cd "$RUNNER_TEMP/harness" && go build -trimpath -o harness .)
+
       - env:
           GH_TOKEN: ${{ github.token }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          gh workflow run codeaf-queue.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f finished_run="$GITHUB_RUN_ID" \
+          "$HARNESS" gh-retry -- gh workflow run codeaf-queue.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f finished_run="$GITHUB_RUN_ID" \
             || echo "::warning::could not start the queue; it will run on its schedule"

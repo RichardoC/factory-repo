@@ -192,18 +192,21 @@ jobs:
             # Each kind gets the input the gate reads for it, with its lane;
             # the title codeaf.yml will give it is mirrored into runs.json so
             # the next pick sees its lane and (for a continuation) its areas.
+            # Issue #429: each dispatch and label strip below goes
+            # through gh-retry, so one transient 5xx cannot skip a run
+            # or leave a stale label; the || true fallbacks are unchanged.
             case "$KIND" in
               review)
                 echo "starting review #$N on lane $LANE"
-                gh workflow run codeaf.yml --ref "$DEFAULT_BRANCH" -f "review=$N" -f "lane=$LANE"
+                "$HARNESS" gh-retry -- gh workflow run codeaf.yml --ref "$DEFAULT_BRANCH" -f "review=$N" -f "lane=$LANE"
                 # The label has done its work; a failure only leaves it stale.
-                gh pr edit "$N" --remove-label "$CODEAF_REVIEW_NEEDED_LABEL" || true
+                "$HARNESS" gh-retry -- gh pr edit "$N" --remove-label "$CODEAF_REVIEW_NEEDED_LABEL" || true
                 TITLE="CodeAF review #$N (lane $LANE)"
                 ;;
               continue)
                 echo "starting continuation #$N on lane $LANE"
-                gh workflow run codeaf.yml --ref "$DEFAULT_BRANCH" -f "pr=$N" -f "lane=$LANE"
-                gh pr edit "$N" --remove-label "$CODEAF_CONTINUE_NEEDED_LABEL" || true
+                "$HARNESS" gh-retry -- gh workflow run codeaf.yml --ref "$DEFAULT_BRANCH" -f "pr=$N" -f "lane=$LANE"
+                "$HARNESS" gh-retry -- gh pr edit "$N" --remove-label "$CODEAF_CONTINUE_NEEDED_LABEL" || true
                 TITLE="CodeAF #$N (lane $LANE)"
                 ;;
               *)
@@ -212,7 +215,7 @@ jobs:
                 # Best effort: once the run has started, `codeaf-queued` has
                 # said all it can; a failure here only leaves a stale label.
                 gh issue edit "$N" --remove-label "$CODEAF_QUEUED_LABEL" || true
-                gh workflow run codeaf.yml --ref "$DEFAULT_BRANCH" -f "issue=$N" -f "lane=$LANE"
+                "$HARNESS" gh-retry -- gh workflow run codeaf.yml --ref "$DEFAULT_BRANCH" -f "issue=$N" -f "lane=$LANE"
                 # Mirror the relabel: the issue stays (the in-flight run's area
                 # is read from it) but is no longer a candidate.
                 jq --argjson n "$N" --arg q "$CODEAF_QUEUED_LABEL" --arg c "$CODEAF_LABEL" \
@@ -256,7 +259,7 @@ jobs:
           [ "$PLAN" = 1 ] || exit 0
           [[ "$LANE" =~ ^[0-9]{1,4}$ ]] || LANE=0
           echo "dispatching a plan run on lane $LANE"
-          gh workflow run codeaf.yml --ref "$DEFAULT_BRANCH" -f plan=true -f "lane=$LANE"
+          "$HARNESS" gh-retry -- gh workflow run codeaf.yml --ref "$DEFAULT_BRANCH" -f plan=true -f "lane=$LANE"
           # Mirror the in-flight run into runs.json the way the loop does, so
           # a later tick sees the lane taken and the plan cooldown running.
           jq --arg t "CodeAF plan (lane $LANE)" \
