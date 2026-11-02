@@ -391,6 +391,8 @@ Normal behavior:
 
 The post-write refresh matters because Linear may rewrite markdown bodies after mutation.
 
+Reading the cache is fail-closed. If a read fails at any point — including a table that stops returning rows part-way, which would otherwise load a partial hash snapshot without reporting anything — the run fails before the comparison instead of quietly re-hashing the missing fingerprints every run. Delete the cache file or rerun with `--bypass-cache` to rebuild it from live data.
+
 An interrupted run (signal, cancelled context) does not refresh the cache. It
 has made no promise about the findings it never reached, and caching "still as
 it was" hashes for them would make the next run skip them.

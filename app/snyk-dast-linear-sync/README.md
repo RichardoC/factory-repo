@@ -502,6 +502,10 @@ An interrupted run (Ctrl-C, SIGTERM, or any cancelled context) never refreshes
 the cache: its plan was only partly written, so the next run re-examines
 everything against live data.
 
+A cache read that fails — including a read that stops part-way through a table —
+aborts the run instead of comparing against a partial hash snapshot. Delete the
+cache file or rerun with `--bypass-cache`; both rebuild it from live data.
+
 The cache fast-path never suppresses a pending move into a terminal state
 (`Done`/`Cancelled`). Use `--bypass-cache` to ignore the cache for a run and
 rebuild it from live data.

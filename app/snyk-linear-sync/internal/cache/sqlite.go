@@ -89,14 +89,14 @@ func (s *Store) Load(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("load cache schema signature: %w", err)
 	}
+	defer rows.Close()
 	for rows.Next() {
 		if err := rows.Scan(&snapshot.SchemaSignature); err != nil {
-			_ = rows.Close()
 			return Snapshot{}, fmt.Errorf("scan cache schema signature: %w", err)
 		}
 	}
-	if err := rows.Close(); err != nil {
-		return Snapshot{}, fmt.Errorf("close cache schema signature rows: %w", err)
+	if err := rows.Err(); err != nil {
+		return Snapshot{}, fmt.Errorf("iterate cache schema signature rows: %w", err)
 	}
 
 	query, args, err = s.builder.
@@ -111,17 +111,17 @@ func (s *Store) Load(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("load Snyk cache rows: %w", err)
 	}
+	defer snykRows.Close()
 	for snykRows.Next() {
 		var fingerprint string
 		var hash string
 		if err := snykRows.Scan(&fingerprint, &hash); err != nil {
-			_ = snykRows.Close()
 			return Snapshot{}, fmt.Errorf("scan Snyk cache row: %w", err)
 		}
 		snapshot.SnykHashes[fingerprint] = hash
 	}
-	if err := snykRows.Close(); err != nil {
-		return Snapshot{}, fmt.Errorf("close Snyk cache rows: %w", err)
+	if err := snykRows.Err(); err != nil {
+		return Snapshot{}, fmt.Errorf("iterate Snyk cache rows: %w", err)
 	}
 
 	query, args, err = s.builder.
@@ -136,17 +136,17 @@ func (s *Store) Load(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("load Linear cache rows: %w", err)
 	}
+	defer linearRows.Close()
 	for linearRows.Next() {
 		var fingerprint string
 		var hash string
 		if err := linearRows.Scan(&fingerprint, &hash); err != nil {
-			_ = linearRows.Close()
 			return Snapshot{}, fmt.Errorf("scan Linear cache row: %w", err)
 		}
 		snapshot.LinearHashes[fingerprint] = hash
 	}
-	if err := linearRows.Close(); err != nil {
-		return Snapshot{}, fmt.Errorf("close Linear cache rows: %w", err)
+	if err := linearRows.Err(); err != nil {
+		return Snapshot{}, fmt.Errorf("iterate Linear cache rows: %w", err)
 	}
 
 	return snapshot, nil

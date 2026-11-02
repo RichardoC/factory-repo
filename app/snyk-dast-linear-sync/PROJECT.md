@@ -440,6 +440,12 @@ mutation. A fingerprint whose Linear write failed in this run is left out of the
 refreshed cache, so the next run compares it against live data again and retries
 the write instead of treating the failed one as reconciled.
 
+Reading the cache is fail-closed. If a read fails at any point — including a
+table that stops returning rows part-way, which would otherwise load a partial
+hash snapshot without reporting anything — the run fails before the comparison
+instead of quietly re-hashing the missing fingerprints every run. Delete the
+cache file or rerun with `--bypass-cache` to rebuild it from live data.
+
 The cache fast-path never suppresses a pending move into a terminal state
 (`Done`/`Cancelled`): a finding that became fixed or permanently
 accepted/invalidated while its ticket sat in an open column must still be
