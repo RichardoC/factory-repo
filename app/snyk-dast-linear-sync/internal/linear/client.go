@@ -1085,20 +1085,28 @@ func metadataBlockLines(description string) iter.Seq[string] {
 // prevents false matches where the marker string appears mid-sentence in
 // user-written text (e.g. "See <!-- snyk-dast-linear-sync notes -->"), which
 // could spoof fingerprint/label extraction if treated as a metadata block.
+//
+// It returns the LAST line-anchored occurrence, not the first, for the same
+// reason as the copy in internal/sync/service.go: embedded Snyk-controlled
+// prose (finding.CorrelationMarkdown can carry scanned-application content)
+// sits above the real metadata block, so a line-anchored marker inside that
+// prose must not hijack fingerprint/label extraction. Keep this in sync with
+// internal/sync/service.go.
 func findMetadataBlockStart(description string) int {
 	header := metadataHeader
+	last := -1
 	for i := 0; i <= len(description)-len(header); {
 		idx := strings.Index(description[i:], header)
 		if idx < 0 {
-			return -1
+			break
 		}
 		absIdx := i + idx
 		if absIdx == 0 || description[absIdx-1] == '\n' {
-			return absIdx
+			last = absIdx
 		}
 		i = absIdx + 1
 	}
-	return -1
+	return last
 }
 
 func (c *Client) ensureStatesLoaded(ctx context.Context) error {

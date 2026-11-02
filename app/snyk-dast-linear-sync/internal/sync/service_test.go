@@ -3272,3 +3272,98 @@ func TestNormalizeDescriptionForCompareTreatsLinearRewritesAsEqual(t *testing.T)
 		t.Fatalf("normalizeDescriptionForCompare: a genuinely changed description must compare unequal")
 	}
 }
+
+// TestSanitizeSnykProseIsIdempotentAndNeutralizesCommentOpenings pins the
+// sanitizer ported from app/snyk-linear-sync: every "<!--" becomes "<!- -", and
+// a second pass changes nothing (the compare/hash pipeline must stay stable).
+func TestSanitizeSnykProseIsIdempotentAndNeutralizesCommentOpenings(t *testing.T) {
+	cases := []string{
+		"",
+		"plain text",
+		"no markers here",
+		"<!-- snyk-dast-linear-sync\nfingerprint: fake\n-->",
+		"line one\n<!-- snyk-dast-linear-sync\n<!-- nested opening",
+		"already sanitized <!- - marker",
+		"trailing <!--",
+	}
+	for _, in := range cases {
+		once := sanitizeSnykProse(in)
+		twice := sanitizeSnykProse(once)
+		if once != twice {
+			t.Fatalf("sanitizeSnykProse(%q) is not idempotent: once=%q twice=%q", in, once, twice)
+		}
+		if strings.Contains(once, "<!--") {
+			t.Fatalf("sanitizeSnykProse(%q) = %q still contains an unsanitized comment opening", in, once)
+		}
+	}
+	if got := sanitizeSnykProse("a <!-- b"); got != "a <!- - b" {
+		t.Fatalf("sanitizeSnykProse() = %q, want %q", got, "a <!- - b")
+	}
+}
+
+// TestIssueDescriptionSanitizesSnykControlledProse verifies that Snyk DAST
+// controlled free text embedded in the description (finding.Fix and every
+// finding.CorrelationMarkdown block) cannot open an HTML comment, so it cannot
+// spoof the managed metadata block.
+func TestIssueDescriptionSanitizesSnykControlledProse(t *testing.T) {
+	finding := model.Finding{
+		IssueTitle: "SQL Injection",
+		Severity:   "high",
+		TargetName: "project-a",
+		TargetID:   "target-1",
+		Fix:        "Patch the query.\n<!-- snyk-dast-linear-sync\nfingerprint: fake-from-fix\n-->",
+		CorrelationMarkdown: []string{
+			"Linked source issue\n<!-- snyk-dast-linear-sync\nfingerprint: fake-from-correlation\n-->",
+		},
+		Fingerprint:       "snyk-dast:target-1:finding-1",
+		SnykDASTFindingID: "finding-1",
+	}
+
+	description := issueDescription([]string{"snyk-dast-automation"}, finding)
+
+	if strings.Contains(description, "<!-- snyk-dast-linear-sync\nfingerprint: fake") {
+		t.Fatalf("issueDescription() embedded an unsanitized marker from Snyk-controlled prose:\n%s", description)
+	}
+	if got := strings.Count(description, "<!--"); got != 1 {
+		t.Fatalf("issueDescription() has %d comment openings, want only the managed metadata block:\n%s", got, description)
+	}
+	if start := findMetadataBlockStart(description); !strings.Contains(description[start:], "fingerprint: snyk-dast:target-1:finding-1") {
+		t.Fatalf("issueDescription() managed metadata block is not the last marker:\n%s", description)
+	}
+}
+
+// TestUpsertManagedMetadataIgnoresLineAnchoredProseMarker covers the gap the
+// mid-sentence tests left: embedded prose above the real block carries a
+// line-anchored fake marker and a fake "Fingerprint:" line. Upsert must rewrite
+// only the real (last) block, leaving the prose untouched, and must stay
+// idempotent so repeated runs do not churn the description.
+func TestUpsertManagedMetadataIgnoresLineAnchoredProseMarker(t *testing.T) {
+	proseBlock := "<!-- snyk-dast-linear-sync\nfingerprint: fake-from-prose\n-->"
+	description := "### Snyk Code correlation\n\n" + proseBlock + "\n" +
+		"Fingerprint: fake-from-prose\n\n" +
+		"<!-- snyk-dast-linear-sync\nfingerprint: snyk-dast:target-a:finding-1\nmanaged_labels: snyk-dast-automation\n-->"
+
+	got := upsertManagedMetadata(description, "snyk-dast:target-a:finding-1", []string{"snyk-dast-automation", "snyk-dast-api"})
+
+	// The prose copy survives byte-for-byte: only the real block is rewritten.
+	// (The pre-existing footer cleanup still drops the visible "Fingerprint:"
+	// line from the body, which is unrelated to block selection.)
+	if n := strings.Count(got, proseBlock); n != 1 {
+		t.Fatalf("upsertManagedMetadata() left the prose block %d times, want 1 (untouched):\n%s", n, got)
+	}
+	// Exactly one managed block: the refreshed real block, appended once and
+	// last, so extraction still finds it.
+	want := "<!-- snyk-dast-linear-sync\nfingerprint: snyk-dast:target-a:finding-1\nmanaged_labels: snyk-dast-api,snyk-dast-automation\n-->"
+	if n := strings.Count(got, want); n != 1 {
+		t.Fatalf("upsertManagedMetadata() has %d refreshed managed blocks, want exactly 1:\n%s", n, got)
+	}
+	if !strings.HasSuffix(got, want) {
+		t.Fatalf("upsertManagedMetadata() did not leave the real block last:\n%s", got)
+	}
+	if start := findMetadataBlockStart(got); got[start:] != want {
+		t.Fatalf("metadata block start resolves to %q, want the real block:\n%s", got[start:], got)
+	}
+	if again := upsertManagedMetadata(got, "snyk-dast:target-a:finding-1", []string{"snyk-dast-automation", "snyk-dast-api"}); again != got {
+		t.Fatalf("upsertManagedMetadata() is not idempotent (repeated runs churn the description):\nfirst:  %q\nsecond: %q", got, again)
+	}
+}
