@@ -285,8 +285,12 @@ func TestHalfDeletedJournalReaderSide(t *testing.T) {
 			buf[i] = 0xff
 		}
 		n, err := f.ReadAt(buf, 0)
-		// [as-is] The header sector is a hole: ReadAt returns the hole's zero
-		// bytes (none of them) as a short read with io.EOF (vfs.go:353-420).
+		// [as-is] The header sector is a hole starting at offset 0: nothing
+		// readable precedes it, so ReadAt reports a short read of zero bytes
+		// with io.EOF (vfs.go's ReadAt). A hole in the MIDDLE of a file, after
+		// bytes that were readable, instead reads as zeros over its own span
+		// and does not end the read — see TestReadAtMiddleHoleReadsZeros
+		// (issue #438). Both keep the buffer untouched past n.
 		if n != 0 || !errors.Is(err, io.EOF) {
 			t.Errorf("ReadAt(16 bytes @0) on the half-deleted journal = (%d, %v), want (0, io.EOF)", n, err)
 		}

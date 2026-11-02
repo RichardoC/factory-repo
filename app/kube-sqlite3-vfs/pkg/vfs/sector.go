@@ -253,8 +253,13 @@ func (f *file) listSectorConfigMaps() ([]corev1.ConfigMap, error) {
 // sizeFromSectorList computes the file size from a sector LIST: the largest
 // index*SectorSize+len(data) over all sectors. This assumes sectors are
 // dense up to the last one, which holds for anything SQLite writes (and for
-// everything the old code could write at all); holes left by out-of-order
-// page writes are tolerated, they only make the size conservative.
+// everything the old code could write at all). A hole left by an interrupted
+// or external sector delete makes this size an upper bound, not the truth:
+// the file really ends earlier. That is the conservative direction for a
+// reader — ReadAt reports the hole as zeros up to this size, and a read past
+// the last present sector still short-reads — but it is not a licence to
+// assume the sectors are dense: ReadAt places every sector at its own
+// offset so a hole cannot shift the bytes after it (issue #438).
 func (f *file) sizeFromSectorList(cms []corev1.ConfigMap) int64 {
 	var size int64
 	for i := range cms {
@@ -269,8 +274,9 @@ func (f *file) sizeFromSectorList(cms []corev1.ConfigMap) int64 {
 }
 
 // getSectorRange fetches sectors [firstSector, lastSector]. A sector that
-// does not exist contributes no bytes (a read into a hole yields short data
-// and io.EOF at the ReadAt layer) — nothing is created on a read.
+// does not exist comes back with nil Data, marking a hole: the presence
+// information is returned per sector, and ReadAt decodes it (zeros over the
+// hole's own span, never a shifted read) — nothing is created on a read.
 func (f *file) getSectorRange(firstSector, lastSector int64) ([]*Sector, error) {
 	f.vfs.logger.Debug("getSectorRange", "firstSector", firstSector, "lastSector", lastSector)
 

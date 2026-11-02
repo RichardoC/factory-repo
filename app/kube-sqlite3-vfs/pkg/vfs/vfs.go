@@ -449,30 +449,97 @@ func (f *file) ReadAt(p []byte, off int64) (int, error) {
 		return 0, err
 	}
 
-	var (
-		n     int
-		first = true
-	)
+	// n is the number of bytes of p this read has filled, as one contiguous
+	// prefix: a hole the read cannot see past ends it, and the short read is
+	// reported once, after the loop.
+	var n int
 	sectors, err := f.getSectorRange(firstSector, lastSector)
 	if err != nil {
 		return 0, sqlite3vfs.IOErrorRead
 	}
 	for _, sect := range sectors {
-		if first {
-			startIndex := off % SectorSize
-			// A sector that does not exist (a hole) contributes no bytes:
-			// guard the slice so this reports a short read instead of
-			// panicking. The imported code created the missing sector on
-			// read (a write to the cluster!) and then panicked anyway.
-			if int(startIndex) < len(sect.Data) {
-				n = copy(p, sect.Data[startIndex:])
+		// Sector s holds file bytes [s*SectorSize, (s+1)*SectorSize), so its
+		// bytes start at s*SectorSize-off in p. Placing every sector by its
+		// own index — not by how many bytes the sectors before it happened to
+		// contribute — is what stops a missing sector from shifting every
+		// later sector's bytes earlier in the buffer.
+		sectOff := sect.Index * SectorSize
+		pos := int(sectOff - off)
+		if pos >= len(p) {
+			break
+		}
+		start := 0 // index into sect.Data of the first byte inside p
+		if pos < 0 {
+			start = -pos
+			pos = 0
+		}
+
+		// The bytes of this sector that fall inside p, by position.
+		want := int(SectorSize) - start
+		if avail := len(p) - pos; want > avail {
+			want = avail
+		}
+		if want <= 0 {
+			break
+		}
+
+		// fillZeros fills p[n:end] with zeros — a hole, or the unwritten tail
+		// of a short sector — and moves the contiguous prefix past it. end is
+		// clipped to the end of the file and to p.
+		fillZeros := func(end int) {
+			if fileEnd := int(fileSize - off); end > fileEnd {
+				end = fileEnd
 			}
-			first = false
+			if end > len(p) {
+				end = len(p)
+			}
+			if end > n {
+				clear(p[n:end])
+				n = end
+			}
+		}
+
+		if len(sect.Data)-start <= 0 {
+			// A hole: the sector has no ConfigMap (an interrupted delete,
+			// or one deleted outside this VFS). Nothing is created here, and
+			// no later sector may move up to fill the gap.
+			//
+			// A hole at or past the end of the file is simply the end of the
+			// file. A hole that begins at file offset 0 is the hasHotJournal
+			// case: SQLite reads one byte there and treats a short read as
+			// "no magic byte", so that hole stays a short read of nothing
+			// rather than zeros. Every other hole lies INSIDE the file (the
+			// file's size reaches past it) and reads as zeros, including one
+			// the read happens to start inside.
+			if sectOff >= fileSize {
+				break
+			}
+			if sectOff == 0 && off == 0 {
+				break
+			}
+			// A hole inside the file reads as zeros over its own span, so the
+			// sectors after it keep their true offsets.
+			fillZeros(pos + want)
 			continue
 		}
 
-		nn := copy(p[n:], sect.Data)
-		n += nn
+		// A present sector. Bytes before pos that this read has not filled
+		// belong to a hole (a sector too short to reach this one): they read
+		// as zeros, again keeping later bytes at their true offsets.
+		if pos > n {
+			fillZeros(pos)
+		}
+		have := len(sect.Data) - start
+		if have > want {
+			have = want
+		}
+		n = pos + copy(p[pos:], sect.Data[start:start+have])
+		if have < want {
+			// The sector is shorter than its slot (a partly written sector, or
+			// the file's last sector): the rest of the slot reads as zeros, and
+			// a later sector, if one exists, still lands at its own offset.
+			fillZeros(pos + want)
+		}
 	}
 	if lastByte >= fileSize {
 		return n, io.EOF
