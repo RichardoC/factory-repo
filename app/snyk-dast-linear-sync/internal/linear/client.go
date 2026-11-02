@@ -6,6 +6,7 @@ import (
 	"iter"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -1752,6 +1753,25 @@ func (c *Client) execute(ctx context.Context, op *gqlclient.Operation, out any) 
 				return err
 			}
 
+			// gqlclient decodes the response body before returning any
+			// GraphQL error, so a per-alias rate-limit error can arrive
+			// joined onto a response whose other aliases already decoded.
+			// Those aliases took effect: re-sending the whole operation
+			// would duplicate every created issue or comment in the batch.
+			// Retry only when nothing was decoded. Read queries are
+			// idempotent and decode into structs, which
+			// decodedPartialData never reports as landed, so they keep
+			// the full retry behavior.
+			if decodedPartialData(out) {
+				delay := linearRateLimitBackoff(attempt)
+				c.noteRateLimit(delay)
+				c.log.Warn("Linear GraphQL rate limit reached after part of a mutation already landed; not retrying it",
+					slog.Duration("retry_after", delay),
+					slog.Int("attempt", attempt+1),
+				)
+				return err
+			}
+
 			delay := linearRateLimitBackoff(attempt)
 			c.noteRateLimit(delay)
 			c.log.Warn("Linear GraphQL rate limit reached",
@@ -1812,6 +1832,25 @@ func isLinearRateLimitError(err error) bool {
 
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "ratelimit exceeded") || strings.Contains(msg, "rate limit exceeded")
+}
+
+// decodedPartialData reports whether out, the decode target execute passes to
+// gqlclient, already holds data from the response. Only maps and slices count:
+// the batch mutations decode per-alias outcomes into maps, so a non-empty map
+// there means at least one alias landed, while the read queries decode into
+// structs and stay retryable because running them again cannot duplicate
+// anything.
+func decodedPartialData(out any) bool {
+	v := reflect.ValueOf(out)
+	if v.Kind() != reflect.Pointer || v.IsNil() {
+		return false
+	}
+	switch v = v.Elem(); v.Kind() {
+	case reflect.Map, reflect.Slice:
+		return v.Len() > 0
+	default:
+		return false
+	}
 }
 
 func linearRateLimitBackoff(attempt int) time.Duration {
