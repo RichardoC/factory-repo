@@ -125,6 +125,18 @@ func TestRoutinesDue(t *testing.T) {
 	if len(got) != 1 || got[0].Name != "model-prices" {
 		t.Fatalf("in-flight routine run: got %+v, want only model-prices", got)
 	}
+	// The same in-flight routine occupies the lane its title names (issue
+	// #436): lane 1, not lane 0, so the due routine takes lane 0 and never
+	// lands on the routine run's own lane.
+	if got[0].Lane != 0 {
+		t.Fatalf("routine run on lane 1: got lane %d, want the free lane 0", got[0].Lane)
+	}
+	// And mirrored: an in-flight routine on lane 0 pushes the next routine
+	// dispatch to lane 1, off the occupied lane.
+	onLane0 := runStatus{Status: "in_progress", DatabaseId: 8, DisplayTitle: "CodeAF routine quota-calibration (lane 0)", CreatedAt: stampBefore(50)}
+	if got := due([]routine{rt}, []runStatus{onLane0}, opts(36, 0, 2)); len(got) != 1 || got[0].Name != "model-prices" || got[0].Lane != 1 {
+		t.Fatalf("routine run on lane 0: got %+v, want model-prices on lane 1", got)
+	}
 	// A routine whose last run has an unparseable stamp is not due (fail
 	// closed): an unknown age must not wave a routine through.
 	bad := routineRuns("model-prices", "not-a-stamp")
