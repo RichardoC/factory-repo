@@ -266,6 +266,19 @@ func TestPlanCheckLanes(t *testing.T) {
 	if lane, ok, _ := PlanCheck(issues, mystery, planOpts()); !ok || lane != 1 {
 		t.Fatalf("unparsable title: lane=%d ok=%v; want lane 1", lane, ok)
 	}
+	// An in-flight routine run occupies the lane its title names (issue
+	// #436): "CodeAF routine pr-sweep (lane 1)" marks lane 1 — read through
+	// runRoutineFields, never the issue shape — so the plan dispatch takes
+	// lane 0 and never the routine's own lane; a routine on lane 0 pushes
+	// it to lane 1.
+	rt := []runStatus{planRun("in_progress", "CodeAF routine pr-sweep (lane 1)", stampAgo(1), 106)}
+	if lane, ok, _ := PlanCheck(issues, rt, planOpts()); !ok || lane != 0 {
+		t.Fatalf("routine run on lane 1: lane=%d ok=%v; want lane 0", lane, ok)
+	}
+	rt0 := []runStatus{planRun("in_progress", "CodeAF routine pr-sweep", stampAgo(1), 107)}
+	if lane, ok, _ := PlanCheck(issues, rt0, planOpts()); !ok || lane != 1 {
+		t.Fatalf("routine run without a suffix (lane 0): lane=%d ok=%v; want lane 1", lane, ok)
+	}
 }
 
 // TestPlanCheckSpendThreshold covers the spend guard: the same
