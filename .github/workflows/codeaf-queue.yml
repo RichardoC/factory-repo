@@ -130,7 +130,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           FINISHED_RUN: ${{ inputs.finished_run }}
         run: |
-          gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" > issues.json
+          # Issue #444: same shape as the plan-report listing in codeaf.yml --
+          # a 5xx must not silently disable the plan dedupe for this tick.
+          "$HARNESS" gh-retry -- gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" > issues.json
           # A CodeAF run that dispatched this tick as its last job is still in
           # progress; leave it out. Digits only, or nothing is left out.
           [[ "$FINISHED_RUN" =~ ^[0-9]{1,20}$ ]] || FINISHED_RUN=""

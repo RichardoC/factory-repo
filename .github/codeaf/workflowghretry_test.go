@@ -32,10 +32,15 @@ import (
 // the two queue-setting workflows: every pr-edit label call (all of them
 // label a PR with a codeaf-* label or strip one), and the dispatches that
 // start CI or another CodeAF run (`ci.yml`, `codeaf-queue.yml`,
-// `codeaf.yml`). The `codeaf-state.yml` dispatch in the handoff job is
-// deliberately not in the set: it starts the state merge, not a run, and its
-// job holds no harness.
-var ghRetryCovered = regexp.MustCompile(`\bgh\s+(?:pr edit|workflow run (codeaf-queue|codeaf|ci).yml)\b`)
+// `codeaf.yml`). Issue #444 adds the load-bearing lookups around them: the
+// existing-PR lookup and the issue-title read that feed `gh pr create`, the
+// two maintainer-approval api calls, and the open-issues listing that
+// plan-report and plan-check dedupe against. The `codeaf-state.yml`
+// dispatch in the handoff job is deliberately not in the set: it starts the
+// state merge, not a run, and its job holds no harness. Also deliberately
+// out: the best-effort calls that already carry their own fallback (`gh pr
+// ready`, `gh label create`, the compare-status probe).
+var ghRetryCovered = regexp.MustCompile(`\bgh\s+(?:pr edit|pr list --head|issue view|workflow run (codeaf-queue|codeaf|ci).yml|api --paginate "repos/\$GITHUB_REPOSITORY/issues\?state=open|api "repos/\$GITHUB_REPOSITORY/(?:actions/runs/\$GITHUB_RUN_ID/approvals|collaborators/[^"]+/permission))`)
 
 // unwrappedGhRetryCalls reports every covered gh invocation in a workflow's
 // text that does not run through `gh-retry --`: the text before the
@@ -93,6 +98,38 @@ func TestWorkflowGhRetryWrapsFailSoftCalls(t *testing.T) {
 			`gh workflow run codeaf.yml --ref "$DEFAULT_BRANCH" -f "review=$N"`)
 		if v := unwrappedGhRetryCalls("codeaf-queue.yml", bare); len(v) == 0 {
 			t.Fatal("unwrapping the queue's review dispatch produced no violation")
+		}
+	})
+	t.Run("unwrapping a load-bearing lookup fails", func(t *testing.T) {
+		for _, tc := range []struct{ name, wrapped, bare string }{
+			{
+				"the existing-PR lookup",
+				`pr=$("$HARNESS" gh-retry -- gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')`,
+				`pr=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')`,
+			},
+			{
+				"the issue-title read",
+				`title=$("$HARNESS" gh-retry -- gh issue view "$NUMBER" --json title --jq .title)`,
+				`title=$(gh issue view "$NUMBER" --json title --jq .title)`,
+			},
+			{
+				"the approval check",
+				`approvers=$("$HARNESS" gh-retry -- gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/approvals" \`,
+				`approvers=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/approvals" \`,
+			},
+			{
+				"the plan-report issue listing",
+				`"$HARNESS" gh-retry -- gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" > "$OPEN_ISSUES_PATH"`,
+				`gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" > "$OPEN_ISSUES_PATH"`,
+			},
+		} {
+			tc := tc
+			t.Run(tc.name, func(t *testing.T) {
+				bare := unwrapOne(t, filepath.Join(dir, "codeaf.yml"), tc.wrapped, tc.bare)
+				if v := unwrappedGhRetryCalls("codeaf.yml", bare); len(v) == 0 {
+					t.Fatalf("unwrapping %s produced no violation", tc.name)
+				}
+			})
 		}
 	})
 	t.Run("unwrapping a label edit fails", func(t *testing.T) {
