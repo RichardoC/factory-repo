@@ -2220,3 +2220,241 @@ func TestFindMetadataBlockStartReturnsLastLineAnchoredMarker(t *testing.T) {
 		t.Fatal("findMetadataBlockStart() = 0, returned the first marker instead of the last")
 	}
 }
+
+// TestCreateIssuesDoesNotRetryWhenPartialBatchLandedWithRateLimitError is the
+// regression test for the joined-GraphQL-error half of the duplicate-ticket
+// bug. gqlclient decodes the response body before returning any GraphQL
+// error, so a batch of two where alias 0 succeeded and alias 1 failed with
+// Linear's rate-limit message arrives here as both decoded data for alias 0
+// and an error whose text matches the rate-limit retry predicate. Retrying
+// the whole mutation would create alias 0's ticket a second time: alias 0
+// already exists in Linear. The create mutation must be sent exactly once
+// and the created alias must be reported as created.
+func TestCreateIssuesDoesNotRetryWhenPartialBatchLandedWithRateLimitError(t *testing.T) {
+	var createBatches atomic.Int32
+	handlerReturned := make(chan struct{}, 8)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			select {
+			case handlerReturned <- struct{}{}:
+			default:
+			}
+		}()
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll() error = %v", err)
+			return
+		}
+		query := string(body)
+
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(query, "issueCreateBatch"):
+			createBatches.Add(1)
+			// Alias 0 landed; alias 1 failed with Linear's rate-limit
+			// message, joined onto the same response as the decoded data.
+			_, _ = io.WriteString(w, `{"data":{"issueCreate0":{"success":true,"issue":{"id":"issue-1","identifier":"SNYK-100"}}},`+
+				`"errors":[{"message":"Rate limit exceeded (issueCreate1)","path":["issueCreate1"]}]}`)
+		default:
+			// Anything else is an unexpected round trip: count it and fail
+			// the request so the test never passes by accident.
+			t.Errorf("unexpected request: %s", query)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	client := New(config.LinearConfig{
+		TeamID: "team-1",
+		APIKey: "test-key",
+		States: config.StateConfig{Todo: "Todo"},
+	}, 1, logger)
+	client.gql = gqlclient.New(server.URL, &http.Client{})
+
+	client.mu.Lock()
+	client.resolvedTeam = "team-1"
+	client.statesByName = map[string]string{"todo": "state-todo"}
+	client.statesByType = map[string]string{}
+	client.managedLabelIDs = map[string]string{}
+	client.mu.Unlock()
+
+	desired := []model.DesiredIssue{
+		{Fingerprint: "snyk-dast:project-a:100", Title: "t", State: model.StateTodo},
+		{Fingerprint: "snyk-dast:project-a:101", Title: "u", State: model.StateTodo},
+	}
+
+	// The fixed client returns at once instead of sleeping out a backoff.
+	// The deadline must outlast the first rate-limit backoff (5s) so that a
+	// regression which retries actually re-sends and is caught by the
+	// request count below, while still bounding the run.
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+
+	failed, err := client.CreateIssues(ctx, desired)
+	if err != nil {
+		t.Fatalf("CreateIssues() error = %v, want nil (alias 0 was created and must be reported)", err)
+	}
+	if !slices.Equal(failed, []int{1}) {
+		t.Fatalf("failed = %#v, want [1]: alias 0 landed and must not be reported as failed", failed)
+	}
+
+	// Let any (buggy) re-send reach the server before counting: the handler
+	// acknowledges every request it serves, so this is a bounded wait, not a
+	// policy sleep.
+	waitForRequests := time.NewTimer(500 * time.Millisecond)
+	defer waitForRequests.Stop()
+	deadline := time.After(500 * time.Millisecond)
+	for createBatches.Load() == 0 {
+		select {
+		case <-handlerReturned:
+		case <-deadline:
+			t.Fatalf("server saw no issueCreateBatch request, want exactly 1")
+		}
+	}
+	select {
+	case <-handlerReturned:
+	case <-waitForRequests.C:
+	}
+
+	if got := createBatches.Load(); got != 1 {
+		t.Fatalf("issueCreateBatch requests = %d, want exactly 1: re-sending a batch whose first alias "+
+			"already created its ticket duplicates that ticket", got)
+	}
+}
+
+// TestPostCommentsDoesNotRetryWhenPartialBatchLandedWithRateLimitError is the
+// comment-mutation twin of the create test above: a commentCreate batch where
+// alias 0 posted and alias 1 failed with Linear's rate-limit message must not
+// be re-sent, because the posted comment is already visible on the issue and a
+// re-send would duplicate it.
+func TestPostCommentsDoesNotRetryWhenPartialBatchLandedWithRateLimitError(t *testing.T) {
+	var commentBatches atomic.Int32
+	handlerReturned := make(chan struct{}, 8)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			select {
+			case handlerReturned <- struct{}{}:
+			default:
+			}
+		}()
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll() error = %v", err)
+			return
+		}
+		query := string(body)
+
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(query, "commentCreateBatch"):
+			commentBatches.Add(1)
+			_, _ = io.WriteString(w, `{"data":{"commentCreate0":{"success":true,"comment":{"id":"comment-1"}}},`+
+				`"errors":[{"message":"Rate limit exceeded (commentCreate1)","path":["commentCreate1"]}]}`)
+		default:
+			t.Errorf("unexpected request: %s", query)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	client := New(config.LinearConfig{
+		TeamID: "team-1",
+		APIKey: "test-key",
+	}, 1, logger)
+	client.gql = gqlclient.New(server.URL, &http.Client{})
+
+	updates := []model.IssueUpdate{
+		{
+			Existing: model.ExistingIssue{ID: "issue-1", Identifier: "SNYK-100"},
+			Diff:     &model.IssueDiff{StateChanged: true, StateFrom: "Todo", StateTo: "Done"},
+		},
+		{
+			Existing: model.ExistingIssue{ID: "issue-2", Identifier: "SNYK-101"},
+			Diff:     &model.IssueDiff{StateChanged: true, StateFrom: "Todo", StateTo: "Done"},
+		},
+	}
+
+	// Same deadline reasoning as the create twin below: a regression that
+	// retries must get past its first 5s backoff to be caught.
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+
+	failed, err := client.PostComments(ctx, updates)
+	if err != nil {
+		t.Fatalf("PostComments() error = %v, want nil (alias 0 was posted and must be reported)", err)
+	}
+	if !slices.Equal(failed, []int{1}) {
+		t.Fatalf("failed = %#v, want [1]: the posted comment's update must not be reported as failed", failed)
+	}
+
+	waitForRequests := time.NewTimer(500 * time.Millisecond)
+	defer waitForRequests.Stop()
+	deadline := time.After(500 * time.Millisecond)
+	for commentBatches.Load() == 0 {
+		select {
+		case <-handlerReturned:
+		case <-deadline:
+			t.Fatalf("server saw no commentCreateBatch request, want exactly 1")
+		}
+	}
+	select {
+	case <-handlerReturned:
+	case <-waitForRequests.C:
+	}
+
+	if got := commentBatches.Load(); got != 1 {
+		t.Fatalf("commentCreateBatch requests = %d, want exactly 1: re-sending a batch whose first comment "+
+			"already posted duplicates that comment", got)
+	}
+}
+
+// TestExecuteStillRetriesWhenNothingDecodedAndRateLimitError pins the other
+// half of the partial-data rule: a rate-limit error that arrived with no data
+// at all decoded is still a genuinely un-landed operation, so execute must
+// keep retrying it instead of reporting the error to the caller.
+func TestExecuteStillRetriesWhenNothingDecodedAndRateLimitError(t *testing.T) {
+	var attempts atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if attempts.Add(1) == 1 {
+			// No data, only the error: nothing about the operation landed.
+			_, _ = io.WriteString(w, `{"errors":[{"message":"Rate limit exceeded"}]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"data":{"issueCreate0":{"success":true,"issue":{"id":"issue-1","identifier":"SNYK-100"}}}}`)
+	}))
+	defer server.Close()
+
+	client := &Client{
+		gql: gqlclient.New(server.URL, &http.Client{}),
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	op := gqlclient.NewOperation(commentCreateMutation(1))
+	op.Var("input0", commentCreateInput{IssueId: "issue-1"})
+	resp := map[string]struct {
+		Success bool `json:"success"`
+	}{}
+
+	// The retry path sleeps out its own backoff, so the deadline only bounds
+	// a hang.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := client.execute(ctx, op, &resp); err != nil {
+		t.Fatalf("execute() error = %v, want nil after the retry succeeded", err)
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("requests = %d, want 2: an operation that decoded nothing must be retried on a rate-limit error", got)
+	}
+	if len(resp) != 1 {
+		t.Fatalf("decoded aliases = %d, want 1 from the successful retry", len(resp))
+	}
+}

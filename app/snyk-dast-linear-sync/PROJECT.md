@@ -357,7 +357,10 @@ It uses:
 - rate-limit backoff -- only retryable statuses (429, 502, 503, 504) are retried;
   a response that exhausts the request budget (`X-RateLimit-Requests-Remaining <= 0`) --
   including a successful `200` -- is delivered to the caller and is not re-sent; its only
-  effect is to delay the next request until the reset instant.
+  effect is to delay the next request until the reset instant. A rate-limit error that
+  arrives as a per-alias GraphQL error joined onto a response whose other aliases decoded
+  is likewise not re-sent: those aliases already took effect, and re-sending the batch
+  would duplicate them. Only an operation that decoded nothing is retried.
 - SQLite caching
 
 The cache is critical for steady-state performance. A healthy steady-state run
