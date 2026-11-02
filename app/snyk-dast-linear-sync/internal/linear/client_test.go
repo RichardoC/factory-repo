@@ -2184,3 +2184,39 @@ func TestDesiredLabelIDsKeepsChildrenOfDistinctGroups(t *testing.T) {
 		t.Fatalf("labelIDs = %#v, want all three distinct-group/ungrouped labels kept", labelIDs)
 	}
 }
+
+// TestExtractFingerprintIgnoresLineAnchoredMarkerInProse covers the gap left by
+// TestExtractFingerprintIgnoresInlineMarker: Snyk-controlled prose embedded
+// above the real metadata block can carry a line-anchored marker and a fake
+// "Fingerprint:" line. Extraction must still read the real (last) block.
+func TestExtractFingerprintIgnoresLineAnchoredMarkerInProse(t *testing.T) {
+	description := "## Example\n\n### Snyk Code correlation\n\n" +
+		"<!-- snyk-dast-linear-sync\nfingerprint: fake-from-prose\nmanaged_labels: fake-label\n-->\n" +
+		"Fingerprint: fake-from-prose\n\n" +
+		"<!-- snyk-dast-linear-sync\nfingerprint: snyk-dast:target-a:finding-1\nmanaged_labels: snyk-dast-automation,snyk-dast-api\n-->"
+
+	if got := extractFingerprint(description); got != "snyk-dast:target-a:finding-1" {
+		t.Fatalf("extractFingerprint() = %q, want the real metadata-block fingerprint", got)
+	}
+	if got := extractManagedLabels(description); !slices.Equal(got, []string{"snyk-dast-api", "snyk-dast-automation"}) {
+		t.Fatalf("extractManagedLabels() = %#v, want the real metadata block's labels", got)
+	}
+}
+
+// TestFindMetadataBlockStartReturnsLastLineAnchoredMarker pins the shared
+// contract with internal/sync/service.go, so a prose copy cannot hijack block
+// detection.
+func TestFindMetadataBlockStartReturnsLastLineAnchoredMarker(t *testing.T) {
+	first := "<!-- snyk-dast-linear-sync\nfingerprint: fake\n-->"
+	description := first + "\n\nbody\n\n<!-- snyk-dast-linear-sync\nfingerprint: real\n-->"
+
+	got := findMetadataBlockStart(description)
+
+	want := strings.LastIndex(description, "<!-- snyk-dast-linear-sync")
+	if got != want {
+		t.Fatalf("findMetadataBlockStart() = %d, want %d (the last line-anchored marker)", got, want)
+	}
+	if got == 0 {
+		t.Fatal("findMetadataBlockStart() = 0, returned the first marker instead of the last")
+	}
+}

@@ -494,13 +494,20 @@ func isReviewRun(r runStatus) bool {
 }
 
 // runLane is the lane a run was dispatched on, read out of its title. Plan
-// runs, review runs and issue runs share the lane numbering: each occupies
-// its lane like any other run, which is what keeps MaxParallelRuns honest.
+// runs, review runs, routine runs and issue runs share the lane numbering:
+// each occupies its lane like any other run, which is what keeps
+// MaxParallelRuns honest. A routine title (issue #436) parses through
+// runRoutineFields — its shape matches neither the plan nor the review nor
+// the issue title — and without that read an in-flight routine on lane 1
+// would mark lane 0 and the next dispatch would share its lane.
 func runLane(r runStatus) int {
 	if lane, ok := runPlanFields(r.DisplayTitle); ok {
 		return lane
 	}
 	if _, lane, ok := runReviewFields(r.DisplayTitle); ok {
+		return lane
+	}
+	if _, lane, ok := runRoutineFields(r.DisplayTitle); ok {
 		return lane
 	}
 	_, lane := runTitleFields(r.DisplayTitle)
@@ -798,14 +805,17 @@ func prAreas(n int, byNumber map[int]item, prFiles map[int][]string) []string {
 
 // areaBusy finds the first in-flight run whose areas collide with the
 // candidate's, and the area to name in the log. An empty set on either side
-// conflicts with everything — except a plan run (issue #61) or a review run
-// (issue #137): each occupies its lane but works on no area, so neither
-// conflicts with an issue run. (Two plan runs are kept apart by the
-// planner's cooldown, not by areas.) When the collision is an intersection,
-// the first (sorted) shared area is named.
+// conflicts with everything — except a plan run (issue #61), a review run
+// (issue #137) or a routine run (issue #436): each occupies its lane but
+// works on no area, so none conflicts with an issue run. (Two plan runs
+// are kept apart by the planner's cooldown, not by areas.) Without the
+// routine exemption an in-flight routine resolves to an empty area set and
+// the empty-set rule below would hold every queued issue and continuation
+// for the whole run. When the collision is an intersection, the first
+// (sorted) shared area is named.
 func areaBusy(areas []string, inflight []runStatus, byNumber map[int]item, prFiles map[int][]string) (busy string, r runStatus, conflict bool) {
 	for _, run := range inflight {
-		if isPlanRun(run) || isReviewRun(run) {
+		if isPlanRun(run) || isReviewRun(run) || isRoutineRun(run) {
 			continue
 		}
 		other := runAreas(run, byNumber, prFiles)

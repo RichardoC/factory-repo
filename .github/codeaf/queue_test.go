@@ -66,6 +66,13 @@ func running(n, lane, dbid int) runStatus {
 		DisplayTitle: fmt.Sprintf("CodeAF #%d (lane %d)", n, lane)}
 }
 
+// routineRun builds an in-flight routine run on a lane (issue #436), with
+// the title a routine dispatch writes (routines.go).
+func routineRun(name string, lane, dbid int) runStatus {
+	return runStatus{Status: "in_progress", DatabaseId: dbid,
+		DisplayTitle: fmt.Sprintf("CodeAF routine %s (lane %d)", name, lane)}
+}
+
 func TestNextNothingQueued(t *testing.T) {
 	pr := queuedIssue(9, "2024-01-01T00:00:00Z", "codeaf-queued")
 	pr.PullRequest = json.RawMessage(`{"number":9}`)
@@ -447,6 +454,11 @@ func TestNextAreas(t *testing.T) {
 			[]runStatus{{Status: "in_progress", DatabaseId: 7, DisplayTitle: "queued: something"}}, 0},
 		{"a queued run holds its area too", []item{issue5, areaIssue(3, "2024-01-01T00:00:00Z", "harness")},
 			[]runStatus{{Status: "queued", DatabaseId: 100, DisplayTitle: "CodeAF #5 (lane 0)"}}, 0},
+		// A routine run works on no area (issue #436): it never holds a
+		// candidate, not even a same-area one — parsed as an issue run it
+		// would resolve to an empty area set and hold everything.
+		{"an in-flight routine run holds no area", []item{issue5, areaIssue(3, "2024-01-01T00:00:00Z", "harness")},
+			[]runStatus{routineRun("pr-sweep", 0, 100)}, 3},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -484,6 +496,10 @@ func TestNextLanes(t *testing.T) {
 		{"lanes 0 and 1 taken", []runStatus{running(4, 0, 100), running(6, 1, 101)}, 2},
 		{"an out-of-range lane does not block in-range lanes", []runStatus{running(4, 9, 100)}, 0},
 		{"two runs on lane 0 never share it with a third", []runStatus{noSuffix(4, 100), noSuffix(6, 101)}, 1},
+		// A routine run occupies the lane its title names (issue #436);
+		// parsed as lane 0 it would hand the dispatch the routine's own lane.
+		{"a routine run on lane 1 keeps lane 1", []runStatus{routineRun("pr-sweep", 1, 100)}, 0},
+		{"a routine run on lane 1 with lane 0 taken", []runStatus{running(4, 0, 100), routineRun("pr-sweep", 1, 101)}, 2},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -496,10 +512,11 @@ func TestNextLanes(t *testing.T) {
 }
 
 // TestRunLane pins the strict parse of an in-flight run's display title,
-// which is untrusted data: only "CodeAF #<n>" and "CodeAF #<n> (lane <n>)"
-// match, and anything else — wrong prefix, letters in the lane, trailing
-// prose, the empty title — is lane 0. A lane that parses out of range still
-// comes back as its value; only Next's assignment is limited to the range.
+// which is untrusted data: the issue, plan, review and routine shapes (issue
+// #436) each parse through their own helper, and anything else — wrong
+// prefix, letters in the lane, trailing prose, the empty title — is lane 0.
+// A lane that parses out of range still comes back as its value; only
+// Next's assignment is limited to the range.
 func TestRunLane(t *testing.T) {
 	cases := []struct {
 		title string
@@ -513,7 +530,15 @@ func TestRunLane(t *testing.T) {
 		{"CodeAF #3 (lane abc)", 0}, // lane letters
 		{"CodeAF #3 (lane )", 0},
 		{"CodeAF #3 (lane -1)", 0},
-		{"harness next #3", 0}, // wrong prefix
+		{"CodeAF routine pr-sweep", 0}, // routine, no suffix
+		{"CodeAF routine pr-sweep (lane 0)", 0},
+		{"CodeAF routine pr-sweep (lane 1)", 1}, // issue #436
+		{"CodeAF routine quota-calibration (lane 12)", 12},
+		{"CodeAF routine pr-sweep (lane abc)", 0},     // lane letters
+		{"CodeAF routine", 0},                         // no name: not a routine title
+		{"CodeAF routine pr sweep (lane 1)", 0},       // space outside the name shape
+		{"CodeAF routine pr-sweep (lane 1) extra", 0}, // trailing prose
+		{"harness next #3", 0},                        // wrong prefix
 		{"CodeAF 3", 0},
 		{"codeaf #3 (lane 1)", 0}, // case
 		{"CodeAF #3 (lane 1) extra", 0},
@@ -710,6 +735,49 @@ func TestNextPlanRunNoAreaConflict(t *testing.T) {
 	p, lines := nextPick([]item{areaIssue(5, "2024-01-01T00:00:00Z", "app/x")}, sameArea, o)
 	if p.Kind != "" || !strings.Contains(strings.Join(lines, "\n"), "busy") {
 		t.Fatalf("same-area issue run: Next = %+v, log %v; want held", p, lines)
+	}
+}
+
+// TestNextRoutineRunNoAreaConflict pins the routine run's place in the queue
+// (issue #436): an in-flight run titled "CodeAF routine <name> (lane N)"
+// occupies lane N — read through runRoutineFields, never the issue shape —
+// and works on no area. A queued issue and a review dispatch therefore both
+// start behind it, on a lane the routine does not occupy, and neither is
+// held for an area conflict for the whole routine run.
+func TestNextRoutineRunNoAreaConflict(t *testing.T) {
+	o := nextOpts()
+	o.MaxParallelRuns = 4
+	rt := routineRun("pr-sweep", 1, 100)
+	// A queued issue, same-named harness area on the candidate or not: the
+	// routine holds nothing, and the dispatch stays off lane 1.
+	issue := areaIssue(3, "2024-01-01T00:00:00Z", "harness")
+	p, lines := nextPick([]item{issue}, []runStatus{rt}, o)
+	if p.Kind != kindIssue || p.Number != 3 || p.Lane != 0 {
+		t.Fatalf("queued issue behind a routine run: Next = %+v; want issue 3, lane 0 (not the routine's lane 1)", p)
+	}
+	joined := strings.Join(lines, "\n")
+	if strings.Contains(joined, "conflicts with run") || strings.Contains(joined, "busy (run") {
+		t.Fatalf("queued issue held for an area conflict behind a routine run: log %v", lines)
+	}
+	if !slices.Contains(lines, "runs in progress: 1/4, lanes in use: 1 (run 100)") {
+		t.Fatalf("routine run's lane 1 not logged as in use: %v", lines)
+	}
+	if !slices.Contains(lines, "starting #3 (lane 0): kind=issue, next queued issue") {
+		t.Fatalf("queued issue not dispatched on lane 0: %v", lines)
+	}
+	// A review dispatch behaves the same: it starts, on a free lane.
+	pr := queuedIssue(124, "2024-01-01T00:00:00Z", "codeaf", "codeaf-review-needed")
+	pr.PullRequest = json.RawMessage(`{"number":124}`)
+	if p := Next([]item{pr}, []runStatus{rt}, o); p.Kind != kindReview || p.Number != 124 || p.Lane != 0 {
+		t.Fatalf("review behind a routine run: Next = %+v; want review #124, lane 0", p)
+	}
+	// Two lanes gone and the routine on lane 1 with an issue run (issue 4,
+	// another area) on lane 0: the next queued issue takes lane 2, never
+	// the routine's lane 1.
+	beside := []runStatus{running(4, 0, 101), rt}
+	both := []item{issue, areaIssue(4, "2024-01-01T00:00:00Z", "app/x")}
+	if p := Next(both, beside, o); p.Number != 3 || p.Lane != 2 {
+		t.Fatalf("routine on 1 and issue run on 0: Next = %+v; want issue 3, lane 2", p)
 	}
 }
 
