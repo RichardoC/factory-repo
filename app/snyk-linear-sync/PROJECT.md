@@ -323,7 +323,11 @@ It uses:
 - concurrent Snyk and Linear snapshot loading
 - worker-based reconciliation
 - batched Linear mutations
-- rate-limit backoff
+- rate-limit backoff -- a rate-limit error that arrives as a per-alias GraphQL
+  error joined onto a response whose other aliases decoded is not re-sent:
+  those aliases already took effect, and re-sending the batch would duplicate
+  them. Only an operation that decoded nothing is retried, and reads (which
+  decode into structs and cannot duplicate anything) keep the full retry.
 - SQLite caching
 
 The cache is critical for steady-state performance. A healthy steady-state run should do little or no work when nothing has changed.
@@ -334,8 +338,10 @@ Linear mutations are batched, one GraphQL alias per entry, so a create batch can
 fail in two ways that need different handling to avoid duplicating tickets:
 
 - **Per-alias failure.** The response carries `success: false`, or omits the
-  alias, while the other aliases succeeded. Only the reported entries are
-  retried; retrying the batch would duplicate the ones that already exist.
+  alias, while the other aliases succeeded. Note that `gqlclient` decodes the
+  response body before returning any GraphQL error, so the successful aliases
+  are still available even when an error is returned. Only the reported entries
+  are retried; retrying the batch would duplicate the ones that already exist.
 - **Ambiguous failure.** No aliases were decoded at all, so nothing is known per
   entry. This covers a transport-level failure and equally a GraphQL failure
   that returned no data, such as a 502 arriving after Linear had already
