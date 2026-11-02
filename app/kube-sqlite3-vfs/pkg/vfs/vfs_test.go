@@ -26,6 +26,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1107,6 +1109,177 @@ func TestReadAtDoesNotCreateSectors(t *testing.T) {
 	if sectors := listSectorConfigMaps(t, fcs, f); len(sectors) != 1 {
 		t.Errorf("read left %d sector configmaps, want 1 (reads must not create sectors)", len(sectors))
 	}
+}
+
+// seedSectorWithHole seeds a three-sector file whose MIDDLE sector (1) has no
+// ConfigMap at all — the state an interrupted, non-journal Delete leaves
+// (vfs.go's deleteSectorsInSafeOrder can stop midway and report aDeleteFailed,
+// which SQLite ignores), or one an externally deleted sector ConfigMap leaves.
+// Sectors 0 and 2 are present and hold distinct patterns, so a read that lets
+// sector 2 slip into sector 1's place is visible byte for byte.
+func seedSectorWithHole(tb testing.TB, fcs *fake.Clientset, f *file) (sector0, sector2 []byte) {
+	tb.Helper()
+	sector0 = make([]byte, SectorSize)
+	fillPattern(sector0)
+	sector2 = make([]byte, SectorSize)
+	fillPatternAlt(sector2)
+	seedSector(tb, fcs, f, 0, sector0)
+	seedSector(tb, fcs, f, 2, sector2)
+	return sector0, sector2
+}
+
+// TestReadAtMiddleHoleReadsZeros pins the fix for issue #438: a read across a
+// hole in the MIDDLE of a file must report zeros over the hole's own span and
+// leave every later sector at its true offset. Before the fix ReadAt advanced
+// its write position only by the bytes a sector actually contributed
+// (n += copy(...)), so a nil-Data hole copied nothing and every byte after it
+// slid earlier in the buffer — silently relocating data. It must also stay
+// true that a read never creates the missing sector (no write to the cluster).
+func TestReadAtMiddleHoleReadsZeros(t *testing.T) {
+	newHoleFile := func(t *testing.T) (*file, *fake.Clientset, []byte, []byte) {
+		t.Helper()
+		v, fcs := newTestVFS(t)
+		f := openTestFile(t, v, "middle-hole.db")
+		sector0, sector2 := seedSectorWithHole(t, fcs, f)
+		// Count Create calls: the read must issue none. A reactor is used in
+		// addition to the ConfigMap diff below, so a create-then-delete would
+		// still be caught.
+		var creates atomic.Int64
+		fcs.PrependReactor("create", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+			creates.Add(1)
+			return false, nil, nil
+		})
+		t.Cleanup(func() {
+			if got := creates.Load(); got != 0 {
+				t.Errorf("ReadAt issued %d ConfigMap Create call(s), want 0 (reads must never create sectors)", got)
+			}
+		})
+		return f, fcs, sector0, sector2
+	}
+
+	t.Run("hole-only-span", func(t *testing.T) {
+		f, fcs, sector0, sector2 := newHoleFile(t)
+
+		size, err := f.FileSize()
+		if err != nil {
+			t.Fatalf("FileSize: %v", err)
+		}
+		// sizeFromSectorList takes the largest index*SectorSize+len(data), so
+		// the file reaches past the hole: the hole is INSIDE the file.
+		if want := int64(3) * SectorSize; size != want {
+			t.Fatalf("FileSize = %d, want %d (sectors 0 and 2 present)", size, want)
+		}
+
+		got := make([]byte, 3*SectorSize)
+		for i := range got {
+			got[i] = 0xff // prefill: a hole that contributes nothing is visible
+		}
+		n, err := f.ReadAt(got, 0)
+		if n != len(got) {
+			t.Fatalf("ReadAt across the middle hole got %d bytes, want %d (the read must cover the whole span)", n, len(got))
+		}
+		if err != nil {
+			t.Fatalf("ReadAt across the middle hole = %d, %v; want %d, nil", n, err, len(got))
+		}
+		if !bytes.Equal(got[:SectorSize], sector0) {
+			t.Error("sector 0's bytes differ from what was written")
+		}
+		if hole := got[SectorSize : 2*SectorSize]; !bytes.Equal(hole, make([]byte, SectorSize)) {
+			t.Errorf("the missing middle sector did not read as zeros: %d non-zero byte(s), first at %d",
+				nonZeroCount(hole), bytes.IndexFunc(hole, func(r rune) bool { return r != 0 }))
+		}
+		if !bytes.Equal(got[2*SectorSize:], sector2) {
+			t.Error("sector 2's bytes are not at their true offset: they were shifted by the hole")
+		}
+
+		// The configmaps on the cluster are exactly the two seeded sectors.
+		if names := sectorConfigMapNames(t, fcs, f); !slices.Equal(names, []string{
+			f.sectorNameFromSectorIndex(0), f.sectorNameFromSectorIndex(2),
+		}) {
+			t.Errorf("sector configmaps after the read = %v, want only sectors 0 and 2 (no sector created for the hole)", names)
+		}
+	})
+
+	t.Run("read-starts-mid-sector", func(t *testing.T) {
+		f, _, sector0, sector2 := newHoleFile(t)
+
+		// Start 10 bytes before the hole: the first sector's tail, the hole's
+		// zeros, then sector 2's head — each at its true offset.
+		const off = SectorSize - 10
+		got := make([]byte, SectorSize+200)
+		for i := range got {
+			got[i] = 0xff
+		}
+		n, err := f.ReadAt(got, off)
+		if n != len(got) {
+			t.Fatalf("read from mid-sector got %d bytes, want %d", n, len(got))
+		}
+		if err != nil {
+			t.Fatalf("read from mid-sector err = %v, want nil", err)
+		}
+		if !bytes.Equal(got[:10], sector0[SectorSize-10:]) {
+			t.Error("the first 10 bytes are not sector 0's tail at the requested offset")
+		}
+		if hole := got[10 : SectorSize+10]; !bytes.Equal(hole, make([]byte, len(hole))) {
+			t.Errorf("the hole did not read as zeros: %d non-zero byte(s)", nonZeroCount(hole))
+		}
+		if !bytes.Equal(got[SectorSize+10:], sector2[:190]) {
+			t.Error("sector 2's bytes are not at their true offset after a mid-sector start")
+		}
+	})
+	t.Run("read-starts-inside-hole", func(t *testing.T) {
+		f, _, _, sector2 := newHoleFile(t)
+
+		// The read begins inside the missing sector: its first bytes are the
+		// hole's zeros, and sector 2 still lands at its true offset. Before
+		// the fix this read returned (0, io.EOF) — a hole at the start of the
+		// buffer was mistaken for the hasHotJournal case at offset 0.
+		// 500 bytes of hole, then sector 2's first 500 bytes: the read starts
+		// 500 bytes before the sector boundary, inside the missing sector.
+		const off = 2*SectorSize - 500
+		got := make([]byte, 1000)
+		for i := range got {
+			got[i] = 0xff
+		}
+		n, err := f.ReadAt(got, off)
+		if n != len(got) {
+			t.Fatalf("read starting inside the hole got %d bytes, want %d", n, len(got))
+		}
+		if err != nil {
+			t.Fatalf("read starting inside the hole err = %v, want nil", err)
+		}
+		if !bytes.Equal(got[:500], make([]byte, 500)) {
+			t.Errorf("the hole's zeros at the start of the read are wrong: %d non-zero byte(s)", nonZeroCount(got[:500]))
+		}
+		if want := sector2[:500]; !bytes.Equal(got[500:], want) {
+			t.Error("sector 2's bytes are not at their true offset when the read starts inside the hole")
+		}
+	})
+}
+
+// nonZeroCount counts the non-zero bytes of b.
+func nonZeroCount(b []byte) int {
+	n := 0
+	for _, c := range b {
+		if c != 0 {
+			n++
+		}
+	}
+	return n
+}
+
+// sectorConfigMapNames lists this file's sector ConfigMap names, sorted by
+// sector index.
+func sectorConfigMapNames(tb testing.TB, fcs *fake.Clientset, f *file) []string {
+	tb.Helper()
+	var out []string
+	for _, cm := range listSectorConfigMaps(tb, fcs, f) {
+		out = append(out, cm.Name)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	// Sector names are fixed-width base32 suffixes, so lexicographic order is
+	// sector order for the small indices these tests use.
+	return out
 }
 
 // --- Delete ---
