@@ -311,6 +311,30 @@ func (s *Store) migrateSnykIgnoresCache(ctx context.Context) error {
 	return nil
 }
 
+// sqliteTimestampLayout is the format of SQLite's CURRENT_TIMESTAMP, which
+// the updated_at migration used to seed existing rows. Unlike RFC3339 it
+// carries no timezone; CURRENT_TIMESTAMP is always UTC.
+const sqliteTimestampLayout = "2006-01-02 15:04:05"
+
+// parseTimestamp parses a cache timestamp column value. Values are written as
+// RFC3339, but rows seeded by the updated_at migration carry SQLite's
+// CURRENT_TIMESTAMP format instead, so both are accepted and the result is
+// normalised to UTC. An empty value means genuinely absent and yields a zero
+// time with ok=true. A non-empty value in neither format yields ok=false so
+// the caller can treat it explicitly rather than silently reading a zero time.
+func parseTimestamp(raw string) (time.Time, bool) {
+	if raw == "" {
+		return time.Time{}, true
+	}
+	if ts, err := time.Parse(time.RFC3339, raw); err == nil {
+		return ts.UTC(), true
+	}
+	if ts, err := time.Parse(sqliteTimestampLayout, raw); err == nil {
+		return ts.UTC(), true
+	}
+	return time.Time{}, false
+}
+
 // LoadIgnores returns the cached v1 ignore metadata for a project.
 func (s *Store) LoadIgnores(ctx context.Context, projectID string) (map[string]IgnoreMeta, error) {
 	out := make(map[string]IgnoreMeta)
@@ -344,19 +368,27 @@ func (s *Store) LoadIgnores(ctx context.Context, projectID string) (map[string]I
 			IssueKey:           issueKey,
 			DisregardIfFixable: disregardIfFixable != 0,
 		}
-		if expiresAtRaw != "" {
-			meta.ExpiresAt, _ = time.Parse(time.RFC3339, expiresAtRaw)
+		// Timestamps are written as RFC3339 (SaveIgnores), but the
+		// updated_at migration seeded existing rows with SQLite's
+		// CURRENT_TIMESTAMP, whose format has no timezone offset. Accept both
+		// on read; otherwise the migration's own rows parse as a zero time
+		// and never age out. An empty value is genuinely absent and keeps its
+		// current meaning (a zero time). A non-empty value in neither format
+		// is corrupt: for updated_at that means evict (see below); for
+		// expires_at and created_at it keeps the previous zero-time reading.
+		if expiresAt, ok := parseTimestamp(expiresAtRaw); ok {
+			meta.ExpiresAt = expiresAt
 		}
-		if createdAtRaw != "" {
-			meta.CreatedAt, _ = time.Parse(time.RFC3339, createdAtRaw)
+		if createdAt, ok := parseTimestamp(createdAtRaw); ok {
+			meta.CreatedAt = createdAt
 		}
-		if updatedAtRaw != "" {
-			meta.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAtRaw)
-		}
-
-		if !meta.UpdatedAt.IsZero() && meta.UpdatedAt.Before(cutoff) {
+		updatedAt, updatedAtOK := parseTimestamp(updatedAtRaw)
+		if !updatedAtOK || (!updatedAt.IsZero() && updatedAt.Before(cutoff)) {
+			// A corrupt updated_at cannot be aged, so evict the row instead
+			// of keeping it silently forever.
 			continue
 		}
+		meta.UpdatedAt = updatedAt
 		out[issueKey] = meta
 	}
 
