@@ -101,6 +101,28 @@ func newClientset(kubeconfigFlag string) (kubernetes.Interface, error) {
 // so the tests can drive it — the error paths included — with the fake
 // clientset, and it returns the first failure to its caller.
 func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Logger) error {
+	return runWithClientFrom(clientset, opts, logger, openLocalFile)
+}
+
+// localFile is what the upload loop needs from the local image: the bytes,
+// its size, and a way to close it. *os.File satisfies it; a test can supply
+// a reader with other behaviour (a short-reader, an injected error) instead.
+type localFile interface {
+	io.Reader
+	Stat() (os.FileInfo, error)
+	Close() error
+}
+
+// openLocalFile opens the local image the upload reads from.
+func openLocalFile(name string) (localFile, error) {
+	return os.Open(name)
+}
+
+// runWithClientFrom is runWithClient with the local-file source injectable,
+// so a test can feed a reader that returns short reads — allowed by the
+// io.Reader contract and realistic on FUSE, NFS or a file changing underneath
+// — without needing a real file that misbehaves.
+func runWithClientFrom(clientset kubernetes.Interface, opts Options, logger *slog.Logger, open func(name string) (localFile, error)) error {
 	vfsN := vfs.NewVFS(context.Background(), clientset, "test", logger, opts.Retries)
 
 	fn := "file2.db"
@@ -148,7 +170,7 @@ func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Lo
 		return fmt.Errorf("open %q in the cluster: %w", fn, err)
 	}
 
-	f, err := os.Open(fn)
+	f, err := open(fn)
 	if err != nil {
 		return fmt.Errorf("open local file: %w", err)
 	}
@@ -164,13 +186,31 @@ func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Lo
 
 	fileA := vfs.NewFile(fn, vfsN)
 
+	// A bare Read may return fewer bytes than the buffer holds without
+	// reaching EOF (allowed by io.Reader, and realistic on FUSE, NFS or a
+	// file being modified underneath). Writing that partial buffer as a
+	// whole sector shifts every later sector to the wrong offset: bytes
+	// 124000 onward landed in sector 2 instead of sector 1. io.ReadFull
+	// fills the buffer before each sector is written, so a sector is only
+	// ever short at the true end of the file. It reports io.EOF with n == 0
+	// at a clean end of file, io.ErrUnexpectedEOF for a partial final
+	// sector (which must still be written), and any other error means the
+	// image cannot be trusted.
 	var index int64
+read:
 	for {
-		n, err := f.Read(buf)
-		if n == 0 && errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil && !errors.Is(err, io.EOF) {
+		n, err := io.ReadFull(f, buf)
+		switch {
+		case err == nil:
+			// A full sector.
+		case errors.Is(err, io.EOF) && n == 0:
+			// A clean end of file, with no partial sector to write.
+			break read
+		case errors.Is(err, io.ErrUnexpectedEOF):
+			// The file ends inside this sector: write the partial sector
+			// and stop. The size check below still verifies the whole image
+			// landed.
+		default:
 			return fmt.Errorf("read %s: %w", fn, err)
 		}
 		logger.Info("Writing sector", "sector", index)
@@ -179,6 +219,9 @@ func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Lo
 			return fmt.Errorf("write sector %d: %w", index, err)
 		}
 		index++
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			break
+		}
 	}
 
 	// WriteSector only creates and overwrites sectors: uploading a smaller

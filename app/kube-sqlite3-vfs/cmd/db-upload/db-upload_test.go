@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/RichardoC/kube-sqlite3-vfs/pkg/vfs"
 	_ "github.com/mattn/go-sqlite3"
@@ -132,6 +133,132 @@ func TestRunWithClientUploadsSectorBySector(t *testing.T) {
 		t.Errorf("lockfile ConfigMaps = %d, want 1", len(lockfiles))
 	}
 }
+
+// shortFile is a localFile whose reader returns at most chunk bytes per
+// Read, and EOF only when the bytes are exhausted — a short read without
+// EOF, which the io.Reader contract allows and a FUSE, NFS or concurrently
+// modified file produces in practice. A bare Read loop would write each
+// short chunk as a whole sector and misplace every later one.
+type shortFile struct {
+	r     io.Reader
+	size  int64
+	chunk int
+}
+
+func (f *shortFile) Read(p []byte) (int, error) {
+	if f.chunk > 0 && len(p) > f.chunk {
+		p = p[:f.chunk]
+	}
+	return f.r.Read(p)
+}
+
+func (f *shortFile) Stat() (os.FileInfo, error) { return fakeFileInfo{size: f.size}, nil }
+func (f *shortFile) Close() error               { return nil }
+
+// fakeFileInfo reports only the size the upload's Stat uses.
+type fakeFileInfo struct{ size int64 }
+
+func (fi fakeFileInfo) Name() string       { return "file2.db" }
+func (fi fakeFileInfo) Size() int64        { return fi.size }
+func (fi fakeFileInfo) Mode() os.FileMode  { return 0o644 }
+func (fi fakeFileInfo) ModTime() time.Time { return time.Time{} }
+func (fi fakeFileInfo) IsDir() bool        { return false }
+func (fi fakeFileInfo) Sys() any           { return nil }
+
+// storedSectorsByIndex lists the sector ConfigMaps keyed by sector index.
+func storedSectorsByIndex(t *testing.T, fcs *fake.Clientset) map[int64][]byte {
+	t.Helper()
+	out := make(map[int64][]byte)
+	for _, cm := range listConfigMaps(t, fcs, "data=sector") {
+		index, ok := sectorIndexFromName(cm.Name)
+		if !ok {
+			t.Fatalf("sector ConfigMap %q has no parseable index", cm.Name)
+		}
+		out[index] = cm.BinaryData["sector"]
+	}
+	return out
+}
+
+// A short-reading source must still store every byte at its correct offset:
+// the upload loop fills each sector with io.ReadFull instead of trusting one
+// Read to fill the buffer (issue #464).
+func TestRunWithClientUploadsCorrectlyFromShortReadingSource(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	want := make([]byte, 2*vfs.SectorSize+123)
+	if _, err := rand.Read(want); err != nil {
+		t.Fatalf("read random bytes: %v", err)
+	}
+
+	open := func(string) (localFile, error) {
+		return &shortFile{r: bytes.NewReader(want), size: int64(len(want)), chunk: 7}, nil
+	}
+	fcs := fake.NewSimpleClientset()
+	if err := runWithClientFrom(fcs, Options{Retries: 1}, testLogger(), open); err != nil {
+		t.Fatalf("runWithClientFrom with a short-reading source: %v", err)
+	}
+
+	sectors := storedSectorsByIndex(t, fcs)
+	if len(sectors) != 3 {
+		t.Fatalf("sector ConfigMaps = %d, want 3", len(sectors))
+	}
+	for index, data := range sectors {
+		start := index * vfs.SectorSize
+		end := min(start+vfs.SectorSize, int64(len(want)))
+		if !bytes.Equal(data, want[start:end]) {
+			t.Errorf("sector %d holds %d bytes, want the %d bytes at offset %d", index, len(data), end-start, start)
+		}
+	}
+	if rSize, err := vfs.NewFile("file2.db", vfs.NewVFS(context.Background(), fcs, "test", testLogger(), 1)).FileSize(); err != nil {
+		t.Fatalf("remote FileSize: %v", err)
+	} else if rSize != int64(len(want)) {
+		t.Errorf("remote file size = %d, want %d", rSize, len(want))
+	}
+}
+
+// A read error part-way through the image must fail the upload cleanly and
+// must not store the bytes read before it as a sector of their own: a
+// misaligned sector is worse than a failed upload.
+func TestRunWithClientFailsCleanlyOnReadError(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	want := make([]byte, 2*vfs.SectorSize)
+	if _, err := rand.Read(want); err != nil {
+		t.Fatalf("read random bytes: %v", err)
+	}
+	wantErr := errors.New("disk on fire")
+	// Serve one full sector, then a short read, then the injected error.
+	src := io.MultiReader(
+		bytes.NewReader(want[:vfs.SectorSize]),
+		bytes.NewReader(want[vfs.SectorSize:vfs.SectorSize+10]),
+		errReader{err: wantErr},
+	)
+	open := func(string) (localFile, error) {
+		return &shortFile{r: src, size: int64(len(want))}, nil
+	}
+
+	fcs := fake.NewSimpleClientset()
+	err := runWithClientFrom(fcs, Options{Retries: 1}, testLogger(), open)
+	if err == nil {
+		t.Fatal("runWithClientFrom succeeded despite a read error mid-image")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("runWithClientFrom error = %v, want it to wrap %v", err, wantErr)
+	}
+
+	sectors := storedSectorsByIndex(t, fcs)
+	if len(sectors) != 1 {
+		t.Fatalf("sector ConfigMaps = %d, want 1 (only the complete sector)", len(sectors))
+	}
+	if !bytes.Equal(sectors[0], want[:vfs.SectorSize]) {
+		t.Errorf("sector 0 does not hold the complete first sector")
+	}
+}
+
+// errReader returns its error on every Read.
+type errReader struct{ err error }
+
+func (r errReader) Read([]byte) (int, error) { return 0, r.err }
 
 func TestRunWithClientFailsWhenLocalFileMissing(t *testing.T) {
 	t.Chdir(t.TempDir()) // no file2.db here
