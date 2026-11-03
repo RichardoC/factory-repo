@@ -384,7 +384,7 @@ func (c *Client) CreateIssues(ctx context.Context, desired []model.DesiredIssue)
 	// per-alias outcomes whenever anything came back, and only surface the
 	// error when nothing did (transport failure, HTTP error, undecodable
 	// body).
-	if execErr := c.execute(ctx, op, &resp); execErr != nil {
+	if execErr := c.executeMutation(ctx, op, &resp); execErr != nil {
 		if len(resp) == 0 {
 			return nil, fmt.Errorf("create Linear issues: %w", execErr)
 		}
@@ -496,7 +496,7 @@ func (c *Client) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) 
 	resp := map[string]struct {
 		Success bool `json:"success"`
 	}{}
-	if err := c.execute(ctx, op, &resp); err != nil {
+	if err := c.executeMutation(ctx, op, &resp); err != nil {
 		return fmt.Errorf("update Linear issues: %w", err)
 	}
 
@@ -563,7 +563,7 @@ func (c *Client) PostComments(ctx context.Context, updates []model.IssueUpdate) 
 	// Same partial-decode reasoning as CreateIssues: comments that posted are
 	// already visible on the issue, so only the aliases that actually failed
 	// may be retried.
-	if execErr := c.execute(ctx, op, &resp); execErr != nil {
+	if execErr := c.executeMutation(ctx, op, &resp); execErr != nil {
 		if len(resp) == 0 {
 			return nil, fmt.Errorf("post Linear change comments: %w", execErr)
 		}
@@ -1171,7 +1171,7 @@ func (c *Client) issueUnsubscribeCreatedIssues(ctx context.Context, created map[
 	resp := map[string]struct {
 		Success bool `json:"success"`
 	}{}
-	if err := c.execute(ctx, op, &resp); err != nil {
+	if err := c.executeMutation(ctx, op, &resp); err != nil {
 		return fmt.Errorf("issue-unsubscribe Linear actor from created issues: %w", err)
 	}
 	for alias, result := range resp {
@@ -2044,6 +2044,18 @@ func commentCreateMutation(size int) string {
 	}
 	builder.WriteString("}")
 	return builder.String()
+}
+
+// executeMutation runs a GraphQL mutation. The context carries the
+// non-idempotent mark, so AdaptiveTransport retries only a 429 -- where the
+// request was rejected rather than possibly applied -- and returns a 502, 503
+// or 504 to the caller. That matters because Linear commits a mutation before
+// the gateway error can reach us and exposes no idempotency key: a blind
+// re-send would duplicate every issue or comment the batch created. The
+// caller reconciles the ambiguous outcome instead (see CreateIssues and
+// PostComments, which retry only the aliases that did not land).
+func (c *Client) executeMutation(ctx context.Context, op *gqlclient.Operation, out any) error {
+	return c.execute(httpx.WithNonIdempotent(ctx), op, out)
 }
 
 func (c *Client) execute(ctx context.Context, op *gqlclient.Operation, out any) error {

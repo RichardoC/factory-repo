@@ -435,7 +435,7 @@ func (c *Client) CreateIssues(ctx context.Context, desired []model.DesiredIssue)
 	// into a retry that recreates every one of them. So derive per-alias
 	// outcomes whenever anything came back, and only surface the error when
 	// nothing did (transport failure, HTTP error, undecodable body).
-	if execErr := c.execute(ctx, op, &resp); execErr != nil {
+	if execErr := c.executeMutation(ctx, op, &resp); execErr != nil {
 		if len(resp) == 0 {
 			return nil, fmt.Errorf("create Linear issues: %w", execErr)
 		}
@@ -547,7 +547,7 @@ func (c *Client) UpdateIssues(ctx context.Context, updates []model.IssueUpdate) 
 	resp := map[string]struct {
 		Success bool `json:"success"`
 	}{}
-	if err := c.execute(ctx, op, &resp); err != nil {
+	if err := c.executeMutation(ctx, op, &resp); err != nil {
 		return fmt.Errorf("update Linear issues: %w", err)
 	}
 
@@ -607,7 +607,7 @@ func (c *Client) PostComments(ctx context.Context, updates []model.IssueUpdate) 
 	// Same partial-decode reasoning as CreateIssues: comments that posted are
 	// already visible on the issue, so only the aliases that actually failed may
 	// be retried.
-	if execErr := c.execute(ctx, op, &resp); execErr != nil {
+	if execErr := c.executeMutation(ctx, op, &resp); execErr != nil {
 		if len(resp) == 0 {
 			return nil, fmt.Errorf("post Linear change comments: %w", execErr)
 		}
@@ -954,7 +954,7 @@ func (c *Client) issueUnsubscribeCreatedIssues(ctx context.Context, created map[
 	resp := map[string]struct {
 		Success bool `json:"success"`
 	}{}
-	if err := c.execute(ctx, op, &resp); err != nil {
+	if err := c.executeMutation(ctx, op, &resp); err != nil {
 		return fmt.Errorf("issue-unsubscribe Linear actor from created issues: %w", err)
 	}
 	for alias, result := range resp {
@@ -1737,6 +1737,17 @@ func commentCreateMutation(size int) string {
 	}
 	builder.WriteString("}")
 	return builder.String()
+}
+
+// executeMutation runs a GraphQL mutation. Unlike a read, a mutation must not
+// be re-sent by the HTTP transport after a 502, 503 or 504: the gateway error
+// can arrive after Linear already committed the write, and re-sending the
+// batch would duplicate every issue and comment in it. The mark makes the
+// transport deliver such a response to the caller, which reconciles the
+// partial write instead of retrying it blindly. The per-alias rate-limit
+// handling below is unchanged and still applies.
+func (c *Client) executeMutation(ctx context.Context, op *gqlclient.Operation, out any) error {
+	return c.execute(httpx.WithNonIdempotent(ctx), op, out)
 }
 
 func (c *Client) execute(ctx context.Context, op *gqlclient.Operation, out any) error {

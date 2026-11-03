@@ -21,6 +21,7 @@ import (
 	gqlclient "git.sr.ht/~emersion/gqlclient"
 
 	"github.com/tesslio/snyk-dast-linear-sync/internal/config"
+	"github.com/tesslio/snyk-dast-linear-sync/internal/httpx"
 	"github.com/tesslio/snyk-dast-linear-sync/internal/model"
 	linSync "github.com/tesslio/snyk-dast-linear-sync/internal/sync"
 )
@@ -2077,6 +2078,146 @@ func TestCreateIssuesSendsOneMutationWhenRateLimitBudgetExhausted(t *testing.T) 
 		t.Fatalf("server saw %d issueCreateBatch and %d issueUnsubscribe requests, want never 2+ per operation",
 			gotCreate, gotUnsubscribe)
 	}
+}
+
+// TestMutationsDeliverGatewayErrorsOnceWhileReadsRetry is the regression test
+// for issue #487 at the Linear client layer. It goes through the real
+// AdaptiveTransport stack, so it proves the two layers agree: a 503 on a
+// CreateIssues or PostComments mutation reaches the caller after exactly one
+// request (the caller reconciles the partial write), while the same status on
+// a snapshot read is retried and succeeds. A re-sent mutation would duplicate
+// every issue or comment in the batch.
+func TestMutationsDeliverGatewayErrorsOnceWhileReadsRetry(t *testing.T) {
+	const gatewayStatus = http.StatusServiceUnavailable
+
+	// stub serves 503 for every mutation and for the first read, then a valid
+	// read response. Counters are atomic because the handler runs in the
+	// server goroutine under -race.
+	newStub := func(t *testing.T) (*httptest.Server, *atomic.Int32, *atomic.Int32, *atomic.Int32) {
+		t.Helper()
+		var creates, comments, reads atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("ReadAll() error = %v", err)
+				return
+			}
+			query := string(body)
+			w.Header().Set("Content-Type", "application/json")
+
+			switch {
+			case strings.Contains(query, "issueCreateBatch"):
+				creates.Add(1)
+				w.WriteHeader(gatewayStatus)
+				_, _ = io.WriteString(w, `{"errors":[{"message":"gateway error"}]}`)
+			case strings.Contains(query, "commentCreateBatch"):
+				comments.Add(1)
+				w.WriteHeader(gatewayStatus)
+				_, _ = io.WriteString(w, `{"errors":[{"message":"gateway error"}]}`)
+			case strings.Contains(query, "existingIssues"):
+				// The snapshot read is retried: the first attempt sees the
+				// gateway error, the second the answer.
+				if reads.Add(1) == 1 {
+					w.WriteHeader(gatewayStatus)
+					_, _ = io.WriteString(w, `{"errors":[{"message":"gateway error"}]}`)
+					return
+				}
+				_, _ = io.WriteString(w, `{"data":{"issues":{
+					"nodes":[{
+						"id":"issue-1","identifier":"SNYK-100","title":"t","description":"",
+						"url":"https://linear.example.test/issue-1","priority":2,
+						"dueDate":null,"archivedAt":null,
+						"state":{"id":"state-todo","name":"Todo"},
+						"labels":{"nodes":[],"pageInfo":{"hasNextPage":false}}
+					}],
+					"pageInfo":{"hasNextPage":false,"endCursor":null}
+				}}}`)
+			default:
+				t.Errorf("unexpected GraphQL operation: %s", query)
+				_, _ = io.WriteString(w, `{"data":{}}`)
+			}
+		}))
+		t.Cleanup(server.Close)
+		return server, &creates, &comments, &reads
+	}
+
+	// newStubClient points a client built by New at the stub while keeping the
+	// production transport stack: HeaderTransport over AdaptiveTransport.
+	newStubClient := func(t *testing.T, url string) *Client {
+		t.Helper()
+		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+		client := New(config.LinearConfig{
+			TeamID: "team-1",
+			APIKey: "test-key",
+			States: config.StateConfig{Todo: "Todo"},
+		}, 1, logger)
+		client.gql = gqlclient.New(url, &http.Client{
+			Transport: &httpx.HeaderTransport{
+				Base:  httpx.NewAdaptiveTransport("linear", 1, logger, nil),
+				Key:   "Authorization",
+				Value: "test-key",
+			},
+		})
+		client.mu.Lock()
+		client.resolvedTeam = "team-1"
+		client.statesByName = map[string]string{"todo": "state-todo"}
+		client.statesByType = map[string]string{}
+		client.managedLabelIDs = map[string]string{}
+		client.mu.Unlock()
+		return client
+	}
+
+	t.Run("create issues mutation is delivered once", func(t *testing.T) {
+		server, creates, _, _ := newStub(t)
+		client := newStubClient(t, server.URL)
+
+		desired := []model.DesiredIssue{{Fingerprint: "snyk-dast:project-a:100", Title: "t", State: model.StateTodo}}
+		if _, err := client.CreateIssues(context.Background(), desired); err == nil {
+			t.Fatal("CreateIssues() error = nil, want the 503 delivered to the caller")
+		}
+		if got := creates.Load(); got != 1 {
+			t.Fatalf("issueCreateBatch requests = %d, want exactly 1: re-sending a mutation on 503 duplicates every issue in the batch", got)
+		}
+	})
+
+	t.Run("post comments mutation is delivered once", func(t *testing.T) {
+		server, _, comments, _ := newStub(t)
+		client := newStubClient(t, server.URL)
+
+		updates := []model.IssueUpdate{{
+			Existing: model.ExistingIssue{ID: "issue-1", Identifier: "SNYK-100", StateName: "Todo"},
+			Desired:  model.DesiredIssue{Fingerprint: "snyk-dast:project-a:100", State: model.StateDone},
+			Diff:     &model.IssueDiff{StateChanged: true, StateFrom: "Todo", StateTo: "Done"},
+		}}
+		if _, err := client.PostComments(context.Background(), updates); err == nil {
+			t.Fatal("PostComments() error = nil, want the 503 delivered to the caller")
+		}
+		if got := comments.Load(); got != 1 {
+			t.Fatalf("commentCreateBatch requests = %d, want exactly 1: re-sending a mutation on 503 duplicates every comment in the batch", got)
+		}
+	})
+
+	t.Run("snapshot read is retried", func(t *testing.T) {
+		server, _, _, reads := newStub(t)
+		client := newStubClient(t, server.URL)
+
+		// The transport backs off for its default two seconds between
+		// attempts; the deadline keeps a regression that never returns from
+		// hanging the test.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		issues, err := client.loadIssues(ctx)
+		if err != nil {
+			t.Fatalf("loadIssues() error = %v, want the snapshot read retried to success", err)
+		}
+		if len(issues) != 1 || issues[0].Identifier != "SNYK-100" {
+			t.Fatalf("issues = %#v, want the one issue the stub returned", issues)
+		}
+		if got := reads.Load(); got != 2 {
+			t.Fatalf("existingIssues requests = %d, want 2: a GraphQL snapshot read on 503 is still retried", got)
+		}
+	})
 }
 
 // TestDesiredLabelIDsManagedLabelEvictsExclusiveGroupSibling guards against
