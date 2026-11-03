@@ -1247,6 +1247,18 @@ func TestNextRepicksStrandedPR(t *testing.T) {
 		t.Fatalf("Next on a review-passed PR = %+v; want nothing", p)
 	}
 
+	// A PR already handed to a maintainer (issue #457) is never re-picked,
+	// whatever its head: the hand-off says a retry cannot change the
+	// outcome, so a later commit must not buy another review either.
+	owned := queuedIssue(206, "2024-01-01T00:00:00Z", "codeaf", maintainerLabel)
+	owned.PullRequest = json.RawMessage(`{"number":206}`)
+	o5 := nextOpts()
+	o5.PRHeads = map[int]string{206: shaA}
+	o5.PRMarkers = map[int][]string{206: nil}
+	if p, _ := nextPick([]item{owned}, nil, o5); p.Kind != "" {
+		t.Fatalf("Next on a maintainer-held PR = %+v; want nothing", p)
+	}
+
 	// A PR with a run in progress is never re-picked (issue #137's guard).
 	o3 := nextOpts()
 	o3.PRHeads = map[int]string{204: shaA}
@@ -1399,7 +1411,150 @@ func TestRunNextRepicksStrandedPR(t *testing.T) {
 	if posts != 2 || len(comments) != 3 || !strings.Contains(comments[2], shaB) {
 		t.Fatalf("marker comments after the move = %q (posts %d); want one naming %s", comments, posts, shaB)
 	}
-} // TestNextPicksReviewBeforeIssues covers the queue's new head of the pass
+} // TestNextPRPolicyRefusalNotRepicked is the end-to-end check of issue
+// #457 on the fake GitHub server, driving the whole `harness next` path: a
+// PR whose latest bot report is a publish refusal naming the workflow policy
+// is not re-picked -- it gets the one maintainer hand-off (label and
+// comment) instead -- while the same PR with an ordinary publishing failure
+// is still re-picked for review. It also covers a hand-off whose label half
+// landed but whose comment half did not: the comment is still served, and
+// the labelled PR is still not re-picked.
+func TestNextPRPolicyRefusalNotRepicked(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	policy := reportMarker + "\n### CodeAF run — publishing failed\n\n| | |\n" +
+		"\n| error | the workflow change breaks the workflow policy (above) and no maintainer approved it; refusing it |\n"
+	ordinary := reportMarker + "\n### CodeAF run — publishing failed\n\n| | |\n"
+	issuesJSON := `[{"number":206,"state":"open","created_at":"2024-01-01T00:00:00Z","pull_request":{"number":206},"labels":[{"name":"codeaf"}]},
+	                {"number":207,"state":"open","created_at":"2024-01-02T00:00:00Z","pull_request":{"number":207},"labels":[{"name":"codeaf"}]},
+	                {"number":208,"state":"open","created_at":"2024-01-03T00:00:00Z","pull_request":{"number":208},"labels":[{"name":"codeaf"},{"name":"codeaf-maintainer"}]}]`
+	comments := map[int][]string{206: {policy}, 207: {ordinary}, 208: {policy}}
+	posts := map[int]int{}
+	// #208's hand-off already carries its label but not its comment: a tick
+	// whose label half landed and whose comment half failed.
+	labels := map[int][]string{208: {maintainerLabel}}
+	labelCreates := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case r.Method == http.MethodGet && path == "/repos/RichardoC/factory-repo/issues" && r.URL.Query().Get("state") == "open":
+			fmt.Fprint(w, issuesJSON)
+		case r.Method == http.MethodGet && strings.HasPrefix(path, "/repos/RichardoC/factory-repo/pulls/"):
+			n := 0
+			fmt.Sscanf(path, "/repos/RichardoC/factory-repo/pulls/%d", &n)
+			fmt.Fprintf(w, `{"number":%d,"head":{"ref":"branch","sha":%q}}`, n, sha)
+		case r.Method == http.MethodGet && strings.HasPrefix(path, "/repos/RichardoC/factory-repo/issues/") && strings.HasSuffix(path, "/comments"):
+			n := 0
+			fmt.Sscanf(path, "/repos/RichardoC/factory-repo/issues/%d/comments", &n)
+			var items []string
+			for _, c := range comments[n] {
+				items = append(items, fmt.Sprintf(`{"body":%q,"user":{"type":"Bot"}}`, c))
+			}
+			fmt.Fprint(w, "["+strings.Join(items, ",")+"]")
+		case r.Method == http.MethodPost && strings.HasPrefix(path, "/repos/RichardoC/factory-repo/issues/") && strings.HasSuffix(path, "/comments"):
+			n := 0
+			fmt.Sscanf(path, "/repos/RichardoC/factory-repo/issues/%d/comments", &n)
+			posts[n]++
+			var body struct {
+				Body string `json:"body"`
+			}
+			data, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(data, &body)
+			comments[n] = append(comments[n], body.Body)
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{}`)
+		case r.Method == http.MethodGet && strings.HasPrefix(path, "/repos/RichardoC/factory-repo/issues/") && !strings.Contains(path, "/comments"):
+			n := 0
+			fmt.Sscanf(path, "/repos/RichardoC/factory-repo/issues/%d", &n)
+			var ls []string
+			for _, l := range labels[n] {
+				ls = append(ls, fmt.Sprintf(`{"name":%q}`, l))
+			}
+			fmt.Fprintf(w, `{"number":%d,"state":"open","labels":[%s]}`, n, strings.Join(ls, ","))
+		case r.Method == http.MethodPost && strings.HasPrefix(path, "/repos/RichardoC/factory-repo/issues/") && strings.HasSuffix(path, "/labels"):
+			n := 0
+			fmt.Sscanf(path, "/repos/RichardoC/factory-repo/issues/%d/labels", &n)
+			var body struct {
+				Labels []string `json:"labels"`
+			}
+			data, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(data, &body)
+			labels[n] = append(labels[n], body.Labels...)
+			fmt.Fprint(w, `[]`)
+		case r.Method == http.MethodPost && path == "/repos/RichardoC/factory-repo/labels":
+			labelCreates++
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{}`)
+		case r.Method == http.MethodGet && path == "/repos/RichardoC/factory-repo/contents/app":
+			fmt.Fprint(w, `[]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	t.Setenv("GITHUB_API_URL", server.URL)
+	t.Setenv("GITHUB_REPOSITORY", "RichardoC/factory-repo")
+	t.Setenv("GH_TOKEN", "tok")
+	t.Setenv("PROXY_MODELS", "models.json")
+	t.Setenv("CODEAF_WEEK_SPENT_USD", "1")
+	if _, err := loadConfig("models.json"); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	issuesPath := filepath.Join(dir, "issues.json")
+	runsPath := filepath.Join(dir, "runs.json")
+	if err := os.WriteFile(issuesPath, []byte(issuesJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(runsPath, []byte(`[{"status":"completed"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// First tick: only the ordinary failure (#207) is re-picked; #206's
+	// policy refusal gets the maintainer hand-off, not a review.
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "kind=review\nnumber=207\nlane=0\n" {
+		t.Fatalf("runNext printed %q, %v; want only the #207 re-pick", out, err)
+	}
+	if posts[207] != 1 || !strings.Contains(comments[207][1], queueRepickMarker) || !strings.Contains(comments[207][1], sha) {
+		t.Fatalf("#207: comments %q (posts %d); want the one re-pick marker naming %s", comments[207], posts[207], sha)
+	}
+	if posts[206] != 1 || !strings.Contains(comments[206][1], queuePRMaintainerMarker) {
+		t.Fatalf("#206: comments %q (posts %d); want the one hand-off comment", comments[206], posts[206])
+	}
+	if len(labels[206]) != 1 || labels[206][0] != maintainerLabel || labelCreates != 1 {
+		t.Fatalf("#206: labels %v, %d label creations; want the %s label once", labels[206], labelCreates, maintainerLabel)
+	}
+	if len(labels[207]) != 0 {
+		t.Fatalf("#207: labels %v; want none", labels[207])
+	}
+	// #208 is already labelled: only the missing comment half is served, and
+	// the PR is not re-picked despite its policy-eligible head.
+	if posts[208] != 1 || !strings.Contains(comments[208][1], queuePRMaintainerMarker) {
+		t.Fatalf("#208: comments %q (posts %d); want the one hand-off comment", comments[208], posts[208])
+	}
+	if len(labels[208]) != 1 {
+		t.Fatalf("#208: labels %v; want the existing one only", labels[208])
+	}
+
+	// Second tick: the hand-off is idempotent — neither half is posted
+	// twice — and the ordinary PR waits, having spent its one re-pick at
+	// this commit.
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "" {
+		t.Fatalf("second tick printed %q, %v; want nothing picked", out, err)
+	}
+	if posts[206] != 1 || labelCreates != 1 {
+		t.Fatalf("#206 second tick: posts %d, label creations %d; want nothing more", posts[206], labelCreates)
+	}
+	if posts[207] != 1 {
+		t.Fatalf("#207 second tick: posts %d; want the marker to hold the re-pick", posts[207])
+	}
+	if posts[208] != 1 {
+		t.Fatalf("#208 second tick: posts %d; want the hand-off served once", posts[208])
+	}
+}
+
+// TestNextPicksReviewBeforeIssues covers the queue's new head of the pass
 // (issue #137): a pull request labelled codeaf and codeaf-review-needed is
 // picked with kind review on the lowest free lane, ahead of any queued
 // issue — and, once the review is in flight as a mirrored run, it does not
@@ -1929,6 +2084,55 @@ func TestStrandedByFailedRun(t *testing.T) {
 	}
 }
 
+// A publish refusal that names the workflow policy leaves a PR unpickable by
+// the re-pick (issue #457): the PR twin of the issue check must return the
+// same no-answer, while an ordinary publishing failure is still re-picked.
+func TestStrandedPRState(t *testing.T) {
+	report := func(outcome, extra string) string {
+		return reportMarker + "\n### CodeAF run — " + outcome + "\n\n| | |\n" + extra
+	}
+	policy := report("publishing failed", "\n| error | the workflow change breaks the workflow policy (above) and no maintainer approved it; refusing it |\n")
+	bot := func(bodies ...string) bodyComments {
+		var cs bodyComments
+		for _, b := range bodies {
+			c := botComment(b)[0]
+			c.User.Type = "Bot"
+			cs = append(cs, c)
+		}
+		return cs
+	}
+	marker := "<!-- codeaf-queue-repick " + strings.Repeat("a", 40) + " -->\n"
+	cases := []struct {
+		name     string
+		comments bodyComments
+		want     string
+	}{
+		{"no comments", nil, strandNone},
+		{"ordinary publishing failure", bot(report("publishing failed", "")), strandRetry},
+		{"ordinary run job failure", bot(report("run job failed", "")), strandRetry},
+		{"policy refusal", bot(policy), strandMaintainer},
+		{"policy refusal after a re-pick marker stays a hand-off", bot(report("publishing failed", ""), marker, policy), strandMaintainer},
+		{"a failure after the hand-off stays a hand-off", bot(policy, prMaintainerBody(7), report("publishing failed", "")), strandMaintainer},
+		{"a well-ended run after the hand-off strands nobody", bot(policy, prMaintainerBody(7), report("done", "")), strandNone},
+		{"a hand-off marker is skipped in the scan", bot(policy, prMaintainerBody(7)), strandMaintainer},
+		{"changes pushed is no failure", bot(report("changes pushed", "")), strandNone},
+		{"a person's report cannot fake a failure", bodyComments{{Body: policy}}, strandNone},
+	}
+	for _, tc := range cases {
+		if got := strandedPRState(tc.comments); got != tc.want {
+			t.Errorf("%s: strandedPRState = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+	// The boolean the re-pick actually reads agrees on both sides of the
+	// fork: a policy refusal is never a re-pick, an ordinary failure is.
+	if strandedByFailedRun(bot(policy)) {
+		t.Error("strandedByFailedRun(policy refusal) = true; want false")
+	}
+	if !strandedByFailedRun(bot(report("publishing failed", ""))) {
+		t.Error("strandedByFailedRun(ordinary publishing failure) = false; want true")
+	}
+}
+
 // botComment builds one bot-authored comment, and personComment a
 // human-authored one: only the bot's comments count for the stranded states
 // (issue #240), so a person's comment can neither fake a failure nor spend
@@ -2157,7 +2361,9 @@ func TestRunNextStrandedIssueGuards(t *testing.T) {
 	                {"number":124,"state":"open","created_at":"2024-01-05T00:00:00Z","body":"## Done when\n\n- tests pass\n\n## End-to-end check\n\nharness next holds #124\n","labels":[{"name":"codeaf"},{"name":"area:app/y"}]},
 	                {"number":120,"state":"open","created_at":"2024-01-06T00:00:00Z","body":"## Done when\n\n- tests pass\n\n## End-to-end check\n\nharness next prints number=120\n","labels":[{"name":"codeaf"},{"name":"area:app/x"}]}]`
 	posts := map[int]int{}
-	labels := map[int][]string{}
+	// #208's hand-off already carries its label but not its comment: a tick
+	// whose label half landed and whose comment half failed.
+	labels := map[int][]string{208: {maintainerLabel}}
 	labelCreates := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path

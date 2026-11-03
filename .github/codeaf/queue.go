@@ -406,6 +406,20 @@ func prInFlight(n int, inflight []runStatus) bool {
 // there: the queue removed continue-needed when it dispatched, and nothing
 // put a label back, so without this the PR would drop out of the factory.
 func strandedPR(i item, o queueOptions, inflight []runStatus) bool {
+	// A PR a maintainer already owns (issue #457) is never re-picked: the
+	// hand-off labelled it because a retry cannot change its outcome, so a
+	// later head commit must not start another review on it either.
+	return strandedPRCandidate(i, o, inflight) && !i.labelled(maintainerLabel)
+}
+
+// strandedPRCandidate reports whether pull request i is in the shape the
+// stranded scan looks at all: open, labelled codeaf, carrying none of the
+// queue labels, with no run in progress for it. The maintainer label is not
+// part of this shape on purpose: a PR already handed over must keep being
+// scanned so the half of the hand-off that failed — its label or its comment
+// — is retried on the next tick, while strandedPR still keeps it out of the
+// re-pick.
+func strandedPRCandidate(i item, o queueOptions, inflight []runStatus) bool {
 	if i.State != "open" || len(i.PullRequest) == 0 {
 		return false
 	}
@@ -1024,8 +1038,9 @@ func runNext() error {
 	// The stranded re-pick (issue #215) reads each candidate's head SHA and
 	// marker comments here, so Next stays pure. With no token the maps stay
 	// empty and no stranded PR is re-picked.
+	var prEscalations []int
 	if gh.token != "" {
-		opts.PRHeads, opts.PRMarkers = fetchStrandedPRs(gh, issues, runs, opts.Label, log.Printf)
+		opts.PRHeads, opts.PRMarkers, prEscalations = fetchStrandedPRs(gh, issues, runs, opts.Label, log.Printf)
 	}
 	// The stranded-issue re-pick (issue #240) reads each candidate's
 	// comments here, so Next stays pure. With no token the map stays empty
@@ -1056,6 +1071,14 @@ func runNext() error {
 	// missing. Best effort: a failed escalation never fails the pick.
 	for _, n := range issueEscalations {
 		if err := ensureMaintainerEscalation(gh, n); err != nil {
+			log.Printf("maintainer hand-off on #%d: %v", n, err)
+		}
+	}
+	// A pull request whose publish refusal names the workflow policy gets
+	// the same one hand-off (issue #457): the label and the PR's own fixed
+	// comment, each ensured independently.
+	for _, n := range prEscalations {
+		if err := ensurePRMaintainerEscalation(gh, n); err != nil {
 			log.Printf("maintainer hand-off on #%d: %v", n, err)
 		}
 	}
@@ -1320,25 +1343,53 @@ type bodyComments []struct {
 }
 
 // strandedByFailedRun reports whether a PR's comments end in a failed CodeAF
-// run: its latest bot comment, the re-pick markers aside, is a run report
-// whose outcome is "publishing failed" or "run job failed". That is the one
-// state the re-pick exists for (issue #215). Every other way a PR ends with no
-// queue label is a deliberate hand-off to a person -- a spent fix budget, an
-// unrecognised severity, an incomplete review -- and re-reviewing those would
-// keep asking until a review passed. Only bot comments count, so a comment
-// anyone can post on a public repository cannot fake a failed run.
+// run that is worth re-picking: its latest bot comment, the queue's own
+// marker comments aside, is a run report whose outcome is "publishing
+// failed" or "run job failed", and it is not a refusal the workflow policy
+// makes deterministic. That is the one state the re-pick exists for (issue
+// #215). Every other way a PR ends with no queue label is a deliberate
+// hand-off to a person -- a spent fix budget, an unrecognised severity, an
+// incomplete review -- and re-reviewing those would keep asking until a
+// review passed. Only bot comments count, so a comment anyone can post on a
+// public repository cannot fake a failed run.
 func strandedByFailedRun(comments bodyComments) bool {
+	return strandedPRState(comments) == strandRetry
+}
+
+// strandedPRState reads what happened to a stranded pull request out of its
+// comments, the twin of strandedIssueState (issue #457). Its latest bot
+// comment, the queue's own marker comments aside, must be a run report; a
+// report that is no failure leaves the PR alone. A publish refusal that names
+// the workflow policy is handed to a maintainer at once instead of being
+// re-picked: the same policy refusal fails identically on every retry, and
+// every re-pick would spend a review run (and up to two fix continuations)
+// on a change no run can publish.
+//
+// Comments are untrusted data: only bot-authored comments count, and the
+// queue's marker comments are skipped in the scan -- including the maintainer
+// hand-off's, so a PR already handed over is still recognised as one.
+func strandedPRState(comments bodyComments) string {
+	escalated := false
+	for _, c := range comments {
+		if c.User.Type == "Bot" && strings.Contains(c.Body, queuePRMaintainerMarker) {
+			escalated = true
+		}
+	}
 	for i := len(comments) - 1; i >= 0; i-- {
 		c := comments[i]
-		if c.User.Type != "Bot" || strings.Contains(c.Body, queueRepickMarker) {
+		if c.User.Type != "Bot" || strings.Contains(c.Body, queueRepickMarker) ||
+			strings.Contains(c.Body, queuePRMaintainerMarker) {
 			continue
 		}
-		if !strings.HasPrefix(c.Body, reportMarker+"\n") {
-			return false
+		if !strings.HasPrefix(c.Body, reportMarker+"\n") || !failedRunReport(c.Body) {
+			return strandNone
 		}
-		return failedRunReport(c.Body)
+		if escalated || strings.Contains(c.Body, workflowPolicyRefusal) {
+			return strandMaintainer
+		}
+		return strandRetry
 	}
-	return false
+	return strandNone
 }
 
 // failedRunReport reports whether a run report (the body of a bot comment
@@ -1426,7 +1477,12 @@ func ensureRepickMarker(g github, n int, sha string) error {
 // whose head cannot be read, or whose comments cannot be, gets no entries
 // and is not re-picked this tick: the guard fails closed, since a re-pick
 // that cannot be recorded could repeat on every tick.
-func fetchStrandedPRs(g github, issues []item, runs []runStatus, lbl string, logf func(string, ...any)) (heads map[int]string, markers map[int][]string) {
+//
+// A PR whose latest failed report names the workflow policy is never
+// re-picked at all (issue #457): retrying repeats the same refusal, so it is
+// returned in escalations instead, for the same one maintainer hand-off the
+// issue path already performs.
+func fetchStrandedPRs(g github, issues []item, runs []runStatus, lbl string, logf func(string, ...any)) (heads map[int]string, markers map[int][]string, escalations []int) {
 	heads = map[int]string{}
 	markers = map[int][]string{}
 	var inflight []runStatus
@@ -1436,7 +1492,7 @@ func fetchStrandedPRs(g github, issues []item, runs []runStatus, lbl string, log
 		}
 	}
 	for _, i := range issues {
-		if !strandedPR(i, queueOptions{Label: lbl}, inflight) {
+		if !strandedPRCandidate(i, queueOptions{Label: lbl}, inflight) {
 			continue
 		}
 		var pr item
@@ -1454,7 +1510,14 @@ func fetchStrandedPRs(g github, issues []item, runs []runStatus, lbl string, log
 			logf("stranded PR #%d comments: %v", i.Number, err)
 			continue
 		}
-		if !strandedByFailedRun(comments) {
+		switch strandedPRState(comments) {
+		case strandRetry:
+		case strandMaintainer:
+			// A policy refusal fails identically on every retry: hand the
+			// PR to a maintainer once instead of re-queueing the review.
+			escalations = append(escalations, i.Number)
+			continue
+		default:
 			// No label because a person was handed the PR, not because a
 			// run failed: leave it to them.
 			continue
@@ -1462,7 +1525,7 @@ func fetchStrandedPRs(g github, issues []item, runs []runStatus, lbl string, log
 		heads[i.Number] = head
 		markers[i.Number] = repickMarkers(comments)
 	}
-	return heads, markers
+	return heads, markers, escalations
 }
 
 // ensureHoldComment posts the area hold comment on issue n unless a comment
@@ -1532,6 +1595,12 @@ const queueIssueRetryMarker = "<!-- codeaf-queue-issue-retry -->"
 // it hands a stranded issue to a maintainer: the marker keeps repeat ticks
 // from adding the label or posting the comment twice.
 const queueIssueMaintainerMarker = "<!-- codeaf-queue-issue-maintainer -->"
+
+// queuePRMaintainerMarker begins the hidden comment the queue posts when it
+// hands a stranded pull request to a maintainer (issue #457). The PR gets its
+// own marker and text, so the hand-off reads correctly on a pull request
+// while the label it ensures is the same codeaf-maintainer one issues use.
+const queuePRMaintainerMarker = "<!-- codeaf-queue-pr-maintainer -->"
 
 // maintainerLabel goes on an issue the queue stopped retrying: a person has
 // to look at it now.
@@ -1775,4 +1844,41 @@ func ensureMaintainerComment(g github, n int) error {
 		}
 	}
 	return g.post(fmt.Sprintf("/issues/%d/comments", n), map[string]string{"body": issueMaintainerBody(n)}, nil)
+}
+
+// prMaintainerBody is the pull request's maintainer hand-off comment (issue
+// #457): the same fixed shape as the issue's, built from the PR number alone.
+// It says why the queue stopped re-picking: the publish refusal names the
+// workflow policy, so a re-review would end in the same refusal.
+func prMaintainerBody(n int) string {
+	return fmt.Sprintf("%s\nCodeAF's queue is handing this pull request (#%d) to a maintainer: its latest CodeAF run failed to publish because the change breaks the workflow policy, so retrying would repeat the same refusal. The pull request carries the `codeaf-maintainer` label and needs a person to look at it.", queuePRMaintainerMarker, n)
+}
+
+// ensurePRMaintainerEscalation hands stranded pull request n to a maintainer
+// (issue #457), the PR twin of ensureMaintainerEscalation: the same
+// codeaf-maintainer label and one fixed comment, each ensured from its own
+// footprint so one half failing never suppresses the other. A PR whose
+// policy refusal was handed over stays in fetchStrandedPRs' escalations list
+// until both halves are served; on later ticks both are present and this is
+// a no-op.
+func ensurePRMaintainerEscalation(g github, n int) error {
+	labelErr := ensureMaintainerLabel(g, n)
+	commentErr := ensurePRMaintainerComment(g, n)
+	return errors.Join(labelErr, commentErr)
+}
+
+// ensurePRMaintainerComment posts the PR hand-off's one fixed comment on pull
+// request n, keyed on its marker. Only a bot's marker counts, as everywhere
+// else here: a person quoting the hand-off must not suppress the real one.
+func ensurePRMaintainerComment(g github, n int) error {
+	var comments bodyComments
+	if err := g.getList(fmt.Sprintf("/issues/%d/comments?per_page=100", n), &comments); err != nil {
+		return err
+	}
+	for _, c := range comments {
+		if c.User.Type == "Bot" && strings.Contains(c.Body, queuePRMaintainerMarker) {
+			return nil
+		}
+	}
+	return g.post(fmt.Sprintf("/issues/%d/comments", n), map[string]string{"body": prMaintainerBody(n)}, nil)
 }
