@@ -127,7 +127,9 @@ It includes:
 
 The synced title is also structured for scanability. It leads with the scanned
 target (host, falling back to target name) and the vulnerable request
-(`METHOD path`).
+(`METHOD path`). The rendered title is capped at Linear's title limit (255
+characters, measured in runes) with a `...` truncation marker, since these
+fields come from the scan API unbounded.
 
 The metadata block also records the managed automation label set when label
 management is enabled.

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tesslio/snyk-linear-sync/internal/cache"
 	"github.com/tesslio/snyk-linear-sync/internal/config"
@@ -7712,4 +7713,33 @@ func createCallSizes(batches [][]model.DesiredIssue) []int {
 		sizes = append(sizes, len(batch))
 	}
 	return sizes
+}
+
+// TestIssueTitleCapsUnboundedFields verifies that a finding whose API fields
+// (repository, package name) are long enough to exceed Linear's title limit
+// still renders a title within that limit, with a truncation marker, instead
+// of producing an issue-create that fails on every run.
+func TestIssueTitleCapsUnboundedFields(t *testing.T) {
+	finding := model.Finding{
+		IssueTitle:  "Use of Default Credentials",
+		Severity:    "critical",
+		Fingerprint: "snyk:project-a:issue-1",
+		Repository:  "owner/" + strings.Repeat("repo-", 60),
+		PackageName: "zlib",
+	}
+
+	title := issueTitle(finding)
+
+	if got := utf8.RuneCountInString(title); got > maxIssueTitleRunes {
+		t.Fatalf("title length = %d runes, want <= %d", got, maxIssueTitleRunes)
+	}
+	if !strings.HasSuffix(title, issueTitleTruncationMarker) {
+		t.Fatalf("title = %q, want truncation marker suffix", title)
+	}
+	if !strings.HasPrefix(title, "Snyk: [critical] owner/repo-") {
+		t.Fatalf("title = %q, want intact prefix", title)
+	}
+	if issueTitle(finding) != title {
+		t.Fatalf("issueTitle is not deterministic for the same finding")
+	}
 }

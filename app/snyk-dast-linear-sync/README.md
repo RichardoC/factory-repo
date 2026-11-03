@@ -234,6 +234,11 @@ The synced title includes the most useful DAST context:
 - the scanned target host (falling back to target name)
 - the vulnerable request as `METHOD path`
 
+These fields come from the scan API unbounded, so the rendered title is capped
+at Linear's title limit (255 characters, measured in runes) with a `...`
+truncation marker. Without the cap, one long request path or target name would
+make that finding's issue-create fail on every run.
+
 ## Managed Labels
 
 `LINEAR_MANAGED_LABEL` controls the automation label applied to managed issues:

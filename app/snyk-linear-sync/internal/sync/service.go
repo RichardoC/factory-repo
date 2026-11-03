@@ -1191,6 +1191,13 @@ func desiredIssue(cfg config.Config, finding model.Finding) model.DesiredIssue {
 	}
 }
 
+// issueTitle renders a scan-friendly Linear title. The context is the source
+// repository (or reference) and the subject is the most specific source
+// locator Snyk reports (file basename, package, target file or project).
+// The rendered title is capped by truncateIssueTitle: the context and subject
+// fields come from the Snyk API unbounded, so one long repository or package
+// name would otherwise exceed Linear's title limit and make that finding's
+// issue-create fail on every run, permanently.
 func issueTitle(finding model.Finding) string {
 	contextLabel := issueTitleContext(finding)
 	severity := strings.ToLower(strings.TrimSpace(finding.Severity))
@@ -1198,14 +1205,38 @@ func issueTitle(finding model.Finding) string {
 	subject := issueTitleSubject(finding)
 	if contextLabel == "" {
 		if subject == "" {
-			return fmt.Sprintf("Snyk: [%s] %s", severity, title)
+			return truncateIssueTitle(fmt.Sprintf("Snyk: [%s] %s", severity, title))
 		}
-		return fmt.Sprintf("Snyk: [%s] %s in %s", severity, title, subject)
+		return truncateIssueTitle(fmt.Sprintf("Snyk: [%s] %s in %s", severity, title, subject))
 	}
 	if subject == "" {
-		return fmt.Sprintf("Snyk: [%s] %s: %s", severity, contextLabel, title)
+		return truncateIssueTitle(fmt.Sprintf("Snyk: [%s] %s: %s", severity, contextLabel, title))
 	}
-	return fmt.Sprintf("Snyk: [%s] %s: %s in %s", severity, contextLabel, title, subject)
+	return truncateIssueTitle(fmt.Sprintf("Snyk: [%s] %s: %s in %s", severity, contextLabel, title, subject))
+}
+
+// maxIssueTitleRunes caps the rendered title at Linear's title limit (255
+// characters), measured in runes so multibyte characters are not miscounted.
+// The cap is applied to the fully rendered title, after every API-controlled
+// field (severity, issue title, context, subject) has been concatenated.
+const maxIssueTitleRunes = 255
+
+// issueTitleTruncationMarker is appended when a rendered title is truncated,
+// so readers understand why the text is cut off.
+const issueTitleTruncationMarker = "..."
+
+// truncateIssueTitle caps title at maxIssueTitleRunes runes, never splitting
+// a multibyte rune and appending issueTitleTruncationMarker when truncation
+// occurs (the marker replaces the last runes, so the result is never longer
+// than the limit). It is a pure function of title, so the same finding always
+// renders a byte-identical title — required for the sync's compare/hash
+// pipeline to stay stable and not churn tickets between runs.
+func truncateIssueTitle(title string) string {
+	if utf8.RuneCountInString(title) <= maxIssueTitleRunes {
+		return title
+	}
+	runes := []rune(title)
+	return string(runes[:maxIssueTitleRunes-utf8.RuneCountInString(issueTitleTruncationMarker)]) + issueTitleTruncationMarker
 }
 
 func issueDescription(sourceCfg config.SourceConfig, managedLabels []string, finding model.Finding) string {
