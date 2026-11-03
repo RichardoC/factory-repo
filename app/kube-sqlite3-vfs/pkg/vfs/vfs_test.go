@@ -2303,6 +2303,241 @@ func TestLeaseLossFailsSectorIOUntilRelock(t *testing.T) {
 	}
 }
 
+// TestLeaseLossMidWriteStopsSectorLoop pins the mid-call side of the write
+// gate (issue #459): a single WriteAt that spans several sectors re-checks
+// the lease for every sector, not only at entry. Each sector write is its
+// own Kubernetes call on the construction context, with no timeout, so one
+// slow UPDATE on a large write can push the loop past the lease expiry — at
+// which point another process prunes this holder and takes EXCLUSIVE, and
+// this loop must stop with sqlite3vfs.BusyError instead of writing sectors
+// under a lock the cluster has given away. The injected fake clock is
+// advanced by a ConfigMap reactor running during sector 0's write — after
+// the first sector write and before the second — so this one WriteAt call
+// outlives its own lease mid-loop.
+func TestLeaseLossMidWriteStopsSectorLoop(t *testing.T) {
+	fcs := fake.NewSimpleClientset()
+	const lease = time.Minute
+	clock := &fakeClock{now: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}
+	v := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3, WithLockLease(lease))
+	v.clock = clock.Now
+
+	f := openTestFile(t, v, "mid-write-loss.db")
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("Lock(Shared): %v", err)
+	}
+	// Warm the sector cache outside the interesting call, as the renew-on-
+	// I/O test does: FileSize's LIST runs while the lease is fresh, so the
+	// only call the WriteAt below makes before the lapse is sector 0's write.
+	if _, err := f.FileSize(); err != nil {
+		t.Fatalf("cache-warming FileSize: %v", err)
+	}
+
+	// Advance the clock past the lease exactly once, from a reactor that
+	// runs during sector 0's UPDATE — between the two sector writes of the
+	// single WriteAt below. It hands the action back to the fake clientset
+	// (false), so sector 0's write itself still lands.
+	sector0 := f.sectorNameFromSectorIndex(0)
+	advanced := false
+	fcs.PrependReactor("update", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if !advanced && action.(k8stesting.UpdateAction).GetObject().(*v1.ConfigMap).Name == sector0 {
+			advanced = true
+			clock.Advance(2 * lease)
+		}
+		return false, nil, nil
+	})
+
+	// One write straddling the sector 0/1 boundary: sector 0 is written
+	// under the live lease, and the loop must never reach sector 1.
+	buf := make([]byte, 64)
+	fillPattern(buf)
+	n, err := f.WriteAt(buf, SectorSize-32)
+	if !errors.Is(err, sqlite3vfs.BusyError) {
+		t.Fatalf("WriteAt whose sector loop outlived the lease = %v, want sqlite3vfs.BusyError", err)
+	}
+	if n != 32 {
+		t.Errorf("WriteAt reported %d bytes written, want the 32 written under the live lease", n)
+	}
+	if !f.leaseLost {
+		t.Error("mid-write lease loss did not stick: leaseLost = false, want true")
+	}
+
+	// No sector was written after the lease lapsed: sector 1 — the only
+	// sector that would have followed — never got a ConfigMap...
+	if _, err := fcs.CoreV1().ConfigMaps(testNamespace).Get(t.Context(), f.sectorNameFromSectorIndex(1), metav1.GetOptions{}); !kerrors.IsNotFound(err) {
+		t.Errorf("sector 1 after the mid-write lease loss: get err %v, want NotFound (no sector written past the lapse)", err)
+	}
+	// ...and sector 0 holds exactly what was written under the live lease.
+	cm, err := fcs.CoreV1().ConfigMaps(testNamespace).Get(t.Context(), sector0, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get sector 0: %v", err)
+	}
+	got := cm.BinaryData["sector"]
+	if len(got) != SectorSize || !bytes.Equal(got[SectorSize-32:], buf[:32]) {
+		t.Errorf("sector 0 after the mid-write loss = (%d bytes, tail %v), want (%d, the 32 bytes written under the live lease)", len(got), got[SectorSize-32:], SectorSize)
+	}
+
+	// The mid-loop loss is sticky exactly like one found at entry: the next
+	// WriteAt is refused before any API call at all.
+	alt := make([]byte, 64)
+	fillPatternAlt(alt)
+	callsBefore := len(fcs.Actions())
+	if _, err := f.WriteAt(alt, 0); !errors.Is(err, sqlite3vfs.BusyError) {
+		t.Fatalf("WriteAt after the mid-write lease loss = %v, want sqlite3vfs.BusyError (sticky)", err)
+	}
+	if n := len(fcs.Actions()) - callsBefore; n != 0 {
+		t.Errorf("sticky refusal caused %d ConfigMap API calls, want 0", n)
+	}
+
+	// A successful re-Lock re-establishes the holder and clears the loss,
+	// and the refused sectors never landed: only sector 0, pre-lapse, is
+	// on the cluster.
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("re-Lock(Shared) after the mid-write loss: %v", err)
+	}
+	out := make([]byte, 2*SectorSize)
+	if n, err := f.ReadAt(out, 0); err != nil && !errors.Is(err, io.EOF) {
+		t.Fatalf("ReadAt after re-lock: %v", err)
+	} else if n != SectorSize || !bytes.Equal(out[SectorSize-32:SectorSize], buf[:32]) {
+		t.Errorf("stored bytes after the re-lock = (%d, %v), want (%d, the 32 pre-lapse pattern bytes at the tail of sector 0 and nothing more)", n, out[SectorSize-32:SectorSize], SectorSize)
+	}
+}
+
+// TestLeaseLossMidReadStopsSectorLoop pins the read side of the mid-call
+// gate (issue #459): ReadAt fetches its sectors up front (one GET each for
+// a sector not in the cache) and then serves them one by one, so a
+// multi-sector read can cross the lease expiry while fetching — and once
+// another process has pruned this holder, the sectors it is rewriting must
+// not be served. The fake clock is advanced by a reactor running between
+// the GETs of sector 0 and sector 1 within the one ReadAt call; the
+// re-check at the top of the serving loop must fail the whole read with
+// sqlite3vfs.BusyError and serve nothing.
+func TestLeaseLossMidReadStopsSectorLoop(t *testing.T) {
+	fcs := fake.NewSimpleClientset()
+	const lease = time.Minute
+	clock := &fakeClock{now: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}
+	v := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3, WithLockLease(lease))
+	v.clock = clock.Now
+
+	f := openTestFile(t, v, "mid-read-loss.db")
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("Lock(Shared): %v", err)
+	}
+	bufA := make([]byte, 64)
+	fillPattern(bufA)
+	mustWriteAt(t, f, bufA, 0)
+	bufB := make([]byte, 64)
+	fillPatternAlt(bufB)
+	mustWriteAt(t, f, bufB, SectorSize)
+
+	// FileSize warms the cache (one LIST, fresh lease), then the cache is
+	// reset the way cacheSector's cap does: when the 256-sector cap is
+	// exceeded it drops the WHOLE map, so a locked file over the cap reads
+	// every sector with a real GET. Simulating that reset is what lets the
+	// reactor below observe the ReadAt between two of its sector GETs.
+	if _, err := f.FileSize(); err != nil {
+		t.Fatalf("cache-warming FileSize: %v", err)
+	}
+	f.sectors = make(map[int64][]byte)
+
+	sector0 := f.sectorNameFromSectorIndex(0)
+	advanced := false
+	fcs.PrependReactor("get", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if !advanced && action.(k8stesting.GetAction).GetName() == sector0 {
+			advanced = true
+			clock.Advance(2 * lease)
+		}
+		return false, nil, nil
+	})
+
+	out := make([]byte, 2*SectorSize)
+	n, err := f.ReadAt(out, 0)
+	if !errors.Is(err, sqlite3vfs.BusyError) {
+		t.Fatalf("ReadAt whose sector fetch outlived the lease = %v, want sqlite3vfs.BusyError", err)
+	}
+	if n != 0 {
+		t.Errorf("ReadAt after the mid-read lease loss served %d bytes, want 0", n)
+	}
+	if !bytes.Equal(out, make([]byte, len(out))) {
+		t.Error("ReadAt after the mid-read lease loss filled the buffer, want every byte unserved")
+	}
+	if !f.leaseLost {
+		t.Error("mid-read lease loss did not stick: leaseLost = false, want true")
+	}
+
+	// The loss is sticky: the next ReadAt is refused at entry with no API
+	// call, and a successful re-Lock re-enables the path — after which the
+	// stored sectors read back exactly as written, proving the refused read
+	// served nothing it should not have.
+	callsBefore := len(fcs.Actions())
+	if _, err := f.ReadAt(out, 0); !errors.Is(err, sqlite3vfs.BusyError) {
+		t.Fatalf("ReadAt after the mid-read lease loss = %v, want sqlite3vfs.BusyError (sticky)", err)
+	}
+	if n := len(fcs.Actions()) - callsBefore; n != 0 {
+		t.Errorf("sticky refusal caused %d ConfigMap API calls, want 0", n)
+	}
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("re-Lock(Shared) after the mid-read loss: %v", err)
+	}
+	if n, err := f.ReadAt(out, 0); err != nil && !errors.Is(err, io.EOF) {
+		t.Fatalf("ReadAt after re-lock: %v", err)
+	} else if n != SectorSize+64 || !bytes.Equal(out[:64], bufA) || !bytes.Equal(out[SectorSize:SectorSize+64], bufB) {
+		t.Errorf("stored bytes after re-lock = (%d, %v), want (%d, the two committed patterns)", n, out[:128], SectorSize+64)
+	}
+}
+
+// TestLeaseLossMidTruncateStopsSectorLoop pins the Truncate half of the
+// mid-call gate (issue #459): the delete loop runs once per sector of the
+// file and can outlive its entry gate the same way WriteAt can, so a lease
+// that lapses after the first sector delete must stop the loop with
+// sqlite3vfs.BusyError and leave the later sectors un-deleted. The fake
+// clock is advanced by a reactor running between the deletes of sector 0
+// and sector 1 of the one Truncate call.
+func TestLeaseLossMidTruncateStopsSectorLoop(t *testing.T) {
+	fcs := fake.NewSimpleClientset()
+	const lease = time.Minute
+	clock := &fakeClock{now: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}
+	v := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3, WithLockLease(lease))
+	v.clock = clock.Now
+
+	f := openTestFile(t, v, "mid-truncate-loss.db")
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("Lock(Shared): %v", err)
+	}
+	sect := make([]byte, SectorSize)
+	fillPattern(sect)
+	for i := range 3 {
+		mustWriteAt(t, f, sect, int64(i)*SectorSize)
+	}
+
+	sector0 := f.sectorNameFromSectorIndex(0)
+	advanced := false
+	fcs.PrependReactor("delete", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if !advanced && action.(k8stesting.DeleteAction).GetName() == sector0 {
+			advanced = true
+			clock.Advance(2 * lease)
+		}
+		return false, nil, nil
+	})
+
+	if err := f.Truncate(0); !errors.Is(err, sqlite3vfs.BusyError) {
+		t.Fatalf("Truncate whose delete loop outlived the lease = %v, want sqlite3vfs.BusyError", err)
+	}
+	if !f.leaseLost {
+		t.Error("mid-truncate lease loss did not stick: leaseLost = false, want true")
+	}
+
+	// Sector 0 — deleted under the live lease — is gone, and the loop
+	// stopped there: sectors 1 and 2, which would have followed, remain.
+	if _, err := fcs.CoreV1().ConfigMaps(testNamespace).Get(t.Context(), sector0, metav1.GetOptions{}); !kerrors.IsNotFound(err) {
+		t.Errorf("sector 0 after the mid-truncate loss: get err %v, want NotFound (deleted pre-lapse)", err)
+	}
+	for i := 1; i <= 2; i++ {
+		if _, err := fcs.CoreV1().ConfigMaps(testNamespace).Get(t.Context(), f.sectorNameFromSectorIndex(int64(i)), metav1.GetOptions{}); err != nil {
+			t.Errorf("sector %d after the mid-truncate loss: get err %v, want it un-deleted (the loop must stop at the lapse)", i, err)
+		}
+	}
+}
+
 // ctxSensitiveProbe wraps a kubernetes.Interface and fails every ConfigMap
 // Get/Update/Create whose CALL context is already done, the way a real
 // clientset honours per-call context cancellation. The bare fake ignores the
