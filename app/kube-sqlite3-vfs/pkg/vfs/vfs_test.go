@@ -521,6 +521,99 @@ func TestOpenLostRaceSector0VanishedAgain(t *testing.T) {
 	}
 }
 
+// TestOpenTransientLockfileGetErrorHonoursRetryBudget covers the lockfile
+// GET failure path itself (issue #485). Every sibling failure path in the
+// open loop honours the retry budget — the lockfile CAS, the sector LIST,
+// the fresh-file CREATE and the re-read — but the lockfile GET used to be
+// the one exception: one transient 500 or timeout failed the whole open
+// with a raw Kubernetes error, no retry, and (uniquely) a non-nil file
+// object alongside the non-nil error, which sqlite3vfs does not expect
+// from a failed xOpen. The fix makes the GET like its siblings: retry
+// within the budget, and on exhaustion return a nil file with the error
+// wrapped in the usual "did not settle after N attempts" message.
+//
+// At retries=3 one injected error leaves budget for the second attempt,
+// so the open succeeds; at the shipped --retries 1 default there is no
+// second attempt, so the open fails with the wrapped error and a nil file
+// (mirroring the retries=1/retries=3 structure of the lost-fresh-file-race
+// tests above).
+func TestOpenTransientLockfileGetErrorHonoursRetryBudget(t *testing.T) {
+	name := "transient-get.db"
+	for _, tc := range []struct {
+		retries     int
+		wantOpen    bool
+		wantNErrMsg string
+	}{
+		{retries: 1, wantOpen: false, wantNErrMsg: "did not settle after 1 attempts"},
+		{retries: 3, wantOpen: true},
+	} {
+		t.Run(fmt.Sprintf("retries=%d", tc.retries), func(t *testing.T) {
+			fcs := fake.NewSimpleClientset()
+			v := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), tc.retries)
+			f := NewFile(name, v)
+
+			// The first GET of the lock ConfigMap fails transiently; every
+			// later call passes through to the fake tracker untouched.
+			var injected int32
+			fcs.PrependReactor("get", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				ga, ok := action.(k8stesting.GetAction)
+				if !ok || ga.GetName() != f.LockFileName() {
+					return false, nil, nil
+				}
+				if !atomic.CompareAndSwapInt32(&injected, 0, 1) {
+					return false, nil, nil
+				}
+				// A plain error, so the exhaustion message can be proved to
+				// wrap the raw failure with errors.Is: apimachinery status
+				// errors expose their cause through Cause(), not Unwrap().
+				return true, nil, errTransientLockfileGet
+			})
+
+			sf, _, err := v.Open(name, 0)
+			if tc.wantOpen {
+				if err != nil {
+					t.Fatalf("Open(%q) with retries=%d after one transient lockfile GET error = %v, want success: the retry budget covers the GET like every sibling path", name, tc.retries, err)
+				}
+				if injected != 1 {
+					t.Errorf("injected lockfile GET error count = %d, want exactly 1", injected)
+				}
+				rf, ok := sf.(*file)
+				if !ok {
+					t.Fatalf("Open(%q) returned %T, want *file", name, sf)
+				}
+				// The retry created the lockfile: the open settled as a
+				// fresh file with an empty sector 0 and reads as empty.
+				if _, err := rf.ReadAt(make([]byte, 8), 0); err != nil && !errors.Is(err, io.EOF) {
+					t.Fatalf("ReadAt(0) after the retry: %v", err)
+				}
+				sectors := listSectorConfigMaps(t, fcs, rf)
+				if len(sectors) != 1 {
+					t.Errorf("file has %d sector configmaps after the retry, want exactly 1", len(sectors))
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Open(%q) with retries=%d after one transient lockfile GET error = nil error and file %T, want the wrapped error with a nil file", name, tc.retries, sf)
+			}
+			if sf != nil {
+				t.Errorf("Open(%q) on exhaustion returned a non-nil file (%T) alongside its error; sqlite3vfs does not expect a file from a failed xOpen", name, sf)
+			}
+			if !errors.Is(err, errTransientLockfileGet) {
+				t.Errorf("Open(%q) error = %v, want it to wrap the injected transient GET error", name, err)
+			}
+			if !strings.Contains(err.Error(), tc.wantNErrMsg) {
+				t.Errorf("Open(%q) error = %q, want it to contain %q", name, err, tc.wantNErrMsg)
+			}
+		})
+	}
+}
+
+// errTransientLockfileGet is the injected error of
+// TestOpenTransientLockfileGetErrorHonoursRetryBudget; a sentinel so the
+// test can prove the exhaustion error wraps (not replaces) the raw
+// Kubernetes-side failure.
+var errTransientLockfileGet = errors.New("injected transient lockfile GET failure")
+
 // --- Label limits (issue #351) ---
 
 // longNameDB is the 40-byte database name of issue #351: its base32
