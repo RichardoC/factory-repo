@@ -133,13 +133,16 @@ jobs:
           # Issue #444: same shape as the plan-report listing in codeaf.yml --
           # a 5xx must not silently disable the plan dedupe for this tick.
           "$HARNESS" gh-retry -- gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" > issues.json
-          # A CodeAF run that dispatched this tick as its last job is still in
-          # progress; leave it out. Digits only, or nothing is left out.
+          # A CodeAF run that dispatched this tick as its last job still reads
+          # as in progress: mark it completed so its lane counts as free.
+          # Keep it in the list: dropping it hid a just-finished plan run
+          # from plan-check's cooldown, which then dispatched a second plan
+          # run straight after the first. Digits only, or nothing is marked.
           [[ "$FINISHED_RUN" =~ ^[0-9]{1,20}$ ]] || FINISHED_RUN=""
           # createdAt comes along for the planner (issue #61): plan-check
           # measures its cooldown against every plan-title run's stamp.
           gh run list --workflow=codeaf.yml --json databaseId,status,displayTitle,createdAt --limit 100 \
-            | jq --arg id "$FINISHED_RUN" '[.[] | select((.databaseId | tostring) != $id)]' > runs.json
+            | jq --arg id "$FINISHED_RUN" '[.[] | if (.databaseId | tostring) == $id then .status = "completed" else . end]' > runs.json
           # The newest completed plan run's outcome marker (issue #119): the
           # publish job of a plan run uploads codeaf-plan-outcome with the
           # number of proposals it opened. plan-check cools down
