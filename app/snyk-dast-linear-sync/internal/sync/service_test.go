@@ -3586,6 +3586,256 @@ func TestIssueDescriptionBoundsTotalEmbeddedCorrelationProse(t *testing.T) {
 	}
 }
 
+// descriptionBodyBeforeMetadata returns the rendered body above the managed
+// metadata block, with the separator newlines that precede the block trimmed,
+// so its rune count can be compared with maxDescriptionBodyRunes.
+func descriptionBodyBeforeMetadata(t *testing.T, description string) string {
+	t.Helper()
+	start := findMetadataBlockStart(description)
+	if start < 0 {
+		t.Fatalf("description has no managed metadata block:\n%s", description)
+	}
+	return strings.TrimRight(description[:start], "\n")
+}
+
+// assertNoOrphanSectionHeadings fails when a "### " heading in body has no
+// non-blank line under it before the next heading. The description-body bound
+// must drop a section's heading together with its body rather than leave an
+// empty heading in the ticket.
+func assertNoOrphanSectionHeadings(t *testing.T, body string) {
+	t.Helper()
+	lines := strings.Split(body, "\n")
+	for i, line := range lines {
+		if !strings.HasPrefix(line, "### ") {
+			continue
+		}
+		hasBody := false
+		for j := i + 1; j < len(lines); j++ {
+			if strings.HasPrefix(lines[j], "### ") {
+				break
+			}
+			if strings.TrimSpace(lines[j]) != "" {
+				hasBody = true
+				break
+			}
+		}
+		if !hasBody {
+			t.Fatalf("section heading %q has no body under it:\n%s", line, body)
+		}
+	}
+}
+
+// TestIssueDescriptionRendersMaximalFixAndCorrelationBlocks verifies that the
+// description-body bound is at least as large as the content its own per-block
+// caps allow. One Fix at maxEmbeddedProseRunes plus maxEmbeddedCorrelationBlocks
+// correlation blocks at the same cap must all render in full: the earlier
+// bound was lower than those caps, so it silently dropped a whole section and
+// could leave its heading behind.
+func TestIssueDescriptionRendersMaximalFixAndCorrelationBlocks(t *testing.T) {
+	// Each input is just over the per-block cap, so its maximal rendered form
+	// is maxEmbeddedProseRunes runes plus the truncation marker. The derived
+	// body bound must fit all four rendered blocks and their markers.
+	capPlus := maxEmbeddedProseRunes + 1
+	fixRendered := strings.Repeat("q", maxEmbeddedProseRunes) + truncationMarker
+	blocksRendered := []string{
+		strings.Repeat("j", maxEmbeddedProseRunes) + truncationMarker,
+		strings.Repeat("k", maxEmbeddedProseRunes) + truncationMarker,
+		strings.Repeat("l", maxEmbeddedProseRunes) + truncationMarker,
+	}
+	finding := model.Finding{
+		IssueTitle: "SQL Injection",
+		Severity:   "high",
+		TargetName: "project-a",
+		TargetID:   "target-1",
+		Fix:        strings.Repeat("q", capPlus),
+		CorrelationMarkdown: []string{
+			strings.Repeat("j", capPlus),
+			strings.Repeat("k", capPlus),
+			strings.Repeat("l", capPlus),
+		},
+		Fingerprint:       "snyk-dast:target-1:finding-1",
+		SnykDASTFindingID: "finding-1",
+	}
+
+	description := issueDescription([]string{"snyk-dast-automation"}, finding)
+	body := descriptionBodyBeforeMetadata(t, description)
+
+	if !strings.Contains(body, "### Fix") {
+		t.Fatalf("description dropped the Fix heading:\n%s", body)
+	}
+	if !strings.Contains(body, fixRendered) {
+		t.Fatalf("description did not render the maximal Fix in full")
+	}
+	if !strings.Contains(body, "### Snyk Code correlation") {
+		t.Fatalf("description dropped the correlation heading:\n%s", body)
+	}
+	for i, block := range blocksRendered {
+		if !strings.Contains(body, block) {
+			t.Fatalf("description did not render correlation block %d in full", i)
+		}
+	}
+	// Four blocks were truncated by the per-block cap; the body bound must not
+	// add a fifth marker or drop any of them.
+	if got := strings.Count(body, truncationMarker); got != 4 {
+		t.Fatalf("description has %d truncation markers, want 4 (one per maximal block):\n%s", got, body)
+	}
+	if got := utf8.RuneCountInString(body); got > maxDescriptionBodyRunes {
+		t.Fatalf("body is %d runes, want at most the %d-rune bound", got, maxDescriptionBodyRunes)
+	}
+	assertNoOrphanSectionHeadings(t, body)
+
+	// The result must stay a pure function of the finding.
+	if again := issueDescription([]string{"snyk-dast-automation"}, finding); description != again {
+		t.Fatalf("issueDescription() is not idempotent for maximal bounded content")
+	}
+}
+
+// TestIssueDescriptionDropsSectionHeadingWithItsBody verifies that when the
+// description-body bound cannot fit a section, it drops that section's heading
+// together with its body instead of leaving an empty heading. A long finding
+// URL that fits on its own consumes most of the budget, so the Fix and
+// correlation sections no longer fit alongside it.
+func TestIssueDescriptionDropsSectionHeadingWithItsBody(t *testing.T) {
+	href := "https://example.test/vuln?" + strings.Repeat("q", maxDescriptionBodyRunes-2000)
+	fixProse := strings.Repeat("f", maxEmbeddedProseRunes)
+	finding := model.Finding{
+		IssueTitle: "SQL Injection",
+		Severity:   "high",
+		TargetName: "project-a",
+		TargetID:   "target-1",
+		FindingURL: href,
+		Fix:        fixProse,
+		CorrelationMarkdown: []string{
+			strings.Repeat("x", maxEmbeddedProseRunes),
+			strings.Repeat("y", maxEmbeddedProseRunes),
+			strings.Repeat("z", maxEmbeddedProseRunes),
+		},
+		Fingerprint:       "snyk-dast:target-1:finding-1",
+		SnykDASTFindingID: "finding-1",
+	}
+
+	description := issueDescription([]string{"snyk-dast-automation"}, finding)
+	body := descriptionBodyBeforeMetadata(t, description)
+
+	if !strings.Contains(body, href) {
+		t.Fatalf("description dropped a long href that fits in the bound")
+	}
+	if strings.Contains(body, "### Fix") {
+		t.Fatalf("description kept the Fix heading after dropping its body:\n%s", body)
+	}
+	if strings.Contains(body, fixProse) {
+		t.Fatalf("description kept the oversized Fix body after dropping its heading")
+	}
+	if strings.Contains(body, "### Snyk Code correlation") {
+		t.Fatalf("description kept the correlation heading after dropping its body:\n%s", body)
+	}
+	if !strings.Contains(body, truncationMarker) {
+		t.Fatalf("description is missing the truncation marker after dropping sections:\n%s", body)
+	}
+	if got := utf8.RuneCountInString(body); got > maxDescriptionBodyRunes {
+		t.Fatalf("body is %d runes, want at most the %d-rune bound", got, maxDescriptionBodyRunes)
+	}
+	assertNoOrphanSectionHeadings(t, body)
+
+	start := findMetadataBlockStart(description)
+	if start < 0 {
+		t.Fatalf("findMetadataBlockStart() found no block after dropping sections")
+	}
+	if block := description[start:]; !strings.Contains(block, "fingerprint: snyk-dast:target-1:finding-1") {
+		t.Fatalf("metadata block missing fingerprint after dropping sections:\n%s", block)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(description), "-->") {
+		t.Fatalf("metadata block is not the last thing in the description:\n%s", description)
+	}
+}
+
+// TestIssueDescriptionKeepsLongHrefThatFits verifies that a long href which
+// fits inside the body bound is rendered whole. Hrefs are never truncated — a
+// shortened URL is a wrong link — so only the whole-line body bound may drop
+// one, and it must not drop one that fits.
+func TestIssueDescriptionKeepsLongHrefThatFits(t *testing.T) {
+	href := "https://example.test/vuln?" + strings.Repeat("h", 5000)
+	finding := model.Finding{
+		IssueTitle:        "SQL Injection",
+		Severity:          "high",
+		TargetName:        "project-a",
+		TargetID:          "target-1",
+		FindingURL:        href,
+		Fingerprint:       "snyk-dast:target-1:finding-1",
+		SnykDASTFindingID: "finding-1",
+	}
+
+	description := issueDescription([]string{"snyk-dast-automation"}, finding)
+	body := descriptionBodyBeforeMetadata(t, description)
+
+	if !strings.Contains(body, "]("+href+")") {
+		t.Fatalf("description did not render the long fitting href whole:\n%s", body)
+	}
+	if strings.Contains(body, truncationMarker) {
+		t.Fatalf("description bounded away a long href that fits:\n%s", body)
+	}
+	if got := utf8.RuneCountInString(body); got > maxDescriptionBodyRunes {
+		t.Fatalf("body is %d runes, want at most the %d-rune bound", got, maxDescriptionBodyRunes)
+	}
+	assertNoOrphanSectionHeadings(t, body)
+}
+
+// TestIssueDescriptionBodyBoundAndMetadataAfterOversizedFields verifies that
+// the rendered body above the metadata block never exceeds
+// maxDescriptionBodyRunes, and that an oversized IssueTitle, DefinitionID or
+// IssueURL still leaves the managed metadata block last and parseable. The
+// block is the deduplication key, so losing it mints a duplicate ticket on the
+// next run.
+func TestIssueDescriptionBodyBoundAndMetadataAfterOversizedFields(t *testing.T) {
+	huge := strings.Repeat("x", 100000)
+	base := model.Finding{
+		IssueTitle:          "SQL Injection",
+		Severity:            "high",
+		TargetName:          "project-a",
+		TargetID:            "target-1",
+		Fix:                 "Patch the query.",
+		CorrelationMarkdown: []string{"Linked source issue"},
+		Fingerprint:         "snyk-dast:target-1:finding-1",
+		SnykDASTFindingID:   "finding-1",
+	}
+	cases := []struct {
+		name   string
+		mutate func(*model.Finding)
+	}{
+		{"oversized IssueTitle", func(f *model.Finding) { f.IssueTitle = huge }},
+		{"oversized DefinitionID", func(f *model.Finding) { f.DefinitionID = huge }},
+		{"oversized IssueURL", func(f *model.Finding) { f.IssueURL = "https://example.test/finding/" + huge }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			finding := base
+			tc.mutate(&finding)
+			description := issueDescription([]string{"snyk-dast-automation"}, finding)
+			body := descriptionBodyBeforeMetadata(t, description)
+
+			if got := utf8.RuneCountInString(body); got > maxDescriptionBodyRunes {
+				t.Fatalf("body is %d runes, want at most the %d-rune bound", got, maxDescriptionBodyRunes)
+			}
+			start := findMetadataBlockStart(description)
+			if start < 0 {
+				t.Fatalf("findMetadataBlockStart() found no block after an oversized field")
+			}
+			block := description[start:]
+			if !strings.Contains(block, "fingerprint: snyk-dast:target-1:finding-1") {
+				t.Fatalf("metadata block missing fingerprint after an oversized field:\n%s", block)
+			}
+			if !strings.HasSuffix(strings.TrimSpace(description), "-->") {
+				t.Fatalf("metadata block is not the last thing in the description:\n%s", description)
+			}
+			assertNoOrphanSectionHeadings(t, body)
+
+			if again := issueDescription([]string{"snyk-dast-automation"}, finding); description != again {
+				t.Fatalf("issueDescription() is not idempotent for an oversized field")
+			}
+		})
+	}
+}
+
 // TestUpsertManagedMetadataIgnoresLineAnchoredProseMarker covers the gap the
 // mid-sentence tests left: embedded prose above the real block carries a
 // line-anchored fake marker and a fake "Fingerprint:" line. Upsert must rewrite
