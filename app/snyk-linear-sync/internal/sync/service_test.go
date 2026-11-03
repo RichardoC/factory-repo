@@ -59,6 +59,12 @@ type fakeLinear struct {
 	// batch call and each per-item retry — mirroring updateErr. It models a
 	// transport-level failure where no per-alias data comes back at all.
 	commentErr error
+	// commentFailOutOfRange mirrors createFailOutOfRange for the comment
+	// batch: the next PostComments call reports one failed index beyond the
+	// end of the batch instead of indices derived from the updates. It
+	// enjoys exactly one call and then resets, so any retry the service
+	// makes proceeds normally.
+	commentFailOutOfRange bool
 
 	// lastOpenStates / lastOpenStatesErr are what LastOpenStates returns;
 	// lastOpenStatesCalls records the issue IDs of each call.
@@ -196,6 +202,10 @@ func (f *fakeLinear) UpdateIssues(ctx context.Context, updates []model.IssueUpda
 
 func (f *fakeLinear) PostComments(_ context.Context, updates []model.IssueUpdate) ([]int, error) {
 	f.commentCallBatches = append(f.commentCallBatches, append([]model.IssueUpdate(nil), updates...))
+	if f.commentFailOutOfRange {
+		f.commentFailOutOfRange = false
+		return []int{len(updates)}, nil
+	}
 	if f.commentErr != nil {
 		return nil, f.commentErr
 	}
@@ -5916,6 +5926,96 @@ func TestRunBatchCommentPartialFailureRetriesOnlyFailedComment(t *testing.T) {
 	}
 }
 
+// TestRunBatchCommentOutOfRangeFailedIndexCountsFailedComment pins the second
+// half of the failed-index contract for PostComments: a faultily implemented
+// LinearClient can report a failed index outside the batch. It names no batch
+// entry, so indexing with it would panic the worker goroutine and take the
+// whole run down; instead the run must count one failed comment, keep its
+// updates, and complete.
+func TestRunBatchCommentOutOfRangeFailedIndexCountsFailedComment(t *testing.T) {
+	cfg := minimalCfg()
+	cfg.Linear.CommentsEnabled = true
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint: "snyk:project-a:issue-1",
+					SnykIssueID: "issue-1",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "Updated title one",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					CreatedAt:   time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+				{
+					Fingerprint: "snyk:project-a:issue-2",
+					SnykIssueID: "issue-2",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "Updated title two",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					CreatedAt:   time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       "stale title one",
+				Description: "old description",
+				StateName:   "Todo",
+				Fingerprint: "snyk:project-a:issue-1",
+				Priority:    3,
+			},
+			{
+				ID:          "existing-2",
+				Identifier:  "SEC-2",
+				Title:       "stale title two",
+				Description: "old description",
+				StateName:   "Todo",
+				Fingerprint: "snyk:project-a:issue-2",
+				Priority:    3,
+			},
+		},
+		commentFailOutOfRange: true,
+	}
+
+	service := New(cfg, discardLogger(), snyk, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v, want a completed run", err)
+	}
+	if result.FailedComments != 1 {
+		t.Fatalf("FailedComments = %d, want 1 (the out-of-range index counts one failed comment)", result.FailedComments)
+	}
+	if result.FailedOps != 0 {
+		t.Fatalf("FailedOps = %d, want 0 (the updates themselves landed)", result.FailedOps)
+	}
+	if err := result.Err(); err != nil {
+		t.Fatalf("result.Err() = %v, want nil (a failed comment must not fail the run)", err)
+	}
+	updatedFingerprints := make(map[string]int, len(linear.updated))
+	for _, desired := range linear.updated {
+		updatedFingerprints[desired.Fingerprint]++
+	}
+	for _, fingerprint := range []string{"snyk:project-a:issue-1", "snyk:project-a:issue-2"} {
+		if updatedFingerprints[fingerprint] != 1 {
+			t.Fatalf("update of %s = %d times, want exactly 1 (the run must finish its other work)", fingerprint, updatedFingerprints[fingerprint])
+		}
+	}
+	if len(linear.commentCallBatches) != 1 {
+		t.Fatalf("PostComments calls = %d, want 1 (the out-of-range index names no batch entry, so no comment is retried)", len(linear.commentCallBatches))
+	}
+}
+
 // storedIssue models what the next run reads back after Linear stores
 // desired: the same description, with the metadata fields the Linear client
 // would parse out of it (fingerprint, identity, closed_reason, labels).
@@ -7500,7 +7600,8 @@ func TestPostCommentsWithFallbackRetriesAllWhenBatchCallFails(t *testing.T) {
 	}
 	linear := &fakeLinear{commentErr: errors.New("linear transport down")}
 	service := New(minimalCfg(), discardLogger(), fakeSnyk{}, linear, nil)
-	service.postCommentsWithFallback(context.Background(), batch)
+	var result RunResult
+	service.postCommentsWithFallback(context.Background(), batch, &result)
 
 	if len(linear.commentCallBatches) != 3 {
 		t.Fatalf("PostComments calls = %d, want 3 (failed batch + one retry per item)", len(linear.commentCallBatches))
@@ -7515,6 +7616,41 @@ func TestPostCommentsWithFallbackRetriesAllWhenBatchCallFails(t *testing.T) {
 	}
 	if len(linear.comments) != 0 {
 		t.Fatalf("comments = %d, want 0 (every attempt failed)", len(linear.comments))
+	}
+	if result.FailedComments != 2 {
+		t.Fatalf("FailedComments = %d, want 2 (both individual retries failed)", result.FailedComments)
+	}
+}
+
+// TestPostCommentsWithFallbackCountsRetryReportingFailedIndex pins the
+// single-comment retry's own failed-index return: a retry that reports its
+// comment as failed with a nil error must be counted, not dropped silently.
+func TestPostCommentsWithFallbackCountsRetryReportingFailedIndex(t *testing.T) {
+	batch := make([]model.IssueUpdate, 0, 2)
+	for _, ident := range []string{"SNYK-1", "SNYK-2"} {
+		existing := model.ExistingIssue{
+			ID:          "issue-" + ident,
+			Identifier:  ident,
+			StateName:   "Todo",
+			Fingerprint: "snyk:project-a:" + ident,
+		}
+		desired := model.DesiredIssue{Fingerprint: existing.Fingerprint, State: model.StateDone, PreserveState: true}
+		batch = append(batch, model.IssueUpdate{Existing: existing, Desired: desired})
+	}
+	// SNYK-1 fails in the batch and again on its retry; SNYK-2 posts.
+	linear := &fakeLinear{commentFailFingerprints: map[string]int{"snyk:project-a:SNYK-1": 2}}
+	service := New(minimalCfg(), discardLogger(), fakeSnyk{}, linear, nil)
+	var result RunResult
+	service.postCommentsWithFallback(context.Background(), batch, &result)
+
+	if len(linear.commentCallBatches) != 2 {
+		t.Fatalf("PostComments calls = %d, want 2 (batch + one retry of the failed comment)", len(linear.commentCallBatches))
+	}
+	if result.FailedComments != 1 {
+		t.Fatalf("FailedComments = %d, want 1 (the retry reported its comment failed)", result.FailedComments)
+	}
+	if len(linear.comments) != 1 || linear.comments[0].Existing.Identifier != "SNYK-2" {
+		t.Fatalf("comments = %+v, want only SNYK-2 posted", linear.comments)
 	}
 }
 

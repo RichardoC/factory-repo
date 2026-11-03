@@ -95,6 +95,7 @@ func runSync(ctx context.Context, cfg config.Config, logger *slog.Logger, snyk s
 		slog.Int64("planned_resolves", result.PlannedResolves),
 		slog.Int64("cancelled_duplicates", result.CancelledDuplicates),
 		slog.Int64("failed_ops", result.FailedOps),
+		slog.Int64("failed_comments", result.FailedComments),
 	)
 
 	return result.Err()
