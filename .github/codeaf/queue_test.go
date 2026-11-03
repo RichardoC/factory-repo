@@ -1247,6 +1247,18 @@ func TestNextRepicksStrandedPR(t *testing.T) {
 		t.Fatalf("Next on a review-passed PR = %+v; want nothing", p)
 	}
 
+	// A PR already handed to a maintainer (issue #457) is never re-picked,
+	// whatever its head: the hand-off says a retry cannot change the
+	// outcome, so a later commit must not buy another review either.
+	owned := queuedIssue(206, "2024-01-01T00:00:00Z", "codeaf", maintainerLabel)
+	owned.PullRequest = json.RawMessage(`{"number":206}`)
+	o5 := nextOpts()
+	o5.PRHeads = map[int]string{206: shaA}
+	o5.PRMarkers = map[int][]string{206: nil}
+	if p, _ := nextPick([]item{owned}, nil, o5); p.Kind != "" {
+		t.Fatalf("Next on a maintainer-held PR = %+v; want nothing", p)
+	}
+
 	// A PR with a run in progress is never re-picked (issue #137's guard).
 	o3 := nextOpts()
 	o3.PRHeads = map[int]string{204: shaA}
@@ -1399,7 +1411,174 @@ func TestRunNextRepicksStrandedPR(t *testing.T) {
 	if posts != 2 || len(comments) != 3 || !strings.Contains(comments[2], shaB) {
 		t.Fatalf("marker comments after the move = %q (posts %d); want one naming %s", comments, posts, shaB)
 	}
-} // TestNextPicksReviewBeforeIssues covers the queue's new head of the pass
+} // TestNextPRPolicyRefusalNotRepicked is the end-to-end check of issue
+// #457 on the fake GitHub server, driving the whole `harness next` path: a
+// PR whose latest bot report is a publish refusal naming the workflow policy
+// is not re-picked -- it gets the one maintainer hand-off (label and
+// comment) instead -- while the same PR with an ordinary publishing failure
+// is still re-picked for review. It also covers a hand-off whose label half
+// landed but whose comment half did not: the comment is still served, and
+// the labelled PR is still not re-picked.
+func TestNextPRPolicyRefusalNotRepicked(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	policy := reportMarker + "\n### CodeAF run — publishing failed\n\n| | |\n" +
+		"\n| publish error | the workflow change breaks the workflow policy (above) and no maintainer approved it; refusing it |\n"
+	ordinary := reportMarker + "\n### CodeAF run — publishing failed\n\n| | |\n"
+	// CodeAF's own summary is untrusted text quoted into the report: one
+	// that happens to mention the policy must not turn an ordinary publish
+	// failure into a hand-off, so #209 is still re-picked.
+	mentions := ordinary + "\n<details><summary>CodeAF's summary</summary>\n\nthis change breaks the workflow policy nowhere\n\n</details>\n"
+	approval := reportMarker + "\n### CodeAF run — publishing failed\n\n| | |\n" +
+		"\n| publish error | " + approvalGateRefusal + " |\n"
+	issuesJSON := `[{"number":206,"state":"open","created_at":"2024-01-01T00:00:00Z","pull_request":{"number":206},"labels":[{"name":"codeaf"}]},
+	                {"number":207,"state":"open","created_at":"2024-01-02T00:00:00Z","pull_request":{"number":207},"labels":[{"name":"codeaf"}]},
+	                {"number":208,"state":"open","created_at":"2024-01-03T00:00:00Z","pull_request":{"number":208},"labels":[{"name":"codeaf"},{"name":"codeaf-maintainer"}]},
+	                {"number":209,"state":"open","created_at":"2024-01-04T00:00:00Z","pull_request":{"number":209},"labels":[{"name":"codeaf"}]},
+	                {"number":210,"state":"open","created_at":"2024-01-05T00:00:00Z","pull_request":{"number":210},"labels":[{"name":"codeaf"}]}]`
+	comments := map[int][]string{206: {policy}, 207: {ordinary}, 208: {policy}, 209: {mentions}, 210: {approval}}
+	posts := map[int]int{}
+	// #208's hand-off already carries its label but not its comment: a tick
+	// whose label half landed and whose comment half failed.
+	labels := map[int][]string{208: {maintainerLabel}}
+	labelCreates := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case r.Method == http.MethodGet && path == "/repos/RichardoC/factory-repo/issues" && r.URL.Query().Get("state") == "open":
+			fmt.Fprint(w, issuesJSON)
+		case r.Method == http.MethodGet && strings.HasPrefix(path, "/repos/RichardoC/factory-repo/pulls/"):
+			n := 0
+			fmt.Sscanf(path, "/repos/RichardoC/factory-repo/pulls/%d", &n)
+			fmt.Fprintf(w, `{"number":%d,"head":{"ref":"branch","sha":%q}}`, n, sha)
+		case r.Method == http.MethodGet && strings.HasPrefix(path, "/repos/RichardoC/factory-repo/issues/") && strings.HasSuffix(path, "/comments"):
+			n := 0
+			fmt.Sscanf(path, "/repos/RichardoC/factory-repo/issues/%d/comments", &n)
+			var items []string
+			for _, c := range comments[n] {
+				items = append(items, fmt.Sprintf(`{"body":%q,"user":{"type":"Bot"}}`, c))
+			}
+			fmt.Fprint(w, "["+strings.Join(items, ",")+"]")
+		case r.Method == http.MethodPost && strings.HasPrefix(path, "/repos/RichardoC/factory-repo/issues/") && strings.HasSuffix(path, "/comments"):
+			n := 0
+			fmt.Sscanf(path, "/repos/RichardoC/factory-repo/issues/%d/comments", &n)
+			posts[n]++
+			var body struct {
+				Body string `json:"body"`
+			}
+			data, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(data, &body)
+			comments[n] = append(comments[n], body.Body)
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{}`)
+		case r.Method == http.MethodGet && strings.HasPrefix(path, "/repos/RichardoC/factory-repo/issues/") && !strings.Contains(path, "/comments"):
+			n := 0
+			fmt.Sscanf(path, "/repos/RichardoC/factory-repo/issues/%d", &n)
+			var ls []string
+			for _, l := range labels[n] {
+				ls = append(ls, fmt.Sprintf(`{"name":%q}`, l))
+			}
+			fmt.Fprintf(w, `{"number":%d,"state":"open","labels":[%s]}`, n, strings.Join(ls, ","))
+		case r.Method == http.MethodPost && strings.HasPrefix(path, "/repos/RichardoC/factory-repo/issues/") && strings.HasSuffix(path, "/labels"):
+			n := 0
+			fmt.Sscanf(path, "/repos/RichardoC/factory-repo/issues/%d/labels", &n)
+			var body struct {
+				Labels []string `json:"labels"`
+			}
+			data, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(data, &body)
+			labels[n] = append(labels[n], body.Labels...)
+			fmt.Fprint(w, `[]`)
+		case r.Method == http.MethodPost && path == "/repos/RichardoC/factory-repo/labels":
+			labelCreates++
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{}`)
+		case r.Method == http.MethodGet && path == "/repos/RichardoC/factory-repo/contents/app":
+			fmt.Fprint(w, `[]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	t.Setenv("GITHUB_API_URL", server.URL)
+	t.Setenv("GITHUB_REPOSITORY", "RichardoC/factory-repo")
+	t.Setenv("GH_TOKEN", "tok")
+	t.Setenv("PROXY_MODELS", "models.json")
+	t.Setenv("CODEAF_WEEK_SPENT_USD", "1")
+	if _, err := loadConfig("models.json"); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	issuesPath := filepath.Join(dir, "issues.json")
+	runsPath := filepath.Join(dir, "runs.json")
+	if err := os.WriteFile(issuesPath, []byte(issuesJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(runsPath, []byte(`[{"status":"completed"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// First tick: only the ordinary failures (#207, and #209 whose summary
+	// merely mentions the policy) are re-picked; #206's policy refusal and
+	// #210's approval-gate refusal get the maintainer hand-off, not a review.
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "kind=review\nnumber=207\nlane=0\n" {
+		t.Fatalf("runNext printed %q, %v; want only the #207 re-pick", out, err)
+	}
+	if posts[207] != 1 || !strings.Contains(comments[207][1], queueRepickMarker) || !strings.Contains(comments[207][1], sha) {
+		t.Fatalf("#207: comments %q (posts %d); want the one re-pick marker naming %s", comments[207], posts[207], sha)
+	}
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "kind=review\nnumber=209\nlane=0\n" {
+		t.Fatalf("second tick printed %q, %v; want the #209 re-pick", out, err)
+	}
+	if posts[209] != 1 || !strings.Contains(comments[209][1], queueRepickMarker) {
+		t.Fatalf("#209: comments %q (posts %d); want the one re-pick marker -- a summary mentioning the policy is no refusal", comments[209], posts[209])
+	}
+	if posts[210] != 1 || !strings.Contains(comments[210][1], queuePRMaintainerMarker) || len(labels[210]) != 1 {
+		t.Fatalf("#210: comments %q (posts %d, labels %v); want the one hand-off comment and its label", comments[210], posts[210], labels[210])
+	}
+	if posts[206] != 1 || !strings.Contains(comments[206][1], queuePRMaintainerMarker) {
+		t.Fatalf("#206: comments %q (posts %d); want the one hand-off comment", comments[206], posts[206])
+	}
+	// Two hand-offs (#206 and #210), each creating codeaf-maintainer once
+	// before adding it: #208's label is already there, so it creates none.
+	if len(labels[206]) != 1 || labels[206][0] != maintainerLabel || labelCreates != 2 {
+		t.Fatalf("#206: labels %v, %d label creations; want the %s label once and two creations", labels[206], labelCreates, maintainerLabel)
+	}
+	if len(labels[207]) != 0 {
+		t.Fatalf("#207: labels %v; want none", labels[207])
+	}
+	// #208 is already labelled: only the missing comment half is served, and
+	// the PR is not re-picked despite its policy-eligible head.
+	if posts[208] != 1 || !strings.Contains(comments[208][1], queuePRMaintainerMarker) {
+		t.Fatalf("#208: comments %q (posts %d); want the one hand-off comment", comments[208], posts[208])
+	}
+	if len(labels[208]) != 1 {
+		t.Fatalf("#208: labels %v; want the existing one only", labels[208])
+	}
+
+	// Third tick: every hand-off is idempotent — neither half is posted
+	// twice — and the ordinary PRs wait, each having spent its one re-pick
+	// at this commit.
+	if out, err := runNextStdout(t, issuesPath, runsPath); err != nil || out != "" {
+		t.Fatalf("third tick printed %q, %v; want nothing picked", out, err)
+	}
+	if posts[206] != 1 || labelCreates != 2 {
+		t.Fatalf("#206 third tick: posts %d, label creations %d; want nothing more", posts[206], labelCreates)
+	}
+	for _, n := range []int{207, 209} {
+		if posts[n] != 1 {
+			t.Fatalf("#%d third tick: posts %d; want the marker to hold the re-pick", n, posts[n])
+		}
+	}
+	for _, n := range []int{208, 210} {
+		if posts[n] != 1 {
+			t.Fatalf("#%d third tick: posts %d; want the hand-off served once", n, posts[n])
+		}
+	}
+}
+
+// TestNextPicksReviewBeforeIssues covers the queue's new head of the pass
 // (issue #137): a pull request labelled codeaf and codeaf-review-needed is
 // picked with kind review on the lowest free lane, ahead of any queued
 // issue — and, once the review is in flight as a mirrored run, it does not
@@ -1893,38 +2072,93 @@ func TestNextExemptsRefUpdate(t *testing.T) {
 
 // Only a failed run strands a PR (issue #215 follow-up): a PR whose last bot
 // comment hands it to a person -- a spent fix budget, a withheld label -- is
-// not re-reviewed, and a non-bot comment cannot fake a failed run.
-func TestStrandedByFailedRun(t *testing.T) {
+// not re-reviewed, and a non-bot comment cannot fake a failed run. This is
+// the PR twin of TestStrandedIssueState, on the states the re-pick reads.
+func TestStrandedPRStateFailedRun(t *testing.T) {
 	report := func(outcome string) string {
 		return reportMarker + "\n### CodeAF run — " + outcome + "\n\n| | |\n"
 	}
-	bot := func(body string) struct {
-		Body string `json:"body"`
-		User struct {
-			Type string `json:"type"`
-		} `json:"user"`
-	} {
-		c := bodyComments{{Body: body}}[0]
-		c.User.Type = "Bot"
-		return c
+	bot := func(bodies ...string) bodyComments {
+		var cs bodyComments
+		for _, b := range bodies {
+			c := botComment(b)[0]
+			c.User.Type = "Bot"
+			cs = append(cs, c)
+		}
+		return cs
 	}
 	marker := "<!-- codeaf-queue-repick " + strings.Repeat("a", 40) + " -->\n"
 	budget := "The automatic fix budget of 2 continuations per pull request is spent, so no fix run starts"
 	for _, tc := range []struct {
 		name     string
 		comments bodyComments
-		want     bool
+		want     string
 	}{
-		{"failed publish", bodyComments{bot(report("changes pushed")), bot(report("publishing failed"))}, true},
-		{"failed run job", bodyComments{bot(report("run job failed"))}, true},
-		{"marker after the failure", bodyComments{bot(report("publishing failed")), bot(marker)}, true},
-		{"fix budget spent", bodyComments{bot(report("publishing failed")), bot(budget)}, false},
-		{"run pushed changes", bodyComments{bot(report("changes pushed"))}, false},
-		{"forged by a person", bodyComments{{Body: report("publishing failed")}}, false},
-		{"no comments", nil, false},
+		{"failed publish", bot(report("changes pushed"), report("publishing failed")), strandRetry},
+		{"failed run job", bot(report("run job failed")), strandRetry},
+		{"marker after the failure", bot(report("publishing failed"), marker), strandRetry},
+		{"fix budget spent", bot(report("publishing failed"), budget), strandNone},
+		{"run pushed changes", bot(report("changes pushed")), strandNone},
+		{"forged by a person", bodyComments{{Body: report("publishing failed")}}, strandNone},
+		{"no comments", nil, strandNone},
 	} {
-		if got := strandedByFailedRun(tc.comments); got != tc.want {
-			t.Errorf("%s: strandedByFailedRun = %v, want %v", tc.name, got, tc.want)
+		if got := strandedPRState(tc.comments); got != tc.want {
+			t.Errorf("%s: strandedPRState = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A publish refusal that names the workflow policy leaves a PR unpickable by
+// the re-pick (issue #457): the PR twin of the issue check must return the
+// same no-answer, while an ordinary publishing failure is still re-picked.
+func TestStrandedPRState(t *testing.T) {
+	report := func(outcome, extra string) string {
+		return reportMarker + "\n### CodeAF run — " + outcome + "\n\n| | |\n" + extra
+	}
+	policy := report("publishing failed", "\n| publish error | the workflow change breaks the workflow policy (above) and no maintainer approved it; refusing it |\n")
+	bot := func(bodies ...string) bodyComments {
+		var cs bodyComments
+		for _, b := range bodies {
+			c := botComment(b)[0]
+			c.User.Type = "Bot"
+			cs = append(cs, c)
+		}
+		return cs
+	}
+	marker := "<!-- codeaf-queue-repick " + strings.Repeat("a", 40) + " -->\n"
+	cases := []struct {
+		name     string
+		comments bodyComments
+		want     string
+	}{
+		{"no comments", nil, strandNone},
+		{"ordinary publishing failure", bot(report("publishing failed", "")), strandRetry},
+		{"ordinary run job failure", bot(report("run job failed", "")), strandRetry},
+		{"policy refusal", bot(policy), strandMaintainer},
+		{"policy refusal after a re-pick marker stays a hand-off", bot(report("publishing failed", ""), marker, policy), strandMaintainer},
+		// The deterministic refusal is read from its own row, never from a
+		// search of the whole report: CodeAF's summary is untrusted text
+		// quoted into the report, and one that mentions the policy does not
+		// make an ordinary publish failure deterministic. Re-picking it is
+		// the point -- the change may publish on the next attempt.
+		{"an ordinary failure whose summary mentions the policy is still retried",
+			bot(report("publishing failed", "") + "\n<details><summary>CodeAF's summary</summary>\n\nnothing here breaks the workflow policy\n\n</details>\n"), strandRetry},
+		{"a policy sentence in a non-publish-error row is not a refusal",
+			bot(report("publishing failed", "") + "\n| note | the workflow change breaks the workflow policy (above) and no maintainer approved it; refusing it |\n"), strandRetry},
+		// AGENTS.md needs a maintainer's approval for .github/ outside
+		// .github/codeaf/; without one the publish step refuses that patch
+		// the same way every run, so it is a hand-off too (issue #457).
+		{"approval-gate refusal", bot(report("publishing failed", "\n| publish error | "+approvalGateRefusal+" |\n")), strandMaintainer},
+		{"approval gate refusal on a run job failure", bot(report("run job failed", "\n| publish error | "+approvalGateRefusal+" |\n")), strandMaintainer},
+		{"a failure after the hand-off stays a hand-off", bot(policy, prMaintainerBody(7), report("publishing failed", "")), strandMaintainer},
+		{"a well-ended run after the hand-off strands nobody", bot(policy, prMaintainerBody(7), report("done", "")), strandNone},
+		{"a hand-off marker is skipped in the scan", bot(policy, prMaintainerBody(7)), strandMaintainer},
+		{"changes pushed is no failure", bot(report("changes pushed", "")), strandNone},
+		{"a person's report cannot fake a failure", bodyComments{{Body: policy}}, strandNone},
+	}
+	for _, tc := range cases {
+		if got := strandedPRState(tc.comments); got != tc.want {
+			t.Errorf("%s: strandedPRState = %q, want %q", tc.name, got, tc.want)
 		}
 	}
 }
@@ -1945,7 +2179,7 @@ func TestStrandedIssueState(t *testing.T) {
 	report := func(outcome string) string {
 		return reportMarker + "\n### CodeAF run — " + outcome + "\n\n| | |\n"
 	}
-	policy := report("publishing failed") + "\n| error | the workflow change breaks the workflow policy (above) and no maintainer approved it; refusing it |\n"
+	policy := report("publishing failed") + "\n| publish error | the workflow change breaks the workflow policy (above) and no maintainer approved it; refusing it |\n"
 	bot := func(bodies ...string) bodyComments {
 		var cs bodyComments
 		for _, b := range bodies {
@@ -1973,6 +2207,8 @@ func TestStrandedIssueState(t *testing.T) {
 		{"a person's comment does not shield a failure", append(bot(report("run job failed")), personComment("looking into it")...), strandRetry},
 		{"a failure after the retry marker goes to a maintainer", bot(report("run job failed"), issueRetryBody(120), report("run job failed")), strandMaintainer},
 		{"a policy refusal is never retried", bot(policy), strandMaintainer},
+		{"the approval-gate refusal is never retried", bot(report("publishing failed") + "\n| publish error | " + approvalGateRefusal + " |\n"), strandMaintainer},
+		{"a summary mentioning the policy is no refusal", bot(report("publishing failed") + "\n<details><summary>CodeAF's summary</summary>\n\nthis breaks the workflow policy nowhere\n\n</details>\n"), strandRetry},
 		{"a policy refusal after the retry marker stays a hand-off", bot(report("run job failed"), issueRetryBody(120), policy), strandMaintainer},
 		{"a retry marker with a well-ended run after it strands nobody", bot(report("run job failed"), issueRetryBody(120), report("done")), strandNone},
 		{"an escalation marker keeps later failures a hand-off", bot(report("run job failed"), issueRetryBody(120), report("run job failed"), issueMaintainerBody(120), report("run job failed")), strandMaintainer},
@@ -2144,7 +2380,7 @@ func TestRunNextStrandedIssueGuards(t *testing.T) {
 		return reportMarker + "\n### CodeAF run — " + outcome + "\n\n| | |\n" + extra
 	}
 	comments := map[int][]string{
-		117: {report("publishing failed", "\n| error | the workflow change breaks the workflow policy (above) and no maintainer approved it; refusing it |\n")},
+		117: {report("publishing failed", "\n| publish error | the workflow change breaks the workflow policy (above) and no maintainer approved it; refusing it |\n")},
 		171: {report("changes pushed", "")},
 		122: {report("run job failed", "")},
 		124: {report("run job failed", "")},
@@ -2475,8 +2711,8 @@ func TestFailedRunReportIgnoresDoneRunIsNotStranded(t *testing.T) {
 	if got := strandedIssueState(bot); got != strandNone {
 		t.Errorf("done issue state = %q, want %q", got, strandNone)
 	}
-	if got := strandedByFailedRun(bot); got {
-		t.Errorf("strandedByFailedRun(done changes pushed) = true, want false")
+	if got := strandedPRState(bot); got != strandNone {
+		t.Errorf("strandedPRState(done changes pushed) = %q, want %q", got, strandNone)
 	}
 }
 
@@ -2743,5 +2979,69 @@ func TestNextPaginatedItems(t *testing.T) {
 	}
 	if want := fmt.Sprintf("kind=issue\nnumber=%d\nlane=0\n", pick); out != want {
 		t.Fatalf("runNext on a two-page listing printed %q; want %q", out, want)
+	}
+}
+
+// approvalGateRefusal is codeaf.yml's "Apply the patch" sentence for a patch
+// that changes .github/ outside .github/codeaf/ without a maintainer's
+// approval: AGENTS.md makes that approval mandatory, so the refusal is
+// deterministic like the workflow-policy one (issue #457).
+const approvalGateRefusal = "patch touches .github/ outside .github/codeaf/ and top-level workflow files without a maintainer's approval; refusing it"
+
+// The queue's deterministic-refusal check must read the report the writer
+// actually emits: each refusal sentence codeaf.yml's "Apply the patch" step
+// prints is reproduced here as a ::error:: line, run through Report, and
+// must come back as a deterministic refusal of the PR and issue paths. A
+// workflow or writer change that reshapes the row therefore fails this test
+// rather than silently re-opening the re-pick loop of issue #457.
+func TestReportIsDeterministicRefusalRoundTrip(t *testing.T) {
+	cfg := Config{Limits: Limits{Plan: "big", WeeklyCreditUSD: 20, RunCreditUSD: 5, OverageUSD: 0}, Models: testModels(t)}
+	outcome := map[string]string{"OUTCOME": "publishing failed"}
+	env := func(k string) string { return outcome[k] }
+	// The exact ::error:: lines codeaf.yml writes, with the prefix the
+	// publish step collects.
+	for _, line := range []string{
+		"::error::the workflow change breaks the workflow policy (above) and no maintainer approved it; refusing it",
+		"::error::patch touches .github/ outside .github/codeaf/ and top-level workflow files without a maintainer's approval; refusing it",
+	} {
+		ok := false
+		body := Report(Result{Stop: "done", OK: &ok}, true, nil, cfg, nil,
+			ReportInputs{PublishErrors: []string{line}}, env)
+		if !reportIsDeterministicRefusal(body) {
+			t.Errorf("reportIsDeterministicRefusal(%q) = false; want true for the refusal row:\n%s", line, body)
+		}
+		bot := bodyComments{{Body: body}}
+		bot[0].User.Type = "Bot"
+		if got := strandedPRState(bot); got != strandMaintainer {
+			t.Errorf("strandedPRState(%q) = %q; want %q", line, got, strandMaintainer)
+		}
+		if got := strandedIssueState(bot); got != strandMaintainer {
+			t.Errorf("strandedIssueState(%q) = %q; want %q", line, got, strandMaintainer)
+		}
+	}
+	// An ordinary publish error row -- and a workflow-policy line that is
+	// only a note, not a refusal -- leaves a PR a re-pick candidate.
+	ok := false
+	body := Report(Result{Stop: "done", OK: &ok}, true, nil, cfg, nil,
+		ReportInputs{PublishErrors: []string{"::error::GitHub refused the push of codeaf/issue-9-42"}}, env)
+	if reportIsDeterministicRefusal(body) {
+		t.Errorf("reportIsDeterministicRefusal(ordinary push refusal) = true; want false:\n%s", body)
+	}
+}
+
+// TestDeterministicRefusalsMatchWorkflow pins each deterministicRefusals entry
+// to the ::error:: line codeaf.yml's "Apply the patch" step actually prints:
+// the match is exact (issue #457), so rewording a refusal in the workflow
+// without updating the list would silently re-open the re-pick loop instead
+// of failing here.
+func TestDeterministicRefusalsMatchWorkflow(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "workflows", "codeaf.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range deterministicRefusals {
+		if !strings.Contains(string(data), "::error::"+s+"\"") {
+			t.Errorf("codeaf.yml prints no ::error:: line with exactly %q; update deterministicRefusals with the workflow", s)
+		}
 	}
 }

@@ -195,7 +195,7 @@ func TestCountReports(t *testing.T) {
 
 	// A bot report whose run job failed did not land its patch either: like
 	// a failed publish it does not spend a continuation slot (queue.go's
-	// strandedByFailedRun treats both headings as the same stranded state).
+	// strandedPRState treats both headings as the same stranded state).
 	runJobFailed := append(mixed,
 		issueComment{ID: 15, User: bot, Body: runJobFailedHeading + "\n| stop / ok | done / `true` |\n"},
 	)
@@ -1598,7 +1598,7 @@ func TestContinuePlanIgnoresFailedPublish(t *testing.T) {
 }
 
 // A report headed "run job failed" is the same stranded state as a failed
-// publish (queue.go's strandedByFailedRun treats both alike): the run job
+// publish (queue.go's strandedPRState treats both alike): the run job
 // died, no patch landed, so the report must not spend a continuation slot.
 // The stub PR carries the opener's report plus one such report; the plan
 // continues and labels the next run "Continuation 2 of 2".
