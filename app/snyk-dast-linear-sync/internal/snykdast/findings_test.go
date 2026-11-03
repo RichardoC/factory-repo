@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -638,5 +639,91 @@ func TestLoadSnapshotDoesNotWarnOnParseableAcceptanceExpiry(t *testing.T) {
 				t.Fatalf("status = %q, want %q", got, want)
 			}
 		})
+	}
+}
+
+// TestLoadSnapshotDefersFindingWithoutTargetID: a finding whose embedded target
+// summary carries no id cannot be given a fingerprint, so it is left out of the
+// snapshot — but loudly, and its id is recorded so the sync defers the tickets
+// that track it instead of resolving them as no longer present.
+func TestLoadSnapshotDefersFindingWithoutTargetID(t *testing.T) {
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	target := targetNode{ID: "target-a", Type: "web"}
+	target.Site.Name = "project-a"
+	target.Site.URL = "https://project-a.example.test/"
+	target.Site.Host = "project-a.example.test"
+
+	passive := false
+	definition := definitionNode{ID: "def-1", Name: "Cross-site scripting", Passive: &passive}
+
+	var drifted findingNode
+	drifted.ID = json.Number("7")
+	drifted.State = "notfixed"
+	drifted.Severity = 30
+	drifted.Definition.ID = "def-1"
+	drifted.Definition.Name = "Cross-site scripting"
+	// The embedded target summary has no id: the API drift this test covers.
+	drifted.Target.Name = "project-a"
+
+	var normal findingNode
+	normal.ID = json.Number("8")
+	normal.State = "notfixed"
+	normal.Severity = 30
+	normal.Definition.ID = "def-1"
+	normal.Definition.Name = "Cross-site scripting"
+	normal.Target.ID = "target-a"
+	normal.Target.Name = "project-a"
+
+	mux.HandleFunc("/targets/", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(correlationTestPageNoT([]targetNode{target}))
+	})
+	mux.HandleFunc("/findings/", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(correlationTestPageNoT([]findingNode{drifted, normal}))
+	})
+	mux.HandleFunc("/definitions/", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(correlationTestPageNoT([]definitionNode{definition}))
+	})
+
+	base, _ := url.Parse(server.URL + "/")
+	handler := &captureHandler{}
+	c := &Client{
+		apiBase:     base,
+		httpClient:  server.Client(),
+		logger:      slog.New(handler),
+		concurrency: 2,
+	}
+	snapshot, err := c.LoadSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("LoadSnapshot() error = %v, want success", err)
+	}
+
+	if len(snapshot.Findings) != 1 || snapshot.Findings[0].SnykDASTFindingID != "8" {
+		t.Fatalf("Findings = %#v, want only finding 8 (finding 7 has no target id)", snapshot.Findings)
+	}
+	if want := []string{"7"}; !slices.Equal(snapshot.DeferredFindingIDs, want) {
+		t.Fatalf("DeferredFindingIDs = %v, want %v", snapshot.DeferredFindingIDs, want)
+	}
+
+	warned := false
+	for _, r := range handler.records {
+		if r.Level != slog.LevelWarn {
+			continue
+		}
+		var id string
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == "finding_id" {
+				id = a.Value.String()
+			}
+			return true
+		})
+		if id == "7" {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatal("LoadSnapshot logged no warning naming the finding whose target id is empty")
 	}
 }

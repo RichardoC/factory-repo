@@ -82,6 +82,12 @@ type RunResult struct {
 	// FailedOps counts state-changing operations that did not apply: creates,
 	// updates, resolves and duplicate cancellations.
 	FailedOps int64
+	// DeferredTickets counts managed tickets held back for this run because
+	// their finding could not be normalized (the Snyk DAST finding carries no
+	// target id). They are neither resolved nor recreated: the finding is
+	// still reported by Snyk DAST, so closing the ticket would record a false
+	// resolution.
+	DeferredTickets int64
 	// FailedComments counts change comments that could not be posted. These are
 	// tracked separately from FailedOps because a missing comment leaves the
 	// synced issue state correct — the comment is explanatory, and the feature is
@@ -229,6 +235,17 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 		}
 	}
 
+	// deferredFindingIDs are the findings the loader skipped because their
+	// embedded target summary carried no id. Such a finding has no fingerprint
+	// of its own, so its existing tickets cannot be matched by full
+	// fingerprint; they are matched by the finding-id part instead. Treating
+	// their tickets as resolved would close live tickets on incomplete source
+	// data, so they are held back for this run — not resolved, not recreated.
+	deferredFindingIDs := make(map[string]struct{}, len(snykdastSnapshot.DeferredFindingIDs))
+	for _, findingID := range snykdastSnapshot.DeferredFindingIDs {
+		deferredFindingIDs[findingID] = struct{}{}
+	}
+
 	desiredByFingerprint := make(map[string]model.DesiredIssue, len(findings))
 	snykdastHashes := make(map[string]string, len(findings))
 	for _, finding := range findings {
@@ -269,6 +286,7 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	result.Findings = len(findings)
 	result.ExistingIssues = len(existingIssues)
 	result.Conflicts = len(duplicatesToCancel)
+	result.DeferredTickets = deferredTicketCount(existingByFingerprint, deferredFindingIDs)
 	var queuedJobs int64
 
 	g, workerCtx := errgroup.WithContext(runCtx)
@@ -378,6 +396,18 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 			// place; restoring one would require issueUnarchive first.
 			if existing.ArchivedAt != nil {
 				continue
+			}
+			// The finding behind this ticket was skipped during the load (its
+			// embedded target had no id), so its absence from the snapshot is
+			// not evidence that it is gone. Leave the ticket alone this run.
+			if findingID, ok := FingerprintFindingID(existing.Fingerprint); ok {
+				if _, deferred := deferredFindingIDs[findingID]; deferred {
+					s.logger.Warn("deferring resolve of a ticket whose finding could not be normalized (embedded target has no id)",
+						slog.String("issue", existing.Identifier),
+						slog.String("fingerprint", existing.Fingerprint),
+						slog.String("finding_id", findingID))
+					continue
+				}
 			}
 			desiredState, stateReason := missingFindingState(existing.Fingerprint, snykdastSnapshot.TargetIDs, snykdastSnapshot.InactiveTargetIDs)
 			resolved := model.DesiredIssue{
@@ -1558,6 +1588,40 @@ func missingFindingState(fingerprint string, activeTargets map[string]struct{}, 
 	// Both deleted and inactive targets result in Cancelled: the issue is no
 	// longer actionable regardless of why the target stopped producing findings.
 	return model.StateCancelled, "the Snyk DAST target no longer exists"
+}
+
+// deferredTicketCount counts the managed tickets whose finding id is in
+// deferredIDs, i.e. the tickets the resolve loop holds back for this run.
+func deferredTicketCount(existingByFingerprint map[string]model.ExistingIssue, deferredIDs map[string]struct{}) int64 {
+	if len(deferredIDs) == 0 {
+		return 0
+	}
+	var count int64
+	for fingerprint := range existingByFingerprint {
+		if findingID, ok := FingerprintFindingID(fingerprint); ok {
+			if _, deferred := deferredIDs[findingID]; deferred {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+// FingerprintFindingID extracts the numeric finding ID portion of a Snyk DAST
+// fingerprint. A finding id is only unique within its target, so callers must
+// use it for a coarse match (a ticket whose finding could not be normalized),
+// never as the deduplication key.
+func FingerprintFindingID(fingerprint string) (string, bool) {
+	const prefix = "snyk-dast:"
+	if !strings.HasPrefix(fingerprint, prefix) {
+		return "", false
+	}
+	rest := strings.TrimPrefix(fingerprint, prefix)
+	_, findingID, ok := strings.Cut(rest, ":")
+	if !ok || strings.TrimSpace(findingID) == "" {
+		return "", false
+	}
+	return findingID, true
 }
 
 // FingerprintTargetID extracts the target ID portion of a Snyk DAST fingerprint.

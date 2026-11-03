@@ -3628,3 +3628,70 @@ func TestTruncateForTitleNeverSplitsRunes(t *testing.T) {
 		t.Fatalf("truncateForTitle(%q) = %q, want unchanged", short, got)
 	}
 }
+
+// TestRunDefersTicketWhoseFindingHasNoTargetID: a finding whose embedded target
+// summary carries no id never reaches the snapshot, so its ticket is absent
+// from the "seen" set. Resolving it would close a ticket Snyk DAST still
+// reports open. The ticket is matched by the finding-id part of its fingerprint
+// (the finding id alone identifies nothing, but it is all the deferral gets) and
+// left untouched for the run, while a genuinely missing finding still resolves.
+func TestRunDefersTicketWhoseFindingHasNoTargetID(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// The one finding in Snyk DAST could not be normalized, so it is absent
+	// from Findings and named in DeferredFindingIDs instead.
+	snykdast := fakeSnykDAST{
+		snapshot: model.SnykDASTSnapshot{
+			TargetIDs:          map[string]struct{}{"target-a": {}, "target-b": {}},
+			DeferredFindingIDs: []string{"7"},
+		},
+	}
+	linear := &fakeLinear{
+		snapshot: []model.ExistingIssue{
+			{
+				ID:          "existing-1",
+				Identifier:  "SEC-1",
+				Title:       "finding on project-a",
+				Description: "old description",
+				StateName:   "Todo",
+				Fingerprint: "snyk-dast:target-a:7",
+			},
+			{
+				ID:          "existing-2",
+				Identifier:  "SEC-2",
+				Title:       "gone finding on project-b",
+				Description: "old description",
+				StateName:   "Todo",
+				Fingerprint: "snyk-dast:target-b:9",
+			},
+		},
+	}
+
+	service := New(cfg, logger, snykdast, linear, nil)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v, want success", err)
+	}
+
+	if result.DeferredTickets != 1 {
+		t.Fatalf("DeferredTickets = %d, want 1", result.DeferredTickets)
+	}
+	if len(linear.created) != 0 {
+		t.Fatalf("created = %v, want none (a deferred ticket is neither resolved nor recreated)", desiredStates(linear.created))
+	}
+	for _, update := range linear.updated {
+		if update.Fingerprint == "snyk-dast:target-a:7" {
+			t.Fatalf("the deferred ticket SEC-1 was moved to %q, want it left in Todo", update.State)
+		}
+	}
+	if !containsDesiredState(linear.updated, model.StateDone) {
+		t.Fatalf("updated states = %v, want the genuinely missing finding resolved", desiredStates(linear.updated))
+	}
+	if result.PlannedResolves != 1 {
+		t.Fatalf("PlannedResolves = %d, want 1 (only the finding that is really gone)", result.PlannedResolves)
+	}
+	if result.Err() != nil {
+		t.Fatalf("Err() = %v, want nil", result.Err())
+	}
+}

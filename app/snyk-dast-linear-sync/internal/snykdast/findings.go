@@ -125,13 +125,24 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykDASTSnapshot, erro
 
 	normalized := make([]model.Finding, 0, len(findings))
 	correlated := make([]bool, 0, len(findings))
+	// deferredFindingIDs names the findings skipped below. The sync holds their
+	// existing tickets back for this run instead of resolving them: a skipped
+	// finding is missing from the snapshot, which the resolve loop would
+	// otherwise read as "no longer present" and close a live ticket.
+	var deferredFindingIDs []string
 	for _, finding := range findings {
 		targetID := strings.TrimSpace(finding.Target.ID)
 		if targetID == "" {
 			// The finding's embedded target summary has no id. The finding id is a
 			// bare numeric id (not composite), so there is no way to recover the
 			// target id from it. Skip the finding rather than emit an empty
-			// fingerprint that cannot be deduplicated.
+			// fingerprint that cannot be deduplicated — but say so, and record it
+			// so its tickets are deferred rather than resolved.
+			findingIDStr := finding.ID.String()
+			c.logger.Warn("skipping finding whose embedded target has no id; its tickets are deferred for this run",
+				slog.String("finding_id", findingIDStr),
+				slog.String("target_name", finding.Target.Name))
+			deferredFindingIDs = append(deferredFindingIDs, findingIDStr)
 			continue
 		}
 
@@ -199,9 +210,10 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykDASTSnapshot, erro
 	}
 
 	return model.SnykDASTSnapshot{
-		Findings:          normalized,
-		TargetIDs:         targetIDs,
-		InactiveTargetIDs: map[string]struct{}{},
+		Findings:           normalized,
+		TargetIDs:          targetIDs,
+		DeferredFindingIDs: deferredFindingIDs,
+		InactiveTargetIDs:  map[string]struct{}{},
 	}, nil
 }
 

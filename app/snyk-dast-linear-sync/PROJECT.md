@@ -80,6 +80,17 @@ Update the Linear issue when managed fields differ:
 When a previously tracked finding no longer exists in Snyk DAST but its target
 still exists, move the Linear issue to the resolved (`Done`) state.
 
+A finding that cannot be normalized is never read as "no longer exists". If a
+finding's embedded target summary carries no id, no
+`snyk-dast:<target-id>:<finding-id>` fingerprint can be built for it, so it is
+skipped during the load with a warning naming its finding id. Its id is
+recorded on the snapshot, and the resolve loop holds back every managed ticket
+whose fingerprint ends in that finding id — matched on the finding-id part of
+the fingerprint, since the target id is exactly what is missing. A deferred
+ticket is neither resolved nor recreated for that run, and the count is
+reported as `deferred_tickets`, so API drift cannot record a false resolution
+or cause a close/reopen cycle.
+
 When a previously tracked finding no longer exists because its Snyk DAST target
 no longer exists, cancel the Linear issue instead.
 
