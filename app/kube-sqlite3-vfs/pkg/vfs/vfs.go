@@ -855,22 +855,28 @@ func (f *file) newLockConfigMap(lockLevel, holdersJSON, writerJSON string) *core
 	}
 }
 
-// stampOwnLease refreshes the lease on every entry this file holds in st.
+// stampOwnLease computes the fresh lease for every entry this file holds
+// in st and writes it into the state, returning the expiry it stamped.
 // casLock runs it after every successful mutation, which is what keeps a
 // live holder's lease fresh: any CAS a file performs — transition, renewal
 // or no-op that turned out to need a write — re-stamps its own entries.
-func (f *file) stampOwnLease(st *lockView) {
+//
+// The return value is the expiry casLock must commit to f.leaseExpires once
+// the mutation is known to have reached the cluster (issue #499). Stamping
+// the local timer inside the mutate path — before the ConfigMap Update is
+// known to have succeeded — recorded an extension the cluster never saw: a
+// renewal CAS that exhausted its 409 retries, or failed on an API error,
+// left the cluster keeping the old expiry while maybeRenew skipped renewal
+// for another lockLease/2 on the strength of the phantom local stamp.
+func (f *file) stampOwnLease(st *lockView) time.Time {
 	lease := f.vfs.clock().UTC().Add(f.vfs.lockLease)
-	// Keep the local renewal timer in step with the expiry just written, so
-	// the next renewal decision measures against the fresh lease instead of
-	// firing again on every subsequent call.
-	f.leaseExpires = lease
 	if _, ok := st.sharedHolders[f.holderID]; ok {
 		st.sharedHolders[f.holderID] = lease
 	}
 	if st.writer != nil && st.writer.ID == f.holderID {
 		st.writer.Lease = lease
 	}
+	return lease
 }
 
 // casLock applies mutate to the lock ConfigMap's state with real mutual
@@ -919,7 +925,7 @@ func (f *file) casLock(mutate func(*lockView) error) error {
 		if err := mutate(&st); err != nil {
 			return err
 		}
-		f.stampOwnLease(&st)
+		lease := f.stampOwnLease(&st)
 
 		lockLevel, holdersJSON, writerJSON := serializeLockState(&st)
 		if exists {
@@ -927,6 +933,9 @@ func (f *file) casLock(mutate func(*lockView) error) error {
 				cm.Data[sharedHoldersDataKey] == holdersJSON &&
 				cm.Data[writerDataKey] == writerJSON {
 				// Nothing changed: no write, and no API call beyond the Get.
+				// The store already carries exactly the fresh expiry we
+				// computed, so the local timer may adopt it (issue #499).
+				f.leaseExpires = lease
 				return nil
 			}
 			cm.Data[lockLevelDataKey] = lockLevel
@@ -948,6 +957,11 @@ func (f *file) casLock(mutate func(*lockView) error) error {
 			if err != nil {
 				return fmt.Errorf("update lock configmap: %w", err)
 			}
+			// The Update landed: the store now carries the expiry we
+			// stamped, so the local renewal timer may adopt it (issue
+			// #499). Committing only here keeps a failed or exhausted CAS
+			// from recording an extension the cluster never saw.
+			f.leaseExpires = lease
 		} else {
 			cm = f.newLockConfigMap(lockLevel, holdersJSON, writerJSON)
 			ctx, cancel := f.vfs.lockCallCtx()
@@ -960,6 +974,7 @@ func (f *file) casLock(mutate func(*lockView) error) error {
 			if err != nil {
 				return fmt.Errorf("create lock configmap: %w", err)
 			}
+			f.leaseExpires = lease
 		}
 		return nil
 	}
