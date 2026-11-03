@@ -152,8 +152,14 @@ Linear's description limit truncating the block away, making the ticket
 unmanaged and minting a duplicate on the next run. Each embedded block is
 therefore capped at 10,000 runes (matching the sibling `snyk-linear-sync`),
 via a truncation helper that never splits a multibyte rune and appends one
-stable marker when it cuts. Capping is a pure function of the input text, so
-description comparison and cache hashing stay stable between runs.
+stable marker when it cuts. The per-block cap is not a bound on the
+description by itself, because Snyk DAST returns one Snyk Code correlation
+block per linked vulnerability and does not bound how many; only the first
+three blocks are embedded and the rest are replaced by one stable
+`_N more linked Snyk Code vulnerabilities not shown._` line, so the embedded
+correlation section has a fixed upper bound however many blocks the API
+returns. Capping is a pure function of the input, so description comparison and
+cache hashing stay stable between runs.
 
 Linear may rewrite parts of the description body when rendering or storing
 markdown. The sync therefore normalizes known Linear formatting changes during
