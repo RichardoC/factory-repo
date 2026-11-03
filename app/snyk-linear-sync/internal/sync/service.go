@@ -982,6 +982,9 @@ func (s *Service) retryUnlandedCreates(ctx context.Context, batch []model.Desire
 // indices from the slice it was handed, so they are always valid in practice,
 // but LinearClient is an interface, so an out-of-range index from a faulty
 // implementation must count a FailedOp rather than panic the worker goroutine.
+// Because such an index identifies no batch entry, the caller also keeps every
+// fingerprint of the batch out of the refreshed cache: nothing in it is proven
+// to have landed.
 func inRange(idx, length int) bool {
 	return idx >= 0 && idx < length
 }
@@ -1107,7 +1110,19 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult, fa
 			for _, idx := range failedIdx {
 				if !inRange(idx, len(job.desiredBatch)) {
 					atomic.AddInt64(&result.FailedOps, 1)
-					s.logger.Error("Linear client reported an out-of-range failed create index",
+					// The index identifies no batch entry, so no entry of
+					// the batch can be proven to have landed. As with an
+					// ambiguous create whose reconciliation also fails,
+					// every fingerprint is treated as failed and kept out
+					// of the refreshed cache: caching any of them could
+					// let the next run's cache fast path skip the ticket
+					// the bogus index was trying to report as missing.
+					batchFingerprints := make([]string, 0, len(job.desiredBatch))
+					for _, desired := range job.desiredBatch {
+						batchFingerprints = append(batchFingerprints, desired.Fingerprint)
+					}
+					failed.add(batchFingerprints...)
+					s.logger.Error("Linear client reported an out-of-range failed create index; keeping the whole batch out of the refreshed cache",
 						slog.Int("index", idx),
 						slog.Int("batch_size", len(job.desiredBatch)),
 					)

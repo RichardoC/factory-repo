@@ -44,6 +44,12 @@ type fakeLinear struct {
 	// mimics a Linear alias reporting success:false for one item in a batch
 	// while its siblings succeed.
 	createFailFingerprints map[string]int
+	// createFailOutOfRange, when set, makes the next CreateIssues call report
+	// one index past the end of the batch as failed, without creating any
+	// entry and without an error. It mimics a faulty LinearClient
+	// implementation deriving failed indices incorrectly; the real client
+	// derives them from the slice it was handed, so they are always valid.
+	createFailOutOfRange bool
 
 	// commentCallBatches / commentFailFingerprints mirror the create fields
 	// above but for PostComments.
@@ -145,6 +151,10 @@ func (f *fakeLinear) CreateIssues(ctx context.Context, desired []model.DesiredIs
 	}
 	if f.createErr != nil {
 		return nil, f.createErr
+	}
+	if f.createFailOutOfRange {
+		f.createFailOutOfRange = false
+		return []int{len(desired)}, nil
 	}
 	var failed []int
 	for i, d := range desired {
@@ -5611,6 +5621,83 @@ func TestRunBatchCreatePartialFailureFailedRetryFailsRun(t *testing.T) {
 	}
 	if _, ok := store.saved.SnykHashes["snyk:project-a:issue-1"]; !ok {
 		t.Fatalf("saved SnykHashes must contain \"snyk:project-a:issue-1\" (its create landed and stays cached)")
+	}
+}
+
+// TestRunBatchCreateOutOfRangeFailedIndexFailsRun covers a degenerate
+// LinearClient that reports a failed index outside the batch (nil error, index
+// one past the end, nothing created). The index identifies no batch entry, so
+// the sync must count a failed op, fail the run, and keep every fingerprint of
+// the batch out of the refreshed cache: caching any of them would let the next
+// run's cache fast path skip the ticket the bogus index tried to report as
+// never created.
+func TestRunBatchCreateOutOfRangeFailedIndexFailsRun(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint: "snyk:project-a:issue-1",
+					SnykIssueID: "issue-1",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "First finding",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					CreatedAt:   time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+				{
+					Fingerprint: "snyk:project-a:issue-2",
+					SnykIssueID: "issue-2",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "Second finding",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					CreatedAt:   time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+
+	linear := &fakeLinear{
+		// The batch create reports index 2 as failed - one past the end of
+		// the two-entry batch - with no entry created and no error, so the
+		// reported failure matches no batch entry.
+		createFailOutOfRange: true,
+	}
+	store := &fakeCache{}
+
+	service := New(cfg, logger, snyk, linear, store)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if len(linear.createCallBatches) != 1 {
+		t.Fatalf("CreateIssues calls = %d, want 1 (an out-of-range index identifies no batch entry, so no single-item retry is possible)", len(linear.createCallBatches))
+	}
+
+	if result.FailedOps != 1 {
+		t.Fatalf("FailedOps = %d, want 1 (the out-of-range failed index is counted)", result.FailedOps)
+	}
+	if err := result.Err(); err == nil {
+		t.Fatal("RunResult.Err() = nil, want non-nil (a create reported failed by an index outside the batch must fail the run)")
+	}
+
+	// Nothing in the batch is proven to have landed, so no fingerprint of it
+	// may be cached: the next run has to compare every entry against live
+	// data instead of skipping the still-missing ticket on the fast path.
+	for _, fp := range []string{"snyk:project-a:issue-1", "snyk:project-a:issue-2"} {
+		if _, ok := store.saved.SnykHashes[fp]; ok {
+			t.Fatalf("saved SnykHashes must not contain %q (an out-of-range failed index proves nothing landed)", fp)
+		}
+		if _, ok := store.saved.LinearHashes[fp]; ok {
+			t.Fatalf("saved LinearHashes must not contain %q (an out-of-range failed index proves nothing landed)", fp)
+		}
 	}
 }
 
