@@ -125,6 +125,15 @@ type RunResult struct {
 	PlannedResolves     int64
 	CancelledDuplicates int64
 	FailedOps           int64
+	// FailedComments counts change comments the run gave up on: a partially
+	// failed comment batch whose failed-index list named no batch entry, so
+	// the index could not be retried. It is tracked separately from FailedOps
+	// because a missing change comment leaves the synced issue state
+	// correct — the comment is explanatory, and the feature is opt-in via
+	// LINEAR_COMMENTS — so it does not fail the run; it is counted rather
+	// than only logged so a run cannot report success while silently
+	// dropping comments.
+	FailedComments int64
 }
 
 func New(cfg config.Config, logger *slog.Logger, snyk SnykClient, linear LinearClient, cacheStore CacheStore) *Service {
@@ -147,9 +156,10 @@ func New(cfg config.Config, logger *slog.Logger, snyk SnykClient, linear LinearC
 // a clean run and returns nil here. The exception is an ambiguous batch create
 // whose reconciliation lookup also fails: the whole batch is counted without a
 // retry, because there is no safe way to tell which entries landed. Comment
-// failures never reach FailedOps: a
-// missing change comment leaves the synced issue state correct, and comments
-// are opt-in via LINEAR_COMMENTS, so they are logged as warnings only.
+// failures never reach FailedOps: a missing change comment leaves the synced
+// issue state correct, and comments are opt-in via LINEAR_COMMENTS, so they
+// are logged as warnings and counted in FailedComments, which never fails
+// the run.
 func (r RunResult) Err() error {
 	if r.FailedOps > 0 {
 		return fmt.Errorf("sync finished with failed_ops=%d; see the error log for the Linear operation(s) that could not be applied", r.FailedOps)
@@ -1022,8 +1032,9 @@ func (s *Service) updateBatchWithFallback(ctx context.Context, kind jobKind, ver
 
 // postCommentsWithFallback posts the change comments for batch in one call and,
 // when the call fails, retries every item on its own. A comment failure is not
-// a job failure: it is logged as a warning, not counted in FailedOps.
-func (s *Service) postCommentsWithFallback(ctx context.Context, batch []model.IssueUpdate) {
+// a job failure: it is counted in result.FailedComments and logged as a
+// warning, not counted in FailedOps.
+func (s *Service) postCommentsWithFallback(ctx context.Context, batch []model.IssueUpdate, result *RunResult) {
 	retryComment := func(update model.IssueUpdate) {
 		if _, err := s.linear.PostComments(ctx, []model.IssueUpdate{update}); err != nil {
 			s.logger.Warn("failed to post change comment",
@@ -1053,6 +1064,19 @@ func (s *Service) postCommentsWithFallback(ctx context.Context, batch []model.Is
 			slog.Int("batch_size", len(batch)),
 		)
 		for _, idx := range failedIdx {
+			if !inRange(idx, len(batch)) {
+				// A faultily implemented LinearClient can name a failed
+				// index that is no member of the batch. Count it as a
+				// failed comment rather than indexing the batch with it,
+				// which would panic the worker goroutine and take down
+				// the whole run.
+				atomic.AddInt64(&result.FailedComments, 1)
+				s.logger.Warn("Linear client reported an out-of-range failed comment index; counting a failed comment",
+					slog.Int("index", idx),
+					slog.Int("batch_size", len(batch)),
+				)
+				continue
+			}
 			retryComment(batch[idx])
 		}
 	}
@@ -1153,7 +1177,7 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult, fa
 			return nil
 		}
 		if s.updateBatchWithFallback(ctx, jobUpdate, "update", job.updateBatch, result, failed) && s.cfg.Linear.CommentsEnabled {
-			s.postCommentsWithFallback(ctx, job.updateBatch)
+			s.postCommentsWithFallback(ctx, job.updateBatch, result)
 		}
 		// A batch that failed because the context ended must stop the worker,
 		// not be retried item by item: see the jobCreateBatch case.

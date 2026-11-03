@@ -401,7 +401,9 @@ Update, resolve and duplicate-cancel batches keep their item-by-item fallback:
 those writes set state, so re-applying one that already landed converges instead
 of duplicating. Change comments also have no fingerprint to reconcile against;
 an ambiguous comment-batch failure retries each comment individually, accepting
-a possible duplicate notification comment over a missing one.
+a possible duplicate notification comment over a missing one. A failed-index
+entry that names no member of the batch is never used to index it: it counts a
+failed comment (in `failed_comments`) instead of panicking the worker.
 
 ## SQLite Cache
 
