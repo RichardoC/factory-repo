@@ -978,6 +978,14 @@ func (s *Service) retryUnlandedCreates(ctx context.Context, batch []model.Desire
 	}
 }
 
+// inRange guards indexing by a failed-index list. The Linear client derives the
+// indices from the slice it was handed, so they are always valid in practice,
+// but LinearClient is an interface, so an out-of-range index from a faulty
+// implementation must count a FailedOp rather than panic the worker goroutine.
+func inRange(idx, length int) bool {
+	return idx >= 0 && idx < length
+}
+
 // updateBatchWithFallback sends batch to Linear in one call and, when the
 // call fails, retries every item on its own. It reports whether the batch call
 // itself succeeded, counts each item that still fails in FailedOps, and records
@@ -1097,8 +1105,19 @@ func (s *Service) executeJob(ctx context.Context, job job, result *RunResult, fa
 				slog.Int("batch_size", len(job.desiredBatch)),
 			)
 			for _, idx := range failedIdx {
+				if !inRange(idx, len(job.desiredBatch)) {
+					atomic.AddInt64(&result.FailedOps, 1)
+					s.logger.Error("Linear client reported an out-of-range failed create index",
+						slog.Int("index", idx),
+						slog.Int("batch_size", len(job.desiredBatch)),
+					)
+					continue
+				}
 				desired := job.desiredBatch[idx]
-				if _, err := s.linear.CreateIssues(ctx, []model.DesiredIssue{desired}); err != nil {
+				// createOne treats a failed-index return with a nil error
+				// (success: false on the alias) like the error it is; the
+				// run must count the item and keep it out of the cache.
+				if err := s.createOne(ctx, desired); err != nil {
 					atomic.AddInt64(&result.FailedOps, 1)
 					failed.add(desired.Fingerprint)
 					s.logger.Error("failed to create issue",

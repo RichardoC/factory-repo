@@ -5521,6 +5521,99 @@ func TestRunBatchCreatePartialFailureRetriesOnlyFailedIssue(t *testing.T) {
 	}
 }
 
+// TestRunBatchCreatePartialFailureFailedRetryFailsRun covers a single-item
+// retry that is itself reported as failed through the failed-index return
+// with a nil top-level error (success: false on the alias). Before the retry
+// went through createOne, that nil error was taken as success: the item was
+// never counted in FailedOps, never recorded in failedWrites, the run
+// reported success and the fingerprint was cached as if it had landed.
+func TestRunBatchCreatePartialFailureFailedRetryFailsRun(t *testing.T) {
+	cfg := minimalCfg()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	snyk := fakeSnyk{
+		snapshot: model.SnykSnapshot{
+			Findings: []model.Finding{
+				{
+					Fingerprint: "snyk:project-a:issue-1",
+					SnykIssueID: "issue-1",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "First finding",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					CreatedAt:   time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+				{
+					Fingerprint: "snyk:project-a:issue-2",
+					SnykIssueID: "issue-2",
+					ProjectID:   "project-a",
+					ProjectName: "Project A",
+					IssueTitle:  "Second finding",
+					Severity:    "high",
+					Status:      model.FindingOpen,
+					CreatedAt:   time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC),
+				},
+			},
+			ProjectIDs: map[string]struct{}{"project-a": {}},
+		},
+	}
+
+	linear := &fakeLinear{
+		// issue-2 is reported as failed on the batch call and again on
+		// the single-item retry - both times through the failed-index
+		// return, without a top-level error.
+		createFailFingerprints: map[string]int{"snyk:project-a:issue-2": 2},
+	}
+	store := &fakeCache{}
+
+	service := New(cfg, logger, snyk, linear, store)
+	result, err := service.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	counts := map[string]int{}
+	for _, d := range linear.created {
+		counts[d.Fingerprint]++
+	}
+	if counts["snyk:project-a:issue-1"] != 1 {
+		t.Fatalf("issue-1 created %d times, want exactly 1 (batch-sibling must not be recreated on partial failure)", counts["snyk:project-a:issue-1"])
+	}
+	if counts["snyk:project-a:issue-2"] != 0 {
+		t.Fatalf("issue-2 created %d times, want 0 (both the batch call and the retry reported it as failed)", counts["snyk:project-a:issue-2"])
+	}
+
+	if len(linear.createCallBatches) != 2 {
+		t.Fatalf("CreateIssues calls = %d, want 2 (initial batch + single-item retry)", len(linear.createCallBatches))
+	}
+	retry := linear.createCallBatches[1]
+	if len(retry) != 1 || retry[0].Fingerprint != "snyk:project-a:issue-2" {
+		t.Fatalf("retry batch = %+v, want only the failed issue-2", retry)
+	}
+
+	if result.FailedOps != 1 {
+		t.Fatalf("FailedOps = %d, want 1 (the retry also failed)", result.FailedOps)
+	}
+	if err := result.Err(); err == nil {
+		t.Fatal("RunResult.Err() = nil, want non-nil (a create that failed twice must fail the run)")
+	}
+
+	// The still-missing ticket must not be cached: the fast path of the next
+	// run has to compare it against live Snyk data again instead of skipping
+	// it as reconciled.
+	const failed = "snyk:project-a:issue-2"
+	if _, ok := store.saved.SnykHashes[failed]; ok {
+		t.Fatalf("saved SnykHashes must not contain %q (a create that failed twice is not reconciled)", failed)
+	}
+	if _, ok := store.saved.LinearHashes[failed]; ok {
+		t.Fatalf("saved LinearHashes must not contain %q (a create that failed twice is not reconciled)", failed)
+	}
+	if _, ok := store.saved.SnykHashes["snyk:project-a:issue-1"]; !ok {
+		t.Fatalf("saved SnykHashes must contain \"snyk:project-a:issue-1\" (its create landed and stays cached)")
+	}
+}
+
 // TestRunReconcilesAmbiguousBatchCreateBeforeRetry covers the lost-response
 // case: a transport failure does not prove Linear rejected the mutation, so
 // the entries that actually landed must not be created a second time.
