@@ -455,6 +455,101 @@ func TestFlakyNotTested(t *testing.T) {
 	})
 }
 
+// TestFlakyPerPackageJudgement pins issue #492: the not-tested judgement
+// is per package, so a broken package beside a flaky one in the same
+// module is named, and a budget kill after a `--- FAIL:` marker reads as
+// partially tested — never as the all-clear headline.
+func TestFlakyPerPackageJudgement(t *testing.T) {
+	tests := []struct {
+		name        string
+		in          string
+		wantFailed  []string
+		wantHas     []string
+		wantMissing []string
+	}{
+		{
+			// (a) A build failure in one package of a module whose other
+			// package has a flaky test: the marker must not cover the
+			// broken package.
+			name: "flaky test beside a build failure in the same module",
+			in: "# module app/demo\n" +
+				"--- FAIL: TestChatty (0.01s)\n" +
+				"    chatty_test.go:24: flaked\n" +
+				"FAIL\n" +
+				"FAIL\texample.com/demo/flaky\t1.0s\n" +
+				"# example.com/demo/broken\n" +
+				"./broken.go:5:2: undefined: Nope\n" +
+				"FAIL\texample.com/demo/broken [build failed]\n" +
+				"FAIL\n",
+			wantFailed: []string{"TestChatty"},
+			wantHas: []string{
+				"Not tested this run",
+				"package `example.com/demo/broken` ended in a package-level FAIL",
+			},
+			wantMissing: []string{
+				"No intermittent test failures",
+				"Partially tested this run",
+				"package `example.com/demo/flaky`",
+			},
+		},
+		{
+			// (b) The budget killed the module run after its first marker:
+			// packages after the kill never printed a summary line, so the
+			// module is only partially tested.
+			name: "budget kill after a marker",
+			in: "# module app/killed\n" +
+				"--- FAIL: TestHeld (0.01s)\n" +
+				"    held_test.go:3: flaked\n" +
+				"FAIL\n" +
+				"# module app/killed: run ended in an error: the 20m0s budget ran out mid-module\n",
+			wantFailed: []string{"TestHeld"},
+			wantHas: []string{
+				"Partially tested this run",
+				"`app/killed` — run was killed by the 20m0s budget mid-module after a `--- FAIL:` marker",
+			},
+			wantMissing: []string{"No intermittent test failures"},
+		},
+		{
+			// A completed run that failed only through markers (the plain
+			// exit-status-1 note) is fully tested: no partial, no
+			// not-tested section.
+			name: "complete failing run is not partially tested",
+			in: "# module app/demo\n" +
+				"--- FAIL: TestChatty (0.01s)\n" +
+				"    chatty_test.go:24: flaked\n" +
+				"FAIL\n" +
+				"FAIL\texample.com/demo\t1.0s\n" +
+				"# module app/demo: run ended in an error\n",
+			wantFailed:  []string{"TestChatty"},
+			wantHas:     []string{"### TestChatty"},
+			wantMissing: []string{"Not tested this run", "Partially tested this run", "No intermittent test failures"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			report, failed := flakyTests([]byte(tc.in))
+			if len(failed) != len(tc.wantFailed) {
+				t.Fatalf("failed = %v, want %v", failed, tc.wantFailed)
+			}
+			for i, n := range tc.wantFailed {
+				if failed[i] != n {
+					t.Errorf("failed[%d] = %q, want %q", i, failed[i], n)
+				}
+			}
+			for _, want := range tc.wantHas {
+				if !strings.Contains(report, want) {
+					t.Errorf("report missing %q:\n%s", want, report)
+				}
+			}
+			for _, miss := range tc.wantMissing {
+				if strings.Contains(report, miss) {
+					t.Errorf("report carries %q:\n%s", miss, report)
+				}
+			}
+		})
+	}
+}
+
 // TestFactoryReport pins the weekly report on a fixture with a done run and
 // an incomplete stop, a merged PR, per-model spend and queue-to-merge
 // stamps.
