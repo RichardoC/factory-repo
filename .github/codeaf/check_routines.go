@@ -381,15 +381,56 @@ const (
 // text is bounded and stripped of control characters and backticks before
 // it goes into a fenced block, so no output can break the fence or inject
 // markdown.
+//
+// The parser also reads the module notes the live wrapper writes around
+// each module's output (`# module <dir>` headers, budget-skipped lines,
+// run-errored notes): a module that was skipped, or whose run ended in an
+// error with no `--- FAIL:` marker attributed to it — a build failure, a
+// context kill, a test-timeout panic, a TestMain exit — is reported under
+// a "not tested this run" section, so an incomplete run can never read as
+// a clean bill of health (issue #477).
 func flakyTests(output []byte) (report string, failed []string) {
 	lines := strings.Split(string(output), "\n")
 	type flaky struct {
 		fails  int
 		output []string
 	}
+	// modState accumulates what the parser saw of one module's slice of
+	// the combined output, to judge whether the module was really tested.
+	type modState struct {
+		markers int  // `--- FAIL: <test>` markers attributed to the module
+		pkgFail bool // a package-level `FAIL\t<pkg>` line: a failing or unbuilt package
+		errored bool // the wrapper noted that this run ended in an error
+	}
 	found := map[string]*flaky{}
+	mods := map[string]*modState{}
 	var order []string
+	type untested struct{ dir, reason string }
+	var notRun []untested
+	cur := "" // module dir whose output slice is open, "" when none
 	capturing := ""
+	// judge closes the current module's slice. A module counts as not
+	// tested when its run was skipped, errored, or ended in a
+	// package-level FAIL and nothing in its output attributed a failure
+	// to a test; a module with `--- FAIL:` markers is covered by the
+	// per-test sections whatever its exit status.
+	judge := func() {
+		if cur == "" {
+			return
+		}
+		s := mods[cur]
+		if s != nil && s.markers == 0 {
+			switch {
+			case s.pkgFail:
+				notRun = append(notRun, untested{cur,
+					"ended in a package-level FAIL with no `--- FAIL:` marker (a build failure, a test-timeout panic, or a TestMain exit)"})
+			case s.errored:
+				notRun = append(notRun, untested{cur,
+					"run ended in an error with no per-test failure marker (the output may be truncated)"})
+			}
+		}
+		cur = ""
+	}
 	for _, line := range lines {
 		switch {
 		case strings.HasPrefix(line, "--- FAIL: "):
@@ -408,12 +449,43 @@ func flakyTests(output []byte) (report string, failed []string) {
 				order = append(order, name)
 			}
 			f.fails++
+			if s := mods[cur]; s != nil {
+				s.markers++
+			}
 			// Keep the first failure's output only; later runs say the same.
 			if len(f.output) == 0 {
 				capturing = name
 			} else {
 				capturing = ""
 			}
+		case strings.HasPrefix(line, "# module "):
+			// The wrapper's module notes frame each module's output.
+			capturing = ""
+			rest := line[len("# module "):]
+			if i := strings.Index(rest, ": skipped, the "); i > 0 {
+				judge()
+				notRun = append(notRun, untested{rest[:i],
+					"skipped: the " + flakyTestBudget.String() + " budget ran out"})
+				continue
+			}
+			if strings.HasSuffix(rest, ": run ended in an error") {
+				// The errored run's module slice is still open: flag it.
+				if s := mods[cur]; s != nil {
+					s.errored = true
+				}
+				continue
+			}
+			judge()
+			cur = rest
+			mods[cur] = &modState{}
+		case strings.HasPrefix(line, "FAIL\t"):
+			// A package-level FAIL line: a failing package, or one that
+			// never built or crashed before any test reported. Only
+			// meaningful if no `--- FAIL:` marker is attributed (judge).
+			if s := mods[cur]; s != nil {
+				s.pkgFail = true
+			}
+			capturing = ""
 		case capturing == "":
 			// Not inside a failure's output; nothing to do.
 		case strings.HasPrefix(line, "--- ") || strings.HasPrefix(line, "=== ") ||
@@ -427,18 +499,31 @@ func flakyTests(output []byte) (report string, failed []string) {
 			}
 		}
 	}
+	judge()
 	sort.Strings(order)
 	var b strings.Builder
 	if len(order) == 0 {
-		return "## Flaky tests\n\nNo intermittent test failures.\n", nil
+		if len(notRun) == 0 {
+			return "## Flaky tests\n\nNo intermittent test failures.\n", nil
+		}
+		// Incomplete run: never let it read as an all-clear (issue #477).
+		b.WriteString("## Flaky tests\n\nNo test carried a `--- FAIL:` marker, but the run is incomplete — see the not-tested section below.\n")
+	} else {
+		fmt.Fprintf(&b, "## Flaky tests: %d test(s) failed intermittently under `go test -race -count=10`\n", len(order))
+		for _, name := range order {
+			f := found[name]
+			fmt.Fprintf(&b, "\n### %s\n\nFailed %d of its runs. First failure output:\n\n```\n",
+				escapeMD(name, 120, true), f.fails)
+			b.WriteString(fenceText(strings.Join(f.output, "\n")))
+			b.WriteString("\n```\n\nPropose a fix or a quarantine for this test; rerun `go test -race -count=10` on its module before closing.\n")
+		}
 	}
-	fmt.Fprintf(&b, "## Flaky tests: %d test(s) failed intermittently under `go test -race -count=10`\n", len(order))
-	for _, name := range order {
-		f := found[name]
-		fmt.Fprintf(&b, "\n### %s\n\nFailed %d of its runs. First failure output:\n\n```\n",
-			escapeMD(name, 120, true), f.fails)
-		b.WriteString(fenceText(strings.Join(f.output, "\n")))
-		b.WriteString("\n```\n\nPropose a fix or a quarantine for this test; rerun `go test -race -count=10` on its module before closing.\n")
+	if len(notRun) > 0 {
+		fmt.Fprintf(&b, "\n## Not tested this run: %d module(s)\n\nThese modules were skipped or ended without a per-test failure marker, so their tests were not checked and may hide intermittent failures:\n\n", len(notRun))
+		for _, m := range notRun {
+			fmt.Fprintf(&b, "- `%s` — %s\n", escapeMD(m.dir, 200, true), m.reason)
+		}
+		b.WriteString("\nRerun `go test -race -count=10 ./...` on these modules before trusting this report as a clean bill of health.\n")
 	}
 	return b.String(), order
 }
@@ -498,12 +583,12 @@ func checkFlakyTests() (string, error) {
 	deadline := time.Now().Add(flakyTestBudget)
 	var out strings.Builder
 	for _, mod := range modules {
+		dir := filepath.Dir(mod)
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			fmt.Fprintf(&out, "# module %s: skipped, the %s budget ran out\n", mod, flakyTestBudget)
+			fmt.Fprintf(&out, "# module %s: skipped, the %s budget ran out\n", dir, flakyTestBudget)
 			continue
 		}
-		dir := filepath.Dir(mod)
 		ctx, cancel := context.WithTimeout(context.Background(), remaining)
 		cmd := exec.CommandContext(ctx, "go", "test", "-race", "-count=10", "./...")
 		cmd.Dir = dir
@@ -516,6 +601,12 @@ func checkFlakyTests() (string, error) {
 			if _, ok := err.(*exec.ExitError); !ok {
 				fmt.Fprintf(&out, "# (%s: %v)\n", dir, err)
 			}
+			// flakyTests only reports per-test `--- FAIL:` markers, so a
+			// run that died another way — a build failure, the context
+			// deadline, a test-timeout panic — would otherwise read as an
+			// all-clear. Note the module so flakyTests reports it as not
+			// tested (issue #477).
+			fmt.Fprintf(&out, "# module %s: run ended in an error\n", dir)
 		}
 	}
 	report, _ := flakyTests([]byte(out.String()))
