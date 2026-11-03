@@ -226,6 +226,14 @@ Metadata block detection also takes the *last* line-anchored marker, since the
 managed block is always appended last. Prose therefore cannot spoof or
 hide the fingerprint, and an update rewrites only the real block.
 
+The whole description body above the metadata block is bounded too, at a limit
+derived from the per-block caps plus a margin for headings and single-line
+fields, so one maximal Fix and three maximal correlation blocks still render
+in full while the bound stays below Linear's description limit. A line that
+does not fit is dropped whole with a stable truncation marker, and a `### `
+section heading is dropped together with its body, so an oversized field can
+never push the metadata block away or leave an empty section heading.
+
 ## Issue Format
 
 The synced issue body is optimized for fast developer triage:

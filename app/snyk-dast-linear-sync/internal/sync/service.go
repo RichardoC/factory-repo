@@ -1215,20 +1215,41 @@ func truncateProse(s string, maxRunes int) string {
 	return string(runes[:maxRunes]) + truncationMarker
 }
 
+// maxDescriptionBodyMarginRunes is the room the description-body bound keeps
+// for everything the per-block prose caps do not count: the two section
+// headings, the correlation subtitle and omission line, blank separators, the
+// title line and the bounded single-line fields (status, CWE, target and
+// finding identifiers, and their labels). Those lines are at most a few
+// hundred runes in practice; the margin is deliberately generous so the bound
+// never cuts into the maximal bounded content below.
+const maxDescriptionBodyMarginRunes = 2000
+
 // maxDescriptionBodyRunes bounds the whole rendered description body — every
-// line before the managed metadata block — at 4 x maxEmbeddedProseRunes
-// runes. The per-block prose caps bound Fix and the correlation section, but
-// they do not bound the scan-controlled request-context fields (heading,
-// Host, Path, Parameter, rendered links and identifiers), which Snyk DAST
-// returns unbounded. One overall cap applied before the metadata block is
-// appended guarantees the block always fits below Linear's description limit
-// whichever field grows: without it, an oversized path, parameter or URL
-// silently truncates the block away, extractFingerprint finds nothing, the
-// ticket is unmanaged, and the next run mints a duplicate.
-const maxDescriptionBodyRunes = 4 * maxEmbeddedProseRunes
+// line before the managed metadata block. It is derived from the per-block
+// caps rather than chosen separately: the largest body the caps themselves
+// allow is one Fix plus maxEmbeddedCorrelationBlocks correlation blocks, each
+// at maxEmbeddedProseRunes runes, plus the truncation marker each truncated
+// block appends. Adding the margin above keeps every maximal bounded section
+// inside the bound, so a finding with a maximal Fix and three maximal
+// correlation blocks still renders all of them. The result stays far below
+// Linear's description limit, so the managed metadata block appended last
+// always survives.
+//
+// The per-block prose caps do not bound the scan-controlled request-context
+// fields (heading, Host, Path, Parameter, rendered links and identifiers),
+// which Snyk DAST returns unbounded. The overall cap applied before the
+// metadata block is appended guarantees the block still fits whichever field
+// grows: without it, an oversized path, parameter or URL silently truncates
+// the block away, extractFingerprint finds nothing, the ticket is unmanaged,
+// and the next run mints a duplicate.
+const maxDescriptionBodyRunes = (1+maxEmbeddedCorrelationBlocks)*(maxEmbeddedProseRunes+len(truncationMarker)) + maxDescriptionBodyMarginRunes
 
 // boundDescriptionBody caps the rendered description body at maxRunes runes,
-// deterministically, by dropping whole lines. A line that does not fit in the
+// deterministically, by dropping whole sections. A "### " heading is kept or
+// dropped together with the lines that follow it up to the next heading, so a
+// section that does not fit never leaves its heading behind with nothing under
+// it. Lines before the first section heading (the title and request-context
+// fields) are still considered individually: a line that does not fit in the
 // remaining budget is dropped and later lines are still considered, so one
 // oversized field cannot push the later bounded content (fix text,
 // correlation, Snyk links, identifiers) out of the description. Dropping
@@ -1236,24 +1257,59 @@ const maxDescriptionBodyRunes = 4 * maxEmbeddedProseRunes
 // function of the finding, never leaves a backtick span unbalanced, and keeps
 // the multi-line truncationMarker out of backtick spans: the marker is
 // appended once, as its own line, only when at least one line was dropped.
-// The result is a pure function of lines and maxRunes, so description
-// comparison and hashing stay stable between runs.
+// The budget reserves room for that marker, so the rendered body never
+// exceeds maxRunes. The result is a pure function of lines and maxRunes, so
+// description comparison and hashing stay stable between runs.
 func boundDescriptionBody(lines []string, maxRunes int) []string {
+	budget := maxRunes - utf8.RuneCountInString(truncationMarker) - 1
 	used := 0
 	dropped := false
 	bounded := make([]string, 0, len(lines)+1)
-	for _, line := range lines {
-		if used+utf8.RuneCountInString(line)+1 > maxRunes {
+	for _, section := range descriptionSections(lines) {
+		size := 0
+		for _, line := range section {
+			size += utf8.RuneCountInString(line) + 1
+		}
+		if used+size > budget {
 			dropped = true
 			continue
 		}
-		used += utf8.RuneCountInString(line) + 1
-		bounded = append(bounded, line)
+		used += size
+		bounded = append(bounded, section...)
 	}
 	if dropped {
 		bounded = append(bounded, truncationMarker)
 	}
 	return bounded
+}
+
+// descriptionSections groups description lines into the units
+// boundDescriptionBody must keep or drop together: each "### " heading and the
+// lines after it up to the next heading form one section. Every other line is
+// its own unit. Grouping the heading with its body is what keeps a heading
+// from surviving after the bound dropped the only content under it.
+func descriptionSections(lines []string) [][]string {
+	sections := make([][]string, 0, len(lines))
+	for i := 0; i < len(lines); i++ {
+		if !isDescriptionSectionHeading(lines[i]) {
+			sections = append(sections, lines[i:i+1])
+			continue
+		}
+		j := i + 1
+		for j < len(lines) && !isDescriptionSectionHeading(lines[j]) {
+			j++
+		}
+		sections = append(sections, lines[i:j])
+		i = j - 1
+	}
+	return sections
+}
+
+// isDescriptionSectionHeading reports whether line opens a description
+// section whose body must travel with it. The title uses "## " and is a single
+// self-contained line, so it is deliberately not matched here.
+func isDescriptionSectionHeading(line string) bool {
+	return strings.HasPrefix(line, "### ")
 }
 
 // issueDescription builds the managed Linear issue body. It is optimized for

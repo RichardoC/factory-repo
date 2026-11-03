@@ -184,13 +184,18 @@ inside a backticked field would otherwise carry a fake marker and a fake
 is rewritten. Rendered labels and identifier fields are additionally capped at
 the same 80-rune limit the title uses; hrefs are never truncated — a shortened
 URL is a wrong link. Instead, the whole rendered body (every line above the
-metadata block) is bounded at 40,000 runes, four times the per-block prose
-cap: any line that no longer fits is dropped whole, one stable truncation
-marker is appended, and later lines still fit, so one oversized path,
-parameter or URL can push out its own line but never the fix text, the links,
-or the metadata block, which is still appended last and intact. Like the prose
-caps, bounding is a pure function of the finding, so description comparison
-and cache hashing stay stable between runs.
+metadata block) is bounded at a limit derived from the per-block caps plus a
+margin for headings and single-line fields — one 10,000-rune Fix, three
+10,000-rune correlation blocks, their truncation markers and the surrounding
+lines all fit — and that limit stays far below Linear's description limit. A
+line that no longer fits is dropped whole, one stable truncation marker is
+appended, and later lines still fit, so one oversized path, parameter or URL
+can push out its own line but never the fix text, the links, or the metadata
+block, which is still appended last and intact. A `### ` section heading is
+kept or dropped together with its body, so the bound can never leave an empty
+`### Fix` or `### Snyk Code correlation` heading. Like the prose caps,
+bounding is a pure function of the finding, so description comparison and
+cache hashing stay stable between runs.
 
 Linear may rewrite parts of the description body when rendering or storing
 markdown. The sync therefore normalizes known Linear formatting changes during
