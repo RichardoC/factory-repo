@@ -1080,6 +1080,36 @@ func sanitizeSnykProse(text string) string {
 	return strings.ReplaceAll(text, "<!--", "<!- -")
 }
 
+// singleLine prepares a scan-controlled value that renders on a single line
+// of the ticket description (heading, Host, Path, Parameter, rendered labels
+// and hrefs, identifiers). It trims surrounding space, flattens carriage
+// returns and newlines to single spaces, and neutralizes HTML-comment
+// openings via sanitizeSnykProse. Newline flattening is the anti-spoofing
+// step that matters for these fields: findMetadataBlockStart matches a
+// line-anchored "<!-- snyk-dast-linear-sync" marker, so a newline inside an
+// otherwise backticked field would let a fake marker — and a fake
+// "Fingerprint:" line — onto its own line even though sanitizeSnykProse had
+// already rewritten the "<!--" itself. Flattening rather than escaping keeps
+// the value on one rendered line in every client. Like the prose helpers, it
+// is a pure function of its input, so description comparison and hashing stay
+// stable between runs.
+func singleLine(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.ReplaceAll(value, "\r\n", "\n")
+	value = strings.ReplaceAll(value, "\r", "\n")
+	value = strings.ReplaceAll(value, "\n", " ")
+	return sanitizeSnykProse(value)
+}
+
+// boundedSingleLine is singleLine plus truncateForTitle, for the rendered
+// labels and identifier fields that are bounded at the source rather than by
+// the description-body bound. truncateForTitle appends a single-line "..."
+// marker, never the multi-line prose truncationMarker, so a bounded value can
+// never carry the multi-line marker into a backtick span.
+func boundedSingleLine(value string) string {
+	return truncateForTitle(singleLine(value))
+}
+
 // maxEmbeddedProseRunes bounds how much of Snyk DAST's free-text Fix field
 // and CorrelationMarkdown blocks is embedded verbatim in the ticket
 // description. Linear enforces its own description length limit; since the
@@ -1185,48 +1215,89 @@ func truncateProse(s string, maxRunes int) string {
 	return string(runes[:maxRunes]) + truncationMarker
 }
 
+// maxDescriptionBodyRunes bounds the whole rendered description body — every
+// line before the managed metadata block — at 4 x maxEmbeddedProseRunes
+// runes. The per-block prose caps bound Fix and the correlation section, but
+// they do not bound the scan-controlled request-context fields (heading,
+// Host, Path, Parameter, rendered links and identifiers), which Snyk DAST
+// returns unbounded. One overall cap applied before the metadata block is
+// appended guarantees the block always fits below Linear's description limit
+// whichever field grows: without it, an oversized path, parameter or URL
+// silently truncates the block away, extractFingerprint finds nothing, the
+// ticket is unmanaged, and the next run mints a duplicate.
+const maxDescriptionBodyRunes = 4 * maxEmbeddedProseRunes
+
+// boundDescriptionBody caps the rendered description body at maxRunes runes,
+// deterministically, by dropping whole lines. A line that does not fit in the
+// remaining budget is dropped and later lines are still considered, so one
+// oversized field cannot push the later bounded content (fix text,
+// correlation, Snyk links, identifiers) out of the description. Dropping
+// whole lines rather than cutting mid-line keeps every rendered line a pure
+// function of the finding, never leaves a backtick span unbalanced, and keeps
+// the multi-line truncationMarker out of backtick spans: the marker is
+// appended once, as its own line, only when at least one line was dropped.
+// The result is a pure function of lines and maxRunes, so description
+// comparison and hashing stay stable between runs.
+func boundDescriptionBody(lines []string, maxRunes int) []string {
+	used := 0
+	dropped := false
+	bounded := make([]string, 0, len(lines)+1)
+	for _, line := range lines {
+		if used+utf8.RuneCountInString(line)+1 > maxRunes {
+			dropped = true
+			continue
+		}
+		used += utf8.RuneCountInString(line) + 1
+		bounded = append(bounded, line)
+	}
+	if dropped {
+		bounded = append(bounded, truncationMarker)
+	}
+	return bounded
+}
+
 // issueDescription builds the managed Linear issue body. It is optimized for
 // fast developer triage: the vulnerability and severity lead, the target and
 // vulnerable request context follow, then the fix and Snyk DAST links, then the
 // identifiers and the hidden metadata block used for deduplication.
 func issueDescription(managedLabels []string, finding model.Finding) string {
 	lines := []string{
-		fmt.Sprintf("## %s [%s]", strings.TrimSpace(finding.IssueTitle), strings.ToUpper(strings.TrimSpace(finding.Severity))),
+		fmt.Sprintf("## %s [%s]", truncateIssueTitle(singleLine(finding.IssueTitle)), strings.ToUpper(singleLine(finding.Severity))),
 	}
 
-	if targetLabel, targetLink := targetLink(finding); targetLabel != "" {
-		if targetLink != "" {
-			lines = append(lines, fmt.Sprintf("Target: [%s](%s)", targetLabel, targetLink))
+	if targetLabel, targetHref := targetLink(finding); targetLabel != "" {
+		if targetHref != "" {
+			lines = append(lines, fmt.Sprintf("Target: [%s](%s)", targetLabel, targetHref))
 		} else {
 			lines = append(lines, fmt.Sprintf("Target: %s", targetLabel))
 		}
 	}
-	if host := strings.TrimSpace(finding.TargetHost); host != "" {
+	if host := singleLine(finding.TargetHost); host != "" {
 		lines = append(lines, fmt.Sprintf("Host: `%s`", host))
 	}
 
 	if findingURLLabel, findingURL := vulnerableURLLine(finding); findingURL != "" {
 		lines = append(lines, fmt.Sprintf("URL: [%s](%s)", findingURLLabel, findingURL))
 	}
-	if method := strings.ToUpper(strings.TrimSpace(finding.Method)); method != "" {
+	if method := strings.ToUpper(singleLine(finding.Method)); method != "" {
 		lines = append(lines, fmt.Sprintf("Method: `%s`", method))
 	}
-	if path := strings.TrimSpace(finding.Path); path != "" {
+	if path := singleLine(finding.Path); path != "" {
 		lines = append(lines, fmt.Sprintf("Path: `%s`", path))
 	}
-	if param := strings.TrimSpace(finding.Parameter); param != "" {
-		insertion := insertionPointLabel(finding.InsertionPoint)
+	if param := singleLine(finding.Parameter); param != "" {
+		insertion := singleLine(insertionPointLabel(finding.InsertionPoint))
 		if insertion != "" {
 			lines = append(lines, fmt.Sprintf("Parameter: `%s` (%s)", param, insertion))
 		} else {
 			lines = append(lines, fmt.Sprintf("Parameter: `%s`", param))
 		}
-	} else if insertion := insertionPointLabel(finding.InsertionPoint); insertion != "" {
+	} else if insertion := singleLine(insertionPointLabel(finding.InsertionPoint)); insertion != "" {
 		lines = append(lines, fmt.Sprintf("Insertion point: %s", insertion))
 	}
 
-	if cwe := strings.TrimSpace(finding.CWE); cwe != "" {
-		if name := strings.TrimSpace(finding.CWEName); name != "" {
+	if cwe := boundedSingleLine(finding.CWE); cwe != "" {
+		if name := boundedSingleLine(finding.CWEName); name != "" {
 			lines = append(lines, fmt.Sprintf("CWE: `%s` (%s)", cwe, name))
 		} else {
 			lines = append(lines, fmt.Sprintf("CWE: `%s`", cwe))
@@ -1253,57 +1324,73 @@ func issueDescription(managedLabels []string, finding model.Finding) string {
 	}
 
 	lines = append(lines, "")
-	if finding.IssueURL != "" {
-		lines = append(lines, fmt.Sprintf("Snyk DAST: [Open finding](%s)", finding.IssueURL))
+	if issueURL := singleLine(finding.IssueURL); issueURL != "" {
+		lines = append(lines, fmt.Sprintf("Snyk DAST: [Open finding](%s)", issueURL))
 	}
-	if finding.IssueAPIURL != "" {
-		lines = append(lines, fmt.Sprintf("API: [Finding details](%s)", finding.IssueAPIURL))
+	if apiURL := singleLine(finding.IssueAPIURL); apiURL != "" {
+		lines = append(lines, fmt.Sprintf("API: [Finding details](%s)", apiURL))
 	}
 
 	lines = append(lines, "")
-	lines = append(lines, fmt.Sprintf("Target: `%s` (`%s`)", finding.TargetName, finding.TargetID))
-	lines = append(lines, fmt.Sprintf("Finding ID: `%s`", finding.SnykDASTFindingID))
-	if defID := strings.TrimSpace(finding.DefinitionID); defID != "" {
+	lines = append(lines, fmt.Sprintf("Target: `%s` (`%s`)", boundedSingleLine(finding.TargetName), boundedSingleLine(finding.TargetID)))
+	lines = append(lines, fmt.Sprintf("Finding ID: `%s`", boundedSingleLine(finding.SnykDASTFindingID)))
+	if defID := boundedSingleLine(finding.DefinitionID); defID != "" {
 		lines = append(lines, fmt.Sprintf("Definition ID: `%s`", defID))
 	}
 
+	// The managed metadata block is appended LAST, after the body has been
+	// bounded, so whichever scan-controlled field grows, the block (with the
+	// fingerprint used for deduplication) always survives intact.
+	lines = boundDescriptionBody(lines, maxDescriptionBodyRunes)
 	lines = append(lines, "", metadataBlock(finding.Fingerprint, managedLabels))
 	return strings.Join(lines, "\n")
 }
 
 // targetLink returns the display label and optional URL for the scanned
 // target. The label prefers the target name, falling back to the host; the
-// link uses the target's base URL when available.
+// link uses the target's base URL when available. Both come from the scan
+// API unbounded: the label is flattened, sanitized and capped by
+// boundedSingleLine, and the href is flattened and sanitized by singleLine
+// but never truncated — a shortened URL is a wrong link. An oversized href is
+// handled by the description-body bound (boundDescriptionBody), which drops
+// the whole rendered line rather than the link target.
 func targetLink(finding model.Finding) (string, string) {
-	label := strings.TrimSpace(finding.TargetName)
+	label := boundedSingleLine(finding.TargetName)
 	if label == "" {
-		label = strings.TrimSpace(finding.TargetHost)
+		label = boundedSingleLine(finding.TargetHost)
 	}
-	link := strings.TrimSpace(finding.TargetURL)
+	link := singleLine(finding.TargetURL)
 	if link == "" {
-		link = strings.TrimSpace(finding.FindingURL)
+		link = singleLine(finding.FindingURL)
 	}
 	return label, link
 }
 
 // vulnerableURLLine returns a short label and the full vulnerable URL for the
 // finding. The label is the method + path when available (more readable than a
-// long query-string URL), otherwise a truncated form of the URL itself.
+// long query-string URL), otherwise a truncated form of the URL itself; it is
+// capped by truncateForTitle because a scanned path can be arbitrarily long.
+// The href is flattened and sanitized by singleLine but never truncated — a
+// shortened URL is a wrong link — and an oversized href is handled by the
+// description-body bound (boundDescriptionBody), which drops the whole
+// rendered line rather than the link target.
 func vulnerableURLLine(finding model.Finding) (string, string) {
-	url := strings.TrimSpace(finding.FindingURL)
+	url := singleLine(finding.FindingURL)
 	if url == "" {
 		return "", ""
 	}
-	method := strings.ToUpper(strings.TrimSpace(finding.Method))
-	path := strings.TrimSpace(finding.Path)
+	method := strings.ToUpper(singleLine(finding.Method))
+	path := singleLine(finding.Path)
+	var label string
 	switch {
 	case path != "" && method != "":
-		return method + " " + path, url
+		label = method + " " + path
 	case path != "":
-		return path, url
+		label = path
 	default:
-		return truncateForTitle(url), url
+		label = truncateForTitle(url)
 	}
+	return truncateForTitle(label), url
 }
 
 func insertionPointLabel(value string) string {

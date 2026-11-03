@@ -172,6 +172,26 @@ correlation section has a fixed upper bound however many blocks the API
 returns. Capping is a pure function of the input, so description comparison and
 cache hashing stay stable between runs.
 
+The other scan-controlled fields — the heading, host, path, parameter,
+insertion point, rendered labels and hrefs, and the target, finding and
+definition identifiers — are single lines, and each is prepared the same way:
+surrounding space is trimmed, carriage returns and newlines are flattened to
+single spaces, and HTML comment openings are sanitized exactly like the prose
+blocks. Flattening newlines is the defence that matters for these fields,
+because metadata block detection matches a *line-anchored* marker; a newline
+inside a backticked field would otherwise carry a fake marker and a fake
+`fingerprint:` line onto their own lines even after the `<!--` opening itself
+is rewritten. Rendered labels and identifier fields are additionally capped at
+the same 80-rune limit the title uses; hrefs are never truncated — a shortened
+URL is a wrong link. Instead, the whole rendered body (every line above the
+metadata block) is bounded at 40,000 runes, four times the per-block prose
+cap: any line that no longer fits is dropped whole, one stable truncation
+marker is appended, and later lines still fit, so one oversized path,
+parameter or URL can push out its own line but never the fix text, the links,
+or the metadata block, which is still appended last and intact. Like the prose
+caps, bounding is a pure function of the finding, so description comparison
+and cache hashing stay stable between runs.
+
 Linear may rewrite parts of the description body when rendering or storing
 markdown. The sync therefore normalizes known Linear formatting changes during
 compare and cache hashing.
