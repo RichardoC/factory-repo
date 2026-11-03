@@ -71,12 +71,17 @@ func (t *AdaptiveTransport) RoundTrip(req *http.Request) (*http.Response, error)
 			t.noteBlock(delay)
 		}
 
-		// Only retryable statuses are retried. A "no requests remaining"
-		// header on a successful response must not cause a re-send: the
-		// request that used the last unit of the window succeeded, and
-		// re-sending a mutation would duplicate it. Its only effect is the
-		// noteBlock above, which delays the next request.
-		if !shouldRetry(resp.StatusCode) {
+		// Only retryable statuses are retried: 429 for every request, and
+		// 502/503/504 for idempotent requests and GraphQL reads (which are
+		// POSTs but carry no mark). A request marked non-idempotent -- a
+		// GraphQL mutation -- is not re-sent on a gateway error, because
+		// the error can arrive after Linear committed the mutation;
+		// re-sending would duplicate the write. The caller reconciles the
+		// ambiguous outcome instead. A "no requests remaining" header on a
+		// successful response must not cause a re-send either: the request
+		// that used the last unit of the window succeeded. Its only effect
+		// is the noteBlock above, which delays the next request.
+		if !shouldRetry(req, resp.StatusCode) {
 			return resp, nil
 		}
 
@@ -175,8 +180,44 @@ func canRetry(req *http.Request) bool {
 	return req.Body == nil || req.GetBody != nil
 }
 
-func shouldRetry(status int) bool {
-	return status == http.StatusTooManyRequests || status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
+// nonIdempotentKey marks a request whose re-send could duplicate a write.
+type nonIdempotentKey struct{}
+
+// WithNonIdempotent marks the request carried by ctx as non-idempotent: one
+// whose re-send after a gateway error (502/503/504) could create a duplicate
+// write. Only 429 -- where the request was rejected rather than possibly
+// applied -- is retried for such a request.
+func WithNonIdempotent(ctx context.Context) context.Context {
+	return context.WithValue(ctx, nonIdempotentKey{}, true)
+}
+
+// isNonIdempotent reports whether req is a non-GET/HEAD request whose context
+// carries the WithNonIdempotent mark. A GET or HEAD is always idempotent, so
+// the mark is ignored there. It is safe with a nil request or context.
+func isNonIdempotent(req *http.Request) bool {
+	if req == nil || req.Context() == nil {
+		return false
+	}
+	if req.Method == http.MethodGet || req.Method == http.MethodHead {
+		return false
+	}
+	marked, _ := req.Context().Value(nonIdempotentKey{}).(bool)
+	return marked
+}
+
+// shouldRetry reports whether a response with status may be re-sent for req.
+// 429 is always retryable; 502, 503 and 504 are retryable only for
+// idempotent requests -- reads, including GraphQL POST reads -- and not for
+// requests marked WithNonIdempotent.
+func shouldRetry(req *http.Request, status int) bool {
+	switch status {
+	case http.StatusTooManyRequests:
+		return true
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return !isNonIdempotent(req)
+	default:
+		return false
+	}
 }
 
 func retryAfter(header http.Header, attempt int) time.Duration {

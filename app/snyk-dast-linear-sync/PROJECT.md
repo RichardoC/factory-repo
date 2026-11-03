@@ -381,13 +381,19 @@ It uses:
 - concurrent Snyk DAST and Linear snapshot loading
 - worker-based reconciliation
 - batched Linear mutations
-- rate-limit backoff -- only retryable statuses (429, 502, 503, 504) are retried;
-  a response that exhausts the request budget (`X-RateLimit-Requests-Remaining <= 0`) --
-  including a successful `200` -- is delivered to the caller and is not re-sent; its only
-  effect is to delay the next request until the reset instant. A rate-limit error that
-  arrives as a per-alias GraphQL error joined onto a response whose other aliases decoded
-  is likewise not re-sent: those aliases already took effect, and re-sending the batch
-  would duplicate them. Only an operation that decoded nothing is retried.
+- rate-limit backoff -- the HTTP transport retries `429` for every request, and
+  `502`, `503` and `504` only for idempotent requests and GraphQL reads. Every
+  GraphQL request is a `POST`, so the Linear client marks its mutation requests
+  (create, update, comment, issue-unsubscribe) as non-idempotent; an operation
+  marked as a mutation is delivered once, and a `502`/`503`/`504` on it goes to
+  the caller, which reconciles the partial write rather than re-sending it (see
+  Batch Failure Handling). A response that exhausts the request budget
+  (`X-RateLimit-Requests-Remaining <= 0`) -- including a successful `200` -- is
+  delivered to the caller and is not re-sent either; its only effect is to delay
+  the next request until the reset instant. A rate-limit error that arrives as a
+  per-alias GraphQL error joined onto a response whose other aliases decoded is
+  likewise not re-sent: those aliases already took effect, and re-sending the
+  batch would duplicate them. Only an operation that decoded nothing is retried.
 - SQLite caching
 
 The cache is critical for steady-state performance. A healthy steady-state run
@@ -406,7 +412,10 @@ tickets:
   retried; retrying the batch would duplicate the ones that already exist.
 - **Ambiguous failure.** No aliases were decoded at all, so nothing is known per
   entry. This covers a transport-level failure and equally a GraphQL failure that
-  returned no data, such as a rejected query. Crucially it does *not* prove Linear
+  returned no data, such as a rejected query. A `502`, `503` or `504` on a
+  mutation also lands here: the transport does not re-send a marked mutation,
+  because a gateway error can arrive after Linear committed it, so the response
+  reaches the caller and the reconciliation below decides what to retry. Crucially it does *not* prove Linear
   rejected the mutation, which may have been committed before the response was
   lost. Creates are therefore reconciled first: `ExistingFingerprints` asks Linear
   which of the batch's fingerprints now have a live issue, and only the rest are

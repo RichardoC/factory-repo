@@ -135,7 +135,12 @@ CI enforces all of these: `gofmt -l`, `go fix` + `git diff --exit-code`,
   re-creates only the rest, so a lost response does not duplicate tickets. If
   that lookup also fails, the batch is left for the next run rather than
   blindly retried.
-- Retries and backs off on Linear rate limiting.
+- Retries and backs off on Linear rate limiting. Retryable HTTP statuses are
+  asymmetric: 429 is retried for every request; 502, 503 and 504 only for
+  idempotent requests and GraphQL reads. A request marked as a mutation is
+  delivered once, and its 502/503/504 reaches the caller, which reconciles the
+  partial write (see the create-batch behavior above) instead of duplicating it
+  — a gateway error can arrive after Linear already committed the mutation.
 - Normalizes common Linear markdown rewrites when comparing descriptions so steady-state runs do not churn, and ignores the scanned commit and line numbers of Snyk Code findings, so a rescan that changes nothing else does not rewrite every ticket of the repository. The commit and line links on a ticket are refreshed when anything else about its finding changes.
 
 ## Linear Permissions

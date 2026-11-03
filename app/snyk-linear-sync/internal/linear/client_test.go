@@ -20,6 +20,7 @@ import (
 	gqlclient "git.sr.ht/~emersion/gqlclient"
 
 	"github.com/tesslio/snyk-linear-sync/internal/config"
+	"github.com/tesslio/snyk-linear-sync/internal/httpx"
 	"github.com/tesslio/snyk-linear-sync/internal/model"
 	linSync "github.com/tesslio/snyk-linear-sync/internal/sync"
 )
@@ -3115,5 +3116,165 @@ func TestExecuteStillRetriesWhenNothingDecodedAndRateLimitError(t *testing.T) {
 	}
 	if !resp["commentCreate0"].Success {
 		t.Fatalf("resp = %#v, want the retried response decoded", resp)
+	}
+}
+
+// gatewayStub serves the Linear GraphQL operations a client needs for the
+// retry tests, answering the named operations with gateway errors and
+// recording how many times each one reached the server.
+type gatewayStub struct {
+	mu     syncstd.Mutex
+	counts map[string]int
+	// failFirst maps an operation name to how many of its requests get a 503
+	// before the stub answers normally.
+	failFirst map[string]int
+}
+
+func newGatewayStub(t *testing.T, failFirst map[string]int) (*gatewayStub, *httptest.Server) {
+	t.Helper()
+	stub := &gatewayStub{counts: map[string]int{}, failFirst: failFirst}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		var payload struct {
+			Query string `json:"query"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			http.Error(w, "unmarshal: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		name := ""
+		for _, candidate := range []string{
+			"issueCreateBatch", "commentCreateBatch", "issueUpdateBatch",
+			"resolveTeam", "teamStates", "existingIssues",
+		} {
+			if strings.Contains(payload.Query, candidate) {
+				name = candidate
+				break
+			}
+		}
+
+		stub.mu.Lock()
+		stub.counts[name]++
+		seen := stub.counts[name]
+		failures := stub.failFirst[name]
+		stub.mu.Unlock()
+
+		if seen <= failures {
+			http.Error(w, "gateway error", http.StatusServiceUnavailable)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		switch name {
+		case "teamStates":
+			_, _ = io.WriteString(w, `{"data":{"team":{"states":{"nodes":[{"id":"state-1","name":"Todo","type":"unstarted"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}`)
+		case "existingIssues":
+			_, _ = io.WriteString(w, `{"data":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`)
+		case "issueCreateBatch":
+			_, _ = io.WriteString(w, `{"data":{"issueCreate0":{"success":true,"issue":{"id":"issue-1","identifier":"SNYK-100"}}}}`)
+		case "commentCreateBatch":
+			_, _ = io.WriteString(w, `{"data":{"commentCreate0":{"success":true,"comment":{"id":"comment-1"}}}}`)
+		default:
+			http.Error(w, "unhandled operation: "+payload.Query, http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return stub, server
+}
+
+func (s *gatewayStub) count(name string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.counts[name]
+}
+
+// newGatewayClient builds a real client whose GraphQL traffic goes through the
+// real AdaptiveTransport, which is what decides whether a response is re-sent.
+func newGatewayClient(t *testing.T, serverURL string, cfg config.LinearConfig) *Client {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	client := &Client{
+		cfg:          cfg,
+		gql:          gqlclient.New(serverURL, &http.Client{Transport: httpx.NewAdaptiveTransport("linear", 1, logger, nil)}),
+		log:          logger,
+		resolvedTeam: "team-1",
+		statesByName: map[string]string{"todo": "state-1"},
+		statesByType: map[string]string{"unstarted": "state-1"},
+	}
+	return client
+}
+
+// TestCreateIssuesSendsMutationOnceOn503 pins that a gateway error on a create
+// reaches the caller instead of being re-sent underneath it: the mutation may
+// have been committed before the response was lost, so a second attempt would
+// duplicate the ticket. The caller reconciles instead.
+func TestCreateIssuesSendsMutationOnceOn503(t *testing.T) {
+	stub, server := newGatewayStub(t, map[string]int{"issueCreateBatch": 100})
+	client := newGatewayClient(t, server.URL, config.LinearConfig{
+		TeamID: "team-1",
+		States: config.StateConfig{Todo: "Todo"},
+	})
+
+	_, err := client.CreateIssues(t.Context(), []model.DesiredIssue{{
+		Fingerprint: "snyk:project-a:issue-1",
+		Title:       "Snyk: example issue",
+		Description: "body",
+		State:       model.StateTodo,
+		Priority:    3,
+	}})
+	if err == nil {
+		t.Fatal("CreateIssues() error = nil, want the 503 surfaced to the caller for reconciliation")
+	}
+	if got := stub.count("issueCreateBatch"); got != 1 {
+		t.Fatalf("create mutation reached the server %d times, want exactly 1", got)
+	}
+}
+
+// TestPostCommentsSendsMutationOnceOn503 is the same rule for the comment
+// mutation: a lost response must not become a duplicated comment.
+func TestPostCommentsSendsMutationOnceOn503(t *testing.T) {
+	stub, server := newGatewayStub(t, map[string]int{"commentCreateBatch": 100})
+	client := newGatewayClient(t, server.URL, config.LinearConfig{TeamID: "team-1"})
+
+	_, err := client.PostComments(t.Context(), []model.IssueUpdate{{
+		Existing: model.ExistingIssue{ID: "issue-1", Identifier: "SNYK-100"},
+		Desired: model.DesiredIssue{
+			Fingerprint: "snyk:project-a:issue-1",
+			Title:       "Snyk: example issue",
+			Description: "body",
+			State:       model.StateTodo,
+		},
+		// A diff makes PostComments produce a change comment to post.
+		Diff: &model.IssueDiff{TitleChanged: true},
+	}})
+	if err == nil {
+		t.Fatal("PostComments() error = nil, want the 503 surfaced to the caller for reconciliation")
+	}
+	if got := stub.count("commentCreateBatch"); got != 1 {
+		t.Fatalf("comment mutation reached the server %d times, want exactly 1", got)
+	}
+}
+
+// TestLoadSnapshotRetriesReadOn503 is the other half of the contract: a
+// GraphQL read is a POST too, but it carries no non-idempotent mark, so a
+// gateway error on the snapshot query is retried rather than lost.
+func TestLoadSnapshotRetriesReadOn503(t *testing.T) {
+	stub, server := newGatewayStub(t, map[string]int{"existingIssues": 1})
+	client := newGatewayClient(t, server.URL, config.LinearConfig{TeamID: "team-1"})
+
+	issues, err := client.LoadSnapshot(t.Context())
+	if err != nil {
+		t.Fatalf("LoadSnapshot() error = %v", err)
+	}
+	if len(issues) != 0 {
+		t.Fatalf("LoadSnapshot() issues = %v, want none", issues)
+	}
+	if got := stub.count("existingIssues"); got != 2 {
+		t.Fatalf("snapshot read reached the server %d times, want 2 (one 503, one retry)", got)
 	}
 }

@@ -148,6 +148,10 @@ func TestRoundTripRetriesOn429UntilSuccess(t *testing.T) {
 	}
 }
 
+// TestRoundTripRewindsBodyOnRetry proves a re-sent POST is rewound from
+// GetBody. It drives the rewind with a 429, the one status that is retried for
+// a non-idempotent request: a 502/503/504 must not re-send a POST that might
+// already have applied.
 func TestRoundTripRewindsBodyOnRetry(t *testing.T) {
 	previous := defaultBackoff
 	defaultBackoff = time.Millisecond
@@ -166,7 +170,7 @@ func TestRoundTripRewindsBodyOnRetry(t *testing.T) {
 		mu.Unlock()
 
 		if calls.Add(1) == 1 {
-			return response(http.StatusServiceUnavailable, "unavailable"), nil
+			return response(http.StatusTooManyRequests, "slow down"), nil
 		}
 		return response(http.StatusOK, "done"), nil
 	})
@@ -192,6 +196,265 @@ func TestRoundTripRewindsBodyOnRetry(t *testing.T) {
 		if got != "payload" {
 			t.Fatalf("body of call %d = %q, want %q", i+1, got, "payload")
 		}
+	}
+}
+
+// TestRoundTripDoesNotRetryNonIdempotentPOSTOnGatewayError is the regression
+// test for issue #487: a POST marked WithNonIdempotent (a GraphQL mutation)
+// answered 502, 503 or 504 must reach the caller after exactly one base call.
+// The gateway error can arrive after Linear committed the write, so re-sending
+// the batch would duplicate every issue and comment in it; the caller
+// reconciles the partial write instead.
+func TestRoundTripDoesNotRetryNonIdempotentPOSTOnGatewayError(t *testing.T) {
+	previous := defaultBackoff
+	defaultBackoff = time.Millisecond
+	t.Cleanup(func() { defaultBackoff = previous })
+
+	for _, status := range []int{http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+		t.Run(fmt.Sprintf("status_%d", status), func(t *testing.T) {
+			var calls atomic.Int32
+			base := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls.Add(1)
+				return response(status, `{"errors":[{"message":"gateway"}]}`), nil
+			})
+
+			transport := NewAdaptiveTransport("test", 1, discardLogger(), base)
+			ctx := WithNonIdempotent(context.Background())
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://example.test/graphql", bytes.NewReader([]byte("mutation")))
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+
+			resp, err := transport.RoundTrip(req)
+			if err != nil {
+				t.Fatalf("RoundTrip: %v", err)
+			}
+			defer func() { readAll(t, resp.Body) }()
+
+			if resp.StatusCode != status {
+				t.Fatalf("status = %d, want %d delivered to the caller", resp.StatusCode, status)
+			}
+			if got := calls.Load(); got != 1 {
+				t.Fatalf("base calls = %d, want exactly 1: a non-idempotent POST must not be re-sent on %d", got, status)
+			}
+		})
+	}
+}
+
+// TestRoundTripRetriesGETOnGatewayError covers the other side of the rule: a
+// GET is idempotent, so 502, 503 and 504 are still retried.
+func TestRoundTripRetriesGETOnGatewayError(t *testing.T) {
+	previous := defaultBackoff
+	defaultBackoff = time.Millisecond
+	t.Cleanup(func() { defaultBackoff = previous })
+
+	for _, status := range []int{http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+		t.Run(fmt.Sprintf("status_%d", status), func(t *testing.T) {
+			var calls atomic.Int32
+			base := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if calls.Add(1) == 1 {
+					return response(status, "gateway"), nil
+				}
+				return response(http.StatusOK, "done"), nil
+			})
+
+			transport := NewAdaptiveTransport("test", 1, discardLogger(), base)
+			req, err := http.NewRequest(http.MethodGet, "http://example.test/issues", nil)
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+
+			resp, err := transport.RoundTrip(req)
+			if err != nil {
+				t.Fatalf("RoundTrip: %v", err)
+			}
+			body := readAll(t, resp.Body)
+
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200 after the retry", resp.StatusCode)
+			}
+			if body != "done" {
+				t.Fatalf("body = %q, want %q", body, "done")
+			}
+			if got := calls.Load(); got != 2 {
+				t.Fatalf("base calls = %d, want 2: a GET on %d is still retried", got, status)
+			}
+		})
+	}
+}
+
+// TestRoundTripRetriesNonIdempotentPOSTOn429 pins the exception: 429 means the
+// request was rejected rather than applied, so even a marked POST rewinds and
+// is re-sent.
+func TestRoundTripRetriesNonIdempotentPOSTOn429(t *testing.T) {
+	previous := defaultBackoff
+	defaultBackoff = time.Millisecond
+	t.Cleanup(func() { defaultBackoff = previous })
+
+	var mu sync.Mutex
+	var bodies []string
+	var calls atomic.Int32
+	base := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+		}
+		mu.Lock()
+		bodies = append(bodies, string(body))
+		mu.Unlock()
+
+		if calls.Add(1) == 1 {
+			return response(http.StatusTooManyRequests, "slow down"), nil
+		}
+		return response(http.StatusOK, "done"), nil
+	})
+
+	transport := NewAdaptiveTransport("test", 1, discardLogger(), base)
+	ctx := WithNonIdempotent(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://example.test/graphql", bytes.NewReader([]byte("mutation")))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	readAll(t, resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after the 429 retry", resp.StatusCode)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("base calls = %d, want 2: a 429 is retried for every request", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 {
+		t.Fatalf("base read %d request bodies, want 2", len(bodies))
+	}
+	for i, got := range bodies {
+		if got != "mutation" {
+			t.Fatalf("body of call %d = %q, want %q", i+1, got, "mutation")
+		}
+	}
+}
+
+// TestRoundTripRetriesUnmarkedPOSTOnGatewayError keeps GraphQL reads working:
+// every read is a POST and is left unmarked, so 502/503/504 remain retryable
+// for it.
+func TestRoundTripRetriesUnmarkedPOSTOnGatewayError(t *testing.T) {
+	previous := defaultBackoff
+	defaultBackoff = time.Millisecond
+	t.Cleanup(func() { defaultBackoff = previous })
+
+	var calls atomic.Int32
+	base := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if calls.Add(1) == 1 {
+			return response(http.StatusServiceUnavailable, "unavailable"), nil
+		}
+		return response(http.StatusOK, "done"), nil
+	})
+
+	transport := NewAdaptiveTransport("test", 1, discardLogger(), base)
+	req, err := http.NewRequest(http.MethodPost, "http://example.test/graphql", bytes.NewReader([]byte("query")))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	readAll(t, resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200: an unmarked POST is a GraphQL read and is retried", resp.StatusCode)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("base calls = %d, want 2", got)
+	}
+}
+
+// TestIsNonIdempotent pins the predicate itself, including the nil and
+// idempotent-method cases the transport must tolerate.
+func TestIsNonIdempotent(t *testing.T) {
+	marked := func(method string) *http.Request {
+		req, err := http.NewRequestWithContext(WithNonIdempotent(context.Background()), method, "http://example.test/graphql", nil)
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		return req
+	}
+	plain := func(method string) *http.Request {
+		req, err := http.NewRequest(method, "http://example.test/graphql", nil)
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		return req
+	}
+
+	cases := []struct {
+		name string
+		req  *http.Request
+		want bool
+	}{
+		{name: "nil request", req: nil, want: false},
+		{name: "marked POST", req: marked(http.MethodPost), want: true},
+		{name: "unmarked POST", req: plain(http.MethodPost), want: false},
+		{name: "marked GET", req: marked(http.MethodGet), want: false},
+		{name: "marked HEAD", req: marked(http.MethodHead), want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isNonIdempotent(tc.req); got != tc.want {
+				t.Fatalf("isNonIdempotent() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestShouldRetryStatusesAndRequests states the retry contract directly: 429
+// for every request, 502/503/504 only for an idempotent one.
+func TestShouldRetryStatusesAndRequests(t *testing.T) {
+	markedPOST, err := http.NewRequestWithContext(WithNonIdempotent(context.Background()), http.MethodPost, "http://example.test/graphql", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	plainPOST, err := http.NewRequest(http.MethodPost, "http://example.test/graphql", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	get, err := http.NewRequest(http.MethodGet, "http://example.test/issues", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+
+	cases := []struct {
+		name   string
+		req    *http.Request
+		status int
+		want   bool
+	}{
+		{name: "marked POST 429", req: markedPOST, status: http.StatusTooManyRequests, want: true},
+		{name: "marked POST 502", req: markedPOST, status: http.StatusBadGateway, want: false},
+		{name: "marked POST 503", req: markedPOST, status: http.StatusServiceUnavailable, want: false},
+		{name: "marked POST 504", req: markedPOST, status: http.StatusGatewayTimeout, want: false},
+		{name: "unmarked POST 502", req: plainPOST, status: http.StatusBadGateway, want: true},
+		{name: "unmarked POST 503", req: plainPOST, status: http.StatusServiceUnavailable, want: true},
+		{name: "unmarked POST 504", req: plainPOST, status: http.StatusGatewayTimeout, want: true},
+		{name: "GET 503", req: get, status: http.StatusServiceUnavailable, want: true},
+		{name: "nil request 503", req: nil, status: http.StatusServiceUnavailable, want: true},
+		{name: "marked POST 400", req: markedPOST, status: http.StatusBadRequest, want: false},
+		{name: "marked POST 200", req: markedPOST, status: http.StatusOK, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldRetry(tc.req, tc.status); got != tc.want {
+				t.Fatalf("shouldRetry(%d) = %v, want %v", tc.status, got, tc.want)
+			}
+		})
 	}
 }
 

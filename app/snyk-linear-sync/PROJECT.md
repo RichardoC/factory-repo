@@ -332,6 +332,19 @@ It uses:
   those aliases already took effect, and re-sending the batch would duplicate
   them. Only an operation that decoded nothing is retried, and reads (which
   decode into structs and cannot duplicate anything) keep the full retry.
+- transport-level retry of HTTP statuses -- `AdaptiveTransport`
+  (`internal/httpx`) retries 429 for every request, and 502, 503 and 504 only
+  for idempotent requests: GET and HEAD, and GraphQL reads, which are POSTs
+  but carry no mark. Every Linear mutation is sent with a non-idempotent
+  context mark (`httpx.WithNonIdempotent`, applied by
+  `Client.executeMutation`), so an operation marked as a mutation is delivered
+  once and its 502, 503 or 504 goes to the caller, which reconciles partial
+  writes (see "Batch Failure Handling"). The reason is that a gateway error
+  can arrive after Linear committed the mutation, and Linear exposes no
+  idempotency key: re-sending would duplicate the creates or comments the
+  batch already made. A 429 is different -- the request was rejected rather
+  than possibly applied -- so even a mutation is re-sent, with its body
+  rewound from `GetBody`.
 - SQLite caching
 
 The cache is critical for steady-state performance. A healthy steady-state run should do little or no work when nothing has changed.
@@ -349,7 +362,9 @@ fail in two ways that need different handling to avoid duplicating tickets:
 - **Ambiguous failure.** No aliases were decoded at all, so nothing is known per
   entry. This covers a transport-level failure and equally a GraphQL failure
   that returned no data, such as a 502 arriving after Linear had already
-  committed the mutation. Crucially it does *not* prove Linear rejected the
+  committed the mutation (the transport does not retry a marked mutation on
+  502/503/504 for exactly this reason, so that response reaches the caller
+  instead of becoming a second batch). Crucially it does *not* prove Linear rejected the
   mutation, and Linear exposes no idempotency key to make the retry safe: the
   sync therefore reconciles first. `ExistingFingerprints` asks Linear which of
   the batch's fingerprints now have a live issue, and only the rest are
