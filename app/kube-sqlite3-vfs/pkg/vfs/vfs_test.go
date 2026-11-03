@@ -2080,10 +2080,7 @@ func TestLockCASExhaustionReturnsBusy(t *testing.T) {
 // ioFailure. That is arguably right (contention, not corruption), but it
 // must NOT be mistaken for a lost lease: noteLeaseLost matches only
 // errLockLeaseLost, so leaseLost stays unset and the sticky read/write gate
-// must not engage. Each subtest runs on a fresh VFS and clock, because an
-// exhausted renewal optimistically stamps the local expiry forward on every
-// conflicted attempt (stampOwnLease keeps the local timer in step with the
-// expiry it tried to write), which would mask a second due renewal.
+// must not engage.
 func TestRenewCASExhaustionReturnsBusyWithoutLeaseLoss(t *testing.T) {
 	const lease = time.Minute
 
@@ -2151,6 +2148,88 @@ func TestRenewCASExhaustionReturnsBusyWithoutLeaseLoss(t *testing.T) {
 			t.Errorf("local lock state after exhausted renewal = level %v known %v, want SHARED still held", f.lockLevel, f.lockKnown)
 		}
 	})
+}
+
+// TestRenewExhaustedCASLeavesLocalTimerBehind pins the maybeRenew side of
+// issue #499: when a renewal CAS is exhausted — every Update answered 409 —
+// the local renewal timer must stay where the last successful write left it.
+// stampOwnLease once committed the expiry it stamped into f.leaseExpires
+// inside the mutate path, before the ConfigMap Update was known to have
+// succeeded, so an exhausted renewal recorded an extension the cluster
+// never saw and maybeRenew then skipped renewal for another lockLease/2 —
+// long enough for the cluster-side lease to lapse and another process to
+// prune this holder while it still believed the lock held. The test also
+// pins the other half of the contract: a renewal whose CAS does land still
+// advances the timer.
+func TestRenewExhaustedCASLeavesLocalTimerBehind(t *testing.T) {
+	const lease = time.Minute
+
+	fcs := fake.NewSimpleClientset()
+	clock := &fakeClock{now: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}
+	v := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3, WithLockLease(lease))
+	v.clock = clock.Now
+
+	f := openTestFile(t, v, "renew-timer.db")
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("Lock(Shared): %v", err)
+	}
+	held := f.leaseExpires // the expiry the successful Lock wrote and adopted
+
+	conflict := true
+	var attempts int32
+	fcs.PrependReactor("update", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		ua, ok := action.(k8stesting.UpdateAction)
+		if !ok || !conflict {
+			return false, nil, nil
+		}
+		if cm, ok := ua.GetObject().(*v1.ConfigMap); !ok || cm.Name != f.LockFileName() {
+			return false, nil, nil
+		}
+		atomic.AddInt32(&attempts, 1)
+		return true, nil, kerrors.NewConflict(v1.Resource("configmaps"), f.LockFileName(), errors.New("injected 409"))
+	})
+
+	// Renewal only fires once less than half the lease remains; move the
+	// fake clock past that point so maybeRenew actually CASes.
+	clock.Advance(lease/2 + time.Second)
+	if err := f.maybeRenew(); err != sqlite3vfs.BusyError {
+		t.Fatalf("maybeRenew under sustained 409s = %v (%T), want bare sqlite3vfs.BusyError", err, err)
+	}
+	if got := atomic.LoadInt32(&attempts); got != maxLockCASAttempts {
+		t.Errorf("renewal update attempts = %d, want %d (the CAS bound)", got, maxLockCASAttempts)
+	}
+	if !f.leaseExpires.Equal(held) {
+		t.Errorf("exhausted renewal advanced f.leaseExpires to %v, want it still at the last successful write %v (issue #499)", f.leaseExpires, held)
+	}
+
+	// The local timer never moved, so the very next maybeRenew — no clock
+	// advance — is still due and attempts the CAS again, instead of the old
+	// behaviour of waiting out another lockLease/2 while the cluster lease
+	// lapses.
+	if err := f.maybeRenew(); err != sqlite3vfs.BusyError {
+		t.Fatalf("second maybeRenew after the exhausted one = %v (%T), want sqlite3vfs.BusyError (the renewal must be re-attempted, not skipped)", err, err)
+	}
+	if got := atomic.LoadInt32(&attempts); got != 2*maxLockCASAttempts {
+		t.Errorf("renewal update attempts after the second maybeRenew = %d, want %d (the next renewal must attempt its own CAS bound)", got, 2*maxLockCASAttempts)
+	}
+	if !f.leaseExpires.Equal(held) {
+		t.Errorf("second exhausted renewal still advanced f.leaseExpires to %v, want %v", f.leaseExpires, held)
+	}
+
+	// Contention ends: the next renewal CAS lands, and only then does the
+	// local timer advance past the expiry the store used to carry.
+	conflict = false
+	if err := f.maybeRenew(); err != nil {
+		t.Fatalf("maybeRenew once the 409s stop: %v, want nil", err)
+	}
+	want := clock.Now().UTC().Add(lease)
+	if !f.leaseExpires.Equal(want) {
+		t.Errorf("successful renewal left f.leaseExpires at %v, want %v (clock + lease)", f.leaseExpires, want)
+	}
+	holders := sharedHoldersIn(t, fcs, f)
+	if got := holders[f.holderID]; !got.Equal(want) {
+		t.Errorf("stored shared-holder lease after successful renewal = %v, want %v", got, want)
+	}
 }
 
 // TestOpenCASExhaustionReturnsBusy pins Open's fresh-lockfile CAS path
