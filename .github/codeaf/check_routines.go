@@ -458,6 +458,9 @@ func flakyTests(output []byte) (report string, failed []string) {
 		case s.killed && s.markers > 0:
 			partial = append(partial, untested{dir, fmt.Sprintf(
 				"run was killed by the %s budget mid-module after a `--- FAIL:` marker, so packages later in the module were not tested", flakyTestBudget)})
+		case s.killed && len(untestedPkgs) > 0:
+			partial = append(partial, untested{dir, fmt.Sprintf(
+				"run was killed by the %s budget mid-module after a failed package, so packages later in the module were not tested", flakyTestBudget)})
 		case len(untestedPkgs) == 0 && s.markers == 0 && s.killed:
 			notRun = append(notRun, untested{dir, fmt.Sprintf(
 				"run was killed by the %s budget mid-module with no per-test failure marker (the output may be truncated)", flakyTestBudget)})
@@ -667,11 +670,14 @@ func checkFlakyTests() (string, error) {
 		cmd := exec.CommandContext(ctx, "go", "test", "-race", "-count=10", "./...")
 		cmd.Dir = dir
 		b, err := cmd.CombinedOutput()
+		// Read the budget verdict before cancel(): after cancel ctx.Err()
+		// is always non-nil, which would mark every module as killed.
+		killed := err != nil && ctx.Err() != nil
 		cancel()
 		fmt.Fprintf(&out, "# module %s\n", dir)
 		out.Write(b)
 		out.WriteString("\n")
-		if ctx.Err() != nil {
+		if killed {
 			// The budget killed this module's run mid-module: the
 			// packages after the kill never print a summary line, so
 			// flakyTests cannot name them — note the kill and let it

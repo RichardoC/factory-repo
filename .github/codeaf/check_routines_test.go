@@ -510,6 +510,23 @@ func TestFlakyPerPackageJudgement(t *testing.T) {
 			wantMissing: []string{"No intermittent test failures"},
 		},
 		{
+			// The budget killed the module run after a package failed to
+			// build but before any marker: the broken package is named, and
+			// the kill still marks the rest of the module as untested.
+			name: "budget kill after a failed package",
+			in: "# module app/killed\n" +
+				"# example.com/killed/broken\n" +
+				"./broken.go:5:2: undefined: Nope\n" +
+				"FAIL\texample.com/killed/broken [build failed]\n" +
+				"# module app/killed: run ended in an error: the 20m0s budget ran out mid-module\n",
+			wantHas: []string{
+				"package `example.com/killed/broken` ended in a package-level FAIL",
+				"Partially tested this run",
+				"`app/killed` — run was killed by the 20m0s budget mid-module after a failed package",
+			},
+			wantMissing: []string{"No intermittent test failures"},
+		},
+		{
 			// A completed run that failed only through markers (the plain
 			// exit-status-1 note) is fully tested: no partial, no
 			// not-tested section.
@@ -705,5 +722,42 @@ func TestFlakyModuleDiscovery(t *testing.T) {
 	}
 	if len(mods) != 2 {
 		t.Errorf("module discovery found %v, want the harness module and app/demo", mods)
+	}
+}
+
+// TestCheckFlakyTestsCleanModuleReadsClean runs the real wrapper over one
+// passing module. The wrapper must not report a run that finished inside
+// the budget as killed: reading ctx.Err() after cancel() did, so the
+// all-clear could never appear.
+func TestCheckFlakyTestsCleanModuleReadsClean(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs go test on a temporary module")
+	}
+	root := t.TempDir()
+	dir := filepath.Join(root, "app", "clean")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"go.mod":        "module example.com/clean\n\ngo 1.21\n",
+		"clean_test.go": "package clean\n\nimport \"testing\"\n\nfunc TestPasses(t *testing.T) {}\n",
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("CODEAF_REPO_ROOT", root)
+	report, err := checkFlakyTests()
+	if err != nil {
+		t.Fatalf("checkFlakyTests: %v", err)
+	}
+	if !strings.Contains(report, "No intermittent test failures") {
+		t.Fatalf("a clean module did not read as clean:\n%s", report)
+	}
+	for _, miss := range []string{"killed", "Not tested this run", "Partially tested this run"} {
+		if strings.Contains(report, miss) {
+			t.Errorf("clean report carries %q:\n%s", miss, report)
+		}
 	}
 }
