@@ -3106,18 +3106,26 @@ func TestReviewReportKeepsFindingsOnTruncatedDiff(t *testing.T) {
 	oldArgs := os.Args
 	t.Cleanup(func() { os.Args = oldArgs })
 	os.Args = []string{"harness", "review-report", "7"}
-	// One small file first, then a huge one, so the cap cuts inside the
-	// second: app/x/main.go is known, app/late/main.go is not.
+	// One small file, then a huge one the cap cuts inside, then a third
+	// file wholly past the cut: app/x/main.go and app/late/main.go have
+	// their headers in the fetched prefix, app/past/main.go does not, so a
+	// diff-path filter built from the prefix would treat a finding on it as
+	// a quote and drop it.
 	late := "diff --git a/app/late/main.go b/app/late/main.go\n--- a/app/late/main.go\n+++ b/app/late/main.go\n@@ -1 +1 @@\n" +
 		strings.Repeat("+ filler line for the oversized tail of the diff\n", 40000)
-	diffBody := "diff --git a/app/x/main.go b/app/x/main.go\n--- a/app/x/main.go\n+++ b/app/x/main.go\n@@ -1,2 +1,3 @@\n context\n" + late
+	past := "diff --git a/app/past/main.go b/app/past/main.go\n--- a/app/past/main.go\n+++ b/app/past/main.go\n@@ -1 +1,2 @@\n context\n+changed\n"
+	diffBody := "diff --git a/app/x/main.go b/app/x/main.go\n--- a/app/x/main.go\n+++ b/app/x/main.go\n@@ -1,2 +1,3 @@\n context\n" + late + past
 	server := reviewServer(t, map[string]string{
 		"/repos/RichardoC/factory-repo/pulls/7":           `{"number":7,"title":"Review target","body":"The change.","state":"open","head":{"ref":"codeaf/issue-3-42"},"base":{"ref":"main"}}`,
 		"/repos/RichardoC/factory-repo/issues/7/comments": `[]`,
 	}, diffBody, nil)
 	t.Cleanup(server.Close)
 	ghEnv(t, server)
-	writeReviewResult(t, stopDone, "## Findings\n\n```\n- [high] app/late/main.go:3 - a real bug past the fetch cut\n```\n")
+	// The finding sits in a closed fence outside a "## Findings" section:
+	// that is where the diff-path filter applies (inside the section it is
+	// exempt, issue #334), so it is the case a prefix-only path set would
+	// wrongly drop as a quote.
+	writeReviewResult(t, stopDone, "The one blocking problem:\n\n```\n- [high] app/past/main.go:2 - a real bug past the fetch cut\n```\n")
 	reviewLedger(t)
 	t.Setenv("REVIEW_COMMENT_PATH", filepath.Join(t.TempDir(), "comment.md"))
 	out, err := captureStdout(t, runReviewReport)
