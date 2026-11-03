@@ -1074,9 +1074,10 @@ func runNext() error {
 			log.Printf("maintainer hand-off on #%d: %v", n, err)
 		}
 	}
-	// A pull request whose publish refusal names the workflow policy gets
-	// the same one hand-off (issue #457): the label and the PR's own fixed
-	// comment, each ensured independently.
+	// A pull request refused on deterministic grounds — the workflow policy,
+	// or the maintainer approval a `.github/` change needs — gets the same
+	// one hand-off (issue #457): the label and the PR's own fixed comment,
+	// each ensured independently.
 	for _, n := range prEscalations {
 		if err := ensurePRMaintainerEscalation(gh, n); err != nil {
 			log.Printf("maintainer hand-off on #%d: %v", n, err)
@@ -1342,26 +1343,16 @@ type bodyComments []struct {
 	} `json:"user"`
 }
 
-// strandedByFailedRun reports whether a PR's comments end in a failed CodeAF
-// run that is worth re-picking: its latest bot comment, the queue's own
-// marker comments aside, is a run report whose outcome is "publishing
-// failed" or "run job failed", and it is not a refusal the workflow policy
-// makes deterministic. That is the one state the re-pick exists for (issue
-// #215). Every other way a PR ends with no queue label is a deliberate
-// hand-off to a person -- a spent fix budget, an unrecognised severity, an
-// incomplete review -- and re-reviewing those would keep asking until a
-// review passed. Only bot comments count, so a comment anyone can post on a
-// public repository cannot fake a failed run.
-func strandedByFailedRun(comments bodyComments) bool {
-	return strandedPRState(comments) == strandRetry
-}
-
 // strandedPRState reads what happened to a stranded pull request out of its
 // comments, the twin of strandedIssueState (issue #457). Its latest bot
 // comment, the queue's own marker comments aside, must be a run report; a
-// report that is no failure leaves the PR alone. A publish refusal that names
-// the workflow policy is handed to a maintainer at once instead of being
-// re-picked: the same policy refusal fails identically on every retry, and
+// report that is no failure leaves the PR alone. A publishing failure is the
+// one state the re-pick exists for (issue #215): every other way a PR ends
+// with no queue label -- a spent fix budget, an unrecognised severity, an
+// incomplete review -- is a deliberate hand-off to a person, and re-reviewing
+// those would keep asking until a review passed. A report carrying a
+// deterministic refusal (deterministicRefusals) is handed to a maintainer at
+// once instead of being re-picked: retrying repeats the same refusal, and
 // every re-pick would spend a review run (and up to two fix continuations)
 // on a change no run can publish.
 //
@@ -1384,7 +1375,7 @@ func strandedPRState(comments bodyComments) string {
 		if !strings.HasPrefix(c.Body, reportMarker+"\n") || !failedRunReport(c.Body) {
 			return strandNone
 		}
-		if escalated || strings.Contains(c.Body, workflowPolicyRefusal) {
+		if escalated || reportIsDeterministicRefusal(c.Body) {
 			return strandMaintainer
 		}
 		return strandRetry
@@ -1413,7 +1404,7 @@ func failedRunReport(body string) bool {
 	// Only a report with no stop / ok row to parse counts on the fixed
 	// line: a literal this package writes itself (main.go), so a report
 	// from any other writer matches it only by reproducing it, and only
-	// bot comments reach here anyway (strandedByFailedRun).
+	// bot comments reach here anyway (strandedIssueState, strandedPRState).
 	if _, ok := reportTableRow(body, "stop / ok"); !ok &&
 		strings.Contains(body, "\n"+noResultRow+"\n") {
 		return true
@@ -1431,7 +1422,7 @@ const noResultRow = "| result | CodeAF produced no JSON result; see the workflow
 
 // repickMarkers collects the head SHAs the re-pick marker comments name, in
 // comment order, lowercased. A malformed marker is ignored as if absent
-// (issue #215). Only a bot's marker counts, as in strandedByFailedRun,
+// (issue #215). Only a bot's marker counts, as in strandedPRState,
 // ensureHoldCommentBody and ensureIssueRetryMarker: comments are untrusted
 // data, so a person quoting or reposting the marker on a public repository
 // must not make the queue believe its re-pick was already posted — that
@@ -1478,7 +1469,7 @@ func ensureRepickMarker(g github, n int, sha string) error {
 // and is not re-picked this tick: the guard fails closed, since a re-pick
 // that cannot be recorded could repeat on every tick.
 //
-// A PR whose latest failed report names the workflow policy is never
+// A PR whose latest failed report carries a deterministic refusal is never
 // re-picked at all (issue #457): retrying repeats the same refusal, so it is
 // returned in escalations instead, for the same one maintainer hand-off the
 // issue path already performs.
@@ -1513,8 +1504,9 @@ func fetchStrandedPRs(g github, issues []item, runs []runStatus, lbl string, log
 		switch strandedPRState(comments) {
 		case strandRetry:
 		case strandMaintainer:
-			// A policy refusal fails identically on every retry: hand the
-			// PR to a maintainer once instead of re-queueing the review.
+			// A deterministic refusal fails identically on every retry:
+			// hand the PR to a maintainer once instead of re-queueing the
+			// review.
 			escalations = append(escalations, i.Number)
 			continue
 		default:
@@ -1614,10 +1606,44 @@ const (
 	maintainerLabelDesc  = "The queue hands this issue to a maintainer: retrying the run again will not fix it"
 )
 
-// workflowPolicyRefusal is the phrase a publish refusal carries when the
-// change breaks the workflow policy. A run refused on policy grounds fails
-// identically on every retry, so it is never retried at all.
-const workflowPolicyRefusal = "breaks the workflow policy"
+// deterministicRefusals are the exact sentences the publish step writes into
+// a run report's `| publish error |` row when a refusal cannot change on a
+// retry (codeaf.yml's "Apply the patch" step): the change breaks the
+// deterministic workflow policy, or it touches `.github/` outside
+// `.github/codeaf/` without a maintainer's approval -- which AGENTS.md says
+// needs one, so every run refuses that patch the same way. Such a run fails
+// identically on every retry, so it is never retried at all (issues #240,
+// #457).
+//
+// Each entry is the row's whole cell, matched exactly and only against a
+// `| publish error |` row: a report's prose -- CodeAF's own summary, say,
+// which is untrusted text quoted from the run -- can mention the policy
+// without the publish having been refused on it, and a search of the whole
+// comment would misread that as a deterministic refusal.
+var deterministicRefusals = []string{
+	"the workflow change breaks the workflow policy (above) and no maintainer approved it; refusing it",
+	"patch touches .github/ outside .github/codeaf/ and top-level workflow files without a maintainer's approval; refusing it",
+}
+
+// reportIsDeterministicRefusal reports whether a run report carries one of
+// deterministicRefusals as a `| publish error |` row, which is how the
+// report writer records the publish step's ::error:: lines (main.go). The
+// row's cell is compared whole, never searched: it is fixed prose written by
+// the workflow, so a report matches only by reproducing it exactly in the
+// one place the writer puts it.
+func reportIsDeterministicRefusal(body string) bool {
+	const prefix = "| publish error |"
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		cell := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(line, prefix)), "|"))
+		if slices.Contains(deterministicRefusals, cell) {
+			return true
+		}
+	}
+	return false
+}
 
 // What the queue does with a stranded issue, as strandedIssueState reports
 // it: strandNone leaves the issue where it is, strandRetry re-picks it
@@ -1631,16 +1657,16 @@ const (
 // strandedIssueState reads what happened to a stranded issue out of its
 // comments: its latest bot comment, the queue's own marker comments aside,
 // is a run report, and the report's outcome decides. A failure report on a
-// first failure is a retry; a failure after the retry, or a publish refusal
-// that names the workflow policy — retrying would repeat the same refusal —
-// goes to a maintainer. Everything else leaves the issue alone: a run that
-// ended well ("done", "changes pushed", "no changes"), a latest bot comment
-// that is no run report, or no bot comments at all.
+// first failure is a retry; a failure after the retry, or a report carrying
+// a deterministic refusal (deterministicRefusals) — retrying would repeat the
+// same refusal — goes to a maintainer. Everything else leaves the issue
+// alone: a run that ended well ("done", "changes pushed", "no changes"), a
+// latest bot comment that is no run report, or no bot comments at all.
 //
 // Comments are untrusted data: only bot-authored comments count, so a
 // comment anyone can post on a public repository cannot fake a failed run
 // or spend the retry, and the report shape is matched as strictly as
-// strandedByFailedRun's. The marker comments are skipped in the scan but
+// strandedPRState's. The marker comments are skipped in the scan but
 // not forgotten — a retry marker anywhere in the history is what makes the
 // next failure report a maintainer case, whichever order the comments came
 // in.
@@ -1669,7 +1695,7 @@ func strandedIssueState(comments bodyComments) string {
 		if !failedRunReport(c.Body) {
 			return strandNone
 		}
-		if escalated || retried || strings.Contains(c.Body, workflowPolicyRefusal) {
+		if escalated || retried || reportIsDeterministicRefusal(c.Body) {
 			return strandMaintainer
 		}
 		return strandRetry
@@ -1848,19 +1874,21 @@ func ensureMaintainerComment(g github, n int) error {
 
 // prMaintainerBody is the pull request's maintainer hand-off comment (issue
 // #457): the same fixed shape as the issue's, built from the PR number alone.
-// It says why the queue stopped re-picking: the publish refusal names the
-// workflow policy, so a re-review would end in the same refusal.
+// It says why the queue stopped re-picking: the publish refusal is one that
+// deterministicRefusals names — the workflow policy, or the maintainer
+// approval a `.github/` change needs — so a re-review would end in the same
+// refusal.
 func prMaintainerBody(n int) string {
-	return fmt.Sprintf("%s\nCodeAF's queue is handing this pull request (#%d) to a maintainer: its latest CodeAF run failed to publish because the change breaks the workflow policy, so retrying would repeat the same refusal. The pull request carries the `codeaf-maintainer` label and needs a person to look at it.", queuePRMaintainerMarker, n)
+	return fmt.Sprintf("%s\nCodeAF's queue is handing this pull request (#%d) to a maintainer: its latest CodeAF run failed to publish on a refusal retrying cannot change — the change breaks the workflow policy, or it changes `.github/` without the maintainer approval it needs — so a re-review would repeat the same refusal. The pull request carries the `codeaf-maintainer` label and needs a person to look at it.", queuePRMaintainerMarker, n)
 }
 
 // ensurePRMaintainerEscalation hands stranded pull request n to a maintainer
 // (issue #457), the PR twin of ensureMaintainerEscalation: the same
 // codeaf-maintainer label and one fixed comment, each ensured from its own
 // footprint so one half failing never suppresses the other. A PR whose
-// policy refusal was handed over stays in fetchStrandedPRs' escalations list
-// until both halves are served; on later ticks both are present and this is
-// a no-op.
+// deterministic refusal was handed over stays in fetchStrandedPRs'
+// escalations list until both halves are served; on later ticks both are
+// present and this is a no-op.
 func ensurePRMaintainerEscalation(g github, n int) error {
 	labelErr := ensureMaintainerLabel(g, n)
 	commentErr := ensurePRMaintainerComment(g, n)
