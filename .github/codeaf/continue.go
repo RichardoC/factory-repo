@@ -110,8 +110,8 @@ func continuationCapReached(used int) bool { return used >= maxContinuations }
 // (issue #219): main.go writes the outcome as "### CodeAF run — <outcome>",
 // and codeaf.yml's report step sets that outcome to "publishing failed" when
 // the publish job failed and to "run job failed" when the run job itself did.
-// queue.go's strandedByFailedRun treats both as the same stranded state
-// (issue #215), so both must be excluded here too. Each entry is an exact
+// queue.go's strandedPRState and strandedIssueState treat both as the same
+// stranded state (issue #215), so both must be excluded here too. Each entry is an exact
 // prefix, never a search inside the body, because a comment is untrusted
 // data; the strings are fixed literals this package writes itself, so a
 // comment matches only by reproducing one exactly, and only bot comments
