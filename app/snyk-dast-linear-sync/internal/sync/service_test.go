@@ -3332,6 +3332,72 @@ func TestIssueDescriptionSanitizesSnykControlledProse(t *testing.T) {
 	}
 }
 
+// TestIssueDescriptionTruncatesOversizedEmbeddedProse verifies that very
+// long Snyk DAST controlled free text (finding.Fix and each
+// finding.CorrelationMarkdown block) is capped so the managed metadata
+// block appended after it can never be pushed past what Linear accepts.
+// Without a cap, oversized prose risks Linear silently truncating away the
+// metadata block, making the ticket unmanaged and causing duplicate-ticket
+// creation on the next run. The truncation marker is a stable constant and
+// truncation is a pure function of the input, so building the description
+// twice from the same finding is byte-identical and the compare/hash
+// pipeline does not churn between runs.
+func TestIssueDescriptionTruncatesOversizedEmbeddedProse(t *testing.T) {
+	huge := strings.Repeat("x", 100000)
+	finding := model.Finding{
+		IssueTitle: "SQL Injection",
+		Severity:   "high",
+		TargetName: "project-a",
+		TargetID:   "target-1",
+		Fix:        huge,
+		CorrelationMarkdown: []string{
+			huge,
+			"short correlation block survives untouched",
+		},
+		Fingerprint:       "snyk-dast:target-1:finding-1",
+		SnykDASTFindingID: "finding-1",
+	}
+
+	description := issueDescription([]string{"snyk-dast-automation"}, finding)
+
+	// Both oversized blocks were truncated; the short correlation block was
+	// not, and none of the huge raw input found its way in whole.
+	if got := strings.Count(description, truncationMarker); got != 2 {
+		t.Fatalf("description has %d truncation markers, want 2 (one per oversized block):\n%s", got, description)
+	}
+	if !strings.Contains(description, "short correlation block survives untouched") {
+		t.Fatalf("description dropped the short correlation block:\n%s", description)
+	}
+	if len(description) >= len(huge) {
+		t.Fatalf("description length %d not bounded relative to raw input length %d", len(description), len(huge))
+	}
+	// Each embedded block is capped at maxEmbeddedProseRunes runes, so the
+	// description stays far below Linear's overall description limit.
+	if got := strings.Count(description, "x"); got > 2*maxEmbeddedProseRunes+200 {
+		t.Fatalf("description embeds %d prose runes, want each block capped at %d", got, maxEmbeddedProseRunes)
+	}
+
+	// The metadata block must still be present and parseable at the end.
+	start := findMetadataBlockStart(description)
+	if start < 0 {
+		t.Fatalf("findMetadataBlockStart() found no block after truncation")
+	}
+	block := description[start:]
+	if !strings.Contains(block, "fingerprint: snyk-dast:target-1:finding-1") {
+		t.Fatalf("metadata block missing fingerprint after truncation:\n%s", block)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(description), "-->") {
+		t.Fatalf("metadata block is not the last thing in the description:\n%s", description)
+	}
+
+	// Building twice from the same finding must be byte-identical, so
+	// description hashes do not churn between runs.
+	again := issueDescription([]string{"snyk-dast-automation"}, finding)
+	if description != again {
+		t.Fatalf("issueDescription() is not idempotent across builds for oversized input")
+	}
+}
+
 // TestUpsertManagedMetadataIgnoresLineAnchoredProseMarker covers the gap the
 // mid-sentence tests left: embedded prose above the real block carries a
 // line-anchored fake marker and a fake "Fingerprint:" line. Upsert must rewrite
