@@ -364,6 +364,97 @@ func TestFlakyBacktickFence(t *testing.T) {
 	}
 }
 
+// TestFlakyNotTested pins issue #477: a module the routine skipped (the
+// budget ran out), one whose run ended in an error with no per-test marker
+// (a build failure, a context kill), and one with both flaky tests and a
+// skipped sibling are all reported as not tested — an incomplete run never
+// reads as "No intermittent test failures" — while a genuinely clean run
+// still does.
+func TestFlakyNotTested(t *testing.T) {
+	t.Run("skipped module beside a clean one", func(t *testing.T) {
+		var out strings.Builder
+		out.WriteString("# module app/one\n")
+		out.WriteString("ok  \texample.com/one\t1.0s\n")
+		out.WriteString("# module app/two: skipped, the 20m0s budget ran out\n")
+		report, failed := flakyTests([]byte(out.String()))
+		if len(failed) != 0 {
+			t.Errorf("failed = %v, want none", failed)
+		}
+		if strings.Contains(report, "No intermittent test failures") {
+			t.Errorf("an incomplete run reads as an all-clear:\n%s", report)
+		}
+		if !strings.Contains(report, "app/two") || !strings.Contains(report, "Not tested this run") {
+			t.Errorf("report does not name the skipped module:\n%s", report)
+		}
+		if strings.Contains(report, "`app/one`") {
+			t.Errorf("the tested clean module is reported as not tested:\n%s", report)
+		}
+	})
+	t.Run("build failure", func(t *testing.T) {
+		var out strings.Builder
+		out.WriteString("# module app/demo\n")
+		out.WriteString("# example.com/demo\n")
+		out.WriteString("./demo.go:5:2: undefined: Nope\n")
+		out.WriteString("FAIL\texample.com/demo [build failed]\n")
+		out.WriteString("FAIL\n")
+		report, failed := flakyTests([]byte(out.String()))
+		if len(failed) != 0 {
+			t.Errorf("failed = %v, want none", failed)
+		}
+		if strings.Contains(report, "No intermittent test failures") {
+			t.Errorf("an unbuilt module reads as an all-clear:\n%s", report)
+		}
+		if !strings.Contains(report, "app/demo") || !strings.Contains(report, "Not tested this run") {
+			t.Errorf("report does not name the unbuilt module:\n%s", report)
+		}
+	})
+	t.Run("context kill", func(t *testing.T) {
+		var out strings.Builder
+		out.WriteString("# module app/killed\n")
+		out.WriteString("=== RUN   TestHeld\n")
+		out.WriteString("# module app/killed: run ended in an error\n")
+		report, failed := flakyTests([]byte(out.String()))
+		if len(failed) != 0 {
+			t.Errorf("failed = %v, want none", failed)
+		}
+		if strings.Contains(report, "No intermittent test failures") {
+			t.Errorf("a context-killed module reads as an all-clear:\n%s", report)
+		}
+		if !strings.Contains(report, "app/killed") || !strings.Contains(report, "Not tested this run") {
+			t.Errorf("report does not name the killed module:\n%s", report)
+		}
+	})
+	t.Run("flaky test beside a skipped module", func(t *testing.T) {
+		var out strings.Builder
+		out.WriteString("--- FAIL: TestChatty (0.01s)\n")
+		out.WriteString("    chatty_test.go:24: flaked\n")
+		out.WriteString("FAIL\texample.com/one\t1.0s\n")
+		out.WriteString("# module app/two: skipped, the 20m0s budget ran out\n")
+		report, failed := flakyTests([]byte(out.String()))
+		if len(failed) != 1 || failed[0] != "TestChatty" {
+			t.Fatalf("failed = %v, want [TestChatty]", failed)
+		}
+		if !strings.Contains(report, "### TestChatty") {
+			t.Errorf("flaky test missing from report:\n%s", report)
+		}
+		if !strings.Contains(report, "app/two") || !strings.Contains(report, "Not tested this run") {
+			t.Errorf("skipped module missing from report:\n%s", report)
+		}
+	})
+	t.Run("clean run still all-clear", func(t *testing.T) {
+		var out strings.Builder
+		out.WriteString("# module app/one\n")
+		out.WriteString("ok  \texample.com/one\t1.0s\n")
+		report, failed := flakyTests([]byte(out.String()))
+		if len(failed) != 0 || !strings.Contains(report, "No intermittent test failures") {
+			t.Errorf("clean run: failed = %v, report:\n%s", failed, report)
+		}
+		if strings.Contains(report, "Not tested this run") {
+			t.Errorf("clean run carries a not-tested section:\n%s", report)
+		}
+	})
+}
+
 // TestFactoryReport pins the weekly report on a fixture with a done run and
 // an incomplete stop, a merged PR, per-model spend and queue-to-merge
 // stamps.
