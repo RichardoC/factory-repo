@@ -3399,6 +3399,80 @@ func TestIssueDescriptionTruncatesOversizedEmbeddedProse(t *testing.T) {
 	}
 }
 
+// TestIssueDescriptionBoundsTotalEmbeddedCorrelationProse verifies that the
+// Snyk Code correlation section as a whole stays within a fixed bound, not
+// just each block: Snyk DAST returns one CorrelationMarkdown block per linked
+// Snyk Code vulnerability without bounding how many, so many maximum-size
+// blocks would otherwise embed N x maxEmbeddedProseRunes runes and push the
+// managed metadata block (appended last) past Linear's description limit,
+// leaving the ticket unmanaged. Only maxEmbeddedCorrelationBlocks blocks are
+// embedded, the rest are named by one stable line, and the description stays a
+// pure function of the finding, so its hash does not churn between runs.
+func TestIssueDescriptionBoundsTotalEmbeddedCorrelationProse(t *testing.T) {
+	const blockCount = 12
+	blocks := make([]string, blockCount)
+	for i := range blocks {
+		blocks[i] = strings.Repeat("x", maxEmbeddedProseRunes)
+	}
+	finding := model.Finding{
+		IssueTitle:          "SQL Injection",
+		Severity:            "high",
+		TargetName:          "project-a",
+		TargetID:            "target-1",
+		CorrelationMarkdown: blocks,
+		Fingerprint:         "snyk-dast:target-1:finding-1",
+		SnykDASTFindingID:   "finding-1",
+	}
+
+	description := issueDescription([]string{"snyk-dast-automation"}, finding)
+
+	// Measure only the correlation section, between its subtitle and the
+	// trailing identifiers, so text from other sections cannot skew the count.
+	const subtitle = "_Linked Snyk Code source vulnerability responsible for this runtime finding._"
+	section := description[strings.Index(description, subtitle)+len(subtitle):]
+	section = section[:strings.Index(section, "Target: `project-a`")]
+
+	// The embedded prose is bounded by the block cap times the per-block cap,
+	// however many blocks the API returned.
+	fixedBound := maxEmbeddedCorrelationBlocks*maxEmbeddedProseRunes + maxEmbeddedProseRunes
+	if got := strings.Count(section, "x"); got > fixedBound {
+		t.Fatalf("correlation section embeds %d prose runes, want at most the fixed bound %d", got, fixedBound)
+	}
+	if got, want := strings.Count(section, "x"), maxEmbeddedCorrelationBlocks*maxEmbeddedProseRunes; got != want {
+		t.Fatalf("correlation section embeds %d prose runes, want %d (one maximum-size block per embedded slot)", got, want)
+	}
+
+	// The blocks that were not embedded are named by one stable line.
+	wantOmitted := fmt.Sprintf("_%d more linked Snyk Code vulnerabilities not shown._", blockCount-maxEmbeddedCorrelationBlocks)
+	if !strings.Contains(section, wantOmitted) {
+		t.Fatalf("correlation section is missing the %q summary line:\n%s", wantOmitted, section)
+	}
+
+	// The metadata block must still be last and parseable.
+	start := findMetadataBlockStart(description)
+	if start < 0 {
+		t.Fatalf("findMetadataBlockStart() found no block after bounding correlation prose")
+	}
+	if block := description[start:]; !strings.Contains(block, "fingerprint: snyk-dast:target-1:finding-1") {
+		t.Fatalf("metadata block missing fingerprint after bounding correlation prose:\n%s", block)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(description), "-->") {
+		t.Fatalf("metadata block is not the last thing in the description:\n%s", description)
+	}
+
+	// An update rewrites only the real (last) block, leaving the bounded prose
+	// untouched, so the ticket stays manageable.
+	if got := upsertManagedMetadata(description, "snyk-dast:target-1:finding-1", []string{"snyk-dast-automation"}); got != strings.TrimSpace(description) {
+		t.Fatalf("upsertManagedMetadata() rewrote more than the managed block:\n%s", got)
+	}
+
+	// Building twice from the same finding must be byte-identical, so
+	// description hashes do not churn between runs.
+	if again := issueDescription([]string{"snyk-dast-automation"}, finding); description != again {
+		t.Fatalf("issueDescription() is not idempotent for many correlation blocks")
+	}
+}
+
 // TestUpsertManagedMetadataIgnoresLineAnchoredProseMarker covers the gap the
 // mid-sentence tests left: embedded prose above the real block carries a
 // line-anchored fake marker and a fake "Fingerprint:" line. Upsert must rewrite

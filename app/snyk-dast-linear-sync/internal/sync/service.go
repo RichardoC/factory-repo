@@ -1060,7 +1060,24 @@ func sanitizeSnykProse(text string) string {
 // and cause the next run to create a duplicate. The cap is conservative
 // relative to Linear's limit so the metadata block always survives, and
 // matches the sibling app/snyk-linear-sync (maxEmbeddedProseRunes).
+//
+// The per-block cap alone is not a bound on the description: a finding can be
+// correlated to any number of Snyk Code vulnerabilities, so N blocks would
+// still embed N x maxEmbeddedProseRunes runes. The correlation section is
+// therefore additionally bounded by maxEmbeddedCorrelationBlocks below.
 const maxEmbeddedProseRunes = 10000
+
+// maxEmbeddedCorrelationBlocks bounds how many finding.CorrelationMarkdown
+// blocks are embedded in the description. The per-block cap above is not a
+// bound on the description by itself: Snyk DAST returns one block per linked
+// Snyk Code vulnerability and does not bound how many, so a heavily correlated
+// finding would still embed N x maxEmbeddedProseRunes runes and could push the
+// managed metadata block (appended last) past Linear's limit — the
+// duplicate-ticket failure the cap exists to prevent. Capping the block count
+// makes the embedded correlation section a fixed bound (3 x 10,000 runes plus
+// the block separators and truncation markers), and naming the number of
+// hidden blocks keeps the omission visible to a reader.
+const maxEmbeddedCorrelationBlocks = 3
 
 // truncationMarker is appended when embedded Snyk prose is truncated, so
 // readers understand why the text is cut off. It is a stable constant so
@@ -1084,6 +1101,46 @@ const truncationMarker = "\n\n_[truncated by snyk-dast-linear-sync]_"
 // churn tickets between runs when nothing has actually changed.
 func embedSnykProse(text string) string {
 	return truncateProse(sanitizeSnykProse(text), maxEmbeddedProseRunes)
+}
+
+// embedCorrelationMarkdown prepares finding.CorrelationMarkdown for embedding
+// in the description, returning the lines to append after the section heading
+// and subtitle (each block preceded by a blank line).
+//
+// Only the first maxEmbeddedCorrelationBlocks blocks are embedded, each
+// sanitized and capped by embedSnykProse; when more blocks are linked, one
+// stable line reports how many were left out, e.g.
+//
+//	_9 more linked Snyk Code vulnerabilities not shown._
+//
+// So the embedded section stays within a fixed bound no matter how many blocks
+// the API returns, while a reader still learns that more correlations exist.
+// The result is a pure function of the input blocks, so the compare/hash
+// pipeline stays stable and descriptions do not churn between runs.
+func embedCorrelationMarkdown(blocks []string) []string {
+	shown := blocks
+	if len(shown) > maxEmbeddedCorrelationBlocks {
+		shown = shown[:maxEmbeddedCorrelationBlocks]
+	}
+	lines := make([]string, 0, 2*len(shown)+2)
+	for _, block := range shown {
+		lines = append(lines, "", embedSnykProse(block))
+	}
+	if omitted := len(blocks) - len(shown); omitted > 0 {
+		lines = append(lines, "", correlationOmittedLine(omitted))
+	}
+	return lines
+}
+
+// correlationOmittedLine is the single stable line that stands in for the
+// correlation blocks that were not embedded. Naming the count (and
+// pluralising it) keeps the text useful to a reader without making the
+// description depend on anything but the finding itself.
+func correlationOmittedLine(omitted int) string {
+	if omitted == 1 {
+		return "_1 more linked Snyk Code vulnerability not shown._"
+	}
+	return fmt.Sprintf("_%d more linked Snyk Code vulnerabilities not shown._", omitted)
 }
 
 // truncateProse truncates s to at most maxRunes runes, never splitting a
@@ -1162,10 +1219,7 @@ func issueDescription(managedLabels []string, finding model.Finding) string {
 		lines = append(lines, "")
 		lines = append(lines, "### Snyk Code correlation")
 		lines = append(lines, "_Linked Snyk Code source vulnerability responsible for this runtime finding._")
-		for _, block := range finding.CorrelationMarkdown {
-			lines = append(lines, "")
-			lines = append(lines, embedSnykProse(block))
-		}
+		lines = append(lines, embedCorrelationMarkdown(finding.CorrelationMarkdown)...)
 	}
 
 	lines = append(lines, "")

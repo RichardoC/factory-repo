@@ -218,8 +218,12 @@ HTML comment opening in it is neutralized (`<!--` becomes `<!- -`) before it is
 embedded. Embedded Snyk-supplied prose is also capped at 10,000 runes per
 block (with a stable `[truncated by snyk-dast-linear-sync]` marker), so an
 oversized block can never push the metadata block past Linear's description
-limit. Metadata block detection also takes the *last* line-anchored marker,
-since the managed block is always appended last. Prose therefore cannot spoof or
+limit. Because a finding can be linked to any number of Snyk Code
+vulnerabilities, at most three correlation blocks are embedded; any further
+ones are summarised by a stable `_N more linked Snyk Code vulnerabilities not
+shown._` line, so the whole correlation section stays within a fixed bound.
+Metadata block detection also takes the *last* line-anchored marker, since the
+managed block is always appended last. Prose therefore cannot spoof or
 hide the fingerprint, and an update rewrites only the real block.
 
 ## Issue Format
