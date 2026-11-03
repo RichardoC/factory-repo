@@ -2775,27 +2775,63 @@ func (g github) patch(path string, body, into any) error {
 	return nil
 }
 
+// diffReadCap bounds how much of the diff body is read at all (issue #458):
+// a PR diff is untrusted input of unbounded size, and the brief keeps far
+// less than this, so a stop at the cap is a truncation, not a failure.
+const diffReadCap = 1 << 20
+
+// diffFetchNote is what a fetched diff ends with when the body stopped at
+// diffReadCap: the reviewer must see that the diff is incomplete instead
+// of silently reviewing a prefix (issue #458).
+func diffFetchNote() string {
+	return fmt.Sprintf("(diff truncated at %d bytes; the rest was not fetched)", diffReadCap)
+}
+
 // diff fetches a pull request's diff (issue #32): the review brief embeds
 // it, so the reviewer reads what changed without touching git. The diff
 // format comes from the Accept header, and the body is returned as text.
-func (g github) diff(n int) (string, error) {
+//
+// The second result reports whether the body stopped at diffReadCap. A
+// consumer that sees only the text cannot tell a cut diff from a complete
+// one, and review-report judges fenced findings against the paths a diff
+// touches: with a prefix in hand, every path past the cut looks untouched
+// and a real finding on it would be dropped as a quote (issue #458 review
+// finding). The cut is on a rune boundary, and a body that cannot be read at
+// all is still an error; only a stop at the cap is a truncation.
+func (g github) diff(n int) (string, bool, error) {
 	request, err := http.NewRequest(http.MethodGet, g.api+"/repos/"+g.repo+fmt.Sprintf("/pulls/%d", n), nil)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	request.Header.Set("Authorization", "Bearer "+g.token)
 	request.Header.Set("Accept", "application/vnd.github.v3.diff")
 	response, err := g.client.Do(request)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		data, _ := io.ReadAll(response.Body)
-		return "", fmt.Errorf("GET /pulls/%d diff: %s: %.300s", n, response.Status, data)
+		// The error body is untrusted too, and it is only ever shown as a
+		// short excerpt, so it is read through the same bound every sibling
+		// read uses (issue #458 review finding).
+		data, _ := io.ReadAll(io.LimitReader(response.Body, quotasReadCap))
+		return "", false, fmt.Errorf("GET /pulls/%d diff: %s: %.300s", n, response.Status, data)
 	}
-	data, err := io.ReadAll(response.Body)
-	return string(data), err
+	data, err := io.ReadAll(io.LimitReader(response.Body, diffReadCap+1))
+	if err != nil {
+		return "", false, err
+	}
+	if len(data) <= diffReadCap {
+		return string(data), false, nil
+	}
+	cut := diffReadCap
+	// Back off to a rune boundary, as capDiff does: cutting inside a
+	// multibyte rune would leave an invalid byte in the reviewed text.
+	for cut > 0 && !utf8.RuneStart(data[cut]) {
+		cut--
+	}
+	text := string(data[:cut]) + "\n" + diffFetchNote() + "\n"
+	return text, true, nil
 }
 
 func readEvent() (event, error) {

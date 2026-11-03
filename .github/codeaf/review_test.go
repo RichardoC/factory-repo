@@ -2961,3 +2961,178 @@ func TestReviewPlanCapKeepsBlockingFindingEveryPath(t *testing.T) {
 		t.Errorf("a clean 60-low answer = action %q, label present %v, want the pass label added", action, strings.Contains(body, reviewPassedLabel))
 	}
 }
+
+// Issue #458: the diff fetch is bounded. A body larger than diffReadCap
+// truncates with a visible note (an incomplete diff the reviewer can see,
+// not an opaque runner failure), reports the truncation to its caller, and
+// leaves valid UTF-8; a body under the cap comes back byte-for-byte
+// unchanged and reports no truncation.
+func TestDiffTruncatesOversizedBody(t *testing.T) {
+	body := strings.Repeat("diff --git a/app/x.go b/app/x.go\n+++ b/app/x.go\n@@\n", 30000)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, body)
+	}))
+	defer server.Close()
+	ghEnv(t, server)
+	got, truncated, err := newGitHub().diff(458)
+	if err != nil {
+		t.Fatalf("diff: %v", err)
+	}
+	if !truncated {
+		t.Error("a body over the cap did not report the truncation")
+	}
+	if len(got) > diffReadCap+128 {
+		t.Errorf("diff returned %d bytes, far over the %d cap", len(got), diffReadCap)
+	}
+	note := diffFetchNote()
+	if !strings.HasSuffix(strings.TrimSpace(got), note) {
+		t.Errorf("truncated diff does not end with the note %q", note)
+	}
+}
+
+// A truncated fetch never splits a UTF-8 rune (issue #458 review finding):
+// the cut backs off to a rune boundary, so the text handed to the reviewer
+// is valid whatever byte the cap lands on.
+func TestDiffTruncationKeepsUTF8Valid(t *testing.T) {
+	// A three-byte rune at every alignment: padding of 0, 1 and 2 bytes puts
+	// the cap inside one of them.
+	for pad := 0; pad < 3; pad++ {
+		body := strings.Repeat("x", diffReadCap-1+pad) + strings.Repeat("\u2192", 100000)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, body)
+		}))
+		ghEnv(t, server)
+		got, truncated, err := newGitHub().diff(458)
+		server.Close()
+		if err != nil {
+			t.Fatalf("pad %d: diff: %v", pad, err)
+		}
+		if !truncated {
+			t.Fatalf("pad %d: a body over the cap did not report the truncation", pad)
+		}
+		if !utf8.ValidString(got) {
+			t.Errorf("pad %d: the truncated diff is not valid UTF-8", pad)
+		}
+		if !strings.HasSuffix(strings.TrimSpace(got), diffFetchNote()) {
+			t.Errorf("pad %d: the truncated diff does not end with the fetch note", pad)
+		}
+	}
+}
+
+// The non-200 error branch reads the body through a bound too (issue #458
+// review finding): an enormous error body must not be read whole on its way
+// into a 300-byte message.
+func TestDiffErrorBodyIsBounded(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, strings.Repeat("e", 4<<20))
+	}))
+	defer server.Close()
+	ghEnv(t, server)
+	_, truncated, err := newGitHub().diff(458)
+	if err == nil {
+		t.Fatal("a non-200 fetch must be an error")
+	}
+	if truncated {
+		t.Error("a failed fetch reported a truncation")
+	}
+	if len(err.Error()) > 1024 {
+		t.Errorf("the error message is %d bytes, way over the 300-byte excerpt it prints", len(err.Error()))
+	}
+}
+
+func TestDiffUnderCapUnchanged(t *testing.T) {
+	body := "diff --git a/app/x.go b/app/x.go\n+++ b/app/x.go\n@@ -1 +1 @@\n-1\n+2\n"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, body)
+	}))
+	defer server.Close()
+	ghEnv(t, server)
+	got, truncated, err := newGitHub().diff(458)
+	if err != nil {
+		t.Fatalf("diff: %v", err)
+	}
+	if truncated {
+		t.Error("an under-cap body reported a truncation")
+	}
+	if got != body {
+		t.Errorf("a diff under the cap was rewritten: got %q, want %q", got, body)
+	}
+	if strings.Contains(got, "truncated") {
+		t.Error("an under-cap diff carries a truncation note")
+	}
+}
+
+// A fetch truncated at diffReadCap still shows its fetch note in the brief
+// (issue #458 review finding): capDiff would cut the note off at ~1 MiB, so
+// the brief reserves room for it instead.
+func TestCappedDiffForBriefKeepsFetchNote(t *testing.T) {
+	body := strings.Repeat("diff --git a/app/x.go b/app/x.go\n+++ b/app/x.go\n@@\n+"+strings.Repeat("y", 90)+"\n", 20000)
+	if len(body) <= diffReadCap {
+		t.Fatalf("test diff must exceed diffReadCap: %d bytes", len(body))
+	}
+	fetched, truncated, err := func() (string, bool, error) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, body)
+		}))
+		defer server.Close()
+		ghEnv(t, server)
+		return newGitHub().diff(458)
+	}()
+	if err != nil || !truncated {
+		t.Fatalf("diff: truncated=%t err=%v", truncated, err)
+	}
+	got := cappedDiffForBrief(fetched, true)
+	if len(got) > maxReviewDiffBytes {
+		t.Errorf("the capped diff is %d bytes, over the %d cap", len(got), maxReviewDiffBytes)
+	}
+	if !strings.Contains(got, diffFetchNote()) {
+		t.Errorf("the brief's capped diff lost the fetch note %q", diffFetchNote())
+	}
+	if !strings.HasSuffix(strings.TrimSpace(got), diffFetchNote()) {
+		t.Errorf("the fetch note is not the last thing the reviewer reads")
+	}
+	// An untruncated fetch is capDiff's business alone.
+	if small := "diff --git a/app/x.go b/app/x.go\n"; cappedDiffForBrief(small, false) != small {
+		t.Error("an untruncated small diff was rewritten")
+	}
+}
+
+// review-report must not drop a fenced finding on a file past the fetch cut
+// as a quote (issue #458 review finding): a truncated diff names only the
+// files before the cap, so it is treated as no diff at all and every finding
+// is kept.
+func TestReviewReportKeepsFindingsOnTruncatedDiff(t *testing.T) {
+	oldArgs := os.Args
+	t.Cleanup(func() { os.Args = oldArgs })
+	os.Args = []string{"harness", "review-report", "7"}
+	// One small file, then a huge one the cap cuts inside, then a third
+	// file wholly past the cut: app/x/main.go and app/late/main.go have
+	// their headers in the fetched prefix, app/past/main.go does not, so a
+	// diff-path filter built from the prefix would treat a finding on it as
+	// a quote and drop it.
+	late := "diff --git a/app/late/main.go b/app/late/main.go\n--- a/app/late/main.go\n+++ b/app/late/main.go\n@@ -1 +1 @@\n" +
+		strings.Repeat("+ filler line for the oversized tail of the diff\n", 40000)
+	past := "diff --git a/app/past/main.go b/app/past/main.go\n--- a/app/past/main.go\n+++ b/app/past/main.go\n@@ -1 +1,2 @@\n context\n+changed\n"
+	diffBody := "diff --git a/app/x/main.go b/app/x/main.go\n--- a/app/x/main.go\n+++ b/app/x/main.go\n@@ -1,2 +1,3 @@\n context\n" + late + past
+	server := reviewServer(t, map[string]string{
+		"/repos/RichardoC/factory-repo/pulls/7":           `{"number":7,"title":"Review target","body":"The change.","state":"open","head":{"ref":"codeaf/issue-3-42"},"base":{"ref":"main"}}`,
+		"/repos/RichardoC/factory-repo/issues/7/comments": `[]`,
+	}, diffBody, nil)
+	t.Cleanup(server.Close)
+	ghEnv(t, server)
+	// The finding sits in a closed fence outside a "## Findings" section:
+	// that is where the diff-path filter applies (inside the section it is
+	// exempt, issue #334), so it is the case a prefix-only path set would
+	// wrongly drop as a quote.
+	writeReviewResult(t, stopDone, "The one blocking problem:\n\n```\n- [high] app/past/main.go:2 - a real bug past the fetch cut\n```\n")
+	reviewLedger(t)
+	t.Setenv("REVIEW_COMMENT_PATH", filepath.Join(t.TempDir(), "comment.md"))
+	out, err := captureStdout(t, runReviewReport)
+	if err != nil {
+		t.Fatalf("review-report on a truncated diff: %v", err)
+	}
+	if !strings.Contains(out, "blocking=1") {
+		t.Errorf("stdout = %q; want the finding on the file past the cut to block", out)
+	}
+}
