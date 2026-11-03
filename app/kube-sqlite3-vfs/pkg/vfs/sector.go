@@ -189,7 +189,15 @@ func (f *file) sectorData(sectorIndex int64) ([]byte, error) {
 		return nil, errSectorNotFound
 	} else if err != nil {
 		f.vfs.logger.Error("sectorData", "sectorIndex", sectorIndex, "err", err)
-		return nil, sqlite3vfs.IOErrorShortRead
+		// Any GET failure other than NotFound is an I/O error, not a hole:
+		// errSectorNotFound stays the sole "sector is absent" signal. The
+		// error is returned UNWRAPPED — the sqlite3vfs shim maps errors with
+		// a bare type assertion (see the casLock doc comment), so a wrapped
+		// error would degrade to the generic SQLITE_ERROR and lose the IOERR
+		// class. IOErrorRead, not IOErrorShortRead: SHORT_READ is an extended
+		// code SQLite reserves for xRead returning fewer bytes than asked,
+		// and Truncate (via getSector) exposes this error unchanged.
+		return nil, sqlite3vfs.IOErrorRead
 	}
 
 	data := make([]byte, len(cm.BinaryData["sector"]))

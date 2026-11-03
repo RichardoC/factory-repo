@@ -1080,6 +1080,74 @@ func TestTruncatePropagatesWriteSectorError(t *testing.T) {
 	}
 }
 
+// TestTruncateSectorGetErrorIsNotShortRead pins the fix for issue #478: the
+// GET that fetches the last surviving sector during Truncate is the one
+// read whose error Truncate returns unchanged, so a transient (non-NotFound)
+// GET failure used to surface as sqlite3vfs.IOErrorShortRead — the extended
+// code SQLite expects only from xRead, meaning "read succeeded but returned
+// fewer bytes" — and sent hot-journal rollback, VACUUM and TRUNCATE-journal
+// recovery down the wrong path. It must be exactly sqlite3vfs.IOErrorRead,
+// while a genuinely absent sector keeps reading as a hole: errSectorNotFound
+// stays the sole absence signal.
+func TestTruncateSectorGetErrorIsNotShortRead(t *testing.T) {
+	t.Run("transient GET failure is IOErrorRead", func(t *testing.T) {
+		v, fcs := newTestVFS(t)
+		f := openTestFile(t, v, "trunc-geterr.db")
+		seedMultiSectorFile(t, fcs, f, multiSectorLen)
+
+		// Drop the sector cache wholesale, the way the 256-sector cap does
+		// (see sectorData), so the shortening fetch of sector 0 is a real
+		// GET the reactor can fail.
+		f.sectors = make(map[int64][]byte)
+
+		sector0 := f.sectorNameFromSectorIndex(0)
+		fcs.PrependReactor("get", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			if action.(k8stesting.GetAction).GetName() == sector0 {
+				return true, nil, errors.New("boom: transient sector GET failure")
+			}
+			return false, nil, nil
+		})
+
+		err := f.Truncate(700)
+		if err == nil {
+			t.Fatal("Truncate(700) with a failing sector GET = nil, want an error")
+		}
+		if err != sqlite3vfs.IOErrorRead {
+			t.Fatalf("Truncate(700) with a failing sector GET = %v (%T), want exactly sqlite3vfs.IOErrorRead", err, err)
+		}
+		// The failure must have stopped the truncate before any deletion.
+		if sectors := listSectorConfigMaps(t, fcs, f); len(sectors) != 2 {
+			t.Errorf("%d sector configmaps remain after the failed truncate, want 2 (no deletions)", len(sectors))
+		}
+	})
+
+	t.Run("absent sector still reads as a hole", func(t *testing.T) {
+		v, fcs := newTestVFS(t)
+		f := openTestFile(t, v, "trunc-hole.db")
+		seedMultiSectorFile(t, fcs, f, multiSectorLen)
+
+		f.sectors = make(map[int64][]byte)
+
+		sector0 := f.sectorNameFromSectorIndex(0)
+		fcs.PrependReactor("get", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			if action.(k8stesting.GetAction).GetName() == sector0 {
+				return true, nil, kerrors.NewNotFound(v1.Resource("configmaps"), sector0)
+			}
+			return false, nil, nil
+		})
+
+		// The sector holding the new last byte does not exist: nothing to
+		// shorten, so the truncate proceeds as over a hole (there is no
+		// short-read error) and drops the sectors past the new end.
+		if err := f.Truncate(700); err != nil {
+			t.Fatalf("Truncate(700) with an absent sector = %v, want nil (treated as a hole)", err)
+		}
+		if sectors := listSectorConfigMaps(t, fcs, f); len(sectors) != 1 {
+			t.Errorf("%d sector configmaps remain after the hole truncate, want 1 (only sector 0)", len(sectors))
+		}
+	})
+}
+
 // TestReadAtDoesNotCreateSectors pins the read-side of the no-create rule:
 // reading — including a read that reaches a sector which does not exist —
 // must never write a sector ConfigMap to the cluster. The imported code
