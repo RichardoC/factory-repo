@@ -954,6 +954,11 @@ func desiredIssue(cfg config.Config, finding model.Finding) model.DesiredIssue {
 // issueTitle renders a scan-friendly Linear title. The context is the scanned
 // target (host or name) and the subject is the HTTP method + path of the
 // vulnerable request, which is the most useful locator for a DAST finding.
+// The rendered title is capped by truncateIssueTitle: TargetHost, TargetName
+// and Path come from the scan API (see snykdast.Findings, where Path is
+// copied from the scan payload unmodified), so a long request path or target
+// name would otherwise exceed Linear's title limit and make that finding's
+// issue-create fail on every run, permanently.
 func issueTitle(finding model.Finding) string {
 	contextLabel := issueTitleContext(finding)
 	severity := strings.ToLower(strings.TrimSpace(finding.Severity))
@@ -961,14 +966,38 @@ func issueTitle(finding model.Finding) string {
 	subject := issueTitleSubject(finding)
 	if contextLabel == "" {
 		if subject == "" {
-			return fmt.Sprintf("Snyk DAST: [%s] %s", severity, title)
+			return truncateIssueTitle(fmt.Sprintf("Snyk DAST: [%s] %s", severity, title))
 		}
-		return fmt.Sprintf("Snyk DAST: [%s] %s at %s", severity, title, subject)
+		return truncateIssueTitle(fmt.Sprintf("Snyk DAST: [%s] %s at %s", severity, title, subject))
 	}
 	if subject == "" {
-		return fmt.Sprintf("Snyk DAST: [%s] %s: %s", severity, contextLabel, title)
+		return truncateIssueTitle(fmt.Sprintf("Snyk DAST: [%s] %s: %s", severity, contextLabel, title))
 	}
-	return fmt.Sprintf("Snyk DAST: [%s] %s: %s at %s", severity, contextLabel, title, subject)
+	return truncateIssueTitle(fmt.Sprintf("Snyk DAST: [%s] %s: %s at %s", severity, contextLabel, title, subject))
+}
+
+// maxIssueTitleRunes caps the rendered title at Linear's title limit (255
+// characters), measured in runes so multibyte characters are not miscounted.
+// The cap is applied to the fully rendered title, after every API-controlled
+// field (severity, issue title, target, request path) has been concatenated.
+const maxIssueTitleRunes = 255
+
+// issueTitleTruncationMarker is appended when a rendered title is truncated,
+// so readers understand why the text is cut off.
+const issueTitleTruncationMarker = "..."
+
+// truncateIssueTitle caps title at maxIssueTitleRunes runes, never splitting
+// a multibyte rune and appending issueTitleTruncationMarker when truncation
+// occurs (the marker replaces the last rune, so the result is never longer
+// than the limit). It is a pure function of title, so the same finding always
+// renders a byte-identical title — required for the sync's compare/hash
+// pipeline to stay stable and not churn tickets between runs.
+func truncateIssueTitle(title string) string {
+	if utf8.RuneCountInString(title) <= maxIssueTitleRunes {
+		return title
+	}
+	runes := []rune(title)
+	return string(runes[:maxIssueTitleRunes-utf8.RuneCountInString(issueTitleTruncationMarker)]) + issueTitleTruncationMarker
 }
 
 func issueTitleContext(finding model.Finding) string {
@@ -996,12 +1025,15 @@ func issueTitleSubject(finding model.Finding) string {
 	}
 }
 
+// truncateForTitle caps a URL used in prose to 80 runes. It counts and cuts
+// runes rather than bytes so a multibyte URL is neither miscounted nor split
+// mid-rune (which would produce invalid UTF-8 in the title).
 func truncateForTitle(value string) string {
 	value = strings.TrimSpace(value)
-	if len(value) <= 80 {
+	if utf8.RuneCountInString(value) <= 80 {
 		return value
 	}
-	return value[:77] + "..."
+	return string([]rune(value)[:77]) + "..."
 }
 
 // sanitizeSnykProse neutralizes HTML-comment openings in Snyk-controlled free

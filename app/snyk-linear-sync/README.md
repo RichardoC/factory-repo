@@ -207,6 +207,10 @@ The synced title includes the most useful source context when Snyk provides it:
 - repository for code and repository-backed findings
 - branch/image/reference for non-GitHub target-file findings such as Kubernetes or container scans
 
+These fields come from the Snyk API unbounded, so the rendered title is capped
+at Linear's title limit (255 characters, measured in runes) with a `...`
+truncation marker.
+
 The subject portion then uses this preference:
 
 1. source file basename

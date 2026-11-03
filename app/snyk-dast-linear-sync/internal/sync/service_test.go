@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tesslio/snyk-dast-linear-sync/internal/cache"
 	"github.com/tesslio/snyk-dast-linear-sync/internal/config"
@@ -3431,5 +3432,125 @@ func TestUpsertManagedMetadataIgnoresLineAnchoredProseMarker(t *testing.T) {
 	}
 	if again := upsertManagedMetadata(got, "snyk-dast:target-a:finding-1", []string{"snyk-dast-automation", "snyk-dast-api"}); again != got {
 		t.Fatalf("upsertManagedMetadata() is not idempotent (repeated runs churn the description):\nfirst:  %q\nsecond: %q", got, again)
+	}
+}
+
+// TestIssueTitleCapsUnboundedFields verifies that a finding whose scan-API
+// fields (Path, TargetHost) are long enough to exceed Linear's title limit
+// still renders a title within that limit, with a truncation marker, instead
+// of producing an issue-create that fails on every run.
+func TestIssueTitleCapsUnboundedFields(t *testing.T) {
+	// Both API-controlled fields are oversized: a multi-hundred-character
+	// TargetHost as well as Path. Either alone would push the rendered title
+	// past Linear's title limit.
+	finding := model.Finding{
+		IssueTitle:  "Reflected XSS",
+		Severity:    "high",
+		Fingerprint: "snyk-dast:target-a:finding-1",
+		TargetHost:  "www." + strings.Repeat("h", 300) + ".example.test",
+		Method:      "get",
+		Path:        "/search?q=" + strings.Repeat("a", 400),
+	}
+
+	title := issueTitle(finding)
+
+	if got := utf8.RuneCountInString(title); got > maxIssueTitleRunes {
+		t.Fatalf("title length = %d runes, want <= %d", got, maxIssueTitleRunes)
+	}
+	if !strings.HasSuffix(title, issueTitleTruncationMarker) {
+		t.Fatalf("title = %q, want truncation marker suffix", title)
+	}
+	if !strings.HasPrefix(title, "Snyk DAST: [high] www.") {
+		t.Fatalf("title = %q, want intact prefix", title)
+	}
+	if strings.Contains(title, strings.Repeat("h", 300)) {
+		t.Fatalf("title = %q, want host truncated", title)
+	}
+	if strings.Contains(title, strings.Repeat("a", 400)) {
+		t.Fatalf("title = %q, want path truncated", title)
+	}
+
+	// A host long enough to matter but short enough to leave room keeps the
+	// whole context and subject prefix intact; only the path tail is cut.
+	finding.TargetHost = "www." + strings.Repeat("h", 100) + ".example.test"
+	title = issueTitle(finding)
+
+	if got := utf8.RuneCountInString(title); got > maxIssueTitleRunes {
+		t.Fatalf("title length = %d runes, want <= %d", got, maxIssueTitleRunes)
+	}
+	if !strings.HasSuffix(title, issueTitleTruncationMarker) {
+		t.Fatalf("title = %q, want truncation marker suffix", title)
+	}
+	if !strings.HasPrefix(title, "Snyk DAST: [high] www."+strings.Repeat("h", 100)+".example.test: Reflected XSS at GET /search?q=") {
+		t.Fatalf("title = %q, want intact context and subject prefix", title)
+	}
+}
+
+// TestIssueTitleTruncationIsStable verifies the rendered title is a pure
+// function of the finding, so the compare/hash pipeline does not churn
+// tickets between runs.
+func TestIssueTitleTruncationIsStable(t *testing.T) {
+	finding := model.Finding{
+		IssueTitle:  "Reflected XSS",
+		Severity:    "high",
+		TargetHost:  "example.test",
+		Method:      "get",
+		Path:        "/" + strings.Repeat("b", 300),
+		Fingerprint: "snyk-dast:target-a:finding-1",
+	}
+
+	if issueTitle(finding) != issueTitle(finding) {
+		t.Fatalf("issueTitle is not deterministic for the same finding")
+	}
+}
+
+// TestDesiredIssueUnboundedFieldsKeepFingerprintAndMetadata verifies that
+// capping the title leaves the fingerprint and managed metadata flow
+// unchanged for a finding with oversized scan-API fields.
+func TestDesiredIssueUnboundedFieldsKeepFingerprintAndMetadata(t *testing.T) {
+	cfg := config.Config{}
+	finding := model.Finding{
+		IssueTitle:  "Reflected XSS",
+		Severity:    "high",
+		Fingerprint: "snyk-dast:target-a:finding-1",
+		TargetHost:  "www." + strings.Repeat("h", 300) + ".example.test",
+		Method:      "get",
+		Path:        "/download/" + strings.Repeat("c", 500),
+	}
+
+	desired := desiredIssue(cfg, finding)
+
+	if desired.Fingerprint != "snyk-dast:target-a:finding-1" {
+		t.Fatalf("Fingerprint = %q, want unchanged", desired.Fingerprint)
+	}
+	if got := utf8.RuneCountInString(desired.Title); got > maxIssueTitleRunes {
+		t.Fatalf("Title length = %d runes, want <= %d", got, maxIssueTitleRunes)
+	}
+	if !strings.Contains(desired.Description, "fingerprint: snyk-dast:target-a:finding-1") {
+		t.Fatalf("description missing fingerprint metadata block:\n%s", desired.Description)
+	}
+}
+
+// TestTruncateForTitleNeverSplitsRunes verifies the URL cap is rune-safe: a
+// multibyte URL is neither miscounted nor cut mid-rune (which would produce
+// invalid UTF-8 in the title).
+func TestTruncateForTitleNeverSplitsRunes(t *testing.T) {
+	long := strings.Repeat("é", 100) // 100 runes, 200 bytes
+
+	got := truncateForTitle(long)
+
+	if got := utf8.RuneCountInString(got); got > 80 {
+		t.Fatalf("truncateForTitle length = %d runes, want <= 80", got)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncateForTitle produced invalid UTF-8: %q", got)
+	}
+	if !strings.HasSuffix(got, "...") {
+		t.Fatalf("truncateForTitle = %q, want ... suffix", got)
+	}
+
+	short := strings.Repeat("é", 40)
+	if got := truncateForTitle(short); got != short {
+		t.Fatalf("truncateForTitle(%q) = %q, want unchanged", short, got)
 	}
 }
