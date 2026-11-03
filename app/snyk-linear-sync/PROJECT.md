@@ -346,6 +346,13 @@ fail in two ways that need different handling to avoid duplicating tickets:
   response body before returning any GraphQL error, so the successful aliases
   are still available even when an error is returned. Only the reported entries
   are retried; retrying the batch would duplicate the ones that already exist.
+  A retried entry that is reported failed again counts in `FailedOps`, fails the
+  run and stays out of the refreshed cache. A reported failed index outside the
+  batch is degenerate — the real client derives indices from the slice it was
+  handed — but `LinearClient` is an interface, so a faulty implementation can
+  produce one; such an index identifies no entry, so nothing in the batch is
+  proven to have landed and every fingerprint of it stays out of the refreshed
+  cache for the same reason an ambiguous create does.
 - **Ambiguous failure.** No aliases were decoded at all, so nothing is known per
   entry. This covers a transport-level failure and equally a GraphQL failure
   that returned no data, such as a 502 arriving after Linear had already

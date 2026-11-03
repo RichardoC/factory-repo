@@ -549,6 +549,11 @@ batch is counted in `failed_ops` without a retry — there is no safe way to
 tell which entries landed, so every one is treated as unapplied and left for
 the next run (see [Current Behavior](#current-behavior)).
 
+A faultily implemented `LinearClient` that reports a failed create index
+outside the batch behaves the same way: the index identifies no entry, the
+run counts `failed_ops` and exits non-zero, and nothing from that batch is
+cached, so the next run re-checks every entry against live data.
+
 The count appears in the `sync complete` summary log either way, and that
 summary is emitted before the exit status is decided.
 
