@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -391,5 +392,153 @@ func TestLedgerTimingClientGoesAway(t *testing.T) {
 	if lines[0].TTFTMs < int64((4*interval)/time.Millisecond) {
 		t.Errorf("ttft_ms = %d, want at least the %dms first-token wait: %+v",
 			lines[0].TTFTMs, (4*interval)/time.Millisecond, lines[0])
+	}
+}
+
+// Issue #456: a call the proxy gives up on before it produces anything is a
+// real wait and must reach the ledger. Two paths left chat() before record()
+// and wrote nothing, so neither the model-stats slot figures nor the
+// abandoned-wait alert could ever see them.
+//
+// This one abandons the call while it waits for a slot: acquire measured the
+// wait and logged it, and the line carries that wait under the abandoned
+// stage "before_start", with no usage and no cost. The model's only slot is
+// taken directly, so the call is queued in chat() itself and is abandoned
+// there -- no upstream is ever contacted.
+func TestLedgerTimingAbandonedWhileQueuedForSlot(t *testing.T) {
+	const interval = 20 * time.Millisecond
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("a call abandoned while queued must never be forwarded upstream")
+	}))
+	defer upstream.Close()
+
+	p, ledger := ledgerTimingProxy(t, interval, upstream)
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	// Hold the model's only slot for the whole test. The slot is shaped here
+	// rather than read off models.json, so the test does not hard-code a
+	// max_concurrent value.
+	m := mustResolve(t, testModels(t), "zai-org/glm-5.3-flash")
+	slot := make(chan struct{}, 1)
+	p.slots = map[string]chan struct{}{m.Upstream: slot}
+	slot <- struct{}{}
+	defer func() { <-slot }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*interval)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"zai-org/glm-5.3-flash","messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := http.DefaultClient.Do(req); err == nil {
+		t.Fatal("the queued call should have been abandoned with its client")
+	}
+
+	lines := waitForLedger(t, ledger, func(lines []LedgerLine) bool { return len(lines) >= 1 })
+	var abandoned []LedgerLine
+	for _, l := range lines {
+		if l.Kind == "abandoned" {
+			abandoned = append(abandoned, l)
+		}
+	}
+	if len(abandoned) != 1 {
+		t.Fatalf("ledger has %d abandoned line(s), want the queued call recorded: %+v", len(abandoned), lines)
+	}
+	got := abandoned[0]
+	if got.Abandoned != abandonedBeforeStart {
+		t.Errorf("abandoned = %q, want %q: %+v", got.Abandoned, abandonedBeforeStart, got)
+	}
+	// Half the deadline is the bound: the measured wait must be the real one,
+	// not a rounding of it, and the cancel lands within a scheduling tick of
+	// the deadline either way.
+	if want := (5 * interval).Seconds(); got.SlotWaitS < want {
+		t.Errorf("slot_wait_s = %.3f, want at least the %.3fs it queued: %+v", got.SlotWaitS, want, got)
+	}
+	// It never started: no usage, no cost, no call timing, and not a cut row.
+	if got.UsageSeen || got.CostUSD != 0 || got.APICostUSD != 0 || got.Cut || got.TTFTMs != 0 || got.DurMs != 0 {
+		t.Errorf("an abandoned-before-start call carries call figures: %+v", got)
+	}
+}
+
+// TestLedgerTimingAbandonedBeforeHeaders: the call already held its slot and
+// its request was issued upstream when the client left during the header
+// wait. It used to be a phantom -- no line at all -- so it is recorded now as
+// the abandoned stage "before_headers", carrying the header wait it spent.
+func TestLedgerTimingAbandonedBeforeHeaders(t *testing.T) {
+	const interval = 20 * time.Millisecond
+	const cancelAfter = 10 * interval
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// No headers until well after the client has gone.
+		select {
+		case <-time.After(time.Second):
+		case <-r.Context().Done():
+		}
+	}))
+	defer upstream.Close()
+
+	p, ledger := ledgerTimingProxy(t, interval, upstream)
+	// The grace and heartbeat are far longer than the cancel, so the proxy is
+	// still waiting for the headers (doWithHeartbeats) when the client goes.
+	p.headerGrace = time.Second
+	server := httptest.NewServer(p)
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), cancelAfter)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"zai-org/glm-5.3-flash","stream":true,"messages":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response, err := http.DefaultClient.Do(req); err == nil {
+		response.Body.Close()
+	}
+
+	lines := waitForLedger(t, ledger, func(lines []LedgerLine) bool { return len(lines) >= 1 })
+	var abandoned []LedgerLine
+	for _, l := range lines {
+		if l.Kind == "abandoned" {
+			abandoned = append(abandoned, l)
+		}
+	}
+	if len(abandoned) != 1 {
+		t.Fatalf("ledger has %d abandoned line(s), want the call abandoned before the headers recorded: %+v",
+			len(abandoned), lines)
+	}
+	got := abandoned[0]
+	if got.Abandoned != abandonedBeforeHeaders {
+		t.Errorf("abandoned = %q, want %q: %+v", got.Abandoned, abandonedBeforeHeaders, got)
+	}
+	// Half the deadline, as above: header_ms is truncated to whole
+	// milliseconds and the cancel lands within a tick of the deadline.
+	if want := (cancelAfter / 2).Milliseconds(); got.HeaderMs < want {
+		t.Errorf("header_ms = %d, want at least the %dms the call waited for headers: %+v",
+			got.HeaderMs, want, got)
+	}
+	if !got.Stream {
+		t.Errorf("the stream flag was lost: %+v", got)
+	}
+	// No usage, no cost, no completion timing, and not the mid-stream cut row.
+	if got.UsageSeen || got.CostUSD != 0 || got.Cut || got.TTFTMs != 0 || got.DurMs != 0 {
+		t.Errorf("an abandoned-before-headers call carries call figures: %+v", got)
+	}
+}
+
+// waitForLedger polls the ledger until want is satisfied, so a test reads a
+// line the handler wrote just after its connection ended.
+func waitForLedger(t *testing.T, ledger string, want func([]LedgerLine) bool) []LedgerLine {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		lines, err := readLedger(ledger)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want(lines) || time.Now().After(deadline) {
+			return lines
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
