@@ -75,6 +75,17 @@ type Finding struct {
 type SnykDASTSnapshot struct {
 	Findings  []Finding
 	TargetIDs map[string]struct{}
+	// DeferredFindingIDs holds the numeric ids of findings that were skipped
+	// during the load because they carry no usable identity: the embedded
+	// target summary has no id, so no `snyk-dast:<target>:<finding>`
+	// fingerprint can be built for them. A finding id identifies nothing on
+	// its own, so an existing managed ticket for one of these findings cannot
+	// be matched by full fingerprint — it is matched by the finding-id part
+	// of its fingerprint instead. The sync holds such tickets back for the
+	// run: it neither resolves nor recreates them while the source data is
+	// incomplete. Without this, the resolve loop would read the missing
+	// finding as resolved and close a ticket Snyk DAST still reports open.
+	DeferredFindingIDs []string
 	// InactiveTargetIDs is kept for structural parity with the missing-finding
 	// state logic. Snyk DAST targets are either present or deleted, so this set
 	// is currently always empty; it exists so the cancellation-on-deletion

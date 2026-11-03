@@ -368,6 +368,7 @@ These distinctions are intentional:
 - Once that acceptance has lapsed, the finding stays in `Todo` rather than being cancelled. A time-limited acceptance is a request to be reminded, so treating an expired one as a permanent acceptance would silently close the ticket at exactly the moment it needs attention.
 - A permanently `accepted` (no expiry) or `invalid` finding is cancelled: it is no longer actionable.
 - If a Snyk DAST finding disappears but the target still exists, the tool treats that as the finding being resolved and moves the Linear ticket to `Done`.
+- A finding that cannot be normalized is deferred, not resolved. When a finding's embedded target summary has no id, no fingerprint can be built for it, so it is skipped with a warning naming its finding id, and every managed ticket whose fingerprint ends in that finding id is left untouched for the run (matched on the finding-id part of the fingerprint, because the target id is what is missing). The run reports the count as `deferred_tickets`.
 - If the Snyk DAST target itself is gone, the tool treats the managed Linear ticket as no longer actionable and moves it to `Cancelled`.
 
 ### Manual Non-Terminal State Override
