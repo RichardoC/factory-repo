@@ -138,6 +138,30 @@ func readerDSN(journalMode string) (string, error) {
 // write, size or byte mismatch used to be logged and the process still
 // exited zero on a half-failed transfer.
 func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Logger) error {
+	return runWithClientFrom(clientset, opts, logger, openLocalFile)
+}
+
+// localFile is what the download needs from the local image: the bytes, its
+// size, and a way to close it. *os.File satisfies it; a test can supply a
+// reader with other behaviour (a short-reader, an injected error) instead.
+type localFile interface {
+	io.Reader
+	io.Seeker
+	Stat() (os.FileInfo, error)
+	Close() error
+}
+
+// openLocalFile opens the local image the download reads from.
+func openLocalFile(name string) (localFile, error) {
+	return os.Open(name)
+}
+
+// runWithClientFrom is runWithClient with the local-file source injectable,
+// so a test can feed a reader that returns short reads — allowed by the
+// io.Reader contract and realistic on FUSE, NFS or a file being modified
+// underneath — without needing a real file that misbehaves, exactly the way
+// db-upload's runWithClientFrom already is (issue #484).
+func runWithClientFrom(clientset kubernetes.Interface, opts Options, logger *slog.Logger, open func(name string) (localFile, error)) error {
 	// Validate --journal-mode and build the DSN before any cluster work, so
 	// an unusable mode fails before the kubeconfig is read, a clientset is
 	// built or a sector is written — the same front-door refusal main.go
@@ -196,7 +220,7 @@ func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Lo
 		return fmt.Errorf("open %q in the cluster: %w", fn, err)
 	}
 
-	f, err := os.Open(opts.FileName)
+	f, err := open(opts.FileName)
 	if err != nil {
 		return fmt.Errorf("open local file: %w", err)
 	}
@@ -214,8 +238,18 @@ func runWithClient(clientset kubernetes.Interface, opts Options, logger *slog.Lo
 
 	allBytesReal := make([]byte, fSize)
 
-	n, err := f.Read(allBytesReal)
-	if err != nil && !errors.Is(err, io.EOF) {
+	// A bare Read may return fewer bytes than the buffer asks for without
+	// reaching EOF — allowed by the io.Reader contract, and realistic on
+	// FUSE, NFS or a file being modified underneath — and one such short
+	// chunk used to fail the whole download here with a misleading
+	// "failed to read all" before anything was written. io.ReadFull keeps
+	// reading until the buffer is full or the file truly ends, mirroring
+	// db-upload's fix for the same class of problem (issue #464): it reports
+	// io.EOF only when the file ends before the size Stat reported, and any
+	// other error means the image cannot be trusted. The n != len check
+	// below stays as the final safety net for exactly that case.
+	n, err := io.ReadFull(f, allBytesReal)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 		return fmt.Errorf("read %s: %w", opts.FileName, err)
 	}
 	if n != len(allBytesReal) {
