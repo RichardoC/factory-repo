@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/sync/errgroup"
 
@@ -1017,6 +1018,54 @@ func sanitizeSnykProse(text string) string {
 	return strings.ReplaceAll(text, "<!--", "<!- -")
 }
 
+// maxEmbeddedProseRunes bounds how much of Snyk DAST's free-text Fix field
+// and CorrelationMarkdown blocks is embedded verbatim in the ticket
+// description. Linear enforces its own description length limit; since the
+// managed metadata block (containing the fingerprint used for
+// deduplication) is always appended LAST, unbounded Snyk prose would risk
+// pushing that block past Linear's limit and silently truncating it away.
+// That would make the ticket unmanaged (extractFingerprint finds nothing)
+// and cause the next run to create a duplicate. The cap is conservative
+// relative to Linear's limit so the metadata block always survives, and
+// matches the sibling app/snyk-linear-sync (maxEmbeddedProseRunes).
+const maxEmbeddedProseRunes = 10000
+
+// truncationMarker is appended when embedded Snyk prose is truncated, so
+// readers understand why the text is cut off. It is a stable constant so
+// description hashes do not churn between runs.
+const truncationMarker = "\n\n_[truncated by snyk-dast-linear-sync]_"
+
+// embedSnykProse prepares Snyk-controlled free text (finding.Fix or a
+// finding.CorrelationMarkdown block) for embedding in a ticket description.
+// It:
+//
+//  1. Sanitizes any HTML-comment opening ("<!--") so embedded text cannot
+//     look like a second "<!-- snyk-dast-linear-sync ... -->" metadata block
+//     (see sanitizeSnykProse above).
+//  2. Caps the length so the text can never grow large enough to push the
+//     metadata block (appended after it) out of what Linear accepts.
+//
+// Both steps are pure functions of the input finding text, so calling
+// embedSnykProse twice with the same Snyk data always produces
+// byte-identical output — required for the sync's compare/hash pipeline
+// (normalizeDescriptionForCompare, desiredIssueHash) to stay stable and not
+// churn tickets between runs when nothing has actually changed.
+func embedSnykProse(text string) string {
+	return truncateProse(sanitizeSnykProse(text), maxEmbeddedProseRunes)
+}
+
+// truncateProse truncates s to at most maxRunes runes, never splitting a
+// multibyte rune, appending truncationMarker when truncation occurs. It is a
+// pure function of s and maxRunes, so the same input always yields the same
+// output.
+func truncateProse(s string, maxRunes int) string {
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:maxRunes]) + truncationMarker
+}
+
 // issueDescription builds the managed Linear issue body. It is optimized for
 // fast developer triage: the vulnerability and severity lead, the target and
 // vulnerable request context follow, then the fix and Snyk DAST links, then the
@@ -1074,7 +1123,7 @@ func issueDescription(managedLabels []string, finding model.Finding) string {
 	if fix := strings.TrimSpace(finding.Fix); fix != "" {
 		lines = append(lines, "")
 		lines = append(lines, "### Fix")
-		lines = append(lines, sanitizeSnykProse(fix))
+		lines = append(lines, embedSnykProse(fix))
 	}
 
 	if len(finding.CorrelationMarkdown) > 0 {
@@ -1083,7 +1132,7 @@ func issueDescription(managedLabels []string, finding model.Finding) string {
 		lines = append(lines, "_Linked Snyk Code source vulnerability responsible for this runtime finding._")
 		for _, block := range finding.CorrelationMarkdown {
 			lines = append(lines, "")
-			lines = append(lines, sanitizeSnykProse(block))
+			lines = append(lines, embedSnykProse(block))
 		}
 	}
 

@@ -215,7 +215,10 @@ Changing or removing that block can cause duplicate issues or prevent updates fr
 Because Snyk-supplied text (the fix description and the Snyk Code correlation
 block) is embedded in the body and can quote scanned-application content, any
 HTML comment opening in it is neutralized (`<!--` becomes `<!- -`) before it is
-embedded. Metadata block detection also takes the *last* line-anchored marker,
+embedded. Embedded Snyk-supplied prose is also capped at 10,000 runes per
+block (with a stable `[truncated by snyk-dast-linear-sync]` marker), so an
+oversized block can never push the metadata block past Linear's description
+limit. Metadata block detection also takes the *last* line-anchored marker,
 since the managed block is always appended last. Prose therefore cannot spoof or
 hide the fingerprint, and an update rewrites only the real block.
 

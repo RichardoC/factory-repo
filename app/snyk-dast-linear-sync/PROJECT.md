@@ -145,6 +145,14 @@ spoofing (or hiding) the fingerprint and managed labels, and stop
 `upsertManagedMetadata` from rewriting the prose region instead of the real
 block.
 
+Because the managed block is appended last, unbounded prose would also risk
+Linear's description limit truncating the block away, making the ticket
+unmanaged and minting a duplicate on the next run. Each embedded block is
+therefore capped at 10,000 runes (matching the sibling `snyk-linear-sync`),
+via a truncation helper that never splits a multibyte rune and appends one
+stable marker when it cuts. Capping is a pure function of the input text, so
+description comparison and cache hashing stay stable between runs.
+
 Linear may rewrite parts of the description body when rendering or storing
 markdown. The sync therefore normalizes known Linear formatting changes during
 compare and cache hashing.
