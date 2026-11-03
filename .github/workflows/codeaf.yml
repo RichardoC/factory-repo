@@ -946,13 +946,13 @@ jobs:
               # PR so the queue starts the continuation run itself (issue
               # #137): it dispatches with the `pr` input and a free lane. If
               # the label fails, a maintainer can continue it by hand.
-              gh pr comment "$PR_NUMBER" --body-file "$CONTINUE_COMMENT_PATH" || true
+              "$HARNESS" gh-retry -- gh pr comment "$PR_NUMBER" --body-file "$CONTINUE_COMMENT_PATH" || true
               "$HARNESS" gh-retry -- gh pr edit "$PR_NUMBER" --add-label codeaf-continue-needed \
                 || echo "::warning::could not queue the continuation of #$PR_NUMBER automatically; a maintainer can continue it by hand with a /codeaf comment on the PR"
               ;;
             cap)
               # The continuation cap is reached: leave the draft to a person.
-              gh pr comment "$PR_NUMBER" --body-file "$CONTINUE_COMMENT_PATH" || true
+              "$HARNESS" gh-retry -- gh pr comment "$PR_NUMBER" --body-file "$CONTINUE_COMMENT_PATH" || true
               ;;
           esac
 
@@ -993,7 +993,7 @@ jobs:
           if grep -qx 'action=fix' "$RUNNER_TEMP/review-plan.env"; then action=fix
           elif grep -qx 'action=label' "$RUNNER_TEMP/review-plan.env"; then action=label
           fi
-          gh pr comment "$NUMBER" --body-file "$REVIEW_COMMENT_PATH"
+          "$HARNESS" gh-retry -- gh pr comment "$NUMBER" --body-file "$REVIEW_COMMENT_PATH" || true
           case "$action" in
             fix)
               # Blocking findings: drop the pass label, then label the PR so
@@ -1134,9 +1134,9 @@ jobs:
           cat "$RUNNER_TEMP/report.md" >> "$GITHUB_STEP_SUMMARY"
           target="${{ steps.pr.outputs.number }}"
           [ -n "$target" ] || target="$NUMBER"
-          gh issue comment "$target" --body-file "$RUNNER_TEMP/report.md"
+          "$HARNESS" gh-retry -- gh issue comment "$target" --body-file "$RUNNER_TEMP/report.md"
           if [ "$target" != "$NUMBER" ] && [ "$MODE" = issue ]; then
-            gh issue comment "$NUMBER" --body "CodeAF opened #$target for this issue."
+            "$HARNESS" gh-retry -- gh issue comment "$NUMBER" --body "CodeAF opened #$target for this issue."
           fi
 
   queue-next:
