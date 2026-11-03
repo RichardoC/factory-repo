@@ -62,6 +62,10 @@ const (
 	// maxLockCASAttempts bounds the compare-and-swap retries on the lock
 	// ConfigMap. Every attempt re-reads the state and re-decides from what
 	// it read, so the bound only matters under sustained contention.
+	// Exhaustion reports sqlite3vfs.BusyError (issue #479): contention is
+	// not an invalid transition, and SQLITE_BUSY is the code sqlite runs
+	// its busy handler for, where a plain error would surface as
+	// SQLITE_ERROR and hard-fail the lock.
 	maxLockCASAttempts = 10
 
 	// lockCallTimeout bounds one lock-path Kubernetes call (the Get, Update
@@ -875,7 +879,11 @@ func (f *file) stampOwnLease(st *lockView) {
 // two processes can never overwrite each other's holders. On a 409 Conflict
 // the state is re-read and re-decided, never overwritten; a missing
 // ConfigMap is Created, with AlreadyExists from the Create treated as
-// "re-read". The loop is bounded by maxLockCASAttempts.
+// "re-read". The loop is bounded by maxLockCASAttempts; exhaustion
+// reports sqlite3vfs.BusyError — sustained contention is not an invalid
+// request, and SQLITE_BUSY is the code sqlite retries through its busy
+// handler, where a plain error would surface as SQLITE_ERROR and hard-fail
+// the lock (issue #479).
 //
 // mutate reports sqlite3vfs.BusyError when another process holds a
 // conflicting lock and a plain error for an invalid request; both are
@@ -955,7 +963,11 @@ func (f *file) casLock(mutate func(*lockView) error) error {
 		}
 		return nil
 	}
-	return fmt.Errorf("lock configmap %q did not settle after %d attempts", f.LockFileName(), maxLockCASAttempts)
+	// The detail goes to the log, not the error: sqlite only sees the
+	// class, and the class must be a bare BusyError (see above) so the
+	// busy handler runs instead of the lock failing with SQLITE_ERROR.
+	f.vfs.logger.Error("lock configmap did not settle", "name", f.LockFileName(), "attempts", maxLockCASAttempts)
+	return sqlite3vfs.BusyError
 }
 
 // lockCallCtx returns the context for ONE lock-path Kubernetes call:
@@ -1570,6 +1582,16 @@ func (v *vfs) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sql
 	}
 	v.logger.Debug("Failed to open file")
 
+	// A deliberate sqlite3vfs error class recorded by an attempt — the CAS
+	// exhaustion's BusyError — is returned bare: wrapping it would degrade
+	// SQLITE_BUSY to a generic SQLITE_ERROR under the cgo shim's bare type
+	// assertion, and SQLITE_BUSY names the truth (the lock could not be
+	// settled) where SQLITE_ERROR claims malformed state. xOpen never runs
+	// sqlite's busy handler either way, so surfacing the class loses
+	// nothing (issue #479).
+	if errors.Is(lastErr, sqlite3vfs.BusyError) {
+		return nil, flags, sqlite3vfs.BusyError
+	}
 	return nil, flags, fmt.Errorf("open %q: file metadata did not settle after %d attempts: %w", name, v.retries, lastErr)
 }
 

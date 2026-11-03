@@ -1928,6 +1928,177 @@ func TestCASRetriesOnConflict(t *testing.T) {
 	}
 }
 
+// alwaysConflictReactor injects a real 409 Conflict on every Update of the
+// named lock ConfigMap — the bare fake clientset cannot produce one natively
+// (see the comment on TestCASRetriesOnConflict) — and counts the attempts it
+// saw.
+func alwaysConflictReactor(fcs *fake.Clientset, lockCM string) *int32 {
+	var attempts int32
+	fcs.PrependReactor("update", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		ua, ok := action.(k8stesting.UpdateAction)
+		if !ok {
+			return false, nil, nil
+		}
+		cm, ok := ua.GetObject().(*v1.ConfigMap)
+		if !ok || cm.Name != lockCM {
+			return false, nil, nil
+		}
+		atomic.AddInt32(&attempts, 1)
+		return true, nil, kerrors.NewConflict(v1.Resource("configmaps"), lockCM, errors.New("injected 409"))
+	})
+	return &attempts
+}
+
+// TestLockCASExhaustionReturnsBusy pins the error class when the compare-
+// and-swap loop runs out of attempts under sustained contention (issue
+// #479): a lock Update that always returns 409 must surface as
+// sqlite3vfs.BusyError — SQLITE_BUSY, which sqlite runs its busy handler
+// for — not the plain error the loop used to end with, which reached the
+// cgo shim's bare type assertion and degraded to a generic SQLITE_ERROR
+// that hard-fails Lock. maxLockCASAttempts bounds the loop, so exactly that
+// many Updates are attempted.
+func TestLockCASExhaustionReturnsBusy(t *testing.T) {
+	v, fcs := newTestVFS(t)
+	f := openTestFile(t, v, "cas-exhaustion.db")
+
+	attempts := alwaysConflictReactor(fcs, f.LockFileName())
+
+	err := f.Lock(sqlite3vfs.LockShared)
+	if err != sqlite3vfs.BusyError {
+		t.Fatalf("Lock(Shared) under sustained 409s = %v (%T), want bare sqlite3vfs.BusyError", err, err)
+	}
+	if got := atomic.LoadInt32(attempts); got != maxLockCASAttempts {
+		t.Errorf("lock update attempts = %d, want %d (the CAS bound)", got, maxLockCASAttempts)
+	}
+	// Nothing was written under the exhausted CAS: the file still holds
+	// nothing, locally and in the store.
+	if f.lockLevel != sqlite3vfs.LockNone || f.lockKnown {
+		t.Errorf("local lock state after exhausted CAS = level %v known %v, want NONE and unknown", f.lockLevel, f.lockKnown)
+	}
+	if holders := sharedHoldersIn(t, fcs, f); len(holders) != 0 {
+		t.Errorf("shared-holders %v written despite the exhausted CAS, want none", holders)
+	}
+}
+
+// TestRenewCASExhaustionReturnsBusyWithoutLeaseLoss pins the maybeRenew
+// path flagged in the discussion on issue #479: the lease renewal rides the
+// same casLock, so its exhaustion under sustained contention also surfaces
+// as SQLITE_BUSY — on Lock, and on ReadAt/WriteAt through renewForIO and
+// ioFailure. That is arguably right (contention, not corruption), but it
+// must NOT be mistaken for a lost lease: noteLeaseLost matches only
+// errLockLeaseLost, so leaseLost stays unset and the sticky read/write gate
+// must not engage. Each subtest runs on a fresh VFS and clock, because an
+// exhausted renewal optimistically stamps the local expiry forward on every
+// conflicted attempt (stampOwnLease keeps the local timer in step with the
+// expiry it tried to write), which would mask a second due renewal.
+func TestRenewCASExhaustionReturnsBusyWithoutLeaseLoss(t *testing.T) {
+	const lease = time.Minute
+
+	// The lock path: maybeRenew itself returns the bare BusyError.
+	t.Run("lock-path", func(t *testing.T) {
+		fcs := fake.NewSimpleClientset()
+		clock := &fakeClock{now: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}
+		v := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3, WithLockLease(lease))
+		v.clock = clock.Now
+
+		f := openTestFile(t, v, "renew-exhaustion-lock.db")
+		if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+			t.Fatalf("Lock(Shared): %v", err)
+		}
+
+		// Renewal only fires once less than half the lease remains; move
+		// the fake clock past that point so maybeRenew actually CASes.
+		clock.Advance(lease/2 + time.Second)
+
+		attempts := alwaysConflictReactor(fcs, f.LockFileName())
+
+		err := f.maybeRenew()
+		if err != sqlite3vfs.BusyError {
+			t.Fatalf("maybeRenew under sustained 409s = %v (%T), want bare sqlite3vfs.BusyError", err, err)
+		}
+		if got := atomic.LoadInt32(attempts); got != maxLockCASAttempts {
+			t.Errorf("renewal update attempts = %d, want %d (the CAS bound)", got, maxLockCASAttempts)
+		}
+		if f.leaseLost {
+			t.Errorf("leaseLost set by renewal CAS exhaustion: SQLITE_BUSY from contention must not engage the sticky read/write gate")
+		}
+		if f.lockLevel != sqlite3vfs.LockShared || !f.lockKnown {
+			t.Errorf("local lock state after exhausted renewal = level %v known %v, want SHARED still held", f.lockLevel, f.lockKnown)
+		}
+	})
+
+	// The sector read/write path: renewForIO reaches the same exhausted
+	// renewal and ioFailure maps it to SQLITE_BUSY for sqlite.
+	t.Run("io-path", func(t *testing.T) {
+		fcs := fake.NewSimpleClientset()
+		clock := &fakeClock{now: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}
+		v := NewVFS(t.Context(), fcs, testNamespace, slog.New(slog.DiscardHandler), 3, WithLockLease(lease))
+		v.clock = clock.Now
+
+		f := openTestFile(t, v, "renew-exhaustion-io.db")
+		if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+			t.Fatalf("Lock(Shared): %v", err)
+		}
+		clock.Advance(lease/2 + time.Second)
+
+		attempts := alwaysConflictReactor(fcs, f.LockFileName())
+
+		// WriteAt, not ReadAt: the file is still empty, so a read returns
+		// io.EOF before its sector work and never reaches renewal.
+		if _, err := f.WriteAt([]byte("x"), 0); err != sqlite3vfs.BusyError {
+			t.Errorf("WriteAt under renewal CAS exhaustion = %v (%T), want sqlite3vfs.BusyError", err, err)
+		}
+		if got := atomic.LoadInt32(attempts); got != maxLockCASAttempts {
+			t.Errorf("renewal update attempts = %d, want %d (the CAS bound)", got, maxLockCASAttempts)
+		}
+		if f.leaseLost {
+			t.Errorf("leaseLost set by renewal CAS exhaustion on the write path, want unset")
+		}
+		if f.lockLevel != sqlite3vfs.LockShared || !f.lockKnown {
+			t.Errorf("local lock state after exhausted renewal = level %v known %v, want SHARED still held", f.lockLevel, f.lockKnown)
+		}
+	})
+}
+
+// TestOpenCASExhaustionReturnsBusy pins Open's fresh-lockfile CAS path
+// flagged in the discussion on issue #479: when creating the initial lock
+// state never settles, Open's final error must carry the BusyError class.
+// xOpen never runs sqlite's busy handler, so nothing is gained or lost by
+// the class itself, but SQLITE_BUSY names the truth (contention) where the
+// wrapped plain error Open used to return degraded through the shim's bare
+// type assertion to a generic SQLITE_ERROR that claims malformed state.
+func TestOpenCASExhaustionReturnsBusy(t *testing.T) {
+	v, fcs := newTestVFS(t)
+	f := NewFile("open-exhaustion.db", v)
+
+	// Contention on the fresh-lockfile CAS is an always-lost Create race:
+	// the Get finds nothing (nothing exists yet) and the Create is answered
+	// AlreadyExists, which casLock treats as "re-read" — the loop then
+	// re-reads NotFound and Creates again, until the bound runs out.
+	var createAttempts int32
+	fcs.PrependReactor("create", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		ca, ok := action.(k8stesting.CreateAction)
+		if !ok {
+			return false, nil, nil
+		}
+		cm, ok := ca.GetObject().(*v1.ConfigMap)
+		if !ok || cm.Name != f.LockFileName() {
+			return false, nil, nil
+		}
+		atomic.AddInt32(&createAttempts, 1)
+		return true, nil, kerrors.NewAlreadyExists(v1.Resource("configmaps"), f.LockFileName())
+	})
+
+	_, _, err := v.Open("open-exhaustion.db", 0)
+	if err != sqlite3vfs.BusyError {
+		t.Fatalf("Open under sustained AlreadyExists on the fresh lockfile = %v (%T), want bare sqlite3vfs.BusyError", err, err)
+	}
+	// The CAS bound is spent once per outer retry (v.retries = 3 here).
+	if got := atomic.LoadInt32(&createAttempts); got != maxLockCASAttempts*3 {
+		t.Errorf("lock create attempts = %d, want %d (CAS bound x retries)", got, maxLockCASAttempts*3)
+	}
+}
+
 // TestStaleHolderPruned pins lease expiry: a holder that stops renewing —
 // a crashed process — is pruned by the next CAS of another process, so its
 // shared entry and writer stop blocking RESERVED and EXCLUSIVE even though
