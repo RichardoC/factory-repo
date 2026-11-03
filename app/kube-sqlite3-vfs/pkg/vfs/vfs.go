@@ -1476,7 +1476,16 @@ func (v *vfs) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sql
 				continue
 			}
 		case err != nil:
-			return f, flags, err
+			// A transient failure of the lockfile GET itself (one 500 or
+			// timeout) must not fail the whole open with a raw Kubernetes
+			// error: every sibling failure path in this loop honours the
+			// retry budget, and returning the file object alongside the
+			// error is not something sqlite3vfs expects from a failed
+			// xOpen. Retry, and fail with a nil file if the attempts run
+			// out.
+			v.logger.Error("Open: get lockfile", "err", err)
+			lastErr = err
+			continue
 		default:
 			// Every opened file starts at NONE locally. The ConfigMap's
 			// stored level may be another process's lock, and adopting it
