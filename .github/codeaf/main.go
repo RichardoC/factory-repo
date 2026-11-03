@@ -2725,6 +2725,11 @@ func (g github) patch(path string, body, into any) error {
 // diff fetches a pull request's diff (issue #32): the review brief embeds
 // it, so the reviewer reads what changed without touching git. The diff
 // format comes from the Accept header, and the body is returned as text.
+// diffReadCap bounds how much of the diff body is read at all (issue #458):
+// a PR diff is untrusted input of unbounded size, and the brief keeps far
+// less than this, so a stop at the cap is a truncation, not a failure.
+const diffReadCap = 1 << 20
+
 func (g github) diff(n int) (string, error) {
 	request, err := http.NewRequest(http.MethodGet, g.api+"/repos/"+g.repo+fmt.Sprintf("/pulls/%d", n), nil)
 	if err != nil {
@@ -2741,8 +2746,19 @@ func (g github) diff(n int) (string, error) {
 		data, _ := io.ReadAll(response.Body)
 		return "", fmt.Errorf("GET /pulls/%d diff: %s: %.300s", n, response.Status, data)
 	}
-	data, err := io.ReadAll(response.Body)
-	return string(data), err
+	// Issue #458: the body is untrusted and its only consumer (capDiff)
+	// keeps far less than diffReadCap, so it is read through a limit and a
+	// stop at the cap is reported in the returned text, never as an error —
+	// the reviewer must see that the diff is incomplete, not lose the run.
+	data, err := io.ReadAll(io.LimitReader(response.Body, diffReadCap+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > diffReadCap {
+		data = data[:diffReadCap]
+		data = append(data, fmt.Sprintf("\n(diff truncated at %d bytes; the rest was not fetched)\n", diffReadCap)...)
+	}
+	return string(data), nil
 }
 
 func readEvent() (event, error) {

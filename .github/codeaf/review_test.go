@@ -2961,3 +2961,46 @@ func TestReviewPlanCapKeepsBlockingFindingEveryPath(t *testing.T) {
 		t.Errorf("a clean 60-low answer = action %q, label present %v, want the pass label added", action, strings.Contains(body, reviewPassedLabel))
 	}
 }
+
+// Issue #458: the diff fetch is bounded. A body larger than diffReadCap
+// truncates with a visible note (an incomplete diff the reviewer can see,
+// not an opaque runner failure), and a body under the cap comes back
+// byte-for-byte unchanged.
+func TestDiffTruncatesOversizedBody(t *testing.T) {
+	body := strings.Repeat("diff --git a/app/x.go b/app/x.go\n+++ b/app/x.go\n@@\n", 30000)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, body)
+	}))
+	defer server.Close()
+	ghEnv(t, server)
+	got, err := newGitHub().diff(458)
+	if err != nil {
+		t.Fatalf("diff: %v", err)
+	}
+	if len(got) > diffReadCap+128 {
+		t.Errorf("diff returned %d bytes, far over the %d cap", len(got), diffReadCap)
+	}
+	note := fmt.Sprintf("(diff truncated at %d bytes; the rest was not fetched)", diffReadCap)
+	if !strings.HasSuffix(strings.TrimSpace(got), note) {
+		t.Errorf("truncated diff does not end with the note %q", note)
+	}
+}
+
+func TestDiffUnderCapUnchanged(t *testing.T) {
+	body := "diff --git a/app/x.go b/app/x.go\n+++ b/app/x.go\n@@ -1 +1 @@\n-1\n+2\n"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, body)
+	}))
+	defer server.Close()
+	ghEnv(t, server)
+	got, err := newGitHub().diff(458)
+	if err != nil {
+		t.Fatalf("diff: %v", err)
+	}
+	if got != body {
+		t.Errorf("a diff under the cap was rewritten: got %q, want %q", got, body)
+	}
+	if strings.Contains(got, "truncated") {
+		t.Error("an under-cap diff carries a truncation note")
+	}
+}
