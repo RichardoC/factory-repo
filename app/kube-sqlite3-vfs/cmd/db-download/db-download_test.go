@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/RichardoC/kube-sqlite3-vfs/pkg/vfs"
 	_ "github.com/mattn/go-sqlite3"
@@ -155,6 +156,66 @@ func TestRunWithClientTransfersAndVerifies(t *testing.T) {
 	}
 
 	assertSectorsMatch(t, fcs, data)
+}
+
+// shortFile is a localFile whose reader returns at most chunk bytes per
+// Read, and EOF only when the bytes are exhausted — a short read without
+// EOF, which the io.Reader contract allows and a FUSE, NFS or concurrently
+// modified file produces in practice. A bare Read treated as "the whole
+// file" would fail the whole download on the first short chunk (issue #484).
+type shortFile struct {
+	r     io.Reader
+	size  int64
+	chunk int
+}
+
+func (f *shortFile) Read(p []byte) (int, error) {
+	if f.chunk > 0 && len(p) > f.chunk {
+		p = p[:f.chunk]
+	}
+	return f.r.Read(p)
+}
+
+func (f *shortFile) Seek(offset int64, whence int) (int64, error) {
+	s, ok := f.r.(io.Seeker)
+	if !ok {
+		return 0, fmt.Errorf("shortFile: underlying reader does not implement io.Seeker")
+	}
+	return s.Seek(offset, whence)
+}
+
+func (f *shortFile) Stat() (os.FileInfo, error) { return fakeFileInfo{size: f.size}, nil }
+func (f *shortFile) Close() error               { return nil }
+
+// fakeFileInfo reports only the size the download's Stat uses.
+type fakeFileInfo struct{ size int64 }
+
+func (fi fakeFileInfo) Name() string       { return "file2.db" }
+func (fi fakeFileInfo) Size() int64        { return fi.size }
+func (fi fakeFileInfo) Mode() os.FileMode  { return 0o644 }
+func (fi fakeFileInfo) ModTime() time.Time { return time.Time{} }
+func (fi fakeFileInfo) IsDir() bool        { return false }
+func (fi fakeFileInfo) Sys() any           { return nil }
+
+// A short-reading source must still transfer and byte-verify the whole
+// image: the download fills its buffer with io.ReadFull instead of trusting
+// one Read to return every byte (issue #484), the same fix the upload got
+// in issue #464.
+func TestRunWithClientTransfersFromShortReadingSource(t *testing.T) {
+	_, want := buildSQLiteFile(t, 2000)
+
+	open := func(string) (localFile, error) {
+		return &shortFile{r: bytes.NewReader(want), size: int64(len(want)), chunk: 7}, nil
+	}
+	fcs := fake.NewSimpleClientset()
+	if err := runWithClientFrom(fcs, Options{Retries: 1}, testLogger(), open); err != nil {
+		t.Fatalf("runWithClientFrom with a short-reading source: %v", err)
+	}
+
+	// runWithClientFrom already byte-compares the read-back image with the
+	// local one and queries the row count through the VFS; assert the
+	// stored sectors too, so a short chunk could not pass unnoticed.
+	assertSectorsMatch(t, fcs, want)
 }
 
 func TestRunWithClientFailsWhenLocalFileMissing(t *testing.T) {
