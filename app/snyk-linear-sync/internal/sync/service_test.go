@@ -7617,6 +7617,41 @@ func TestPostCommentsWithFallbackRetriesAllWhenBatchCallFails(t *testing.T) {
 	if len(linear.comments) != 0 {
 		t.Fatalf("comments = %d, want 0 (every attempt failed)", len(linear.comments))
 	}
+	if result.FailedComments != 2 {
+		t.Fatalf("FailedComments = %d, want 2 (both individual retries failed)", result.FailedComments)
+	}
+}
+
+// TestPostCommentsWithFallbackCountsRetryReportingFailedIndex pins the
+// single-comment retry's own failed-index return: a retry that reports its
+// comment as failed with a nil error must be counted, not dropped silently.
+func TestPostCommentsWithFallbackCountsRetryReportingFailedIndex(t *testing.T) {
+	batch := make([]model.IssueUpdate, 0, 2)
+	for _, ident := range []string{"SNYK-1", "SNYK-2"} {
+		existing := model.ExistingIssue{
+			ID:          "issue-" + ident,
+			Identifier:  ident,
+			StateName:   "Todo",
+			Fingerprint: "snyk:project-a:" + ident,
+		}
+		desired := model.DesiredIssue{Fingerprint: existing.Fingerprint, State: model.StateDone, PreserveState: true}
+		batch = append(batch, model.IssueUpdate{Existing: existing, Desired: desired})
+	}
+	// SNYK-1 fails in the batch and again on its retry; SNYK-2 posts.
+	linear := &fakeLinear{commentFailFingerprints: map[string]int{"snyk:project-a:SNYK-1": 2}}
+	service := New(minimalCfg(), discardLogger(), fakeSnyk{}, linear, nil)
+	var result RunResult
+	service.postCommentsWithFallback(context.Background(), batch, &result)
+
+	if len(linear.commentCallBatches) != 2 {
+		t.Fatalf("PostComments calls = %d, want 2 (batch + one retry of the failed comment)", len(linear.commentCallBatches))
+	}
+	if result.FailedComments != 1 {
+		t.Fatalf("FailedComments = %d, want 1 (the retry reported its comment failed)", result.FailedComments)
+	}
+	if len(linear.comments) != 1 || linear.comments[0].Existing.Identifier != "SNYK-2" {
+		t.Fatalf("comments = %+v, want only SNYK-2 posted", linear.comments)
+	}
 }
 
 // TestRunUpdatesResolvesAndCancelsWithBatchFallback drives the real Run entry

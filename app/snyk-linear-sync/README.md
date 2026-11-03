@@ -533,11 +533,12 @@ for creates, for tickets moved to `Done`/`Cancelled` by the resolve loop, or for
 duplicate cancellations; a description change confined to the hidden metadata
 block posts no comment either.
 
-A partially failed comment batch retries only the failed comments. A
-failed-index entry that names no member of the batch counts a failed comment
-(`failed_comments` in the completion log) instead of indexing the batch with
-it: the run stays upright, the issue state is still correct, and only the
-explanatory comment is missing.
+A partially failed comment batch retries only the failed comments. A comment
+whose individual retry still fails, with an error or with its own index
+reported as failed, counts a failed comment (`failed_comments` in the
+completion log). So does a failed-index entry that names no member of the
+batch, instead of indexing the batch with it: the run stays upright, the issue
+state is still correct, and only the explanatory comment is missing.
 
 
 ## Exit Status
@@ -566,8 +567,8 @@ run counts `failed_ops` and exits non-zero, and nothing from that batch is
 cached, so the next run re-checks every entry against live data.
 
 The comment equivalent is the one write that does **not** fail the run:
-a failed comment index outside the batch counts `failed_comments` and the
-run still exits zero, because the synced issue state itself is already
+a comment given up on (its retry failed, or its failed index lay outside the
+batch) counts `failed_comments` and the run still exits zero, because the synced issue state itself is already
 correct.
 
 The count appears in the `sync complete` summary log either way, and that

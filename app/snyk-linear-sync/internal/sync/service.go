@@ -125,9 +125,10 @@ type RunResult struct {
 	PlannedResolves     int64
 	CancelledDuplicates int64
 	FailedOps           int64
-	// FailedComments counts change comments the run gave up on: a partially
-	// failed comment batch whose failed-index list named no batch entry, so
-	// the index could not be retried. It is tracked separately from FailedOps
+	// FailedComments counts change comments the run gave up on: a comment
+	// whose individual retry still failed (with an error or a failed index),
+	// and a failed index that named no batch entry, so it could not be
+	// retried. It is tracked separately from FailedOps
 	// because a missing change comment leaves the synced issue state
 	// correct — the comment is explanatory, and the feature is opt-in via
 	// LINEAR_COMMENTS — so it does not fail the run; it is counted rather
@@ -1036,11 +1037,17 @@ func (s *Service) updateBatchWithFallback(ctx context.Context, kind jobKind, ver
 // warning, not counted in FailedOps.
 func (s *Service) postCommentsWithFallback(ctx context.Context, batch []model.IssueUpdate, result *RunResult) {
 	retryComment := func(update model.IssueUpdate) {
-		if _, err := s.linear.PostComments(ctx, []model.IssueUpdate{update}); err != nil {
+		// A single-comment retry can fail two ways: an error, or a nil error
+		// with the comment's own index in the failed list. Both mean the
+		// comment was given up on, so both are counted.
+		failed, err := s.linear.PostComments(ctx, []model.IssueUpdate{update})
+		if err != nil || len(failed) > 0 {
+			atomic.AddInt64(&result.FailedComments, 1)
 			s.logger.Warn("failed to post change comment",
 				slog.String("issue", update.Existing.Identifier),
 				slog.String("fingerprint", update.Desired.Fingerprint),
 				slog.Any("error", err),
+				slog.Int("failed_count", len(failed)),
 			)
 		}
 	}
