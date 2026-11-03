@@ -1223,7 +1223,25 @@ type LedgerLine struct {
 	DurMs    int64 `json:"dur_ms,omitempty"`
 	MaxGapMs int64 `json:"max_gap_ms,omitempty"`
 	Cut      bool  `json:"cut,omitempty"`
+	// Abandoned marks a call the proxy gave up on before it produced any
+	// completion, and names the stage it had reached (issue #456):
+	// abandonedBeforeStart for a call abandoned while it queued for a slot,
+	// abandonedBeforeHeaders for one abandoned while it held its slot and
+	// waited on upstream's response headers. Such a line is a marker (kind
+	// "abandoned"), so it joins no figure that counts calls or call timing;
+	// it carries the wait the call actually spent -- slot_wait_s or
+	// header_ms -- and no usage and no cost. A call abandoned mid-stream is
+	// a call row with cut true instead, which is a different thing: that one
+	// started and was billed.
+	Abandoned string `json:"abandoned,omitempty"`
 }
+
+// The stages a call can be abandoned at, as the ledger's abandoned field
+// spells them (issue #456).
+const (
+	abandonedBeforeStart   = "before_start"
+	abandonedBeforeHeaders = "before_headers"
+)
 
 // callTiming is the per-call timing the relays measure and record carries to
 // the ledger (issue #131). It is a struct rather than more positional
@@ -1295,6 +1313,26 @@ func (p *proxy) record(m Model, usage *Usage, usageDropped, stream bool, start t
 	if p.weekSpent+p.runSpent >= p.weekCap {
 		p.overage = true
 	}
+	p.appendLedger(line)
+}
+
+// recordAbandoned writes the marker for a call the proxy gave up on before
+// any completion (issue #456). Both paths that leave chat() before record()
+// have already measured how long the call waited, and that wait is the whole
+// point of the line: acquire's queue abandon logged the wait and wrote no
+// ledger line, and the pre-header cancel was a phantom in the ledger even
+// though the slot had been held and the request issued upstream. The line
+// therefore carries the wait, no usage and no cost, and the stage in
+// Abandoned so modelstats can count the two apart from a mid-stream cut. It
+// is a marker, not a call: the call never produced a completion, and
+// counting it as one would drag every call and timing figure with it.
+func (p *proxy) recordAbandoned(stage string, m Model, stream bool, slotWait, headerWait time.Duration) {
+	line := LedgerLine{Time: time.Now().UTC(), Model: m.ID, Upstream: m.Upstream, Stream: stream,
+		SlotWaitS: slotWait.Seconds(), HeaderMs: headerWait.Milliseconds(), Kind: "abandoned", Abandoned: stage}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// No run-spend bookkeeping: the line costs nothing, and record's overage
+	// and cap logic has nothing to add for a call that never ran.
 	p.appendLedger(line)
 }
 
@@ -1646,7 +1684,14 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 	}
 	release, slotWait, err := p.acquire(r.Context(), m, beat)
 	if err != nil {
-		return // CodeAF gave up on the call while it waited
+		// CodeAF gave up on the call while it waited. The wait acquire
+		// measured still happened -- it is the congestion the slot figures
+		// and the abandoned-wait alert exist to report -- so it goes to the
+		// ledger, like the over-cap refusal's wait below (issue #342), and
+		// with no usage and no cost because the call never started
+		// (issue #456).
+		p.recordAbandoned(abandonedBeforeStart, m, wantsStream(body), slotWait, 0)
+		return
 	}
 	defer release()
 	defer func() {
@@ -1713,6 +1758,14 @@ func (p *proxy) chat(w http.ResponseWriter, r *http.Request) {
 			// buffered does not take this path: doWithHeartbeats hands it
 			// back as a result, so it still reaches the ledger and its body
 			// is still closed (review of #145).
+			//
+			// This one is recorded (issue #456): the request was already
+			// issued upstream and the slot was held for the whole header
+			// wait, so leaving no line made it a phantom -- the abandon
+			// during infinite mode's 40-236 s header wait was in no call
+			// count, no timing figure and no alert. The line carries the
+			// header wait measured above, no usage and no cost.
+			p.recordAbandoned(abandonedBeforeHeaders, m, stream, slotWait, headerWait)
 			return
 		}
 		p.fail(w, out, http.StatusBadGateway, "upstream unreachable: "+err.Error())

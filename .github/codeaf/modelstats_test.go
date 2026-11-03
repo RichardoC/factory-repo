@@ -988,3 +988,76 @@ func TestModelStatsWaitedThenRefusedCountsSlotFigures(t *testing.T) {
 		t.Errorf("the abandoned alert did not count the waited refusals:\n%s", got)
 	}
 }
+
+// Issue #456: the proxy now writes a marker for a call abandoned before it
+// produced anything, and the report has to be able to see it -- that is the
+// whole point of recording it. A queue abandon feeds the slot figures and the
+// abandoned alert; a pre-header abandon is counted as its own stage. Neither
+// is a refusal: an abandoned marker must not widen the 429-rate denominator
+// or add an "other" error.
+func TestModelStatsCountsAbandonedCalls(t *testing.T) {
+	cfg := modelStatsTestConfigWith(t, "alpha")
+	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	win := modelStatsWindowFrom(cfg, now)
+	lines := []string{
+		// One real call that completed, so the model has a call row.
+		`{"ts":"2026-10-21T11:00:00Z","model":"alpha","completion_tokens":100,"usage_seen":true,"ttft_ms":1000,"dur_ms":2000}`,
+		// The queue abandon: 40 s waiting for a slot, stage before_start.
+		`{"ts":"2026-10-21T11:01:00Z","model":"alpha","kind":"abandoned","abandoned":"before_start","slot_wait_s":40}`,
+		// The pre-header abandon: 90 s of header wait, stage before_headers.
+		`{"ts":"2026-10-21T11:02:00Z","model":"alpha","kind":"abandoned","abandoned":"before_headers","header_ms":90000}`,
+	}
+	zr := modelStatsTestZip(t, "codeaf-ledger.jsonl", strings.Join(lines, "\n")+"\n")
+
+	in := parseModelStatsZips([]*zip.Reader{zr}, cfg)
+	if in.Stats.Rows != 1 || in.Stats.Rejected != 0 || len(in.Stats.Markers) != 2 {
+		t.Fatalf("rows=%d rejected=%d markers=%d, want 1/0/2 (classes=%v)",
+			in.Stats.Rows, in.Stats.Rejected, len(in.Stats.Markers), in.Stats.RejectedClass)
+	}
+	var alpha *modelAgg
+	for _, a := range modelAggregate(filterWindow(in, win), cfg, win) {
+		if a.ID == "alpha" {
+			alpha = a
+		}
+	}
+	if alpha == nil {
+		t.Fatal("no alpha aggregate")
+	}
+	// The abandoned markers are not calls, and they are not errors either.
+	if alpha.Calls != 1 || alpha.Errs != 0 || alpha.Four29 != 0 {
+		t.Errorf("abandoned markers leaked into the call figures: calls=%d errs=%d 429=%d, want 1/0/0",
+			alpha.Calls, alpha.Errs, alpha.Four29)
+	}
+	// The queue abandon carries a measured wait, so it reaches the slot
+	// figures and counts abandoned.
+	if alpha.SlotCalls != 1 || alpha.Abandoned != 1 || alpha.slotWaitsPerRun[1] != 1 {
+		t.Errorf("queue abandon: slotCalls=%d abandoned=%d perRun=%d, want 1/1/1",
+			alpha.SlotCalls, alpha.Abandoned, alpha.slotWaitsPerRun[1])
+	}
+	if alpha.AbandonedHeaders != 1 {
+		t.Errorf("pre-header abandon: abandonedHeaders=%d, want 1", alpha.AbandonedHeaders)
+	}
+	got := modelStatsReport(in, cfg, win, now)
+	if want := "`alpha`: 1 abandoned slot wait(s) \u2014 a call queued for a slot and produced no completion"; !strings.Contains(got, want) {
+		t.Errorf("the abandoned-wait alert did not see the queue abandon:\n%s", got)
+	}
+	if want := "`alpha`: 1 call(s) abandoned before upstream headers"; !strings.Contains(got, want) {
+		t.Errorf("the pre-header abandon is not reported:\n%s", got)
+	}
+}
+
+// TestModelStatsRejectsUnknownAbandonStage: the stage decides which wait the
+// marker is evidence for, so an unfamiliar one is refused rather than folded
+// into the abandon figures.
+func TestModelStatsRejectsUnknownAbandonStage(t *testing.T) {
+	cfg := modelStatsTestConfigWith(t, "alpha")
+	zr := modelStatsTestZip(t, "codeaf-ledger.jsonl",
+		`{"ts":"2026-10-21T11:00:00Z","model":"alpha","kind":"abandoned","abandoned":"midnight","slot_wait_s":5}`+"\n")
+	in := parseModelStatsZips([]*zip.Reader{zr}, cfg)
+	if in.Stats.Rows != 0 || in.Stats.Rejected != 1 || len(in.Stats.Markers) != 0 {
+		t.Fatalf("rows=%d rejected=%d markers=%d, want 0/1/0", in.Stats.Rows, in.Stats.Rejected, len(in.Stats.Markers))
+	}
+	if in.Stats.RejectedClass[rejectUnknownKind] != 1 {
+		t.Errorf("refused under %v, want %v", in.Stats.RejectedClass, rejectUnknownKind)
+	}
+}
