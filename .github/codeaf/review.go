@@ -1456,6 +1456,24 @@ func capDiffPrefix(diff string, max int) string {
 	return diff[:cut] + note
 }
 
+// cappedDiffForBrief caps the fetched diff for the brief (issue #458). A
+// fetch that stopped at diffReadCap ends in diffFetchNote, and capDiff
+// keeps a prefix of the whole text with a note of its own — so the fetch
+// note would always land past the cap and never reach the reviewer, who
+// would review an incomplete diff believing it complete. The note is
+// therefore reserved out of the budget and re-appended after the cut.
+func cappedDiffForBrief(diff string, truncated bool) string {
+	if !truncated {
+		return capDiff(diff, maxReviewDiffBytes)
+	}
+	note := diffFetchNote()
+	s := capDiff(diff, maxReviewDiffBytes-len(note)-1)
+	if s != "" && s[len(s)-1] != '\n' {
+		s += "\n" // capDiff's own note may end mid-line after the cut
+	}
+	return s + note
+}
+
 // reviewHarnessPreChangeSentence is the evidence rule review-instructions.md
 // carries (issue #189): the `harness` on PATH predates the run, so a review
 // of a .github/codeaf/ diff rebuilds from the diff's tree.
@@ -1504,11 +1522,11 @@ func runReviewBrief() error {
 			}
 		}
 	}
-	diff, err := gh.diff(number)
+	diff, truncated, err := gh.diff(number)
 	if err != nil {
 		return err
 	}
-	parts = append(parts, "# The diff under review\n\n```diff\n"+capDiff(diff, maxReviewDiffBytes)+"\n```")
+	parts = append(parts, "# The diff under review\n\n```diff\n"+cappedDiffForBrief(diff, truncated)+"\n```")
 	parts = append(parts, previousReportSection(gh, number))
 	parts = append(parts, reviewOutputContract)
 
@@ -1591,10 +1609,17 @@ func runReviewReport() error {
 	// this command already reports a review without one, so a failed or
 	// unreadable fetch parses every finding, as it did before the issue.
 	known := map[string]bool(nil)
-	if diff, err := newGitHub().diff(pr); err == nil {
-		known = diffPaths(diff)
-	} else {
+	if diff, truncated, err := newGitHub().diff(pr); err != nil {
 		fmt.Fprintf(os.Stderr, "review-report: reading the diff of %d: %v; findings are parsed without it\n", pr, err)
+	} else if truncated {
+		// Issue #458 review finding: a diff cut at diffReadCap names only
+		// the files before the cut, so judging findings against it would
+		// drop a real fenced finding on any file past the cut as a quote.
+		// An incomplete diff is no diff here: parse every finding, which is
+		// the same safe direction as a fetch that failed.
+		fmt.Fprintf(os.Stderr, "review-report: the diff of %d stopped at %d bytes; findings are parsed without it\n", pr, diffReadCap)
+	} else {
+		known = diffPaths(diff)
 	}
 	findings, sawSection := parseFindingsIn(effectiveAnswer(result, c), known)
 	if len(findings) == 0 {
