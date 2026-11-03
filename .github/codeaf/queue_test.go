@@ -3028,3 +3028,20 @@ func TestReportIsDeterministicRefusalRoundTrip(t *testing.T) {
 		t.Errorf("reportIsDeterministicRefusal(ordinary push refusal) = true; want false:\n%s", body)
 	}
 }
+
+// TestDeterministicRefusalsMatchWorkflow pins each deterministicRefusals entry
+// to the ::error:: line codeaf.yml's "Apply the patch" step actually prints:
+// the match is exact (issue #457), so rewording a refusal in the workflow
+// without updating the list would silently re-open the re-pick loop instead
+// of failing here.
+func TestDeterministicRefusalsMatchWorkflow(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "workflows", "codeaf.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range deterministicRefusals {
+		if !strings.Contains(string(data), "::error::"+s+"\"") {
+			t.Errorf("codeaf.yml prints no ::error:: line with exactly %q; update deterministicRefusals with the workflow", s)
+		}
+	}
+}
