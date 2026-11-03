@@ -271,6 +271,13 @@ func (f *file) Truncate(size int64) error {
 				copy(padded, sect.Data)
 				sect.Data = padded
 			}
+			// Truncate is sector work too (issue #459): re-check the lease
+			// before the shortening write — free for a live lease — and
+			// stop with BusyError on a loss instead of shortening the
+			// database under a lock the cluster has given away.
+			if err := f.renewForIO(); err != nil {
+				return ioFailure(err)
+			}
 			// BUG FIX (issue #8): the imported code ignored this error and
 			// carried on deleting sectors, silently losing the shortened
 			// sector's data.
@@ -292,6 +299,13 @@ func (f *file) Truncate(size int64) error {
 	// (and, when fileSize was sector-aligned, running past the last
 	// existing sector). It must start after it.
 	for sectToDelete := lastRemainingSector + 1; sectToDelete <= lastSector; sectToDelete++ {
+		// Re-check the lease for every sector deletion (issue #459): the
+		// delete loop runs once per sector of the file and can outlive
+		// the entry gate, so a loss mid-loop must stop it with BusyError
+		// before any further sector is deleted.
+		if err := f.renewForIO(); err != nil {
+			return ioFailure(err)
+		}
 		err := f.deleteSector(sectToDelete)
 		if err != nil && !kerrors.IsNotFound(err) {
 			return err
@@ -458,6 +472,17 @@ func (f *file) ReadAt(p []byte, off int64) (int, error) {
 		return 0, sqlite3vfs.IOErrorRead
 	}
 	for _, sect := range sectors {
+		// Re-check the lease for every sector (issue #459): getSectorRange
+		// above is one Kubernetes call per unfetched sector, so the fetch
+		// of a multi-sector read can itself cross the lease expiry, and a
+		// sector must not be served after another process has pruned this
+		// holder and possibly rewritten it. maybeRenew's local timestamp
+		// guard keeps this check free for a live lease, exactly as at
+		// entry, and the loss maps to BusyError so sqlite re-locks and
+		// revalidates.
+		if err := f.renewForIO(); err != nil {
+			return n, ioFailure(err)
+		}
 		// Sector s holds file bytes [s*SectorSize, (s+1)*SectorSize), so its
 		// bytes start at s*SectorSize-off in p. Placing every sector by its
 		// own index — not by how many bytes the sectors before it happened to
@@ -583,6 +608,18 @@ func (f *file) WriteAt(p []byte, off int64) (int, error) {
 
 	var nW int
 	for sectorIndex := firstSector; sectorIndex <= lastSector; sectorIndex++ {
+		// Re-check the lease for every sector (issue #459): a multi-sector
+		// write can outlive its entry gate — each sector write is its own
+		// Kubernetes call on the construction context, with no timeout, so
+		// one slow UPDATE on a large write can push the loop past the lease
+		// expiry — and once another process has pruned this holder and
+		// taken EXCLUSIVE, no further sector may be written under a lock
+		// the cluster has given away. maybeRenew's local timestamp guard
+		// keeps this check free for a live lease, exactly as at entry, and
+		// the loss maps to BusyError so sqlite re-locks and revalidates.
+		if err := f.renewForIO(); err != nil {
+			return nW, ioFailure(err)
+		}
 		// Fetch each sector's current bytes at most once (a cache hit while
 		// the lock is held, otherwise one GET); a sector that does not exist
 		// yet is created by the write below rather than by the fetch. The
@@ -977,7 +1014,10 @@ func (f *file) maybeRenew() error {
 }
 
 // renewForIO renews this file's lease from the sector read/write path when
-// less than half of it remains, and reports the sticky lease loss. A read or
+// less than half of it remains, and reports the sticky lease loss. It runs
+// at entry to ReadAt/WriteAt/Truncate and again inside each of their sector
+// loops (issue #459): a call whose sector work outlives the lease must not
+// serve or write a single further sector. A read or
 // write stretch longer than the lease used to outrun renewal entirely —
 // renewal lived only on the lock path — so the lease lapsed, another process
 // could prune this holder and take the lock, and WriteAt went on writing

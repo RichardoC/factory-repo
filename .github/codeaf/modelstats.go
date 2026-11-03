@@ -90,7 +90,8 @@ const (
 	rejectBadInteger rejectClass = "integer outside its allowed range"
 	rejectBadStatus  rejectClass = "HTTP status outside 100..599"
 	// rejectUnknownKind is a line whose kind is neither a call (no kind),
-	// "status", nor one of the proxy markers (proxy_start, quotas, search).
+	// "status", "abandoned", nor one of the proxy markers (proxy_start,
+	// quotas, search).
 	// It is refused rather than silently accepted, and rather than charged to
 	// the model-mismatch class it is not.
 	rejectUnknownKind rejectClass = "line kind is not a call, a status or a proxy marker"
@@ -133,6 +134,15 @@ type ledgerMarker struct {
 	// refused without queueing -- a model it never allowed, a body it never
 	// parsed, a call upstream answered outright.
 	SlotWaitS float64
+	// HeaderMs is the header wait an abandoned-before-headers marker carries
+	// (issue #456). It is a fact about a call that never completed, so like
+	// SlotWaitS it is reported and never a call timing.
+	HeaderMs int64
+	// Stage is the abandon stage on a kind "abandoned" marker (issue #456),
+	// and empty on every status line. It is one of the two constants in
+	// main.go, decided by the reader: an unfamiliar stage is refused rather
+	// than folded into a figure.
+	Stage string
 }
 
 // windowStats is everything the report needs that is not per-model.
@@ -440,10 +450,14 @@ type rawLedgerLine struct {
 	DurMs     json.RawMessage `json:"dur_ms"`
 	MaxGapMs  json.RawMessage `json:"max_gap_ms"`
 	SlotWaitS json.RawMessage `json:"slot_wait_s"`
+	HeaderMs  json.RawMessage `json:"header_ms"`
 	Tokens    json.RawMessage `json:"completion_tokens"`
 	UsageSeen bool            `json:"usage_seen"`
 	Cut       bool            `json:"cut"`
 	Status    json.RawMessage `json:"status"`
+	// Abandoned is the stage a call was abandoned at (issue #456): set on a
+	// kind "abandoned" marker only, empty on every other line.
+	Abandoned string `json:"abandoned"`
 }
 
 // decodeLedgerLine validates one line and folds it into the window.
@@ -461,11 +475,11 @@ func (in *modelStatsInput) decodeLedgerLine(line []byte, run int, allowed map[st
 	// whole: not a row, not a rejection. Deciding this before the model check
 	// is what keeps a run that carries them from tripping the reject alert.
 	//
-	// "status" is the one non-call kind the report keeps: it becomes a
-	// marker, handled below. Every other kind -- and a line with no kind at
-	// all -- has to be a call with a model models.json allows; a kind that
-	// is neither a call nor one of the four known ones is refused below
-	// rather than silently accepted.
+	// "status" and "abandoned" are the two non-call kinds the report keeps:
+	// each becomes a marker, handled below. Every other kind -- and a line
+	// with no kind at all -- has to be a call with a model models.json
+	// allows; a kind that is neither a call nor one of the known ones is
+	// refused below rather than silently accepted.
 	switch raw.Kind {
 	case "proxy_start", "quotas", "search":
 		return
@@ -477,7 +491,7 @@ func (in *modelStatsInput) decodeLedgerLine(line []byte, run int, allowed map[st
 		in.addReject(rejectUnknown)
 		return
 	}
-	if raw.Kind != "" && raw.Kind != "status" {
+	if raw.Kind != "" && raw.Kind != "status" && raw.Kind != "abandoned" {
 		// A kind the reader does not know is not a ledger row: the report
 		// states it rather than folding it into a model figure.
 		in.addReject(rejectUnknownKind)
@@ -493,6 +507,45 @@ func (in *modelStatsInput) decodeLedgerLine(line []byte, run int, allowed map[st
 	// the kind as well as the number keeps a successful call that happens to
 	// carry an explicit status -- the ledger this report reads -- from being
 	// filed as a marker and dropped from every count.
+	if raw.Kind == "abandoned" {
+		// An abandoned-call marker (issue #456): the proxy gave up on a call
+		// before it produced any completion and wrote the wait it had
+		// already measured -- the slot wait for a call abandoned while
+		// queueing, the header wait for one abandoned while upstream's
+		// headers were awaited. It is a marker and not a call row: no
+		// completion was produced, so it joins no call or timing figure,
+		// exactly as a status line does. What it does join is the slot
+		// figures and the abandoned alert, which is what neither path could
+		// reach before: a queue abandon left no line at all.
+		stage := raw.Abandoned
+		if stage != abandonedBeforeStart && stage != abandonedBeforeHeaders {
+			// The stage decides which wait the line is evidence for, so an
+			// unfamiliar one is refused rather than guessed at.
+			in.addReject(rejectUnknownKind)
+			return
+		}
+		ts, tsOK := decodeLedgerTS(raw.TS)
+		if !tsOK {
+			in.addReject(rejectBadTime)
+			return
+		}
+		slot, slotOK := decodeSlotWait(raw.SlotWaitS, b.MaxSlotWaitS)
+		if !slotOK {
+			in.addReject(rejectBadNumber)
+			return
+		}
+		header, headerOK := decodeMillis(raw.HeaderMs, b.MaxTimeMs)
+		if !headerOK {
+			in.addReject(rejectBadInteger)
+			return
+		}
+		if len(in.Stats.Markers) < b.MaxMarkers {
+			in.Stats.Markers = append(in.Stats.Markers, ledgerMarker{
+				Time: ts, Model: model, Run: run, SlotWaitS: slot,
+				HeaderMs: header, Stage: stage})
+		}
+		return
+	}
 	if raw.Kind == "status" {
 		// A status marker (kind "status", issue #140) carries no call timing:
 		// it feeds the 4xx/5xx classes and nothing else about the call. It
@@ -804,8 +857,13 @@ type modelAgg struct {
 	SlotCalls int
 	SlotWaits []float64
 	Abandoned int
-	byHour    map[string]*hourBucket
-	hours     []*hourBucket
+	// AbandonedHeaders counts calls abandoned while waiting for upstream's
+	// response headers (issue #456): a slot held and a request issued, no
+	// completion. Such a call may also have queued, in which case it is in
+	// Abandoned too; this counts the stage, not the queue.
+	AbandonedHeaders int
+	byHour           map[string]*hourBucket
+	hours            []*hourBucket
 	// slotWaitsPerRun counts the calls that waited, per run: the alert fires
 	// on more than the configured number of waits in one run.
 	slotWaitsPerRun map[int]int
@@ -913,6 +971,23 @@ func modelAggregate(in modelStatsInput, cfg Config, win modelStatsWindow) []*mod
 	for _, m := range in.Stats.Markers {
 		a, ok := byModel[m.Model]
 		if !ok {
+			continue
+		}
+		if m.Stage != "" {
+			// An abandoned-call marker (issue #456) carries no status and is
+			// not a refusal: it feeds the abandon figures and nothing else,
+			// so it stays out of markerCalls, the error classes and the
+			// 429-rate denominators, which would otherwise read it as an
+			// "other" error.
+			if m.Stage == abandonedBeforeHeaders {
+				a.AbandonedHeaders++
+			}
+			if m.SlotWaitS > 0 {
+				a.SlotCalls++
+				a.SlotWaits = append(a.SlotWaits, m.SlotWaitS)
+				a.slotWaitsPerRun[m.Run]++
+				a.Abandoned++
+			}
 			continue
 		}
 		markerCalls[m.Model]++
@@ -1319,6 +1394,14 @@ func modelStatsAlerts(in modelStatsInput, aggs []*modelAgg, cfg Config, win mode
 			out = append(out, fmt.Sprintf("%s: %d abandoned slot wait(s) — a call queued for a slot and produced no completion",
 				modelIDCell(a.ID), a.Abandoned))
 		}
+		if a.AbandonedHeaders > 0 {
+			// A call abandoned while upstream's headers were awaited held
+			// its slot and had already been sent upstream (issue #456): it
+			// costs real queue time and is invisible in every call figure,
+			// so it is reported even when no threshold is crossed.
+			out = append(out, fmt.Sprintf("%s: %d call(s) abandoned before upstream headers — a slot held, a request issued and no completion",
+				modelIDCell(a.ID), a.AbandonedHeaders))
+		}
 	}
 	return out
 }
@@ -1422,7 +1505,10 @@ func ttftBaseline(a *modelAgg, cfg Config, win modelStatsWindow, now time.Time) 
 func countMarkers(in modelStatsInput, model string) int {
 	n := 0
 	for _, m := range in.Stats.Markers {
-		if m.Model == model {
+		// An abandoned marker (issue #456) is not a refusal: it must not
+		// widen the denominator of the 429-rate alert, which is what the
+		// markers are counted for here.
+		if m.Model == model && m.Stage == "" {
 			n++
 		}
 	}
