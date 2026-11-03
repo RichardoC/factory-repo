@@ -39,8 +39,12 @@ import (
 // dispatch in the handoff job is deliberately not in the set: it starts the
 // state merge, not a run, and its job holds no harness. Also deliberately
 // out: the best-effort calls that already carry their own fallback (`gh pr
-// ready`, `gh label create`, the compare-status probe).
-var ghRetryCovered = regexp.MustCompile(`\bgh\s+(?:pr edit|pr list --head|issue view|workflow run (codeaf-queue|codeaf|ci).yml|api --paginate "repos/\$GITHUB_REPOSITORY/issues\?state=open|api "repos/\$GITHUB_REPOSITORY/(?:actions/runs/\$GITHUB_RUN_ID/approvals|collaborators/[^"]+/permission))`)
+// ready`, `gh label create`, the compare-status probe). Issues #462 and
+// #463 add the comment posts: the review findings and continue comments
+// (fail-soft, so a 5xx on them silently skipped the label edits after them)
+// and the run report with its cross-reference (a report that never posts is
+// one countReports cannot see, so the next run undercounts continuations).
+var ghRetryCovered = regexp.MustCompile(`\bgh\s+(?:pr edit|pr comment|issue comment|pr list --head|issue view|workflow run (codeaf-queue|codeaf|ci).yml|api --paginate "repos/\$GITHUB_REPOSITORY/issues\?state=open|api "repos/\$GITHUB_REPOSITORY/(?:actions/runs/\$GITHUB_RUN_ID/approvals|collaborators/[^"]+/permission))`)
 
 // unwrappedGhRetryCalls reports every covered gh invocation in a workflow's
 // text that does not run through `gh-retry --`: the text before the
@@ -121,6 +125,38 @@ func TestWorkflowGhRetryWrapsFailSoftCalls(t *testing.T) {
 				"the plan-report issue listing",
 				`"$HARNESS" gh-retry -- gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" > "$OPEN_ISSUES_PATH"`,
 				`gh api --paginate "repos/$GITHUB_REPOSITORY/issues?state=open&per_page=100" > "$OPEN_ISSUES_PATH"`,
+			},
+		} {
+			tc := tc
+			t.Run(tc.name, func(t *testing.T) {
+				bare := unwrapOne(t, filepath.Join(dir, "codeaf.yml"), tc.wrapped, tc.bare)
+				if v := unwrappedGhRetryCalls("codeaf.yml", bare); len(v) == 0 {
+					t.Fatalf("unwrapping %s produced no violation", tc.name)
+				}
+			})
+		}
+	})
+	t.Run("unwrapping a comment post fails", func(t *testing.T) {
+		for _, tc := range []struct{ name, wrapped, bare string }{
+			{
+				"the review findings comment",
+				`"$HARNESS" gh-retry -- gh pr comment "$NUMBER" --body-file "$REVIEW_COMMENT_PATH" || true`,
+				`gh pr comment "$NUMBER" --body-file "$REVIEW_COMMENT_PATH"`,
+			},
+			{
+				"the continue comment",
+				`"$HARNESS" gh-retry -- gh pr comment "$PR_NUMBER" --body-file "$CONTINUE_COMMENT_PATH" || true`,
+				`gh pr comment "$PR_NUMBER" --body-file "$CONTINUE_COMMENT_PATH" || true`,
+			},
+			{
+				"the run report",
+				`"$HARNESS" gh-retry -- gh issue comment "$target" --body-file "$RUNNER_TEMP/report.md"`,
+				`gh issue comment "$target" --body-file "$RUNNER_TEMP/report.md"`,
+			},
+			{
+				"the opened-PR cross-reference",
+				`"$HARNESS" gh-retry -- gh issue comment "$NUMBER" --body "CodeAF opened #$target for this issue."`,
+				`gh issue comment "$NUMBER" --body "CodeAF opened #$target for this issue."`,
 			},
 		} {
 			tc := tc
