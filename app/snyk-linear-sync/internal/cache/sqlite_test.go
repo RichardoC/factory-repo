@@ -113,3 +113,127 @@ func TestSaveAndLoadRoundTripsHashes(t *testing.T) {
 		}
 	}
 }
+
+// TestSnykIgnoresMigrationTimestampFormatIsParsedAndAges replays the
+// updated_at migration against a pre-migration table. The migration seeds the
+// new column with CURRENT_TIMESTAMP, whose "YYYY-MM-DD HH:MM:SS" format is
+// not RFC3339; a reader that only parses RFC3339 turns those rows into zero
+// times and the TTL eviction never fires for them.
+func TestSnykIgnoresMigrationTimestampFormatIsParsedAndAges(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test-cache.db")
+	ctx := context.Background()
+	projectID := "project-a"
+
+	// Create the cache, seed a row the way the sync would have written it
+	// before the column existed, then drop the column so the next Open has
+	// to run the migration that seeds it with CURRENT_TIMESTAMP.
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if _, err := store.db.Exec(
+		`INSERT INTO snyk_ignores (project_id, issue_key, expires_at, disregard_if_fixable, created_at) ` +
+			`VALUES ('project-a', 'SNYK-2', '', 0, '')`); err != nil {
+		t.Fatalf("seed pre-migration row: %v", err)
+	}
+	if _, err := store.db.Exec(`ALTER TABLE snyk_ignores DROP COLUMN updated_at`); err != nil {
+		t.Fatalf("drop updated_at column: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	store, err = Open(path)
+	if err != nil {
+		t.Fatalf("re-open for migration error = %v", err)
+	}
+	defer store.Close()
+
+	// The migration just stamped CURRENT_TIMESTAMP (UTC, SQLite's layout).
+	// The entry is fresh, so it must survive, and UpdatedAt must be parsed
+	// rather than silently discarded into a zero time.
+	loaded, err := store.LoadIgnores(ctx, projectID)
+	if err != nil {
+		t.Fatalf("LoadIgnores() error = %v", err)
+	}
+	meta, ok := loaded["SNYK-2"]
+	if !ok {
+		t.Fatalf("migration-seeded ignore entry was evicted")
+	}
+	if meta.UpdatedAt.IsZero() {
+		t.Fatalf("UpdatedAt = zero time, want the CURRENT_TIMESTAMP value parsed")
+	}
+
+	// Age the seeded value past the TTL, written in the very format
+	// CURRENT_TIMESTAMP produces (datetime() returns the same layout; it
+	// cannot itself produce a past timestamp).
+	if _, err := store.db.Exec(`UPDATE snyk_ignores SET updated_at = datetime('now', '-8 days')`); err != nil {
+		t.Fatalf("age seeded updated_at: %v", err)
+	}
+	loaded, err = store.LoadIgnores(ctx, projectID)
+	if err != nil {
+		t.Fatalf("LoadIgnores() stale error = %v", err)
+	}
+	if _, ok := loaded["SNYK-2"]; ok {
+		t.Fatalf("stale migration-format ignore entry was not evicted")
+	}
+}
+
+// TestSnykIgnoresTTLEvictsUnparseableUpdatedAt pins that a corrupt
+// updated_at is evicted rather than kept forever, while well-formed entries
+// in the same load are unaffected.
+func TestSnykIgnoresTTLEvictsUnparseableUpdatedAt(t *testing.T) {
+	dir := t.TempDir()
+	store, err := Open(filepath.Join(dir, "test-cache.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	// SaveIgnores replaces every row of the project, so both entries go
+	// through it first and only then is one row's updated_at corrupted in
+	// place. A well-formed fresh entry sits alongside the corrupt one and
+	// must survive the same load.
+	now := time.Now().UTC()
+	if err := store.SaveIgnores(ctx, "project-a", map[string]IgnoreMeta{
+		"SNYK-3": {IssueKey: "SNYK-3", UpdatedAt: now, CreatedAt: now},
+		"SNYK-4": {IssueKey: "SNYK-4", UpdatedAt: now},
+	}); err != nil {
+		t.Fatalf("SaveIgnores() error = %v", err)
+	}
+	if _, err := store.db.Exec(
+		`UPDATE snyk_ignores SET updated_at = 'not-a-timestamp' WHERE issue_key = 'SNYK-3'`); err != nil {
+		t.Fatalf("corrupt updated_at: %v", err)
+	}
+
+	loaded, err := store.LoadIgnores(ctx, "project-a")
+	if err != nil {
+		t.Fatalf("LoadIgnores() error = %v", err)
+	}
+	if _, ok := loaded["SNYK-3"]; ok {
+		t.Fatalf("ignore entry with unparseable updated_at was not evicted")
+	}
+	if _, ok := loaded["SNYK-4"]; !ok {
+		t.Fatalf("well-formed ignore entry was evicted")
+	}
+
+	// A genuinely absent updated_at keeps its previous meaning: a zero time
+	// that does not age the entry out.
+	if _, err := store.db.Exec(
+		`UPDATE snyk_ignores SET updated_at = '' WHERE issue_key = 'SNYK-4'`); err != nil {
+		t.Fatalf("clear updated_at: %v", err)
+	}
+	loaded, err = store.LoadIgnores(ctx, "project-a")
+	if err != nil {
+		t.Fatalf("LoadIgnores() absent updated_at error = %v", err)
+	}
+	absent, ok := loaded["SNYK-4"]
+	if !ok {
+		t.Fatalf("ignore entry with absent updated_at was evicted")
+	}
+	if !absent.UpdatedAt.IsZero() {
+		t.Fatalf("UpdatedAt = %v, want the zero time for an absent value", absent.UpdatedAt)
+	}
+}
