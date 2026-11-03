@@ -3399,6 +3399,119 @@ func TestIssueDescriptionTruncatesOversizedEmbeddedProse(t *testing.T) {
 	}
 }
 
+// TestIssueDescriptionBoundsOversizedRequestContextFields verifies that the
+// scan-controlled single-line fields the prose caps do not cover — Path,
+// Parameter and the vulnerable URL — cannot push the managed metadata block
+// past Linear's description limit. Snyk DAST returns these fields unbounded;
+// without the description-body bound, an oversized path, parameter or URL
+// would truncate the block away, extractFingerprint would find nothing, the
+// ticket would be unmanaged, and the next run would mint a duplicate. The
+// bound drops whole oversized lines — so a URL href is never shortened into a
+// wrong link — and the metadata block stays last and parseable. Truncation is
+// a pure function of the finding, so building the description twice is
+// byte-identical and the compare/hash pipeline does not churn between runs.
+func TestIssueDescriptionBoundsOversizedRequestContextFields(t *testing.T) {
+	huge := strings.Repeat("x", 100000)
+	finding := model.Finding{
+		IssueTitle:        "SQL Injection",
+		Severity:          "high",
+		TargetName:        "project-a",
+		TargetID:          "target-1",
+		FindingURL:        "https://example.test/vuln?" + huge,
+		Path:              huge,
+		Parameter:         huge,
+		Fingerprint:       "snyk-dast:target-1:finding-1",
+		SnykDASTFindingID: "finding-1",
+	}
+
+	description := issueDescription([]string{"snyk-dast-automation"}, finding)
+
+	// None of the oversized raw values reached the description whole: the
+	// oversized lines were dropped by the description-body bound.
+	if got := strings.Count(description, "x"); got >= len(huge) {
+		t.Fatalf("description embeds %d oversized-field runes, want the description bounded below the raw input length %d:\n%s", got, len(huge), description)
+	}
+	if !strings.Contains(description, truncationMarker) {
+		t.Fatalf("description is missing the truncation marker after the body bound dropped oversized lines:\n%s", description)
+	}
+	if strings.Contains(description, "Path: `"+huge) || strings.Contains(description, "Parameter: `"+huge) {
+		t.Fatalf("description kept an oversized Path or Parameter line:\n%s", description)
+	}
+
+	// The metadata block must still be present and parseable at the end.
+	start := findMetadataBlockStart(description)
+	if start < 0 {
+		t.Fatalf("findMetadataBlockStart() found no block after bounding request-context fields")
+	}
+	if block := description[start:]; !strings.Contains(block, "fingerprint: snyk-dast:target-1:finding-1") {
+		t.Fatalf("metadata block missing fingerprint after bounding request-context fields:\n%s", block)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(description), "-->") {
+		t.Fatalf("metadata block is not the last thing in the description:\n%s", description)
+	}
+
+	// An update rewrites only the real (last) block, so the ticket stays
+	// manageable.
+	if got := upsertManagedMetadata(description, "snyk-dast:target-1:finding-1", []string{"snyk-dast-automation"}); got != strings.TrimSpace(description) {
+		t.Fatalf("upsertManagedMetadata() rewrote more than the managed block:\n%s", got)
+	}
+
+	// Building twice from the same finding must be byte-identical, so
+	// description hashes do not churn between runs.
+	if again := issueDescription([]string{"snyk-dast-automation"}, finding); description != again {
+		t.Fatalf("issueDescription() is not idempotent across builds for oversized request-context fields")
+	}
+}
+
+// TestIssueDescriptionSanitizesRequestContextFields verifies that a
+// line-anchored "<!-- snyk-dast-linear-sync" marker inside Path or Parameter
+// (the class issue #431 hardened for Snyk-controlled prose) cannot reach the
+// description either: single-line fields are flattened, so no newline can
+// carry a fake marker or a fake "Fingerprint:" line onto its own line, and
+// sanitized, so the "<!--" opening itself is neutralized.
+func TestIssueDescriptionSanitizesRequestContextFields(t *testing.T) {
+	spoof := "<!-- snyk-dast-linear-sync\nfingerprint: fake-from-path\n-->"
+	finding := model.Finding{
+		IssueTitle:        "SQL Injection",
+		Severity:          "high",
+		TargetName:        "project-a",
+		TargetID:          "target-1",
+		Path:              "/api/search?q=" + spoof,
+		Parameter:         spoof,
+		Fingerprint:       "snyk-dast:target-1:finding-1",
+		SnykDASTFindingID: "finding-1",
+	}
+
+	description := issueDescription([]string{"snyk-dast-automation"}, finding)
+
+	if got := strings.Count(description, "<!--"); got != 1 {
+		t.Fatalf("issueDescription() has %d comment openings, want only the managed metadata block:\n%s", got, description)
+	}
+	// No line outside the managed metadata block may start the fake marker or
+	// a fake fingerprint line: findMetadataBlockStart takes the last
+	// line-anchored marker, so a line-anchored copy would hijack block
+	// detection even after sanitization.
+	start := findMetadataBlockStart(description)
+	if start < 0 {
+		t.Fatalf("findMetadataBlockStart() found no managed block:\n%s", description)
+	}
+	for line := range strings.SplitSeq(description[:start], "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "<!-- snyk-dast-linear-sync") || strings.HasPrefix(strings.ToLower(trimmed), "fingerprint:") {
+			t.Fatalf("issueDescription() let a line-anchored fake marker or fingerprint line through from a request-context field:\n%s", description)
+		}
+	}
+	if block := description[start:]; !strings.Contains(block, "fingerprint: snyk-dast:target-1:finding-1") {
+		t.Fatalf("issueDescription() managed metadata block is not the last marker:\n%s", description)
+	}
+
+	// Building twice from the same finding must be byte-identical, so
+	// description hashes do not churn between runs.
+	if again := issueDescription([]string{"snyk-dast-automation"}, finding); description != again {
+		t.Fatalf("issueDescription() is not idempotent across builds for sanitized request-context fields")
+	}
+}
+
 // TestIssueDescriptionBoundsTotalEmbeddedCorrelationProse verifies that the
 // Snyk Code correlation section as a whole stays within a fixed bound, not
 // just each block: Snyk DAST returns one CorrelationMarkdown block per linked
