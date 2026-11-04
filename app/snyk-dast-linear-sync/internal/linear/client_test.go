@@ -1101,6 +1101,91 @@ func TestExistingFingerprintsRejectsNonAdvancingCursor(t *testing.T) {
 	}
 }
 
+// stuckCursorClient returns a client whose GraphQL transport always answers the
+// given encoded data payload with hasNextPage true and an unchanged cursor, so
+// any pagination loop without a cursor guard would spin forever. The returned
+// counter records how many requests were made, and fails the test past limit
+// instead of hanging if the guard regresses.
+func stuckCursorClient(t *testing.T, data string, loop string) (*Client, *int) {
+	t.Helper()
+	requests := 0
+	client := &Client{
+		cfg:          config.LinearConfig{TeamID: "team-1"},
+		resolvedTeam: "team-1",
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				requests++
+				if requests > 10 {
+					t.Fatalf("%s kept paginating on an unchanged cursor", loop)
+				}
+				if _, err := io.ReadAll(req.Body); err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				return jsonResponse(t, data), nil
+			}),
+		}),
+		log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		statesByName:    map[string]string{},
+		statesByType:    map[string]string{},
+		managedLabelIDs: map[string]string{},
+	}
+	return client, &requests
+}
+
+// expectNonAdvancingCursorError pins the shared shape of the pagination guard:
+// the error must name the stuck cursor and the loop it came from.
+func expectNonAdvancingCursorError(t *testing.T, err error, loop string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("%s error = nil, want an error when the cursor does not advance", loop)
+	}
+	if !strings.Contains(err.Error(), "did not advance") {
+		t.Fatalf("%s error = %v, want it to name the non-advancing cursor", loop, err)
+	}
+	if !strings.Contains(err.Error(), loop) {
+		t.Fatalf("%s error = %v, want it to name the loop", loop, err)
+	}
+}
+
+// TestLoadStatesPaginationCursorDidNotAdvance pins the guard on the states
+// loop of LoadSnapshot: a server repeating an unchanged endCursor with
+// hasNextPage true would re-append the same states each pass forever.
+func TestLoadStatesPaginationCursorDidNotAdvance(t *testing.T) {
+	client, _ := stuckCursorClient(t, `{"data":{"team":{"states":{
+		"nodes":[{"id":"s1","name":"todo","type":"issue"}],
+		"pageInfo":{"hasNextPage":true,"endCursor":"stuck"}
+	}}}}`, "fetch Linear states")
+
+	err := client.loadStates(context.Background())
+	expectNonAdvancingCursorError(t, err, "fetch Linear states")
+}
+
+// TestLoadIssuesPaginationCursorDidNotAdvance pins the guard on the snapshot
+// loop of LoadSnapshot: a stuck cursor would re-append the same issues each
+// pass, so the sync would see duplicates of every ticket Linear returned.
+func TestLoadIssuesPaginationCursorDidNotAdvance(t *testing.T) {
+	client, _ := stuckCursorClient(t, `{"data":{"issues":{
+		"nodes":[],
+		"pageInfo":{"hasNextPage":true,"endCursor":"stuck"}
+	}}}`, "fetch Linear issues")
+
+	_, err := client.loadIssues(context.Background())
+	expectNonAdvancingCursorError(t, err, "fetch Linear issues")
+}
+
+// TestResolveManagedLabelPaginationCursorDidNotAdvance pins the guard on the
+// label lookup loop: a stuck cursor would re-append the same label matches
+// each pass, turning a single managed label into an ambiguous one.
+func TestResolveManagedLabelPaginationCursorDidNotAdvance(t *testing.T) {
+	client, _ := stuckCursorClient(t, `{"data":{"issueLabels":{
+		"nodes":[],
+		"pageInfo":{"hasNextPage":true,"endCursor":"stuck"}
+	}}}`, "fetch Linear labels")
+
+	err := client.resolveManagedLabel(context.Background(), "snyk-dast-automation")
+	expectNonAdvancingCursorError(t, err, "fetch Linear labels")
+}
+
 // TestExistingFingerprintsReportsOnlyLiveMatches confirms the lookup returns the
 // requested fingerprints that exist and ignores anything else Linear returns.
 func TestExistingFingerprintsReportsOnlyLiveMatches(t *testing.T) {
