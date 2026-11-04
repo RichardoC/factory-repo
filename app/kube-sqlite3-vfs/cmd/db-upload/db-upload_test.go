@@ -22,6 +22,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RichardoC/kube-sqlite3-vfs/internal/journaltest"
+	"github.com/RichardoC/kube-sqlite3-vfs/internal/logcapture"
 	"github.com/RichardoC/kube-sqlite3-vfs/pkg/vfs"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/psanford/sqlite3vfs"
@@ -661,5 +663,69 @@ func assertSectorsMatch(t *testing.T, fcs *fake.Clientset, want []byte) {
 		if got := cm.BinaryData["sector"]; !bytes.Equal(got, want[start:end]) {
 			t.Errorf("sector %d holds %d bytes, want %d matching bytes", i, len(got), end-start)
 		}
+	}
+}
+
+// issue #509: the probe's header read can fail in a way that is neither EOF
+// nor a successful read — a sector GET that fails with anything but NotFound
+// maps to sqlite3vfs.IOErrorRead. The deletion is still safe, because the
+// upload replaces the database outright, but the log must carry the read
+// error and must NOT report a verified-cold journal whose hotness was never
+// established.
+func TestRunWithClientJournalProbeReadErrorLogsUnknownHotness(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	if err := os.WriteFile("file2.db", buildSQLiteFile(t, 500), 0o644); err != nil {
+		t.Fatalf("write old local file: %v", err)
+	}
+	fcs := fake.NewSimpleClientset()
+	if err := runWithClient(fcs, Options{Retries: 1}, testLogger()); err != nil {
+		t.Fatalf("seed upload of the old image: %v", err)
+	}
+	selector := seedHotJournal(t, fcs)
+
+	// Fail exactly the probe's header GET. Delete removes sectors with
+	// LIST + DELETE, so the journal itself can still be deleted.
+	header := journaltest.HeaderSectorName(t, fcs)
+	probeFailed := false
+	fcs.PrependReactor("get", "configmaps", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		if action.(clienttesting.GetAction).GetName() != header {
+			return false, nil, nil
+		}
+		probeFailed = true
+		return true, nil, errors.New("injected sector read failure")
+	})
+
+	if err := os.WriteFile("file2.db", buildSQLiteFile(t, 2000), 0o644); err != nil {
+		t.Fatalf("write new local file: %v", err)
+	}
+	logger, captured := logcapture.NewCapture()
+	if err := runWithClient(fcs, Options{Retries: 1}, logger); err != nil {
+		t.Fatalf("runWithClient with a failing journal probe: %v", err)
+	}
+	if !probeFailed {
+		t.Fatal("the journal header GET was never issued: the probe path was not exercised")
+	}
+	if cms := listConfigMaps(t, fcs, selector); len(cms) != 0 {
+		t.Fatalf("journal sector ConfigMaps after the upload = %d, want 0: an unreadable journal must still be deleted", len(cms))
+	}
+
+	// The warning itself must carry the probe read error: pkg/vfs/sector.go
+	// logs the same error at ERROR level from getSectorRange, so a substring
+	// check over the whole log is satisfied without the warning ever firing
+	// (review finding on the issue #509 PR).
+	rec, ok := captured.Find("hotness unknown")
+	if !ok {
+		t.Fatalf("no \"hotness unknown\" record in the log; log:\n%s", captured.Text())
+	}
+	if rec.Level != slog.LevelWarn {
+		t.Errorf("\"hotness unknown\" logged at %s, want warn", rec.Level)
+	}
+	if got := rec.Attr("error"); !strings.Contains(got, sqlite3vfs.IOErrorRead.Error()) {
+		t.Errorf("the \"hotness unknown\" warning does not carry the probe read error %q (error attr %q); log:\n%s", sqlite3vfs.IOErrorRead.Error(), got, captured.Text())
+	}
+	if _, ok := captured.Find("cold"); ok {
+		t.Errorf("log claims a cold journal although the probe could not read it; log:\n%s", captured.Text())
 	}
 }
