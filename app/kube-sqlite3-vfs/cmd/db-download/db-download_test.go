@@ -612,3 +612,81 @@ func TestRunWithClientDownloadsWithoutJournal(t *testing.T) {
 		t.Errorf("journal sector ConfigMaps = %d, want 0: a download with no journal must not create one", len(cms))
 	}
 }
+
+// journalHeaderSectorName returns the name of the journal's sector-0
+// ConfigMap, the one the hotness probe GETs. Tests in this package cannot
+// build that name directly (the VFS's name helper is unexported), so they
+// list the journal's sectors and take the lowest index.
+func journalHeaderSectorName(t *testing.T, fcs *fake.Clientset) string {
+	t.Helper()
+	vfsN := vfs.NewVFS(context.Background(), fcs, "test", testLogger(), 1)
+	jf := vfs.NewFile("file2.db-journal", vfsN)
+	cms := listConfigMaps(t, fcs, "data=sector,relevant-file="+jf.SectorLabels["relevant-file"])
+	name := ""
+	var lowest int64
+	for _, cm := range cms {
+		idx, ok := sectorIndexFromName(cm.Name)
+		if !ok {
+			continue
+		}
+		if name == "" || idx < lowest {
+			name, lowest = cm.Name, idx
+		}
+	}
+	if name == "" {
+		t.Fatal("setup: the journal has no sector ConfigMaps")
+	}
+	return name
+}
+
+// issue #509: the probe's header read can fail in a way that is neither EOF
+// nor a successful read — a sector GET that fails with anything but NotFound
+// maps to sqlite3vfs.IOErrorRead. The deletion is still safe, because the
+// download replaces the database outright, but the log must carry the read
+// error and must NOT report a verified-cold journal whose hotness was never
+// established.
+func TestRunWithClientJournalProbeReadErrorLogsUnknownHotness(t *testing.T) {
+	_, oldData := buildSQLiteFile(t, 500)
+	fcs := fake.NewSimpleClientset()
+	vfsN := vfs.NewVFS(context.Background(), fcs, "test", testLogger(), 1)
+	if _, err := vfs.NewFile("file2.db", vfsN).WriteAt(oldData, 0); err != nil {
+		t.Fatalf("seed the old image: %v", err)
+	}
+	selector := seedHotJournal(t, fcs)
+
+	// Fail exactly the probe's header GET. Delete removes sectors with
+	// LIST + DELETE, so the journal itself can still be deleted.
+	header := journalHeaderSectorName(t, fcs)
+	probeFailed := false
+	fcs.PrependReactor("get", "configmaps", func(action clienttesting.Action) (bool, runtime.Object, error) {
+		if action.(clienttesting.GetAction).GetName() != header {
+			return false, nil, nil
+		}
+		probeFailed = true
+		return true, nil, errors.New("injected sector read failure")
+	})
+
+	newPath, _ := buildSQLiteFile(t, 2000)
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	if err := runWithClient(fcs, Options{FileName: newPath, Retries: 1}, logger); err != nil {
+		t.Fatalf("runWithClient with a failing journal probe: %v", err)
+	}
+	if !probeFailed {
+		t.Fatal("the journal header GET was never issued: the probe path was not exercised")
+	}
+	if cms := listConfigMaps(t, fcs, selector); len(cms) != 0 {
+		t.Fatalf("journal sector ConfigMaps after the download = %d, want 0: an unreadable journal must still be deleted", len(cms))
+	}
+
+	out := logs.String()
+	if !strings.Contains(out, sqlite3vfs.IOErrorRead.Error()) {
+		t.Errorf("log does not carry the probe read error %q; log:\n%s", sqlite3vfs.IOErrorRead.Error(), out)
+	}
+	if !strings.Contains(out, "hotness unknown") {
+		t.Errorf("log does not report the journal's hotness as unknown; log:\n%s", out)
+	}
+	if strings.Contains(out, "cold") {
+		t.Errorf("log claims a cold journal although the probe could not read it; log:\n%s", out)
+	}
+}

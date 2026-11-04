@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 
 	"github.com/RichardoC/kube-sqlite3-vfs/pkg/journalmode"
+	"github.com/RichardoC/kube-sqlite3-vfs/pkg/stalejournal"
 	"github.com/RichardoC/kube-sqlite3-vfs/pkg/vfs"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/psanford/sqlite3vfs"
@@ -186,34 +187,13 @@ func runWithClientFrom(clientset kubernetes.Interface, opts Options, logger *slo
 	// is written, never after. This also has to precede the read-only open
 	// at the end of this command: a read-only opener would not delete the
 	// journal, only read through it.
+	// The probe classifies the journal as hot, cold, or — when its header
+	// cannot be read — hotness unknown, which is logged as a warning rather
+	// than reported as a verified-cold journal (issue #509). Either way the
+	// name must go before the transfer.
 	journalName := fn + "-journal"
-	exists, err := vfsN.Access(journalName, sqlite3vfs.AccessExists)
-	if err != nil {
-		return fmt.Errorf("look for a stale journal %q: %w", journalName, err)
-	}
-	if exists {
-		// SQLite calls a journal hot when the first bytes at offset 0 (the
-		// journal magic) are non-zero; a missing or zeroed header reads as
-		// a cold journal. Either way the name must go before the transfer.
-		hot := false
-		var head [8]byte
-		n, readErr := vfs.NewFile(journalName, vfsN).ReadAt(head[:], 0)
-		if n > 0 && (readErr == nil || errors.Is(readErr, io.EOF)) {
-			for _, b := range head[:n] {
-				if b != 0 {
-					hot = true
-					break
-				}
-			}
-		}
-		if err := vfsN.Delete(journalName, false); err != nil {
-			return fmt.Errorf("delete stale journal %q: %w", journalName, err)
-		}
-		if hot {
-			logger.Warn("Deleted a HOT rollback journal left by a crashed writer: the download replaces the database outright, so the journal was removed rather than replayed", "journal", journalName)
-		} else {
-			logger.Info("Deleted a stale (cold) rollback journal", "journal", journalName)
-		}
+	if err := stalejournal.DeleteIfPresent(vfsN, vfs.NewFile(journalName, vfsN), journalName, "download", logger); err != nil {
+		return err
 	}
 
 	if _, _, err := vfsN.Open(fn, sqlite3vfs.OpenFlag(0)); err != nil {
