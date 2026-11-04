@@ -22,6 +22,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RichardoC/kube-sqlite3-vfs/internal/journaltest"
+	"github.com/RichardoC/kube-sqlite3-vfs/internal/logcapture"
 	"github.com/RichardoC/kube-sqlite3-vfs/pkg/vfs"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/psanford/sqlite3vfs"
@@ -664,32 +666,6 @@ func assertSectorsMatch(t *testing.T, fcs *fake.Clientset, want []byte) {
 	}
 }
 
-// journalHeaderSectorName returns the name of the journal's sector-0
-// ConfigMap, the one the hotness probe GETs. Tests in this package cannot
-// build that name directly (the VFS's name helper is unexported), so they
-// list the journal's sectors and take the lowest index.
-func journalHeaderSectorName(t *testing.T, fcs *fake.Clientset) string {
-	t.Helper()
-	vfsN := vfs.NewVFS(context.Background(), fcs, "test", testLogger(), 1)
-	jf := vfs.NewFile("file2.db-journal", vfsN)
-	cms := listConfigMaps(t, fcs, "data=sector,relevant-file="+jf.SectorLabels["relevant-file"])
-	name := ""
-	var lowest int64
-	for _, cm := range cms {
-		idx, ok := sectorIndexFromName(cm.Name)
-		if !ok {
-			continue
-		}
-		if name == "" || idx < lowest {
-			name, lowest = cm.Name, idx
-		}
-	}
-	if name == "" {
-		t.Fatal("setup: the journal has no sector ConfigMaps")
-	}
-	return name
-}
-
 // issue #509: the probe's header read can fail in a way that is neither EOF
 // nor a successful read — a sector GET that fails with anything but NotFound
 // maps to sqlite3vfs.IOErrorRead. The deletion is still safe, because the
@@ -711,7 +687,7 @@ func TestRunWithClientJournalProbeReadErrorLogsUnknownHotness(t *testing.T) {
 
 	// Fail exactly the probe's header GET. Delete removes sectors with
 	// LIST + DELETE, so the journal itself can still be deleted.
-	header := journalHeaderSectorName(t, fcs)
+	header := journaltest.HeaderSectorName(t, fcs)
 	probeFailed := false
 	fcs.PrependReactor("get", "configmaps", func(action clienttesting.Action) (bool, runtime.Object, error) {
 		if action.(clienttesting.GetAction).GetName() != header {
@@ -724,8 +700,7 @@ func TestRunWithClientJournalProbeReadErrorLogsUnknownHotness(t *testing.T) {
 	if err := os.WriteFile("file2.db", buildSQLiteFile(t, 2000), 0o644); err != nil {
 		t.Fatalf("write new local file: %v", err)
 	}
-	var logs bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	logger, captured := logcapture.NewCapture()
 	if err := runWithClient(fcs, Options{Retries: 1}, logger); err != nil {
 		t.Fatalf("runWithClient with a failing journal probe: %v", err)
 	}
@@ -736,14 +711,21 @@ func TestRunWithClientJournalProbeReadErrorLogsUnknownHotness(t *testing.T) {
 		t.Fatalf("journal sector ConfigMaps after the upload = %d, want 0: an unreadable journal must still be deleted", len(cms))
 	}
 
-	out := logs.String()
-	if !strings.Contains(out, sqlite3vfs.IOErrorRead.Error()) {
-		t.Errorf("log does not carry the probe read error %q; log:\n%s", sqlite3vfs.IOErrorRead.Error(), out)
+	// The warning itself must carry the probe read error: pkg/vfs/sector.go
+	// logs the same error at ERROR level from getSectorRange, so a substring
+	// check over the whole log is satisfied without the warning ever firing
+	// (review finding on the issue #509 PR).
+	rec, ok := captured.Find("hotness unknown")
+	if !ok {
+		t.Fatalf("no \"hotness unknown\" record in the log; log:\n%s", captured.Text())
 	}
-	if !strings.Contains(out, "hotness unknown") {
-		t.Errorf("log does not report the journal's hotness as unknown; log:\n%s", out)
+	if rec.Level != slog.LevelWarn {
+		t.Errorf("\"hotness unknown\" logged at %s, want warn", rec.Level)
 	}
-	if strings.Contains(out, "cold") {
-		t.Errorf("log claims a cold journal although the probe could not read it; log:\n%s", out)
+	if got := rec.Attr("error"); !strings.Contains(got, sqlite3vfs.IOErrorRead.Error()) {
+		t.Errorf("the \"hotness unknown\" warning does not carry the probe read error %q (error attr %q); log:\n%s", sqlite3vfs.IOErrorRead.Error(), got, captured.Text())
+	}
+	if _, ok := captured.Find("cold"); ok {
+		t.Errorf("log claims a cold journal although the probe could not read it; log:\n%s", captured.Text())
 	}
 }
