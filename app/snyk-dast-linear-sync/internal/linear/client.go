@@ -337,11 +337,8 @@ query issuesByFingerprint($filter: IssueFilter!, $after: String) {
 		if !resp.Issues.PageInfo.HasNextPage || next == nil {
 			break
 		}
-		// A cursor that does not advance would loop forever. The run context may
-		// carry no deadline, so this is guarded explicitly rather than relying on
-		// cancellation to break out.
-		if after != nil && *next == *after {
-			return nil, fmt.Errorf("look up Linear issues by fingerprint: pagination cursor did not advance after page %d", page)
+		if err := checkPaginationAdvanced("look up Linear issues by fingerprint", page, after, next); err != nil {
+			return nil, err
 		}
 		after = next
 	}
@@ -635,12 +632,25 @@ func (c *Client) PostComments(ctx context.Context, updates []model.IssueUpdate) 
 	return failed, nil
 }
 
+// checkPaginationAdvanced returns an error when a paginated Linear loop next
+// endCursor repeats the cursor the page was fetched with while the server still
+// claims another page. A cursor that does not advance would loop forever,
+// re-appending the same nodes each pass, and the run context may carry no
+// deadline, so this is guarded explicitly rather than relying on cancellation
+// to break out. Each caller names its loop so the error says which one stuck.
+func checkPaginationAdvanced(loop string, page int, prev, next *string) error {
+	if prev != nil && next != nil && *next == *prev {
+		return fmt.Errorf("%s: pagination cursor did not advance after page %d", loop, page)
+	}
+	return nil
+}
+
 func (c *Client) loadStates(ctx context.Context) error {
 	var after *string
 	states := map[string]string{}
 	stateTypes := map[string]string{}
 
-	for {
+	for page := 1; ; page++ {
 		op := gqlclient.NewOperation(`
 query teamStates($id: String!, $after: String) {
   team(id: $id) {
@@ -686,10 +696,14 @@ query teamStates($id: String!, $after: String) {
 			}
 		}
 
-		if !resp.Team.States.PageInfo.HasNextPage || resp.Team.States.PageInfo.EndCursor == nil {
+		next := resp.Team.States.PageInfo.EndCursor
+		if !resp.Team.States.PageInfo.HasNextPage || next == nil {
 			break
 		}
-		after = resp.Team.States.PageInfo.EndCursor
+		if err := checkPaginationAdvanced("fetch Linear states", page, after, next); err != nil {
+			return err
+		}
+		after = next
 	}
 
 	c.mu.Lock()
@@ -793,7 +807,7 @@ func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) 
 	var after *string
 	var issues []model.ExistingIssue
 
-	for {
+	for page := 1; ; page++ {
 		// Labels are paged at maxLiveLabelPage with a pageInfo check, like the
 		// live label read: a bare `labels { nodes }` silently truncates at
 		// Linear's default page size of 50, so a managed label removed by hand
@@ -866,10 +880,14 @@ query existingIssues($filter: IssueFilter!, $after: String) {
 			issues = append(issues, linearIssueToModel(node))
 		}
 
-		if !resp.Issues.PageInfo.HasNextPage || resp.Issues.PageInfo.EndCursor == nil {
+		next := resp.Issues.PageInfo.EndCursor
+		if !resp.Issues.PageInfo.HasNextPage || next == nil {
 			break
 		}
-		after = resp.Issues.PageInfo.EndCursor
+		if err := checkPaginationAdvanced("fetch Linear issues", page, after, next); err != nil {
+			return nil, err
+		}
+		after = next
 	}
 
 	return issues, nil
@@ -1152,7 +1170,7 @@ func (c *Client) resolveManagedLabel(ctx context.Context, managedLabel string) e
 	var after *string
 	var teamMatches []labelRef
 	var globalMatches []labelRef
-	for {
+	for page := 1; ; page++ {
 		op := gqlclient.NewOperation(`
 query managedIssueLabels($name: String!, $after: String) {
   issueLabels(first: 100, after: $after, filter: { name: { eqIgnoreCase: $name } }) {
@@ -1213,10 +1231,14 @@ query managedIssueLabels($name: String!, $after: String) {
 			}
 		}
 
-		if !resp.IssueLabels.PageInfo.HasNextPage || resp.IssueLabels.PageInfo.EndCursor == nil {
+		next := resp.IssueLabels.PageInfo.EndCursor
+		if !resp.IssueLabels.PageInfo.HasNextPage || next == nil {
 			break
 		}
-		after = resp.IssueLabels.PageInfo.EndCursor
+		if err := checkPaginationAdvanced("fetch Linear labels", page, after, next); err != nil {
+			return err
+		}
+		after = next
 	}
 
 	var resolved labelRef
