@@ -39,3 +39,14 @@ func TestNextCursorOrErrorNamesLoopAndPageWhenStuck(t *testing.T) {
 		t.Fatalf("error %q does not name the loop and page", err)
 	}
 }
+
+func TestNextCursorOrErrorRejectsRepeatedEmptyCursor(t *testing.T) {
+	// The first page offered an empty cursor with "more pages"; fetching
+	// with it returned the first page again, with the same empty cursor.
+	if _, err := NextCursorOrError("", "", "test loop", 1); err != nil {
+		t.Fatalf("page 1: NextCursorOrError() error = %v, want nil (no cursor existed yet)", err)
+	}
+	if _, err := NextCursorOrError("", "", "test loop", 2); err == nil {
+		t.Fatal("page 2: NextCursorOrError() error = nil, want a did-not-advance error for a repeated empty cursor")
+	}
+}
