@@ -16,6 +16,7 @@ import (
 
 	"github.com/tesslio/snyk-linear-sync/internal/cache"
 	"github.com/tesslio/snyk-linear-sync/internal/model"
+	"github.com/tesslio/snyk-linear-sync/internal/pagination"
 )
 
 type projectRef struct {
@@ -274,7 +275,7 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 	k8sClusterFailed := make(map[string]struct{})
 
 	nextCursor := ""
-	for {
+	for pageNum := 1; ; pageNum++ {
 		page, cursor, err := c.listIssuesPage(ctx, nextCursor)
 		if err != nil {
 			return model.SnykSnapshot{}, err
@@ -402,7 +403,11 @@ func (c *Client) LoadSnapshot(ctx context.Context) (model.SnykSnapshot, error) {
 		if cursor == "" {
 			break
 		}
-		nextCursor = cursor
+		advanced, err := pagination.NextCursorOrError(nextCursor, cursor, "list Snyk issues", pageNum)
+		if err != nil {
+			return model.SnykSnapshot{}, err
+		}
+		nextCursor = advanced
 	}
 
 	return model.SnykSnapshot{
@@ -1067,7 +1072,7 @@ func (c *Client) listProjects(ctx context.Context) ([]projectRef, error) {
 	projects := make([]projectRef, 0, 256)
 	opts := &snyksdk.ListProjectsOptions{}
 
-	for {
+	for pageNum := 1; ; pageNum++ {
 		page, resp, err := c.sdk.Projects.List(ctx, c.orgID, opts)
 		if err != nil {
 			return nil, fmt.Errorf("list Snyk projects: %w", err)
@@ -1109,7 +1114,11 @@ func (c *Client) listProjects(ctx context.Context) ([]projectRef, error) {
 		if cursor == "" {
 			break
 		}
-		opts.StartingAfter = cursor
+		advanced, err := pagination.NextCursorOrError(opts.StartingAfter, cursor, "list Snyk projects", pageNum)
+		if err != nil {
+			return nil, err
+		}
+		opts.StartingAfter = advanced
 	}
 
 	return projects, nil

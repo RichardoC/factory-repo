@@ -10,8 +10,11 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	snyksdk "github.com/pavel-snyk/snyk-sdk-go/v2/snyk"
 
 	"github.com/tesslio/snyk-linear-sync/internal/cache"
 	"github.com/tesslio/snyk-linear-sync/internal/model"
@@ -1450,5 +1453,105 @@ func TestFetchProjectClusterWithRetry(t *testing.T) {
 				t.Fatalf("requests = %d, want %d", requests, tc.wantRequests)
 			}
 		})
+	}
+}
+
+// snykPaginationTestClient builds a Client pointed at an httptest server,
+// with the SDK's base URLs overridden to the same server so listProjects and
+// the REST issue pages are both served by the stub.
+func snykPaginationTestClient(t *testing.T, orgID string) (*Client, *httptest.Server) {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected request: %s %s", r.Method, r.URL)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(server.Close)
+
+	base, err := url.Parse(server.URL + "/")
+	if err != nil {
+		t.Fatalf("parse server URL: %v", err)
+	}
+	sdkClient, err := snyksdk.NewClient("token",
+		snyksdk.WithHTTPClient(server.Client()),
+		snyksdk.WithRegion(snyksdk.Region{
+			Alias:       "test",
+			AppBaseURL:  server.URL + "/",
+			RESTBaseURL: server.URL + "/",
+			V1BaseURL:   server.URL + "/",
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	c := &Client{
+		orgID:      orgID,
+		httpClient: server.Client(),
+		restBase:   base,
+		v1Base:     base,
+		sdk:        sdkClient,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	return c, server
+}
+
+// The links.next URL in these stubs only feeds extractCursor, which reads the
+// starting_after query parameter; the host is never re-fetched, so a neutral
+// example.test URL is enough to repeat the cursor every page.
+const stuckCursorNext = "https://example.test/next?starting_after=cursor-1"
+
+func TestListProjectsFailsFastWhenCursorDoesNotAdvance(t *testing.T) {
+	c, server := snykPaginationTestClient(t, "test-org")
+	server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := fmt.Fprintf(w, `{"data":[],"links":{"next":%q}}`, stuckCursorNext); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	})
+
+	_, err := c.listProjects(context.Background())
+	if err == nil {
+		t.Fatal("listProjects() error = nil, want a did-not-advance error")
+	}
+	if !strings.Contains(err.Error(), "did not advance") {
+		t.Fatalf("error %q does not report a cursor that did not advance", err)
+	}
+	if !strings.Contains(err.Error(), "list Snyk projects") || !strings.Contains(err.Error(), "page 2") {
+		t.Fatalf("error %q does not name the loop and page", err)
+	}
+}
+
+func TestLoadSnapshotFailsFastWhenIssueCursorDoesNotAdvance(t *testing.T) {
+	c, server := snykPaginationTestClient(t, "test-org")
+	server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/orgs/test-org":
+			// orgSlug
+			if _, err := fmt.Fprint(w, `{"data":{"attributes":{"slug":"test-org"}}}`); err != nil {
+				t.Errorf("write response: %v", err)
+			}
+		case strings.HasPrefix(r.URL.Path, "/orgs/test-org/projects"):
+			if _, err := fmt.Fprint(w, `{"data":[]}`); err != nil {
+				t.Errorf("write response: %v", err)
+			}
+		case r.URL.Path == "/orgs/test-org/issues":
+			if _, err := fmt.Fprintf(w, `{"data":[],"links":{"next":%q}}`, stuckCursorNext); err != nil {
+				t.Errorf("write response: %v", err)
+			}
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	_, err := c.LoadSnapshot(context.Background())
+	if err == nil {
+		t.Fatal("LoadSnapshot() error = nil, want a did-not-advance error")
+	}
+	if !strings.Contains(err.Error(), "did not advance") {
+		t.Fatalf("error %q does not report a cursor that did not advance", err)
+	}
+	if !strings.Contains(err.Error(), "list Snyk issues") || !strings.Contains(err.Error(), "page 2") {
+		t.Fatalf("error %q does not name the loop and page", err)
 	}
 }
