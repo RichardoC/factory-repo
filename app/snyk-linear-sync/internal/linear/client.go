@@ -20,6 +20,7 @@ import (
 	"github.com/tesslio/snyk-linear-sync/internal/config"
 	"github.com/tesslio/snyk-linear-sync/internal/httpx"
 	"github.com/tesslio/snyk-linear-sync/internal/model"
+	"github.com/tesslio/snyk-linear-sync/internal/pagination"
 )
 
 const (
@@ -591,7 +592,7 @@ func (c *Client) loadStates(ctx context.Context) error {
 	stateTypes := map[string]string{}
 	statesByID := map[string]workflowState{}
 
-	for {
+	for page := 1; ; page++ {
 		op := gqlclient.NewOperation(`
 query teamStates($id: String!, $after: String) {
   team(id: $id) {
@@ -641,7 +642,11 @@ query teamStates($id: String!, $after: String) {
 		if !resp.Team.States.PageInfo.HasNextPage || resp.Team.States.PageInfo.EndCursor == nil {
 			break
 		}
-		after = resp.Team.States.PageInfo.EndCursor
+		next, err := pagination.NextCursorOrError(deref(after), deref(resp.Team.States.PageInfo.EndCursor), "fetch Linear states", page)
+		if err != nil {
+			return err
+		}
+		after = &next
 	}
 
 	c.mu.Lock()
@@ -908,7 +913,7 @@ func (c *Client) loadIssues(ctx context.Context) ([]model.ExistingIssue, error) 
 	var after *string
 	var issues []model.ExistingIssue
 
-	for {
+	for page := 1; ; page++ {
 		op := gqlclient.NewOperation(`
 query existingIssues($filter: IssueFilter!, $after: String) {
   issues(first: 100, after: $after, filter: $filter, includeArchived: true) {
@@ -984,7 +989,11 @@ query existingIssues($filter: IssueFilter!, $after: String) {
 		if !resp.Issues.PageInfo.HasNextPage || resp.Issues.PageInfo.EndCursor == nil {
 			break
 		}
-		after = resp.Issues.PageInfo.EndCursor
+		next, err := pagination.NextCursorOrError(deref(after), deref(resp.Issues.PageInfo.EndCursor), "fetch Linear issues", page)
+		if err != nil {
+			return nil, err
+		}
+		after = &next
 	}
 
 	return issues, nil
@@ -1080,13 +1089,11 @@ query issuesByFingerprint($filter: IssueFilter!, $after: String) {
 		if !resp.Issues.PageInfo.HasNextPage || next == nil {
 			break
 		}
-		// A cursor that does not advance would loop forever. The run context may
-		// carry no deadline, so this is guarded explicitly rather than relying on
-		// cancellation to break out.
-		if after != nil && *next == *after {
-			return nil, fmt.Errorf("look up Linear issues by fingerprint: pagination cursor did not advance after page %d", page)
+		advanced, err := pagination.NextCursorOrError(deref(after), deref(next), "look up Linear issues by fingerprint", page)
+		if err != nil {
+			return nil, err
 		}
-		after = next
+		after = &advanced
 	}
 
 	return found, nil
@@ -1421,7 +1428,7 @@ func (c *Client) resolveManagedLabel(ctx context.Context, managedLabel string) e
 	var after *string
 	var teamMatches []labelRef
 	var globalMatches []labelRef
-	for {
+	for page := 1; ; page++ {
 		op := gqlclient.NewOperation(`
 query managedIssueLabels($name: String!, $after: String) {
   issueLabels(first: 100, after: $after, filter: { name: { eqIgnoreCase: $name } }) {
@@ -1485,7 +1492,11 @@ query managedIssueLabels($name: String!, $after: String) {
 		if !resp.IssueLabels.PageInfo.HasNextPage || resp.IssueLabels.PageInfo.EndCursor == nil {
 			break
 		}
-		after = resp.IssueLabels.PageInfo.EndCursor
+		next, err := pagination.NextCursorOrError(deref(after), deref(resp.IssueLabels.PageInfo.EndCursor), "fetch Linear labels", page)
+		if err != nil {
+			return err
+		}
+		after = &next
 	}
 
 	var resolved labelRef

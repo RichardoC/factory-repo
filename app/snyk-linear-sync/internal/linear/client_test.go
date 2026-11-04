@@ -3278,3 +3278,98 @@ func TestLoadSnapshotRetriesReadOn503(t *testing.T) {
 		t.Fatalf("snapshot read reached the server %d times, want 2 (one 503, one retry)", got)
 	}
 }
+
+// stuckPaginationClient builds a Client whose GraphQL transport answers
+// every request with a page that claims more pages follow but offers the
+// same endCursor every time. A loop that trusts such a cursor would spin
+// forever; the tests below pin the shared guard that fails fast instead.
+func stuckPaginationClient(t *testing.T, queryMarker, pageBody string, requests *int) *Client {
+	t.Helper()
+	return &Client{
+		cfg: config.LinearConfig{
+			TeamID: "11111111-1111-1111-1111-111111111111",
+		},
+		gql: gqlclient.New("http://linear.test/graphql", &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var payload struct {
+					Query string `json:"query"`
+				}
+				reqBody, err := io.ReadAll(req.Body)
+				if err != nil {
+					t.Fatalf("ReadAll() error = %v", err)
+				}
+				if err := json.Unmarshal(reqBody, &payload); err != nil {
+					t.Fatalf("json.Unmarshal() error = %v", err)
+				}
+				if !strings.Contains(payload.Query, queryMarker) {
+					t.Fatalf("unexpected GraphQL query:\n%s", payload.Query)
+				}
+				*requests++
+				return jsonResponse(t, pageBody), nil
+			}),
+		}),
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+}
+
+// assertDidNotAdvance asserts the loop failed fast with the shared
+// did-not-advance error naming the loop and the page it stuck on, and that
+// it stopped after exactly the two requests the error implies (page 1, then
+// the repeat of page 1's cursor).
+func assertDidNotAdvance(t *testing.T, err error, label string, requests int) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("loop returned no error; a stuck cursor must fail fast, not spin")
+	}
+	if !strings.Contains(err.Error(), "did not advance") {
+		t.Fatalf("error %q does not report a cursor that did not advance", err)
+	}
+	if !strings.Contains(err.Error(), label) {
+		t.Fatalf("error %q does not name the loop %q", err, label)
+	}
+	if !strings.Contains(err.Error(), "page 2") {
+		t.Fatalf("error %q does not name the page the cursor stuck on", err)
+	}
+	if requests != 2 {
+		t.Fatalf("loop reached the server %d times, want 2 (page 1, then the repeated cursor)", requests)
+	}
+}
+
+func TestLoadStatesFailsFastWhenPaginationCursorDoesNotAdvance(t *testing.T) {
+	requests := 0
+	client := stuckPaginationClient(t, "query teamStates",
+		`{"data":{"team":{"states":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}}}`, &requests)
+
+	err := client.loadStates(t.Context())
+	assertDidNotAdvance(t, err, "fetch Linear states", requests)
+}
+
+func TestLoadIssuesFailsFastWhenPaginationCursorDoesNotAdvance(t *testing.T) {
+	requests := 0
+	client := stuckPaginationClient(t, "query existingIssues",
+		`{"data":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}}`, &requests)
+
+	if _, err := client.loadIssues(t.Context()); err != nil {
+		assertDidNotAdvance(t, err, "fetch Linear issues", requests)
+	} else {
+		t.Fatal("loadIssues() error = nil, want a did-not-advance error")
+	}
+}
+
+func TestExistingFingerprintsFailsFastWhenPaginationCursorDoesNotAdvance(t *testing.T) {
+	requests := 0
+	client := stuckPaginationClient(t, "query issuesByFingerprint",
+		`{"data":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}}`, &requests)
+
+	_, err := client.ExistingFingerprints(t.Context(), []string{"fingerprint-1"})
+	assertDidNotAdvance(t, err, "look up Linear issues by fingerprint", requests)
+}
+
+func TestResolveManagedLabelFailsFastWhenPaginationCursorDoesNotAdvance(t *testing.T) {
+	requests := 0
+	client := stuckPaginationClient(t, "query managedIssueLabels",
+		`{"data":{"issueLabels":{"nodes":[{"id":"label-1","name":"managed","team":{"id":"11111111-1111-1111-1111-111111111111"}}],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}}`, &requests)
+
+	err := client.resolveManagedLabel(t.Context(), "managed")
+	assertDidNotAdvance(t, err, "fetch Linear labels", requests)
+}
