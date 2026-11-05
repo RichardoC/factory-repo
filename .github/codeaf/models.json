@@ -74,7 +74,7 @@
       "upstream": "hf:zai-org/GLM-5.3",
       "max_concurrent": 8,
       "name": "GLM-5.3 (synthetic.new)",
-      "role": "top",
+      "role": "experiment",
       "input": 0.40,
       "output": 2.20,
       "cache_read": 0.07,
@@ -84,7 +84,7 @@
       "context_length": 524288,
       "input_modalities": ["text"],
       "efforts": ["medium", "high", "max"],
-      "efforts_note": "low, minimal and medium are all sent as medium: equal correctness (3/3 vs 3/3, 0 empty answers, 0 malformed tool calls) and a real saving (median completion 1332->854, i.e. 35.9% fewer; median wall 26.3->17.8 s, 32.1% less), so medium is sent raw to synthetic.new; low is still never sent raw because GLM returns an empty answer (tested 2026-10-15 and 2026-10-16; measured 2026-10-17, results.md, issue #24)"
+      "efforts_note": "role experiment since 2026-11-05 (owner's decision): Kimi-K3.1-Pro replaced it as the top model and lane 2's worker, being cheaper and faster per passing run in the 2026-11-05 experiment; kept so the glm53 profile can still name it. low, minimal and medium are all sent as medium: equal correctness (3/3 vs 3/3, 0 empty answers, 0 malformed tool calls) and a real saving (median completion 1332->854, i.e. 35.9% fewer; median wall 26.3->17.8 s, 32.1% less), so medium is sent raw to synthetic.new; low is still never sent raw because GLM returns an empty answer (tested 2026-10-15 and 2026-10-16; measured 2026-10-17, results.md, issue #24)"
     },
     {
       "id": "moonshotai/kimi-k3",
@@ -108,7 +108,7 @@
       "upstream": "hf:moonshotai/Kimi-K3.1-Pro",
       "max_concurrent": 8,
       "name": "Kimi-K3.1-Pro (synthetic.new)",
-      "role": "experiment",
+      "role": "top",
       "input": 1.00,
       "output": 7.00,
       "cache_read": 0.10,
@@ -118,7 +118,7 @@
       "context_length": 524288,
       "input_modalities": ["text", "image"],
       "efforts": ["low", "medium", "high"],
-      "efforts_note": "role experiment: never picked by a lane, only by a model-experiment profile (experiments.json). Beta on synthetic.new's pricing page (2026-11-05). Efforts copied from Kimi-K3; whether it honours reasoning_effort is unverified."
+      "efforts_note": "role top since 2026-11-05 (owner's decision, after the Kimi-K3.1-Pro vs GLM-5.3 experiment: on two graded tasks x two copies with one model in every seat, all 8 runs passed every hidden test; Kimi-K3.1-Pro cost $0.81 in total against $2.03, median $0.20 a run against $0.38, with about 4x fewer calls, 6.6x fewer output tokens and half the wall time, though its first token was occasionally slow, p90 up to 47 s). As top it is lane 2's worker. Beta on synthetic.new's pricing page (2026-11-05). Efforts copied from Kimi-K3: a request for xhigh or max is sent as high."
     },
     {
       "id": "openai/gpt-oss-120b",

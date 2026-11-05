@@ -310,9 +310,11 @@ runs alike.
 
 **Lanes.** Each run the queue starts gets the lowest free lane, 0 through
 `max_parallel_runs - 1`. The lane picks the run's worker seat model from the
-allowed list in `models.json`, as `models[lane mod count]`, so two
-concurrent runs rarely compete for one model's call slots; lane 0 keeps
-today's default seat, GLM-5.3-Flash. The lane travels to the run as a
+non-experiment models in `models.json`, in file order, as
+`models[lane mod count]`, so two concurrent runs rarely compete for one
+model's call slots. Today that is GLM-5.3-Flash on lanes 0 and 3,
+DeepSeek-V4.1-Flash 10/17 on lane 1, and Kimi-K3.1-Pro (role `top`) on
+lane 2. The lane travels to the run as a
 digits-only `workflow_dispatch` input, validated by the gate and validated
 again by `seat-config` inside the run job — a missing or malformed lane
 means lane 0. The queue reads lanes back from run titles, which read
@@ -371,7 +373,7 @@ A profile pins the worker, planner and checker seats to models from
 `/codeaf` comments never start an experiment issue, and a profile on any
 other issue is refused. A profile run gets no independent review and no
 continuation, so each result is that profile's unaided work. Models with
-role `experiment` (Kimi-K3, Kimi-K3.1-Pro, GPT-OSS-120B, Qwen3.8-27B,
+role `experiment` (GLM-5.3, Kimi-K3, GPT-OSS-120B, Qwen3.8-27B,
 GLM-4.7-Flash, DeepSeek-V4.1-Flash in infinite mode) are allowed by the
 proxy but never picked as a lane's worker.
 
