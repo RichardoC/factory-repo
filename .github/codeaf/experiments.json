@@ -31,11 +31,6 @@
       "planner": "deepseek-ai/deepseek-v4.1-flash-1017",
       "checker": "deepseek-ai/deepseek-v4.1-flash-1017"
     },
-    "baseline-1017": {
-      "worker": "zai-org/glm-5.3-flash",
-      "planner": "deepseek-ai/deepseek-v4.1-flash-1017",
-      "checker": "deepseek-ai/deepseek-v4.1-flash-1017"
-    },
     "baseline-infinite": {
       "worker": "zai-org/glm-5.3-flash",
       "planner": "synthetic/deepseek-v4.1-flash-infinite",
