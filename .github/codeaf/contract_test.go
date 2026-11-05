@@ -289,7 +289,7 @@ func TestContract(t *testing.T) {
 			// The lane whose worker is the model the config pins the two
 			// seats to rotates both onto the cheapest other lane model:
 			// with the committed files, lane 1 (worker
-			// deepseek-ai/deepseek-v4.1-flash) seats the planner and the
+			// deepseek-ai/deepseek-v4.1-flash-1017) seats the planner and the
 			// checker on zai-org/glm-5.3-flash.
 			if want := lanes[lane%len(lanes)].ID; worker != want {
 				t.Errorf("seat-config %d: worker %q, want lane model %q", lane, worker, want)

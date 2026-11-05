@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -15,7 +17,7 @@ func TestExperimentProfile(t *testing.T) {
 	if p.Worker != "moonshotai/kimi-k3" || p.Planner != p.Worker || p.Checker != p.Worker {
 		t.Fatalf("kimi profile = %+v", p)
 	}
-	for _, name := range []string{"baseline", "deepseek", "glm53", "kimi"} {
+	for _, name := range []string{"baseline", "deepseek-1017", "glm53", "kimi", "kimi31"} {
 		if _, err := experimentProfile(name); err != nil {
 			t.Errorf("committed profile %q: %v", name, err)
 		}
@@ -23,6 +25,37 @@ func TestExperimentProfile(t *testing.T) {
 	for _, bad := range []string{"", "nope", "Kimi", "../models", "a b", strings.Repeat("a", 33)} {
 		if _, err := experimentProfile(bad); err == nil {
 			t.Errorf("experimentProfile(%q) accepted", bad)
+		}
+	}
+}
+
+// TestExperimentProfilesNameCatalogModels pins every profile in
+// experiments.json to models.json: a profile that names a model the catalog
+// no longer carries (one retired upstream, say) must fail here, where it is
+// a one-line config fix, rather than at dispatch time, where it fails the
+// run.
+func TestExperimentProfilesNameCatalogModels(t *testing.T) {
+	data, err := os.ReadFile("experiments.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file struct {
+		Profiles map[string]Profile `json:"profiles"`
+	}
+	if err := json.Unmarshal(data, &file); err != nil {
+		t.Fatal(err)
+	}
+	if len(file.Profiles) == 0 {
+		t.Fatal("no profiles in experiments.json")
+	}
+	models := testModels(t)
+	for name, p := range file.Profiles {
+		for seat, id := range map[string]string{"worker": p.Worker, "planner": p.Planner, "checker": p.Checker} {
+			if m, ok := Resolve(models, id); !ok {
+				t.Errorf("profile %q: %s seat %q is not a models.json model", name, seat, id)
+			} else if m.ID != id {
+				t.Errorf("profile %q: %s seat %q resolves to %q", name, seat, id, m.ID)
+			}
 		}
 	}
 }

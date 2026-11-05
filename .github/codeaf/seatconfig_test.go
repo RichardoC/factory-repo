@@ -223,7 +223,7 @@ func TestSeatConfigDistinctSeats(t *testing.T) {
 			// The lane whose worker is the model the config pins the
 			// planner and checker to rotates both seats onto the cheapest
 			// other lane model. With the committed files that is lane 1
-			// (worker deepseek-ai/deepseek-v4.1-flash, seats
+			// (worker deepseek-ai/deepseek-v4.1-flash-1017, seats
 			// zai-org/glm-5.3-flash).
 			lanes := laneModels(cfg.Models)
 			if want := lanes[lane%len(lanes)].ID; worker != want {
