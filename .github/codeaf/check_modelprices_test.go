@@ -34,17 +34,17 @@ func TestModelPricesDiff(t *testing.T) {
 		"| hf:zai-org/GLM-5.3-Flash | context | 524288 → 262144 |",
 		// efforts mismatch on GLM-5.3-Flash
 		"| hf:zai-org/GLM-5.3-Flash | efforts |",
-		// new infinite: alias, informational
-		"new alias: infinite:small:text",
-		// catalog addition, informational
-		"catalog addition: hf:Qwen/Qwen3.8-27B",
+		// the retired hf:deepseek-ai/DeepSeek-V4.1-Flash upstream and the
+		// infinite: entry for it are catalog additions, informational
+		"catalog addition: hf:deepseek-ai/DeepSeek-V4.1-Flash",
+		"catalog addition: infinite:small:text",
 	} {
 		if !strings.Contains(report, want) {
 			t.Errorf("report missing %q\nreport:\n%s", want, report)
 		}
 	}
 	// informational lines live outside the diff table
-	if strings.Contains(report, "| hf:Qwen/Qwen3.8-27B |") ||
+	if strings.Contains(report, "| hf:deepseek-ai/DeepSeek-V4.1-Flash |") ||
 		strings.Contains(report, "| infinite:small:text |") {
 		t.Errorf("informational catalog entries leaked into the diff table:\n%s", report)
 	}
@@ -69,7 +69,7 @@ func TestModelPricesDiff(t *testing.T) {
 	// catalog with only a new alias is not a change.
 	aliasOnly := strings.Replace(string(unchanged),
 		`{"data":[`,
-		`{"data":[{"id":"infinite:small:text","hugging_face_id":"deepseek-ai/DeepSeek-V4.1-Flash","context_length":524288,"reasoning_parameters":{"efforts":["none","low","high","xhigh","max"]},"pricing":{"prompt":"0","completion":"0","input_cache_reads":"0"}},`,
+		`{"data":[{"id":"infinite:small:text","hugging_face_id":"zai-org/GLM-5.3-Flash","context_length":524288,"reasoning_parameters":{"efforts":["medium","high","max"]},"pricing":{"prompt":"0","completion":"0","input_cache_reads":"0"}},`,
 		1)
 	changed, report, err = modelPricesDiff(modelsJSON, []byte(aliasOnly))
 	if err != nil {

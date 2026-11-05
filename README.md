@@ -42,7 +42,7 @@ Three workflow artifacts are uploaded, none of them encrypted:
 Every CodeAF run that opens or updates a pull request is followed by one
 **review run** — a second CodeAF run in read-only review mode. The reviewer
 sits on a different model from the worker that wrote the patch (worker
-**GLM-5.3-Flash**, reviewer **DeepSeek-V4.1-Flash**, both from
+**GLM-5.3-Flash**, reviewer **DeepSeek-V4.1-Flash 10/17 checkpoint**, both from
 [`models.json`](.github/codeaf/models.json)), so it does not share the same
 blind spots. It reviews the PR's diff against the issue for correctness,
 concurrency, error handling and whether the tests actually exercise the
@@ -112,7 +112,7 @@ maintainer's approval, like any other change under `.github/`.
   own per-model cap (`max_concurrent`, 8):
   - the worker runs on **GLM-5.3-Flash** ($0.15 in / $0.50 out per M tokens at
     the API list prices the factory quotes);
-  - the planner and checker run on **DeepSeek-V4.1-Flash** ($0.60 / $1.20).
+  - the planner and checker run on **DeepSeek-V4.1-Flash 10/17 checkpoint** ($0.60 / $1.20).
   - CodeAF's `task.parallel` is set per run to that run's slice of the
     worker model's `max_concurrent` (below).
   - The proxy enforces the limit per model (`max_concurrent` in
@@ -121,7 +121,7 @@ maintainer's approval, like any other change under `.github/`.
     ledger, so the diagnostics show whether a run was held up by it.
   - Escalation is switched off for now. CodeAF's cascade
     ([`panel.json`](.github/codeaf/panel.json)) would escalate to
-    **DeepSeek-V4.1-Flash** ($0.06 / $0.30) and then **GLM-5.3** ($0.40 / $2.20),
+    **DeepSeek-V4.1-Flash 10/17 checkpoint** ($0.06 / $0.30) and then **GLM-5.3** ($0.40 / $2.20),
     but it has two bugs:
     - it treats a reply made only of tool calls as empty, and fails every run;
     - its pinned rungs all call the seat model, so it never escalates.
@@ -346,7 +346,8 @@ any in-flight run whose area is unknown, still conflicts with everything.
 rolling-week spend reaches 75% of `limits.weekly_credit_usd`, and all
 concurrent runs draw that budget down together.
 
-**Pricing.** DeepSeek-V4.1-Flash has the cheapest cached-input price
+**Pricing.** DeepSeek-V4.1-Flash (the 10/17 checkpoint the lanes run)
+has the cheapest cached-input price
 (0.03 USD/M tokens at API prices), so a non-zero lane can spend less
 per ticket — but it is a weaker model (`role: mid`), so the rotation trades
 a little quality on busy days for no model contention.
@@ -370,8 +371,9 @@ A profile pins the worker, planner and checker seats to models from
 `/codeaf` comments never start an experiment issue, and a profile on any
 other issue is refused. A profile run gets no independent review and no
 continuation, so each result is that profile's unaided work. Models with
-role `experiment` (Kimi-K3) are allowed by the proxy but never picked as a
-lane's worker.
+role `experiment` (Kimi-K3, Kimi-K3.1-Pro, GPT-OSS-120B, Qwen3.8-27B,
+GLM-4.7-Flash, DeepSeek-V4.1-Flash in infinite mode) are allowed by the
+proxy but never picked as a lane's worker.
 
 ### Runs that stop early (issue #31)
 

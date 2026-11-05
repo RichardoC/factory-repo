@@ -289,7 +289,7 @@ func TestContract(t *testing.T) {
 			// The lane whose worker is the model the config pins the two
 			// seats to rotates both onto the cheapest other lane model:
 			// with the committed files, lane 1 (worker
-			// deepseek-ai/deepseek-v4.1-flash) seats the planner and the
+			// deepseek-ai/deepseek-v4.1-flash-1017) seats the planner and the
 			// checker on zai-org/glm-5.3-flash.
 			if want := lanes[lane%len(lanes)].ID; worker != want {
 				t.Errorf("seat-config %d: worker %q, want lane model %q", lane, worker, want)
@@ -559,6 +559,17 @@ func TestContract(t *testing.T) {
 		}
 		if !strings.Contains(stdout, "| `zai-org/glm-5.3-flash` |") {
 			t.Errorf("report has no per-model row for the ledger's worker model")
+		}
+		// The fixtures name only models models.json still lists, so the
+		// seats render by id (not "(other)") and the ledger row is priced:
+		// issue #518 retired deepseek-ai/deepseek-v4.1-flash, and a fixture
+		// still naming it would render an unpriced "(other)" row here.
+		if !strings.Contains(stdout, "planner `deepseek-ai/deepseek-v4.1-flash-1017`, checker `deepseek-ai/deepseek-v4.1-flash-1017`") ||
+			strings.Contains(stdout, "(other)") {
+			t.Errorf("report does not render the planner and the checker by id:\n%s", stdout)
+		}
+		if !strings.Contains(stdout, "| `deepseek-ai/deepseek-v4.1-flash-1017` | 0.6 · 0.03 · 1.2 |") {
+			t.Errorf("report has no priced per-model row for the ledger's planner model:\n%s", stdout)
 		}
 		// The publish job's ::error:: lines reach the report verbatim (the
 		// two most recent; the fixture's oldest line is dropped).
